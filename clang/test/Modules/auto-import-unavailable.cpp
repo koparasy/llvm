@@ -1,7 +1,7 @@
 // RUN: rm -rf %t
 // RUN: not %clang_cc1 -x c++ -Rmodule-build -DMISSING_HEADER -fmodules -fimplicit-module-maps -fmodules-cache-path=%t -I %S/Inputs/auto-import-unavailable %s 2>&1 | FileCheck %s --check-prefix=MISSING-HEADER
 // RUN: %clang_cc1 -x c++ -Rmodule-build -DNONREQUIRED_MISSING_HEADER -fmodules -fimplicit-module-maps -fmodules-cache-path=%t -I %S/Inputs/auto-import-unavailable %s 2>&1 | FileCheck %s --check-prefix=NONREQUIRED-MISSING-HEADER
-// RUN: not %clang_cc1 -x c++ -Rmodule-build -DMISSING_REQUIREMENT -fmodules -fimplicit-module-maps -fmodules-cache-path=%t -I %S/Inputs/auto-import-unavailable %s 2>&1 | FileCheck %s --check-prefix=MISSING-REQUIREMENT
+// RUN: %clang_cc1 -x c++ -Rmodule-build -DMISSING_REQUIREMENT -fmodules -fimplicit-module-maps -fmodules-cache-path=%t -I %S/Inputs/auto-import-unavailable %s 2>&1 | FileCheck %s --check-prefix=MISSING-REQUIREMENT --allow-empty
 
 #ifdef MISSING_HEADER
 
@@ -35,13 +35,13 @@
 
 #ifdef MISSING_REQUIREMENT
 
-// If the header is unavailable due to a missing requirement, an error
-// should be emitted if a user tries to include it.
+// An implicit #include of a header whose module has an unmet 'requires' feature
+// constraint should fall back to textual inclusion rather than emitting an
+// error.  The header's own preprocessor guards take effect, and the module is
+// not built.
 
-// MISSING-REQUIREMENT:module.modulemap:16:8: error: module 'missing_requirement' requires feature 'nonexistent_feature'
-// MISSING-REQUIREMENT: auto-import-unavailable.cpp:[[@LINE+1]]:10: note: submodule of top-level module 'missing_requirement' implicitly imported here
-#include "missing_requirement.h"
-
+// MISSING-REQUIREMENT-NOT: error:
 // MISSING-REQUIREMENT-NOT: remark: building module
+#include "missing_requirement.h"
 
 #endif // #ifdef MISSING_REQUIREMENT
