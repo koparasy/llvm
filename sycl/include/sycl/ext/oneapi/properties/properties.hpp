@@ -142,7 +142,7 @@ template <typename... property_tys> struct properties_sorter {
   template <int... IdxSeq>
   struct helper<std::integer_sequence<int, IdxSeq...>> {
     using type = properties_type_list<
-      properties_nth_type_t<sorted_indices[IdxSeq], property_tys...>...>;
+        properties_nth_type_t<sorted_indices[IdxSeq], property_tys...>...>;
   };
 
   using type = typename helper<
@@ -197,9 +197,9 @@ public:
             if (kinds[i] == kinds[j])
               return std::pair{i, j};
       }();
-        using first_type =
+      using first_type =
           detail::properties_nth_type_t<conflict.first, property_tys...>;
-        using second_type =
+      using second_type =
           detail::properties_nth_type_t<conflict.second, property_tys...>;
       if constexpr (std::is_same_v<typename first_type::key_t,
                                    typename second_type::key_t>) {
@@ -349,7 +349,7 @@ struct filter_properties_impl {
   static constexpr auto apply_impl(const prop_list_ty &props,
                                    std::integer_sequence<int, Idxs...>) {
     return properties{props.template get_property<
-      typename properties_nth_type_t<Idxs, property_tys...>::key_t>()...};
+        typename properties_nth_type_t<Idxs, property_tys...>::key_t>()...};
   }
 
   template <typename prop_list_ty>
