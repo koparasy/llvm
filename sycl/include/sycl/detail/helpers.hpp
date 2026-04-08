@@ -91,6 +91,10 @@ public:
     return nd_item<Dims>(Global, Local, Group);
   }
 
+  template <int Dims> static nd_item<Dims> createNDItem() {
+    return nd_item<Dims>();
+  }
+
   template <int Dims>
   static h_item<Dims> createHItem(const item<Dims, false> &Global,
                                   const item<Dims, false> &Local) {
@@ -150,21 +154,7 @@ public:
 
   template <int Dims> static const nd_item<Dims> getElement(nd_item<Dims> *) {
     static_assert(is_valid_dimensions<Dims>, "invalid dimensions");
-    range<Dims> GlobalSize{__spirv::initBuiltInGlobalSize<Dims, range<Dims>>()};
-    range<Dims> LocalSize{
-        __spirv::initBuiltInWorkgroupSize<Dims, range<Dims>>()};
-    range<Dims> GroupRange{
-        __spirv::initBuiltInNumWorkgroups<Dims, range<Dims>>()};
-    id<Dims> GroupId{__spirv::initBuiltInWorkgroupId<Dims, id<Dims>>()};
-    id<Dims> GlobalId{__spirv::initBuiltInGlobalInvocationId<Dims, id<Dims>>()};
-    id<Dims> LocalId{__spirv::initBuiltInLocalInvocationId<Dims, id<Dims>>()};
-    id<Dims> GlobalOffset{__spirv::initBuiltInGlobalOffset<Dims, id<Dims>>()};
-    group<Dims> Group =
-        createGroup<Dims>(GlobalSize, LocalSize, GroupRange, GroupId);
-    item<Dims, true> GlobalItem =
-        createItem<Dims, true>(GlobalSize, GlobalId, GlobalOffset);
-    item<Dims, false> LocalItem = createItem<Dims, false>(LocalSize, LocalId);
-    return createNDItem<Dims>(GlobalItem, LocalItem, Group);
+    return createNDItem<Dims>();
   }
 
   template <int Dims, bool WithOffset>
