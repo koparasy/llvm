@@ -9,7 +9,6 @@
 #pragma once
 
 #include <array>                                             // for array
-#include <limits>
 #include <stddef.h>                                          // for size_t
 #include <stdint.h>                                          // for uint32_T
 #include <sycl/aspects.hpp>                                  // for aspect
