@@ -60,6 +60,33 @@ that is less error-prone to use. For example, if a function accepts a
 satisfied. It is recommended that this extension is used only when modifying
 existing interfaces is not feasible. _{endnote}_]
 
+=== Header selection
+
+Applications that need the object-returning APIs from this extension should
+include:
+
+[source,c++]
+----
+#include <sycl/ext/oneapi/free_function_queries.hpp>
+----
+
+This header provides the `this_work_item::get_nd_item`,
+`this_work_item::get_work_group`, and `this_work_item::get_sub_group` APIs, as
+well as the deprecated compatibility wrappers described below.
+
+Applications that only need scalar work-item queries may instead include:
+
+[source,c++]
+----
+#include <sycl/ext/oneapi/work_item_primitives.hpp>
+----
+
+This header provides a lighter-weight entry point into the same
+`sycl::ext::oneapi::this_work_item` namespace for scalar queries such as global,
+local, and group ids / ranges and linear ids. It is intended for code paths
+where compile time matters and the object-returning APIs from this extension are
+not required.
+
 
 == Specification
 
