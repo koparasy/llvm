@@ -68,6 +68,7 @@
 // CHECK-NEXT: device_selector.hpp
 // CHECK-NEXT: handler.hpp
 // CHECK-NEXT: accessor.hpp
+// CHECK-NEXT: detail/loop.hpp
 // CHECK-NEXT: buffer.hpp
 // CHECK-NEXT: detail/common.hpp
 // CHECK-NEXT: detail/fwd/accessor.hpp

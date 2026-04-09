@@ -21,9 +21,6 @@
 
 - Improved handling of ... intel/llvm#pr
 - Fixed ... intel/llvm#pr
-- Added smaller public builtin include paths via `<sycl/math.hpp>` and
-  `<sycl/relational.hpp>` while keeping `<sycl/builtins.hpp>` as the umbrella
-  header. intel/llvm#pr
 
 ## Misc
 

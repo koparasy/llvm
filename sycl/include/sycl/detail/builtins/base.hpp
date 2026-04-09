@@ -11,8 +11,9 @@
 
 #pragma once
 
+#include <sycl/detail/loop.hpp>
 #include <sycl/detail/fwd/multi_ptr.hpp>
-#include <sycl/detail/helpers.hpp>
+#include <sycl/detail/generic_type_traits.hpp>
 #include <sycl/detail/type_traits.hpp>
 #include <sycl/detail/type_traits/vec_marray_traits.hpp>
 #include <sycl/half_type.hpp>
@@ -153,28 +154,6 @@ template <class T, int N> marray<T, N> to_marray(vec<T, N> X) {
   return Marray;
 }
 
-// Relation builtins widen signed-char masks to the required integer element
-// type. Keep that conversion local here so builtins.hpp does not need to pull
-// in vector_convert.hpp just for vec::convert.
-template <typename NewElemT, int N>
-vec<NewElemT, N> relational_mask_widen(vec<signed char, N> X) {
-  static_assert(is_scalar_arithmetic_v<NewElemT>);
-
-#ifdef __SYCL_DEVICE_ONLY__
-  if constexpr (N > 1) {
-    using src_vector_t = signed char __attribute__((ext_vector_type(N)));
-    using dst_vector_t = NewElemT __attribute__((ext_vector_type(N)));
-    auto OpenCLVec = bit_cast<src_vector_t>(X);
-    return bit_cast<vec<NewElemT, N>>(
-        __builtin_convertvector(OpenCLVec, dst_vector_t));
-  }
-#endif
-
-  vec<NewElemT, N> Result{};
-  loop<N>([&](auto idx) { Result[idx] = static_cast<NewElemT>(X[idx]); });
-  return Result;
-}
-
 namespace builtins {
 #ifdef __SYCL_DEVICE_ONLY__
 template <typename T> auto convert_arg(T &&x) {
@@ -262,7 +241,9 @@ auto builtin_delegate_to_scalar(FuncTy F, const Ts &...x) {
       r[i] = F(x[i]...);
     }
   } else {
-    loop<Size>([&](auto idx) { r[idx] = F(x[idx]...); });
+    for (size_t i = 0; i < Size; ++i) {
+      r[i] = F(x[i]...);
+    }
   }
 
   return r;

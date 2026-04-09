@@ -9,6 +9,7 @@
 #pragma once
 
 #include <sycl/access/access.hpp>                     // for target, mode
+#include <sycl/detail/loop.hpp>                       //for loop
 #include <sycl/buffer.hpp>                            // for range
 #include <sycl/detail/accessor_iterator.hpp>          // for accessor_iterator
 #include <sycl/detail/common.hpp>                     // for code_location
@@ -17,7 +18,6 @@
 #include <sycl/detail/export.hpp>                     // for __SYCL_EXPORT
 #include <sycl/detail/generic_type_traits.hpp>        // for is_genint, Try...
 #include <sycl/detail/handler_proxy.hpp>              // for associateWithH...
-#include <sycl/detail/helpers.hpp>                    // for loop
 #include <sycl/detail/owner_less_base.hpp>            // for OwnerLessBase
 #include <sycl/detail/property_helper.hpp>            // for PropWithDataKind
 #include <sycl/detail/property_list_base.hpp>         // for PropertyListBase

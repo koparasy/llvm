@@ -11,6 +11,7 @@
 // CHECK-NEXT: group_algorithm.hpp
 // CHECK-NEXT: detail/array.hpp
 // CHECK-NEXT: detail/helpers.hpp
+// CHECK-NEXT: detail/loop.hpp
 // CHECK-NEXT: __spirv/spirv_types.hpp
 // CHECK-NEXT: detail/defines.hpp
 // CHECK-NEXT: access/access.hpp

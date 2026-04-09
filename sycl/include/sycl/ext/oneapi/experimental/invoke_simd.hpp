@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <sycl/detail/loop.hpp>
 #include <sycl/ext/oneapi/experimental/detail/invoke_simd_types.hpp>
 #include <sycl/ext/oneapi/experimental/uniform.hpp>
 

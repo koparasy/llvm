@@ -11,6 +11,7 @@
 // CHECK-NEXT: stream.hpp
 // CHECK-NEXT: access/access.hpp
 // CHECK-NEXT: accessor.hpp
+// CHECK-NEXT: detail/loop.hpp
 // CHECK-NEXT: buffer.hpp
 // CHECK-NEXT: backend_types.hpp
 // CHECK-NEXT: detail/array.hpp
@@ -91,6 +92,8 @@
 // CHECK-NEXT: __spirv/spirv_ops.hpp
 // CHECK-NEXT: builtins.hpp
 // CHECK-NEXT: detail/builtins/builtins.hpp
+// CHECK-NEXT: detail/builtins/math.hpp
+// CHECK-NEXT: detail/builtins/base.hpp
 // CHECK-NEXT: marray.hpp
 // CHECK-NEXT: vector.hpp
 // CHECK-NEXT: detail/named_swizzles_mixin.hpp
@@ -100,9 +103,10 @@
 // CHECK-NEXT: detail/builtins/helper_macros.hpp
 // CHECK-NEXT: detail/builtins/geometric_functions.inc
 // CHECK-NEXT: detail/builtins/half_precision_math_functions.inc
-// CHECK-NEXT: detail/builtins/integer_functions.inc
 // CHECK-NEXT: detail/builtins/math_functions.inc
 // CHECK-NEXT: detail/builtins/native_math_functions.inc
+// CHECK-NEXT: detail/builtins/integer_functions.inc
+// CHECK-NEXT: detail/builtins/relational.hpp
 // CHECK-NEXT: detail/builtins/relational_functions.inc
 // CHECK-NEXT: group.hpp
 // CHECK-NEXT: device_event.hpp

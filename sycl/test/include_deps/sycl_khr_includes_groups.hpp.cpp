@@ -23,6 +23,7 @@
 // CHECK-NEXT: detail/type_traits.hpp
 // CHECK-NEXT: detail/type_traits/vec_marray_traits.hpp
 // CHECK-NEXT: detail/helpers.hpp
+// CHECK-NEXT: detail/loop.hpp
 // CHECK-NEXT: memory_enums.hpp
 // CHECK-NEXT: device_event.hpp
 // CHECK-NEXT: id.hpp

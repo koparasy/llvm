@@ -18,6 +18,7 @@
 // CHECK-NEXT: detail/fwd/accessor.hpp
 // CHECK-NEXT: detail/defines.hpp
 // CHECK-NEXT: detail/helpers.hpp
+// CHECK-NEXT: detail/loop.hpp
 // CHECK-NEXT: __spirv/spirv_types.hpp
 // CHECK-NEXT: memory_enums.hpp
 // CHECK-NEXT: detail/iostream_proxy.hpp

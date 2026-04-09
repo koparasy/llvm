@@ -10,6 +10,7 @@
 // CHECK-NEXT: feature_test.hpp
 // CHECK-NEXT: accessor.hpp
 // CHECK-NEXT: access/access.hpp
+// CHECK-NEXT: detail/loop.hpp
 // CHECK-NEXT: buffer.hpp
 // CHECK-NEXT: backend_types.hpp
 // CHECK-NEXT: detail/array.hpp

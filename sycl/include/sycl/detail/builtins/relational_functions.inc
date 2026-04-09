@@ -84,15 +84,14 @@ auto builtin_delegate_rel_impl(FuncTy F, const Ts &...x) {
   } else if constexpr (is_vec_v<T>) {
     // TODO: using Res{} to avoid Werror. Not sure if ok.
     vec<fixed_width_signed<sizeof(typename T::element_type)>, T::size()> Res{};
-    detail::loop<T::size()>(
-        [&](auto idx) { Res[idx] = F(x[idx]...) ? -1 : 0; });
+    detail::loop<T::size()>([&](size_t I) { Res[I] = F(x[I]...) ? -1 : 0; });
     return Res;
   } else {
     // marray.
     marray<bool, T::size()> Res;
     // TODO: Can we optimize this? Note that using vector version isn't
     // straightforward as it doesn't return booleans.
-    detail::loop<T::size()>([&](auto idx) { Res[idx] = F(x[idx]...); });
+    detail::loop<T::size()>([&](size_t I) { Res[I] = F(x[I]...); });
     return Res;
   }
 }
