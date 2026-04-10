@@ -108,8 +108,9 @@ int main() {
   static_assert(max_work_group_size<28, 29, 30>[2] == 30);
   static_assert(max_linear_work_group_size<28>.value == 28);
 
-  static_assert(std::is_same_v<decltype(sub_group_size<28>)::value_t,
-                               std::integral_constant<uint32_t, 28>>);
+    static_assert(
+        std::is_same_v<std::remove_cv_t<decltype(sub_group_size<28>)>,
+                       sycl::ext::oneapi::experimental::detail::sub_group_size_t<28>>);
 
   singleAspectDeviceHasChecks<aspect::cpu>();
   singleAspectDeviceHasChecks<aspect::gpu>();

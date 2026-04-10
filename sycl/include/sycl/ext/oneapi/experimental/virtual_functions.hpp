@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sycl/ext/oneapi/kernel_properties/function_properties.hpp>
 #include <sycl/ext/oneapi/properties/property.hpp>
 #include <sycl/ext/oneapi/properties/property_utils.hpp>
 #include <sycl/ext/oneapi/properties/property_value.hpp>
@@ -48,6 +49,17 @@ struct PropertyMetaInfo<indirectly_callable_key::value_t<Set>> {
       "";
 #endif
 };
+
+    template <typename Set>
+    struct FunctionPropertyMetaInfo<indirectly_callable_key::value_t<Set>> {
+      static constexpr const char *name = "indirectly-callable";
+      static constexpr const char *value =
+    #ifdef __SYCL_DEVICE_ONLY__
+      __builtin_sycl_unique_stable_name(Set);
+    #else
+      "";
+    #endif
+    };
 
 #ifdef __SYCL_DEVICE_ONLY__
 // Helper to concatenate several lists of characters into a single string.
@@ -104,6 +116,17 @@ struct PropertyMetaInfo<calls_indirectly_key::value_t<SetIds...>> {
       "";
 #endif
 };
+
+    template <typename... SetIds>
+    struct FunctionPropertyMetaInfo<calls_indirectly_key::value_t<SetIds...>> {
+      static constexpr const char *name = "calls-indirectly";
+      static constexpr const char *value =
+    #ifdef __SYCL_DEVICE_ONLY__
+      UniqueStableNameListStr<SetIds...>::value;
+    #else
+      "";
+    #endif
+    };
 
 } // namespace detail
 
