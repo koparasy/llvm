@@ -43,7 +43,7 @@
 // CHECK-NEXT: properties/property_traits.hpp
 // CHECK-NEXT: id.hpp
 // CHECK-NEXT: range.hpp
-// CHECK-NEXT: ur_api.h
+// CHECK-NEXT:   /localdisk2/kparasyr/LLVM-FORK/llvm/build-dev/bin/../include/unified-runtime/ur_api.h
 // CHECK-NEXT: detail/accessor_iterator.hpp
 // CHECK-NEXT: detail/generic_type_traits.hpp
 // CHECK-NEXT: aliases.hpp
@@ -101,9 +101,9 @@
 // CHECK-NEXT: detail/builtins/math.hpp
 // CHECK-NEXT: detail/builtins/base.hpp
 // CHECK-NEXT: marray.hpp
-// CHECK-NEXT: vector.hpp
+// CHECK-NEXT: detail/vector_core.hpp
 // CHECK-NEXT: detail/named_swizzles_mixin.hpp
-// CHECK-NEXT: detail/vector_arith.hpp
+// CHECK-NEXT: detail/vector_traits.hpp
 // CHECK-NEXT: detail/builtins/common_functions.inc
 // CHECK-NEXT: detail/builtins/helper_macros.hpp
 // CHECK-NEXT: detail/builtins/geometric_functions.inc
@@ -130,6 +130,8 @@
 // CHECK-NEXT: group_algorithm.hpp
 // CHECK-NEXT: functional.hpp
 // CHECK-NEXT: known_identity.hpp
+// CHECK-NEXT: vector.hpp
+// CHECK-NEXT: detail/vector_arith.hpp
 // CHECK-NEXT: nd_item.hpp
 // CHECK-NEXT: ext/oneapi/functional.hpp
 // CHECK-NEXT: handler.hpp
@@ -173,7 +175,7 @@
 // CHECK-NEXT: detail/nd_range_view.hpp
 // CHECK-NEXT: detail/range_rounding.hpp
 // CHECK-NEXT: detail/ur.hpp
-// CHECK-NEXT: ur_api_funcs.def
+// CHECK-NEXT:   /localdisk2/kparasyr/LLVM-FORK/llvm/build-dev/bin/../include/unified-runtime/ur_api_funcs.def
 // CHECK-NEXT: ext/oneapi/bindless_images_interop.hpp
 // CHECK-NEXT: ext/oneapi/interop_common.hpp
 // CHECK-NEXT: ext/oneapi/bindless_images_mem_handle.hpp

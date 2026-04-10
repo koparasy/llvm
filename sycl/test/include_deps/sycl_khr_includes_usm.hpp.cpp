@@ -31,9 +31,9 @@
 // CHECK-NEXT: marray.hpp
 // CHECK-NEXT: detail/common.hpp
 // CHECK-NEXT: __spirv/spirv_vars.hpp
-// CHECK-NEXT: vector.hpp
+// CHECK-NEXT: detail/vector_core.hpp
 // CHECK-NEXT: detail/named_swizzles_mixin.hpp
-// CHECK-NEXT: detail/vector_arith.hpp
+// CHECK-NEXT: detail/vector_traits.hpp
 // CHECK-NEXT: detail/fwd/accessor.hpp
 // CHECK-NEXT: detail/memcpy.hpp
 // CHECK-NEXT: detail/builtins/common_functions.inc
@@ -52,7 +52,7 @@
 // CHECK-NEXT: detail/array.hpp
 // CHECK-NEXT: range.hpp
 // CHECK-NEXT: info/info_desc.hpp
-// CHECK-NEXT: ur_api.h
+// CHECK-NEXT:   /localdisk2/kparasyr/LLVM-FORK/llvm/build-dev/bin/../include/unified-runtime/ur_api.h
 // CHECK-NEXT: ext/oneapi/experimental/device_architecture.hpp
 // CHECK-NEXT: ext/oneapi/experimental/device_architecture.def
 // CHECK-NEXT: ext/oneapi/experimental/forward_progress.hpp
@@ -167,7 +167,7 @@
 // CHECK-NEXT: detail/sycl_local_mem_builtins.hpp
 // CHECK-NEXT: detail/reduction_forward.hpp
 // CHECK-NEXT: detail/ur.hpp
-// CHECK-NEXT: ur_api_funcs.def
+// CHECK-NEXT:   /localdisk2/kparasyr/LLVM-FORK/llvm/build-dev/bin/../include/unified-runtime/ur_api_funcs.def
 // CHECK-NEXT: ext/oneapi/bindless_images_interop.hpp
 // CHECK-NEXT: ext/oneapi/interop_common.hpp
 // CHECK-NEXT: ext/oneapi/bindless_images_mem_handle.hpp

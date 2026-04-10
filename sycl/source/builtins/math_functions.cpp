@@ -14,6 +14,7 @@
 
 #include <cmath>
 
+#include <sycl/vector.hpp>
 #include <sycl/detail/builtins/builtins.hpp>
 
 #include "host_helper_macros.hpp"

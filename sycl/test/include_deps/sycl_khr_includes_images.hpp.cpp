@@ -41,7 +41,7 @@
 // CHECK-NEXT: properties/property_traits.hpp
 // CHECK-NEXT: id.hpp
 // CHECK-NEXT: range.hpp
-// CHECK-NEXT: ur_api.h
+// CHECK-NEXT:   /localdisk2/kparasyr/LLVM-FORK/llvm/build-dev/bin/../include/unified-runtime/ur_api.h
 // CHECK-NEXT: detail/accessor_iterator.hpp
 // CHECK-NEXT: detail/generic_type_traits.hpp
 // CHECK-NEXT: aliases.hpp
@@ -99,9 +99,11 @@
 // CHECK-NEXT: event.hpp
 // CHECK-NEXT: sampler.hpp
 // CHECK-NEXT: vector.hpp
+// CHECK-NEXT: detail/vector_core.hpp
 // CHECK-NEXT: detail/named_swizzles_mixin.hpp
-// CHECK-NEXT: detail/vector_arith.hpp
+// CHECK-NEXT: detail/vector_traits.hpp
 // CHECK-NEXT: detail/memcpy.hpp
+// CHECK-NEXT: detail/vector_arith.hpp
 // CHECK-NEXT: detail/image_ocl_types.hpp
 // CHECK-NEXT: __spirv/spirv_ops.hpp
 // CHECK-NEXT: properties/image_properties.hpp

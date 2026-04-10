@@ -8,6 +8,8 @@
 
 // Intentionally insufficient set of includes and no "#pragma once".
 
+#include <algorithm>
+
 #include <sycl/detail/builtins/helper_macros.hpp>
 
 namespace sycl {

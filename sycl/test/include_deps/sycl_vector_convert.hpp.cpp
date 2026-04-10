@@ -24,9 +24,11 @@
 // CHECK-NEXT: info/aspects.def
 // CHECK-NEXT: info/aspects_deprecated.def
 // CHECK-NEXT: vector.hpp
+// CHECK-NEXT: detail/vector_core.hpp
 // CHECK-NEXT: detail/named_swizzles_mixin.hpp
-// CHECK-NEXT: detail/vector_arith.hpp
+// CHECK-NEXT: detail/vector_traits.hpp
 // CHECK-NEXT: detail/common.hpp
 // CHECK-NEXT: __spirv/spirv_vars.hpp
 // CHECK-NEXT: detail/fwd/accessor.hpp
+// CHECK-NEXT: detail/vector_arith.hpp
 // CHECK-EMPTY:

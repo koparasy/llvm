@@ -10,6 +10,9 @@
 
 #pragma once
 
+#include <limits>
+
+#include <sycl/vector.hpp>
 #include <sycl/builtins.hpp>
 #include <sycl/half_type.hpp>
 
