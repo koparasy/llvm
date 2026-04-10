@@ -331,10 +331,25 @@ BUILTIN_LAST_INTPTR(THREE_ARGS, remquo)
 #ifndef __SYCL_DEVICE_ONLY__
 namespace detail {
 template <typename T0, typename T1> auto fract_impl(T0 &x, T1 &y) {
-  auto flr = floor(simplify_if_swizzle_t<T0>{x});
+  using result_t = simplify_if_swizzle_t<T0>;
+
+  auto flr = floor(result_t{x});
   *y = flr;
-  return fmin(x - flr, nextafter(simplify_if_swizzle_t<T0>{1.0},
-                                 simplify_if_swizzle_t<T0>{0.0}));
+
+  if constexpr (is_scalar_arithmetic_v<T0>) {
+    return fmin(x - flr, nextafter(result_t{1.0}, result_t{0.0}));
+  } else {
+    result_t result{};
+    using elem_t = get_elem_type_t<result_t>;
+    const elem_t upper_bound =
+        nextafter(static_cast<elem_t>(1.0), static_cast<elem_t>(0.0));
+
+    loop<result_t::size()>([&](size_t i) {
+      result[i] = fmin(x[i] - flr[i], upper_bound);
+    });
+
+    return result;
+  }
 }
 } // namespace detail
 #endif
