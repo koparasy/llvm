@@ -1,0 +1,4 @@
+-std=c++17
+-fsycl
+-isystem
+/localdisk2/kparasyr/LLVM-FORK/llvm/build-orig/include
