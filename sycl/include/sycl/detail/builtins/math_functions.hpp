@@ -6,9 +6,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-// Intentionally insufficient set of includes and no "#pragma once".
+#pragma once
 
+#include <sycl/detail/builtins/builtin_helpers.hpp>
 #include <sycl/detail/builtins/helper_macros.hpp>
+
+#include <limits>
 
 namespace sycl {
 inline namespace _V1 {
@@ -25,9 +28,8 @@ template <typename... Ts> struct last_int_rest_same {
     return (
         (... &&
          (++i == N
-              ? /* last */ builtin_same_shape_v<Ts> // filter out "bad" types,
-                                                    // e.g. multi-ptr
-                    && std::is_same_v<get_elem_type_t<Ts>, int_type>
+              ? /* last */ builtin_same_shape_v<Ts> &&
+                    std::is_same_v<get_elem_type_t<Ts>, int_type>
               : /* not last  */ builtin_same_or_swizzle_v<first_type, Ts>)));
   }();
 };
@@ -286,8 +288,6 @@ auto builtin_delegate_ptr_impl(FuncTy F, PtrTy p, Ts... xs) {
 namespace detail {
 template <typename T>
 using builtin_last_raw_intptr_t =
-    // FIXME: Should we allow marray here, or limit just to vec/swizzle/ scalar?
-    //        If not, "enabler" has to be changed as well.
     change_elements_t<std::conditional_t<is_marray_v<T>, int, int32_t>,
                       simplify_if_swizzle_t<T>> *;
 }
@@ -348,8 +348,6 @@ __SYCL_EXPORT double modf_impl(double, double *);
 __SYCL_EXPORT half modf_impl(half, half *);
 template <typename T0, typename T1> auto modf_impl(T0 &x, T1 &&y) {
   if constexpr (is_multi_ptr_v<std::remove_reference_t<T1>>) {
-    // TODO: Spec needs to be clarified, multi_ptr shouldn't be possible on
-    // host.
     return modf_impl(x, builtin_raw_ptr(std::forward<T1>(y)));
   } else {
     return builtin_delegate_ptr_impl(
@@ -406,13 +404,6 @@ template <typename T0, typename T1> auto sincos_impl(T0 &x, T1 &&y) {
   } else {
     using detail::builtins::convert_arg;
     if constexpr (use_fast_math_v<T0>) {
-      // This is a performance optimization to ensure that sincos isn't slower
-      // than a pair of sin/cos executed separately. Theoretically, calling
-      // non-native sincos might be faster than calling native::sin plus
-      // native::cos separately and we'd need some kind of cost model to make
-      // the right decision (and move this entirely to the JIT/AOT compilers).
-      // However, in practice, this simpler solution seems to work just fine and
-      // matches how sin/cos above are optimized for the fast math path.
       *y = __spirv_ocl_native_cos(convert_arg(x));
       return __spirv_ocl_native_sin(convert_arg(x));
     } else {
@@ -426,8 +417,6 @@ __SYCL_EXPORT double sincos_impl(double, double *);
 __SYCL_EXPORT half sincos_impl(half, half *);
 template <typename T0, typename T1> auto sincos_impl(T0 &x, T1 &&y) {
   if constexpr (is_multi_ptr_v<std::remove_reference_t<T1>>) {
-    // TODO: Spec needs to be clarified, multi_ptr shouldn't be possible on
-    // host.
     return sincos_impl(x, builtin_raw_ptr(std::forward<T1>(y)));
   } else {
     return builtin_delegate_ptr_impl(
@@ -478,18 +467,12 @@ HOST_IMPL_TEMPLATE(ONE_ARG, ilogb, builtin_enable_ilogb_t, math,
                    ilogb_ret_traits)
 #endif
 
-// nan implementation, as per
-// https://github.com/KhronosGroup/SYCL-Docs/pull/519.
 namespace detail {
 template <typename T>
-// clang-format off
 using nan_elem_result_type = change_elements_t<
-    typename map_type<get_elem_type_t<T>,
-                      uint32_t, /*->*/ float,
-                      uint64_t, /*->*/ double,
-                      uint16_t, /*->*/ half>::type,
+    typename map_type<get_elem_type_t<T>, uint32_t, /*->*/ float, uint64_t,
+                      /*->*/ double, uint16_t, /*->*/ half>::type,
     T>;
-// clang-format on
 
 template <typename T>
 using builtin_enable_nan_t = std::enable_if_t<
@@ -512,7 +495,6 @@ DEVICE_IMPL_TEMPLATE(ONE_ARG, nan, builtin_enable_nan_t, __spirv_ocl_nan)
 #else
 inline float nan(uint32_t) { return std::numeric_limits<float>::quiet_NaN(); }
 inline double nan(uint64_t) { return std::numeric_limits<float>::quiet_NaN(); }
-// NOTE: half_type.hpp provides partial specialization for std::numeric_limits.
 inline half nan(uint16_t) { return std::numeric_limits<half>::quiet_NaN(); }
 template <typename T> detail::builtin_enable_nan_t<T> nan(T x) {
   return detail::builtin_delegate_to_scalar([](auto x) { return nan(x); }, x);

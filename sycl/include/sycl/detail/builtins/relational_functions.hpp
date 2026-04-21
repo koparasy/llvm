@@ -6,8 +6,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-// Intentionally insufficient set of includes and no "#pragma once".
+#pragma once
 
+#include <sycl/detail/builtins/builtin_helpers.hpp>
 #include <sycl/detail/builtins/helper_macros.hpp>
 
 namespace sycl {
@@ -23,8 +24,6 @@ struct bitselect_elem_type
            check_type_in_v<get_elem_type_t<T>, INTEGER_TYPES>)> {};
 
 template <typename T, typename = void> struct rel_ret_traits_impl {
-  // Return type trait is instantiated even if the arguments don't pass
-  // requirements check. Make sure it doesn't cause an error.
   using type = void;
 };
 
@@ -58,10 +57,6 @@ template <typename FuncTy, typename... Ts>
 auto builtin_device_rel_impl(FuncTy F, const Ts &...xs) {
   using T = typename first_type<Ts...>::type;
   if constexpr (detail::is_vec_or_swizzle_v<T>) {
-    // decltype(ret) is signed char ext_vector_type(N). Convert it to
-    // sycl::vec<signed char, N> first and then to the required return type of
-    // the relation builtin (vector of int16_t/int32_t/int64_t depending on the
-    // arguments' element type).
     auto ret = F(builtins::convert_arg(xs)...);
     auto tmp = bit_cast<vec<signed char, num_elements<T>::value>>(ret);
     using res_elem_type = fixed_width_signed<sizeof(get_elem_type_t<T>)>;
@@ -82,16 +77,12 @@ auto builtin_delegate_rel_impl(FuncTy F, const Ts &...x) {
   if constexpr ((... || is_swizzle_v<Ts>)) {
     return F(simplify_if_swizzle_t<T>{x}...);
   } else if constexpr (is_vec_v<T>) {
-    // TODO: using Res{} to avoid Werror. Not sure if ok.
     vec<fixed_width_signed<sizeof(typename T::element_type)>, T::size()> Res{};
     detail::loop<T::size()>(
         [&](auto idx) { Res[idx] = F(x[idx]...) ? -1 : 0; });
     return Res;
   } else {
-    // marray.
     marray<bool, T::size()> Res;
-    // TODO: Can we optimize this? Note that using vector version isn't
-    // straightforward as it doesn't return booleans.
     detail::loop<T::size()>([&](auto idx) { Res[idx] = F(x[idx]...); });
     return Res;
   }
@@ -272,7 +263,7 @@ struct rel_enable_select_vec_helper {
   static constexpr bool check_T2 =
       is_vec_or_swizzle_v<T2> &&
       num_elements<T0>::value == num_elements<T2>::value &&
-      std ::is_integral_v<T2_elem_type> &&
+      std::is_integral_v<T2_elem_type> &&
       sizeof(T0_elem_type) == sizeof(T2_elem_type);
   static constexpr bool value = check_T0 && check_T1 && check_T2;
 };
@@ -283,8 +274,6 @@ inline constexpr bool rel_enable_select_v =
     detail::rel_enable_select_vec_helper<T0, T1, T2>::value;
 } // namespace detail
 
-// __spirv_ocl_select doesn't behave as required by SYCL/OpenCL spec for vector
-// data types (MSB-related stuff).
 template <typename T>
 std::enable_if_t<detail::is_rel_generic_scalar_v<T>, T> select(T a, T b,
                                                                bool c) {
