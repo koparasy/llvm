@@ -10,7 +10,6 @@
 
 #pragma once
 
-#include <sycl/__spirv/spirv_ops.hpp>
 #include <sycl/bit_cast.hpp>
 
 namespace sycl {
