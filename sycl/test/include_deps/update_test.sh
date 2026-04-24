@@ -48,6 +48,7 @@ HEADERS=(
     sycl/khr/includes/usm.hpp
     sycl/khr/includes/vec.hpp
     sycl/khr/includes/version.hpp
+    sycl/khr/includes/work_item_queries.hpp
 )
 
 for x in ${HEADERS[@]} ; do

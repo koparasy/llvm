@@ -667,5 +667,23 @@ template <int Dimensions> sub_group nd_item<Dimensions>::get_sub_group() const {
   return sub_group();
 }
 
+namespace ext::oneapi::this_work_item {
+inline sycl::sub_group get_sub_group() {
+#ifdef __SYCL_DEVICE_ONLY__
+  return sycl::sub_group();
+#else
+  throw sycl::exception(
+      sycl::make_error_code(sycl::errc::feature_not_supported),
+      "Free function calls are not supported on host");
+#endif
+}
+} // namespace ext::oneapi::this_work_item
+
+namespace khr {
+inline sycl::sub_group this_sub_group() {
+  return ext::oneapi::this_work_item::get_sub_group();
+}
+} // namespace khr
+
 } // namespace _V1
 } // namespace sycl

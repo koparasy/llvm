@@ -33,6 +33,10 @@ inline namespace _V1 {
 struct sub_group;
 namespace detail {
 class Builder;
+
+template <int Dimensions> nd_item<Dimensions> getFreeFunctionQueryNDItem();
+
+template <int Dimensions> group<Dimensions> getFreeFunctionQueryGroup();
 }
 
 namespace ext::oneapi::experimental {
@@ -541,5 +545,22 @@ protected:
 #endif
   }
 };
+
+namespace detail {
+template <int Dimensions> inline nd_item<Dimensions> getFreeFunctionQueryNDItem() {
+#ifdef __SYCL_DEVICE_ONLY__
+  return sycl::detail::Builder::getElement(
+      sycl::detail::declptr<nd_item<Dimensions>>());
+#else
+  throw sycl::exception(
+      sycl::make_error_code(sycl::errc::feature_not_supported),
+      "Free function calls are not supported on host");
+#endif
+}
+
+template <int Dimensions> inline group<Dimensions> getFreeFunctionQueryGroup() {
+  return getFreeFunctionQueryNDItem<Dimensions>().get_group();
+}
+} // namespace detail
 } // namespace _V1
 } // namespace sycl
