@@ -11,7 +11,7 @@
 
 #include "version.hpp"
 
-#include <sycl/nd_item.hpp>
+#include <sycl/detail/nd_item_core.hpp>
 
 namespace sycl {
 inline namespace _V1 {
