@@ -33,7 +33,6 @@
 #include <sycl/property_list.hpp>                     // for property_list
 #include <sycl/range.hpp>                             // for range
 
-#include <cstddef>     // for size_t
 #include <functional>  // for hash
 #include <iterator>    // for reverse_iterator
 #include <limits>      // for numeric_limits

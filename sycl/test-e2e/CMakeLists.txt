@@ -46,6 +46,16 @@ else()
       "Flags passed to clang++ when building SYCL end-to-end tests")
 endif() # Standalone.
 
+# Enable modules for SYCL end-to-end tests to speed up compilation
+option(SYCL_E2E_ENABLE_MODULES "Enable -fmodules for SYCL end-to-end tests" OFF)
+if(SYCL_E2E_ENABLE_MODULES)
+  set(SYCL_E2E_MODULE_CACHE_DIR "${CMAKE_CURRENT_BINARY_DIR}/module-cache" CACHE PATH
+      "Directory for module cache used by SYCL end-to-end tests")
+  file(MAKE_DIRECTORY "${SYCL_E2E_MODULE_CACHE_DIR}")
+  set(SYCL_E2E_CLANG_CXX_FLAGS "${SYCL_E2E_CLANG_CXX_FLAGS} -fmodules -fmodules-cache-path=${SYCL_E2E_MODULE_CACHE_DIR}")
+  message(STATUS "SYCL E2E tests will use modules with cache at: ${SYCL_E2E_MODULE_CACHE_DIR}")
+endif()
+
 find_package(Threads REQUIRED)
 set(SYCL_THREADS_LIB ${CMAKE_THREAD_LIBS_INIT})
 
