@@ -13,6 +13,14 @@
 #include <iostream>
 #include <sycl/detail/core.hpp>
 #include <sycl/khr/work_item_queries.hpp>
+// NOTE: work_item_queries.hpp intentionally does not pull in all method
+// definitions for group, sub_group and nd_item (those live in sycl/group.hpp,
+// sycl/sub_group.hpp, sycl/nd_item.hpp). This test also exercises methods on
+// the returned objects (e.g. sub_group::operator==), so include the full
+// headers here.
+#include <sycl/group.hpp>
+#include <sycl/nd_item.hpp>
+#include <sycl/sub_group.hpp>
 
 template <size_t... Dims> static int check_this_nd_item_api() {
   // Define the kernel ranges.

@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
-#include <sycl/ext/oneapi/free_function_queries.hpp>
+#include <sycl/ext/oneapi/detail/free_function_queries_base.hpp>
 
 namespace sycl {
 inline namespace _V1 {

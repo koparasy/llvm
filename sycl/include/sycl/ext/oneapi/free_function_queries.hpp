@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <sycl/ext/oneapi/detail/free_function_queries_base.hpp>
+
 #include <sycl/group.hpp>
 #include <sycl/nd_item.hpp>
 #include <sycl/sub_group.hpp>
@@ -18,33 +20,6 @@
 
 namespace sycl {
 inline namespace _V1 {
-namespace ext::oneapi::this_work_item {
-template <int Dimensions> nd_item<Dimensions> get_nd_item() {
-#ifdef __SYCL_DEVICE_ONLY__
-  return sycl::detail::Builder::getElement(
-      sycl::detail::declptr<nd_item<Dimensions>>());
-#else
-  throw sycl::exception(
-      sycl::make_error_code(sycl::errc::feature_not_supported),
-      "Free function calls are not supported on host");
-#endif
-}
-
-template <int Dimensions> group<Dimensions> get_work_group() {
-  return get_nd_item<Dimensions>().get_group();
-}
-
-inline sycl::sub_group get_sub_group() {
-#ifdef __SYCL_DEVICE_ONLY__
-  return sycl::sub_group();
-#else
-  throw sycl::exception(
-      sycl::make_error_code(sycl::errc::feature_not_supported),
-      "Free function calls are not supported on host");
-#endif
-}
-} // namespace ext::oneapi::this_work_item
-
 namespace ext::oneapi::experimental {
 template <int Dims>
 __SYCL_DEPRECATED(
