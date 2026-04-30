@@ -8,4 +8,4 @@
 
 #pragma once
 
-#include <sycl/detail/sub_group_base.hpp>
+#include <sycl/detail/sub_group_impl.hpp>
