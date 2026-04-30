@@ -8,19 +8,18 @@
 
 #pragma once
 
-#include <sycl/__spirv/spirv_types.hpp> // for Scope
-#include <sycl/__spirv/spirv_vars.hpp>  // for initBuiltInLocalInvocationId
-#include <sycl/access/access.hpp>       // for mode, fence_space
-#include <sycl/detail/async_work_group_copy_ptr.hpp> // for convertToOpenCLGroupAsyncCopyPtr
-#include <sycl/detail/defines.hpp>                   // for __SYCL_ASSUME_INT
-#include <sycl/detail/defines_elementary.hpp> // for __SYCL2020_DEPRECATED, __SY...
-#include <sycl/detail/helpers.hpp>            // for getSPIRVMemorySemanticsMask
-#include <sycl/detail/type_traits.hpp>        // for is_bool, change_base_...
-#include <sycl/device_event.hpp>              // for device_event
-#include <sycl/group.hpp>                     // for group
-#include <sycl/id.hpp>                        // for id
-#include <sycl/item.hpp>                      // for item
-#include <sycl/nd_range.hpp>                  // for nd_range
+#include <sycl/__spirv/spirv_types.hpp>            // for Scope
+#include <sycl/__spirv/spirv_vars.hpp>             // for initBuiltInLocalInvocationId
+#include <sycl/access/access.hpp>                  // for mode, fence_space
+#include <sycl/detail/defines.hpp>                 // for __SYCL_ASSUME_ID_RANGE
+#include <sycl/detail/defines_elementary.hpp>      // for __SYCL2020_DEPRECATED, __SY...
+#include <sycl/detail/group_base.hpp>              // for group
+#include <sycl/detail/helpers.hpp>                 // for Builder, getSPIRVMemo...
+#include <sycl/detail/type_traits/bool_traits.hpp> // for is_bool
+#include <sycl/device_event.hpp>                   // for device_event
+#include <sycl/id.hpp>                             // for id
+#include <sycl/item.hpp>                           // for item
+#include <sycl/nd_range.hpp>                       // for nd_range
 #include <sycl/pointers.hpp> // for decorated_global_ptr, decor...
 #include <sycl/range.hpp>    // for range
 
@@ -31,9 +30,6 @@
 namespace sycl {
 inline namespace _V1 {
 struct sub_group;
-namespace detail {
-class Builder;
-}
 
 namespace ext::oneapi::experimental {
 template <int Dimensions> class root_group;
@@ -115,7 +111,7 @@ public:
                                         get_group_range(), get_group_id());
   }
 
-  // Out-of-class definition in sub_group.hpp
+  // Out-of-class definition in detail/sub_group_impl.hpp
   sub_group get_sub_group() const;
 
   size_t __SYCL_ALWAYS_INLINE get_group(int Dimension) const {
@@ -235,27 +231,13 @@ public:
   /// with a source stride specified by \p srcStride, and returns a SYCL
   /// device_event which can be used to wait on the completion of the copy.
   /// Permitted types for dataT are all scalar and vector types, except boolean.
+  //
+  // Definition lives in detail/nd_item_impl.hpp.
   template <typename dataT>
   __SYCL2020_DEPRECATED("Use decorated multi_ptr arguments instead")
-  std::enable_if_t<
-      !detail::is_bool<dataT>::value,
-      device_event> async_work_group_copy([[maybe_unused]] local_ptr<dataT>
-                                              dest,
-                                          [[maybe_unused]] global_ptr<dataT>
-                                              src,
-                                          [[maybe_unused]] size_t numElements,
-                                          [[maybe_unused]] size_t srcStride)
-      const {
-#ifdef __SYCL_DEVICE_ONLY__
-    __ocl_event_t E = __spirv_GroupAsyncCopy(
-        __spv::Scope::Workgroup, detail::convertToOpenCLGroupAsyncCopyPtr(dest),
-        detail::convertToOpenCLGroupAsyncCopyPtr(src), numElements, srcStride,
-        0);
-    return device_event(E);
-#else
-    return nullptr;
-#endif
-  }
+  std::enable_if_t<!detail::is_bool<dataT>::value, device_event>
+  async_work_group_copy(local_ptr<dataT> dest, global_ptr<dataT> src,
+                        size_t numElements, size_t srcStride) const;
 
   /// Asynchronously copies a number of elements specified by \p numElements
   /// from the source pointed by \p src to destination pointed by \p dest with
@@ -264,24 +246,9 @@ public:
   /// Permitted types for dataT are all scalar and vector types, except boolean.
   template <typename dataT>
   __SYCL2020_DEPRECATED("Use decorated multi_ptr arguments instead")
-  std::enable_if_t<
-      !detail::is_bool<dataT>::value,
-      device_event> async_work_group_copy([[maybe_unused]] global_ptr<dataT>
-                                              dest,
-                                          [[maybe_unused]] local_ptr<dataT> src,
-                                          [[maybe_unused]] size_t numElements,
-                                          [[maybe_unused]] size_t destStride)
-      const {
-#ifdef __SYCL_DEVICE_ONLY__
-    __ocl_event_t E = __spirv_GroupAsyncCopy(
-        __spv::Scope::Workgroup, detail::convertToOpenCLGroupAsyncCopyPtr(dest),
-        detail::convertToOpenCLGroupAsyncCopyPtr(src), numElements, destStride,
-        0);
-    return device_event(E);
-#else
-    return nullptr;
-#endif
-  }
+  std::enable_if_t<!detail::is_bool<dataT>::value, device_event>
+  async_work_group_copy(global_ptr<dataT> dest, local_ptr<dataT> src,
+                        size_t numElements, size_t destStride) const;
 
   /// Asynchronously copies a number of elements specified by \p numElements
   /// from the source pointed by \p src to destination pointed by \p dest
@@ -293,20 +260,9 @@ public:
   std::enable_if_t<!detail::is_bool<DestDataT>::value &&
                        std::is_same_v<std::remove_const_t<SrcDataT>, DestDataT>,
                    device_event>
-  async_work_group_copy([[maybe_unused]] decorated_local_ptr<DestDataT> dest,
-                        [[maybe_unused]] decorated_global_ptr<SrcDataT> src,
-                        [[maybe_unused]] size_t numElements,
-                        [[maybe_unused]] size_t srcStride) const {
-#ifdef __SYCL_DEVICE_ONLY__
-    __ocl_event_t E = __spirv_GroupAsyncCopy(
-        __spv::Scope::Workgroup, detail::convertToOpenCLGroupAsyncCopyPtr(dest),
-        detail::convertToOpenCLGroupAsyncCopyPtr(src), numElements, srcStride,
-        0);
-    return device_event(E);
-#else
-    return nullptr;
-#endif
-  }
+  async_work_group_copy(decorated_local_ptr<DestDataT> dest,
+                        decorated_global_ptr<SrcDataT> src, size_t numElements,
+                        size_t srcStride) const;
 
   /// Asynchronously copies a number of elements specified by \p numElements
   /// from the source pointed by \p src to destination pointed by \p dest with
@@ -318,20 +274,9 @@ public:
   std::enable_if_t<!detail::is_bool<DestDataT>::value &&
                        std::is_same_v<std::remove_const_t<SrcDataT>, DestDataT>,
                    device_event>
-  async_work_group_copy([[maybe_unused]] decorated_global_ptr<DestDataT> dest,
-                        [[maybe_unused]] decorated_local_ptr<SrcDataT> src,
-                        [[maybe_unused]] size_t numElements,
-                        [[maybe_unused]] size_t destStride) const {
-#ifdef __SYCL_DEVICE_ONLY__
-    __ocl_event_t E = __spirv_GroupAsyncCopy(
-        __spv::Scope::Workgroup, detail::convertToOpenCLGroupAsyncCopyPtr(dest),
-        detail::convertToOpenCLGroupAsyncCopyPtr(src), numElements, destStride,
-        0);
-    return device_event(E);
-#else
-    return nullptr;
-#endif
-  }
+  async_work_group_copy(decorated_global_ptr<DestDataT> dest,
+                        decorated_local_ptr<SrcDataT> src, size_t numElements,
+                        size_t destStride) const;
 
   /// Specialization for scalar bool type.
   /// Asynchronously copies a number of elements specified by \p NumElements
@@ -340,24 +285,10 @@ public:
   /// which can be used to wait on the completion of the copy.
   template <typename T, access::address_space DestS, access::address_space SrcS>
   __SYCL2020_DEPRECATED("Use decorated multi_ptr arguments instead")
-  std::enable_if_t<
-      detail::is_scalar_bool<T>::value,
-      device_event> async_work_group_copy(multi_ptr<T, DestS,
-                                                    access::decorated::legacy>
-                                              Dest,
-                                          multi_ptr<T, SrcS,
-                                                    access::decorated::legacy>
-                                              Src,
-                                          size_t NumElements,
-                                          size_t Stride) const {
-    static_assert(sizeof(bool) == sizeof(uint8_t),
-                  "Async copy to/from bool memory is not supported.");
-    auto DestP = multi_ptr<uint8_t, DestS, access::decorated::legacy>(
-        reinterpret_cast<uint8_t *>(Dest.get()));
-    auto SrcP = multi_ptr<uint8_t, SrcS, access::decorated::legacy>(
-        reinterpret_cast<uint8_t *>(Src.get()));
-    return async_work_group_copy(DestP, SrcP, NumElements, Stride);
-  }
+  std::enable_if_t<detail::is_scalar_bool<T>::value, device_event>
+  async_work_group_copy(multi_ptr<T, DestS, access::decorated::legacy> Dest,
+                        multi_ptr<T, SrcS, access::decorated::legacy> Src,
+                        size_t NumElements, size_t Stride) const;
 
   /// Specialization for vector bool type.
   /// Asynchronously copies a number of elements specified by \p NumElements
@@ -366,25 +297,10 @@ public:
   /// which can be used to wait on the completion of the copy.
   template <typename T, access::address_space DestS, access::address_space SrcS>
   __SYCL2020_DEPRECATED("Use decorated multi_ptr arguments instead")
-  std::enable_if_t<
-      detail::is_vector_bool<T>::value,
-      device_event> async_work_group_copy(multi_ptr<T, DestS,
-                                                    access::decorated::legacy>
-                                              Dest,
-                                          multi_ptr<T, SrcS,
-                                                    access::decorated::legacy>
-                                              Src,
-                                          size_t NumElements,
-                                          size_t Stride) const {
-    static_assert(sizeof(bool) == sizeof(uint8_t),
-                  "Async copy to/from bool memory is not supported.");
-    using VecT = detail::change_base_type_t<T, uint8_t>;
-    auto DestP = address_space_cast<DestS, access::decorated::legacy>(
-        reinterpret_cast<VecT *>(Dest.get()));
-    auto SrcP = address_space_cast<SrcS, access::decorated::legacy>(
-        reinterpret_cast<VecT *>(Src.get()));
-    return async_work_group_copy(DestP, SrcP, NumElements, Stride);
-  }
+  std::enable_if_t<detail::is_vector_bool<T>::value, device_event>
+  async_work_group_copy(multi_ptr<T, DestS, access::decorated::legacy> Dest,
+                        multi_ptr<T, SrcS, access::decorated::legacy> Src,
+                        size_t NumElements, size_t Stride) const;
 
   /// Specialization for scalar bool type.
   /// Asynchronously copies a number of elements specified by \p NumElements
@@ -398,21 +314,7 @@ public:
                    device_event>
   async_work_group_copy(multi_ptr<DestT, DestS, access::decorated::yes> Dest,
                         multi_ptr<SrcT, SrcS, access::decorated::yes> Src,
-                        size_t NumElements, size_t Stride) const {
-    static_assert(sizeof(bool) == sizeof(uint8_t),
-                  "Async copy to/from bool memory is not supported.");
-    using QualSrcT =
-        std::conditional_t<std::is_const_v<SrcT>, const uint8_t, uint8_t>;
-    auto DestP = multi_ptr<uint8_t, DestS, access::decorated::yes>(
-        reinterpret_cast<typename multi_ptr<uint8_t, DestS,
-                                            access::decorated::yes>::pointer>(
-            Dest.get_decorated()));
-    auto SrcP = multi_ptr<QualSrcT, SrcS, access::decorated::yes>(
-        reinterpret_cast<typename multi_ptr<QualSrcT, SrcS,
-                                            access::decorated::yes>::pointer>(
-            Src.get_decorated()));
-    return async_work_group_copy(DestP, SrcP, NumElements, Stride);
-  }
+                        size_t NumElements, size_t Stride) const;
 
   /// Specialization for vector bool type.
   /// Asynchronously copies a number of elements specified by \p NumElements
@@ -426,22 +328,7 @@ public:
                    device_event>
   async_work_group_copy(multi_ptr<DestT, DestS, access::decorated::yes> Dest,
                         multi_ptr<SrcT, SrcS, access::decorated::yes> Src,
-                        size_t NumElements, size_t Stride) const {
-    static_assert(sizeof(bool) == sizeof(uint8_t),
-                  "Async copy to/from bool memory is not supported.");
-    using VecT = detail::change_base_type_t<DestT, uint8_t>;
-    using QualSrcVecT =
-        std::conditional_t<std::is_const_v<SrcT>, std::add_const_t<VecT>, VecT>;
-    auto DestP = multi_ptr<VecT, DestS, access::decorated::yes>(
-        reinterpret_cast<
-            typename multi_ptr<VecT, DestS, access::decorated::yes>::pointer>(
-            Dest.get_decorated()));
-    auto SrcP = multi_ptr<QualSrcVecT, SrcS, access::decorated::yes>(
-        reinterpret_cast<typename multi_ptr<QualSrcVecT, SrcS,
-                                            access::decorated::yes>::pointer>(
-            Src.get_decorated()));
-    return async_work_group_copy(DestP, SrcP, NumElements, Stride);
-  }
+                        size_t NumElements, size_t Stride) const;
 
   /// Asynchronously copies a number of elements specified by \p numElements
   /// from the source pointed by \p src to destination pointed by \p dest and
@@ -450,9 +337,9 @@ public:
   /// Permitted types for dataT are all scalar and vector types.
   template <typename dataT>
   __SYCL2020_DEPRECATED("Use decorated multi_ptr arguments instead")
-  device_event
-      async_work_group_copy(local_ptr<dataT> dest, global_ptr<dataT> src,
-                            size_t numElements) const {
+  device_event async_work_group_copy(local_ptr<dataT> dest,
+                                     global_ptr<dataT> src,
+                                     size_t numElements) const {
     return async_work_group_copy(dest, src, numElements, 1);
   }
 
@@ -463,9 +350,9 @@ public:
   /// Permitted types for dataT are all scalar and vector types.
   template <typename dataT>
   __SYCL2020_DEPRECATED("Use decorated multi_ptr arguments instead")
-  device_event
-      async_work_group_copy(global_ptr<dataT> dest, local_ptr<dataT> src,
-                            size_t numElements) const {
+  device_event async_work_group_copy(global_ptr<dataT> dest,
+                                     local_ptr<dataT> src,
+                                     size_t numElements) const {
     return async_work_group_copy(dest, src, numElements, 1);
   }
 

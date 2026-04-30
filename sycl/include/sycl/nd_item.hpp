@@ -8,4 +8,4 @@
 
 #pragma once
 
-#include <sycl/detail/nd_item_base.hpp>
+#include <sycl/detail/nd_item_impl.hpp>
