@@ -480,6 +480,7 @@ void CompilerInstance::createPreprocessor(TranslationUnitKind TUKind) {
   // Mark SYCL integration headers/footers as transient so they don't trigger
   // module cache invalidation when deleted. These files must be marked before
   // preprocessing starts.
+#if 0  // TEMPORARILY DISABLED to test if transient flag causes PCM-reuse bug.
   if (!PPOpts.IncludeHeader.empty()) {
     if (auto FE = getFileManager().getOptionalFileRef(PPOpts.IncludeHeader,
                                                        /*openFile=*/false))
@@ -490,6 +491,7 @@ void CompilerInstance::createPreprocessor(TranslationUnitKind TUKind) {
                                                        /*openFile=*/false))
       getSourceManager().setFileIsTransient(*FE);
   }
+#endif
 
   // Initialize the header search object.  In CUDA compilations, we use the aux
   // triple (the host triple) to initialize our header search, since we need to

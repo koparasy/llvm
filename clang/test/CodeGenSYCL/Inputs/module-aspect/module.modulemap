@@ -1,0 +1,4 @@
+module sycl_aspect {
+  header "sycl_aspect.hpp"
+  export *
+}

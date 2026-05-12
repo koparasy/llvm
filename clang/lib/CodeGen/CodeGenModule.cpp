@@ -1638,6 +1638,12 @@ void CodeGenModule::Release() {
   // Emit SYCL specific module metadata: OpenCL/SPIR version, OpenCL language,
   // metadata for optional features (device aspects).
   if (LangOpts.SYCLIsDevice) {
+    // Under -fmodules, SYCL headers come from a PCM and the aspect enum /
+    // aspect-using record types are only materialized via CodeGenTypes when
+    // user code references them. Eagerly walk the sycl namespace so that
+    // sycl_aspects and sycl_types_that_use_aspects get emitted regardless.
+    findSYCLAspectEnumAndTypesEagerly();
+
     llvm::LLVMContext &Ctx = TheModule.getContext();
     llvm::Metadata *SPIRVerElts[] = {
         llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 1)),
@@ -6720,6 +6726,48 @@ void CodeGenModule::setAspectsEnumDecl(const EnumDecl *ED) {
                       diag::note_previous_definition);
   }
   AspectsEnumDecl = ED;
+}
+
+void CodeGenModule::findSYCLAspectEnumAndTypesEagerly() {
+  // When SYCL headers come from a precompiled module, the aspect enum and
+  // SYCLUsesAspectsAttr-tagged record decls are not materialized through
+  // CodeGenTypes unless user code happens to reference them. Walk the
+  // translation unit's sycl namespace directly to pick them up. This forces
+  // lazy PCM deserialization via DeclContext::decls().
+  struct AspectFinder : RecursiveASTVisitor<AspectFinder> {
+    CodeGenModule &CGM;
+    AspectFinder(CodeGenModule &CGM) : CGM(CGM) {}
+
+    bool shouldVisitTemplateInstantiations() const { return false; }
+    bool shouldVisitImplicitCode() const { return false; }
+
+    bool VisitEnumDecl(EnumDecl *ED) {
+      if (!ED->isCompleteDefinition())
+        return true;
+      if (const auto *Attr = ED->getAttr<SYCLTypeAttr>())
+        if (Attr->getType() == SYCLTypeAttr::SYCLType::aspect)
+          CGM.setAspectsEnumDecl(ED);
+      return true;
+    }
+
+    // Aspect-tagged record types (SYCLUsesAspectsAttr) are intentionally not
+    // registered here: sycl_types_that_use_aspects keys are LLVM StructType
+    // names, and the middle-end reader asserts that each referenced struct
+    // type exists in the module. Types not materialized by ConvertType have
+    // no LLVM StructType to reference, so registering them would corrupt the
+    // metadata. Any aspect-tagged type actually used in device code will be
+    // lowered by CodeGenTypes and registered through the normal path.
+  };
+
+  // Scope the walk to the sycl namespace to avoid touching unrelated PCM decls.
+  TranslationUnitDecl *TU = Context.getTranslationUnitDecl();
+  AspectFinder Finder(*this);
+  for (Decl *D : TU->decls()) {
+    auto *NS = dyn_cast<NamespaceDecl>(D);
+    if (!NS || !NS->getIdentifier() || NS->getName() != "sycl")
+      continue;
+    Finder.TraverseDecl(NS);
+  }
 }
 
 /// Adds global Intel FPGA annotations for a given variable declaration.

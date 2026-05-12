@@ -291,12 +291,43 @@ if(SYCL_USE_HIERARCHICAL_MODULES)
   message(STATUS "Generated hierarchical SYCL module map")
 else()
   # Flat module map - all headers in one module
-  # Collect all top-level SYCL headers (non-recursive) to add to module map
+  # Collect all top-level SYCL headers (non-recursive) to add to module map.
+  # Headers that use __builtin_sycl_unique_stable_name/_id must be excluded
+  # from the PCM because the builtin incorporates -fsycl-unique-prefix=uidXXX
+  # which is different for every translation unit. If such a header were
+  # parsed into the PCM, template instantiations like
+  # KernelInfoImpl<K>::n in sycl/detail/kernel_desc.hpp would freeze the
+  # first TU's unique prefix inside the PCM, then every subsequent TU
+  # reusing the PCM would see the wrong prefix and produce mismatched
+  # kernel name strings (UR_RESULT_ERROR_INVALID_KERNEL_ARGUMENT_SIZE at
+  # runtime). We declare them as `textual header` so the module records
+  # them as belonging to sycl but clang re-parses them per TU.
+  set(SYCL_MODULE_TEXTUAL_HEADERS
+    "kernel_handler.hpp"
+  )
+  # Transitively-included files that also use the builtin but are not
+  # top-level. Explicit `textual header` entries so clang does not implicitly
+  # promote them to the PCM when a top-level header #includes them.
+  set(SYCL_MODULE_TEXTUAL_TRANSITIVE
+    "detail/kernel_desc.hpp"
+    "detail/compile_time_kernel_info.hpp"
+    "detail/get_device_kernel_info.hpp"
+    "detail/kernel_launch_helper.hpp"
+    "ext/oneapi/experimental/virtual_functions.hpp"
+  )
+
   file(GLOB SYCL_TOP_LEVEL_HEADERS "${sycl_inc_dir}/sycl/*.hpp")
   set(SYCL_MODULE_HEADERS "")
   foreach(header ${SYCL_TOP_LEVEL_HEADERS})
     get_filename_component(header_name ${header} NAME)
-    string(APPEND SYCL_MODULE_HEADERS "  header \"${header_name}\"\n")
+    if(header_name IN_LIST SYCL_MODULE_TEXTUAL_HEADERS)
+      string(APPEND SYCL_MODULE_HEADERS "  textual header \"${header_name}\"\n")
+    else()
+      string(APPEND SYCL_MODULE_HEADERS "  header \"${header_name}\"\n")
+    endif()
+  endforeach()
+  foreach(header ${SYCL_MODULE_TEXTUAL_TRANSITIVE})
+    string(APPEND SYCL_MODULE_HEADERS "  textual header \"${header}\"\n")
   endforeach()
 
   file(GENERATE

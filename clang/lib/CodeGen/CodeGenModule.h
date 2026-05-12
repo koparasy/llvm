@@ -1301,6 +1301,16 @@ public:
 
   void setAspectsEnumDecl(const EnumDecl *ED);
 
+  /// Under -fmodules, SYCL headers live in a PCM and types like
+  /// sycl::aspect / SYCLUsesAspectsAttr-tagged records are only materialized
+  /// through CodeGenTypes::ConvertType when user code references them.
+  /// Most device TUs never do, so AspectsEnumDecl stays null and
+  /// TypesWithAspects stays empty, which causes the middle-end
+  /// SYCLPropagateAspectsUsagePass to early-exit and omit
+  /// !sycl_fixed_targets on every kernel. Call this during Release() to
+  /// eagerly walk the sycl namespace and register both.
+  void findSYCLAspectEnumAndTypesEagerly();
+
   void addGlobalIntelFPGAAnnotation(const VarDecl *VD, llvm::GlobalValue *GV);
 
   /// Given a builtin id for a function like "__builtin_fabsf", return a
