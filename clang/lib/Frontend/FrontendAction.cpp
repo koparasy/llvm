@@ -1037,6 +1037,11 @@ bool FrontendAction::BeginSourceFile(CompilerInstance &CI,
           << Input.getFile();
       return false;
     }
+    if (InputLang == Language::CIR && !hasCIRSupport()) {
+      CI.getDiagnostics().Report(diag::err_ast_action_on_cir)
+          << Input.getFile();
+      return false;
+    }
 
     // Inform the diagnostic client we are processing a source file.
     CI.getDiagnosticClient().BeginSourceFile(CI.getLangOpts(), nullptr);

@@ -53,16 +53,16 @@ protected:
 
   bool BeginSourceFileAction(clang::CompilerInstance &CI) override;
 
-  bool hasCIRSupport() const override { return true; }
-
-  void ExecuteAction() override;
-
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &CI,
                     llvm::StringRef InFile) override;
 
+  void ExecuteAction() override;
+
 public:
   ~CIRGenAction() override;
+
+  bool hasCIRSupport() const override;
 
   OutputType Action;
 };
