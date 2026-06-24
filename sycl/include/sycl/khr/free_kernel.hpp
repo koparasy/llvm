@@ -187,3 +187,9 @@ inline constexpr bool is_single_task_kernel_v =
       __SYCL_KHR_KERNEL_SLOT_VALUE(5, __VA_ARGS__),                           \
       __SYCL_KHR_KERNEL_SLOT_VALUE(6, __VA_ARGS__),                           \
       __SYCL_KHR_KERNEL_SLOT_VALUE(7, __VA_ARGS__))]]
+
+// Checked launch surface (Step 5): khr::kernel_function, khr::nd_launch and
+// khr::single_task. Included last so the Step-4 property traits above are
+// already declared when launch.hpp consumes them. (launch.hpp's own include of
+// this header is a pragma-once no-op in that direction.)
+#include <sycl/khr/launch.hpp>
