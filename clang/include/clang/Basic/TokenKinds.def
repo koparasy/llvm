@@ -564,6 +564,11 @@ KEYWORD(__builtin_num_fields, KEYSYCL)
 KEYWORD(__builtin_field_type, KEYSYCL)
 KEYWORD(__builtin_num_bases, KEYSYCL)
 KEYWORD(__builtin_base_type, KEYSYCL)
+// Unary type-trait builtin backing sycl::khr::is_valid_kernel_arg_v<T>.
+// Folds to a bool constant expression like __is_trivially_copyable. Minimal
+// semantics: true iff T is trivially copyable (a ceiling, not a floor). The
+// deeper nested-member / cross-ABI layout walk is left to a later step.
+TYPE_TRAIT_1(__is_valid_sycl_kernel_arg, IsValidSyclKernelArg, KEYSYCL)
 
 // Clang-only C++ Type Traits
 TYPE_TRAIT_1(__is_trivially_equality_comparable, IsTriviallyEqualityComparable, KEYCXX)

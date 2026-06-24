@@ -24,6 +24,7 @@
 #include "clang/Sema/Overload.h"
 #include "clang/Sema/Sema.h"
 #include "clang/Sema/SemaHLSL.h"
+#include "clang/Sema/SemaSYCL.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace clang;
@@ -431,6 +432,9 @@ static bool CheckUnaryTypeTraitTypeCompleteness(Sema &S, TypeTrait UTT,
     //   remove_all_extents_t<T> shall be a complete type or cv void.
   case UTT_IsTrivial:
   case UTT_IsTriviallyCopyable:
+  // __is_valid_sycl_kernel_arg is currently a trivial-copyability ceiling, so
+  // it shares the same complete-type requirement.
+  case UTT_IsValidSyclKernelArg:
   case UTT_IsStandardLayout:
   case UTT_IsPOD:
   case UTT_IsLiteral:
@@ -732,6 +736,25 @@ static bool EvaluateUnaryTypeTrait(Sema &Self, TypeTrait UTT,
     return T.isTrivialType(C);
   case UTT_IsTriviallyCopyable:
     return T.isTriviallyCopyableType(C);
+  case UTT_IsValidSyclKernelArg: {
+    // Step-2 minimal semantics: trivial-copyability is a NECESSARY ceiling.
+    if (!T.isTriviallyCopyableType(C))
+      return false;
+    // Obvious SYCL-type exclusions. Most of these are already not trivially
+    // copyable on the host, but in the device compile (where __sycl_detail__
+    // record attributes apply) some -- notably accessor/local_accessor --
+    // ARE trivially copyable and would slip through the ceiling, so reject
+    // them explicitly here. The deeper nested-member / cross-ABI layout walk
+    // is a later step.
+    SemaSYCL &SYCL = Self.SYCL();
+    if (SYCL.isSyclType(T, SYCLTypeAttr::accessor) ||
+        SYCL.isSyclType(T, SYCLTypeAttr::local_accessor) ||
+        SYCL.isSyclType(T, SYCLTypeAttr::dynamic_local_accessor) ||
+        SYCL.isSyclType(T, SYCLTypeAttr::kernel_handler) ||
+        SYCL.isSyclType(T, SYCLTypeAttr::stream))
+      return false;
+    return true;
+  }
   case UTT_IsStandardLayout:
     return T->isStandardLayoutType();
   case UTT_IsPOD:
