@@ -635,6 +635,127 @@ static bool IsTriviallyRelocatableType(Sema &SemaRef, QualType T) {
   }
 }
 
+// Step-3 SYCL kernel-arg policy: a trivially-copyable type is still rejected if
+// it IS, or RECURSIVELY CONTAINS (as a field, base, or array element), a scalar
+// whose in-memory representation is NOT guaranteed stable across targets and
+// toolchains. This is the concrete realization of the "ceiling that narrows /
+// implementation MAY report false" escape hatch -- the trait is no longer a
+// pure is_trivially_copyable alias.
+//
+// DEMONSTRATOR POLICY (intentionally not exhaustive): reject these RAW BUILTIN
+// scalar kinds whose in-memory representation is not guaranteed stable across
+// targets/toolchains --
+//   * long double                  -- x87 80-bit vs IEEE 64/128-bit by target,
+//   * __int128 / unsigned __int128 -- ABI-divergent / not universally supported,
+//   * _Float16 / __fp16            -- raw builtin half (NOT sycl::half wrapper),
+//   * __bf16                       -- raw builtin bfloat,
+//   * wchar_t                      -- 2 bytes on Windows vs 4 bytes on Linux,
+//   * long / unsigned long         -- 8 bytes LP64 (Linux) vs 4 bytes LLP64
+//                                     (Windows) -- the realistic MSVC-host /
+//                                     Itanium-device cross-ABI case.
+// `long long` deliberately STAYS VALID (fixed 64-bit everywhere).
+// Matching is on the BuiltinType KIND (an AST type predicate), NOT on
+// getTypeSize -- size is target-dependent and would make the trait answer
+// pass-divergent; the kind is stable across passes. Padding, bitfield widths,
+// and has_unique_object_representations nuance are deferred (see RESULT doc).
+static bool isLayoutUnstableSyclScalar(QualType T) {
+  if (const auto *BT = T->getAs<BuiltinType>()) {
+    switch (BT->getKind()) {
+    case BuiltinType::LongDouble: // long double
+    case BuiltinType::Int128:     // __int128
+    case BuiltinType::UInt128:    // unsigned __int128
+    case BuiltinType::Half:       // __fp16
+    case BuiltinType::Float16:    // _Float16
+    case BuiltinType::BFloat16:   // __bf16
+    case BuiltinType::WChar_S:    // wchar_t (signed,   e.g. Linux)
+    case BuiltinType::WChar_U:    // wchar_t (unsigned, e.g. Windows)
+    case BuiltinType::Long:       // long
+    case BuiltinType::ULong:      // unsigned long
+      return true;
+    default:
+      return false;
+    }
+  }
+  return false;
+}
+
+// SYCL library numeric WRAPPER types that contain a layout-unstable raw builtin
+// internally (notably sycl::half, whose sole field is `_Float16` in the device
+// representation) but which the implementation GUARANTEES a stable, defined
+// representation for. The structural walk cannot tell `sycl::half` apart from a
+// user-written `struct { _Float16 x; }` -- they are the same shape -- so such
+// wrappers must be ALLOWLISTED by identity, not by structure. Returning true
+// here means "this record has a defined representation; do NOT recurse into its
+// raw-builtin storage." Detected by qualified name (these carry no sycl_type
+// attribute, so the isSyclType mechanism used for accessor/stream is unavailable).
+//
+// MINIMAL allowlist: just sycl::half. sycl::vec<half> / sycl::marray<half> store
+// the `half` WRAPPER as their element, so they pass transitively once half does
+// -- no separate entry needed. vec/marray of stable scalars never tripped the
+// walk in the first place.
+static bool isLayoutStableSyclWrapper(const CXXRecordDecl *RD) {
+  if (!RD || !RD->getIdentifier() || RD->getName() != "half")
+    return false;
+  // Expect enclosing namespace half_impl (sycl::_V1::detail::half_impl::half).
+  const auto *NS = dyn_cast_or_null<NamespaceDecl>(RD->getDeclContext());
+  return NS && NS->getIdentifier() && NS->getName() == "half_impl";
+}
+
+static bool containsLayoutUnstableSyclScalar(QualType T, ASTContext &C,
+                                             unsigned Depth = 0) {
+  // Trivially-copyable types have no self-referential value members, so the
+  // recursion is naturally finite; bound it defensively anyway.
+  constexpr unsigned MaxDepth = 64;
+  if (Depth > MaxDepth)
+    return false;
+
+  // Peel array types down to their base element (handles nested arrays).
+  T = C.getBaseElementType(T);
+
+  // Resolve enums to their underlying integer type before checking -- an
+  // `enum : long` is just as layout-unstable as a bare `long`.
+  if (const auto *ET = T->getAs<EnumType>()) {
+    if (const EnumDecl *ED = ET->getDecl()->getDefinition()) {
+      QualType Underlying = ED->getIntegerType();
+      if (!Underlying.isNull())
+        return isLayoutUnstableSyclScalar(Underlying);
+    }
+    return false;
+  }
+
+  // Direct unstable scalar?
+  if (isLayoutUnstableSyclScalar(T))
+    return true;
+
+  // Record: recurse over all bases and all fields.
+  if (const CXXRecordDecl *RD = T->getAsCXXRecordDecl()) {
+    // Allowlisted SYCL wrapper (sycl::half): impl-defined stable representation,
+    // do NOT descend into its raw-builtin storage.
+    if (isLayoutStableSyclWrapper(RD))
+      return false;
+    if (RD->hasDefinition()) {
+      for (const CXXBaseSpecifier &Base : RD->bases())
+        if (containsLayoutUnstableSyclScalar(Base.getType(), C, Depth + 1))
+          return true;
+      for (const FieldDecl *Field : RD->fields())
+        if (containsLayoutUnstableSyclScalar(Field->getType(), C, Depth + 1))
+          return true;
+    }
+    return false;
+  }
+
+  // Non-CXXRecord record (C struct / union): recurse over its fields.
+  if (const RecordDecl *RD = T->getAsRecordDecl()) {
+    if (RD->isCompleteDefinition())
+      for (const FieldDecl *Field : RD->fields())
+        if (containsLayoutUnstableSyclScalar(Field->getType(), C, Depth + 1))
+          return true;
+    return false;
+  }
+
+  return false;
+}
+
 static bool EvaluateUnaryTypeTrait(Sema &Self, TypeTrait UTT,
                                    SourceLocation KeyLoc,
                                    TypeSourceInfo *TInfo) {
@@ -752,6 +873,11 @@ static bool EvaluateUnaryTypeTrait(Sema &Self, TypeTrait UTT,
         SYCL.isSyclType(T, SYCLTypeAttr::dynamic_local_accessor) ||
         SYCL.isSyclType(T, SYCLTypeAttr::kernel_handler) ||
         SYCL.isSyclType(T, SYCLTypeAttr::stream))
+      return false;
+    // Step-3: narrow the ceiling -- reject trivially-copyable types that are,
+    // or recursively contain, a layout-unstable scalar (long double / __int128).
+    // Purely structural, so host and device passes agree.
+    if (containsLayoutUnstableSyclScalar(T, C))
       return false;
     return true;
   }
