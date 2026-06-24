@@ -5226,6 +5226,18 @@ def SYCLIsNDRangeKernel : LangBuiltin<"SYCL_LANG"> {
   let Prototype = "bool(...)";
 }
 
+def SYCLHasProperty : LangBuiltin<"SYCL_LANG"> {
+  let Spellings = ["__builtin_sycl_has_property"];
+  let Attributes = [NoThrow, Const, Constexpr, CustomTypeChecking];
+  let Prototype = "bool(...)";
+}
+
+def SYCLGetProperty : LangBuiltin<"SYCL_LANG"> {
+  let Spellings = ["__builtin_sycl_get_property"];
+  let Attributes = [NoThrow, Const, Constexpr, CustomTypeChecking];
+  let Prototype = "int(...)";
+}
+
 // HLSL
 def HLSLAddUint64: LangBuiltin<"HLSL_LANG"> {
   let Spellings = ["__builtin_hlsl_adduint64"];

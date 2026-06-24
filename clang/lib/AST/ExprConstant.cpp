@@ -16391,6 +16391,102 @@ static bool isSYCLFreeFunctionKernel(IntExprEvaluator &IEV,
   return false;
 }
 
+// Resolves the function-pointer / function operand of a
+// __builtin_sycl_*_property call to its FunctionDecl. Mirrors the operand
+// peeling done by isSYCLFreeFunctionKernel above (the operand may be `foo`,
+// `&foo`, `*foo`, a cast such as `(void(*)(int*))foo`, or `&foo<int>` for a
+// template specialization). Returns nullptr if the operand is not a reference
+// to a function.
+static const FunctionDecl *resolveSYCLPropertyFunctionDecl(const Expr *ArgExpr,
+                                                           EvalInfo &Info) {
+  // The operand is a function or function pointer in any of these forms: `foo`,
+  // `&foo`, `*foo`, a cast such as `(void(*)(int*))foo`, or -- crucially for
+  // the `template <auto *Func>` trait spelling -- a
+  // SubstNonTypeTemplateParmExpr wrapping `&foo<int>` after substitution.
+  // Rather than peel every syntactic wrapper, evaluate the operand to a
+  // function pointer / function lvalue and read the FunctionDecl off the
+  // resulting LValue base. This handles the non-type-template-parameter case
+  // (where syntactic peeling does not reach the underlying DeclRefExpr)
+  // uniformly. Pick the evaluator by the operand category/type: EvaluatePointer
+  // asserts on a non-pointer-prvalue operand, so a bare function lvalue (e.g.
+  // `foo`, no `&`) must go through EvaluateLValue instead.
+  LValue Ptr;
+  bool Evaluated = false;
+  if (ArgExpr->isPRValue() && ArgExpr->getType()->hasPointerRepresentation())
+    Evaluated = EvaluatePointer(ArgExpr, Ptr, Info);
+  else if (ArgExpr->isGLValue())
+    Evaluated = EvaluateLValue(ArgExpr, Ptr, Info);
+  if (Evaluated) {
+    APValue::LValueBase Base = Ptr.getLValueBase();
+    if (const auto *VD = Base.dyn_cast<const ValueDecl *>())
+      return dyn_cast<FunctionDecl>(VD);
+  }
+  // Fallback: syntactic peeling for operands that do not evaluate as a pointer
+  // (e.g. a bare function lvalue `foo`).
+  const Expr *Prev = nullptr;
+  const Expr *Cur = ArgExpr;
+  while (Cur && Cur != Prev) {
+    Prev = Cur;
+    Cur = Cur->IgnoreParenImpCasts();
+    if (const auto *CE = dyn_cast<CastExpr>(Cur))
+      Cur = CE->getSubExpr();
+    else if (const auto *SNTTP = dyn_cast<SubstNonTypeTemplateParmExpr>(Cur))
+      Cur = SNTTP->getReplacement();
+    else if (const auto *UO = dyn_cast<UnaryOperator>(Cur))
+      if (UO->getOpcode() == UO_AddrOf || UO->getOpcode() == UO_Deref)
+        Cur = UO->getSubExpr();
+  }
+  if (const auto *DRE = dyn_cast_or_null<DeclRefExpr>(Cur))
+    return dyn_cast<FunctionDecl>(DRE->getDecl());
+  return nullptr;
+}
+
+// Reads the (name, value) IR-attribute pairs off a function's
+// SYCLAddIRAttributesFunctionAttr and looks up PropName. Mirrors the mechanism
+// used by getFreeFunctionRangeDim (SemaSYCL.cpp) and isSYCLFreeFunctionKernel
+// above: the decorated declaration is host-visible, so the property is readable
+// at compile time without the integration header. For a template
+// specialization the attribute is copied from the template with the property
+// values substituted, so &foo<int> reads the instantiated decl's values.
+static bool findSYCLPropertyValue(const FunctionDecl *FD, StringRef PropName,
+                                  const ASTContext &Ctx, std::string &OutValue) {
+  if (!FD)
+    return false;
+  // Helper: scan a decl's redeclaration chain for the named property. Under
+  // -fsycl the host pass appends an integration footer that redeclares the
+  // kernel WITHOUT the decoration attribute, and the operand may resolve to
+  // that attribute-less redeclaration, so the whole redecl chain is checked.
+  auto ScanRedecls = [&](const FunctionDecl *F) -> bool {
+    if (!F)
+      return false;
+    for (const FunctionDecl *Redecl : F->redecls()) {
+      for (const auto *SAIRAttr :
+           Redecl->specific_attrs<SYCLAddIRAttributesFunctionAttr>()) {
+        SmallVector<std::pair<std::string, std::string>, 4> NameValuePairs =
+            SAIRAttr->getFilteredAttributeNameValuePairs(Ctx);
+        for (const auto &NVPair : NameValuePairs) {
+          if (!NVPair.first.compare(PropName)) {
+            OutValue = NVPair.second;
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  if (ScanRedecls(FD))
+    return true;
+  // For a template specialization the footer may also redeclare the function
+  // *template*, and the specialization the operand names can be instantiated
+  // from the attribute-less footer pattern. The decoration attribute lives on
+  // the user's primary template, so fall back to its instantiation pattern.
+  if (const FunctionDecl *Pattern = FD->getTemplateInstantiationPattern())
+    if (ScanRedecls(Pattern))
+      return true;
+  return false;
+}
+
 bool IntExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
                                             unsigned BuiltinOp) {
   auto EvalTestOp = [&](llvm::function_ref<bool(const APInt &, const APInt &)>
@@ -18045,6 +18141,42 @@ bool IntExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
   case Builtin::BI__builtin_sycl_is_nd_range_kernel: {
     return isSYCLFreeFunctionKernel(*this, Info, E, "sycl-nd-range-kernel", "",
                                     /*CheckNDRangeDim=*/true);
+  }
+  case Builtin::BI__builtin_sycl_has_property: {
+    // __builtin_sycl_has_property(&fn, "prop-name") -> bool: does the
+    // decorated function carry an IR attribute with that name. Reads the
+    // property straight off the host-visible FunctionDecl, no integration
+    // header required.
+    const FunctionDecl *FD = resolveSYCLPropertyFunctionDecl(E->getArg(0), Info);
+    const StringLiteral *NameLit =
+        dyn_cast<StringLiteral>(E->getArg(1)->IgnoreParenImpCasts());
+    if (!NameLit)
+      return false;
+    std::string Value;
+    bool Has = findSYCLPropertyValue(FD, NameLit->getString(), Info.Ctx, Value);
+    return Success(Has, E);
+  }
+  case Builtin::BI__builtin_sycl_get_property: {
+    // __builtin_sycl_get_property(&fn, "prop-name") -> int: the property's
+    // value as an int. For the prototype this targets the single-int kind/dim
+    // properties (sycl-nd-range-kernel -> dims, sycl-single-task-kernel -> 0).
+    // Multi-int values such as "8,8" are not parsed here; only the leading
+    // integer is returned (documented limitation, comma-lists are future work).
+    const FunctionDecl *FD = resolveSYCLPropertyFunctionDecl(E->getArg(0), Info);
+    const StringLiteral *NameLit =
+        dyn_cast<StringLiteral>(E->getArg(1)->IgnoreParenImpCasts());
+    if (!NameLit)
+      return false;
+    std::string Value;
+    if (!findSYCLPropertyValue(FD, NameLit->getString(), Info.Ctx, Value))
+      return Success(0, E);
+    // Parse the leading integer of the value string (LLVM builds with
+    // exceptions disabled, so use the non-throwing StringRef parser). For a
+    // multi-int value like "8,8" consumeInteger stops at the comma and yields
+    // the first int.
+    int64_t Parsed = 0;
+    StringRef(Value).consumeInteger(10, Parsed);
+    return Success(static_cast<int>(Parsed), E);
   }
   case X86::BI__builtin_ia32_kmovb:
   case X86::BI__builtin_ia32_kmovw:

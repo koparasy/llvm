@@ -4085,6 +4085,34 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
 
     break;
   }
+
+  case Builtin::BI__builtin_sycl_has_property:
+  case Builtin::BI__builtin_sycl_get_property: {
+    // Signature: (function-or-function-pointer, "property-name").
+    if (TheCall->getNumArgs() != 2) {
+      Diag(TheCall->getBeginLoc(), diag::err_builtin_invalid_argument_count)
+          << 2;
+      return ExprError();
+    }
+
+    const Expr *Arg = TheCall->getArg(0);
+    QualType ArgTy = Arg->getType();
+    if (!ArgTy->isFunctionProtoType() && !ArgTy->isFunctionPointerType()) {
+      Diag(Arg->getBeginLoc(), diag::err_builtin_invalid_arg_type)
+          << 1 << 0 << /* pointer to function type */ 7 << 0 << ArgTy;
+      return ExprError();
+    }
+
+    // The property name must be a string literal.
+    const Expr *NameArg = TheCall->getArg(1);
+    if (!isa<StringLiteral>(NameArg->IgnoreParenImpCasts())) {
+      Diag(NameArg->getBeginLoc(), diag::err_expr_not_string_literal)
+          << NameArg->getSourceRange();
+      return ExprError();
+    }
+
+    break;
+  }
   }
 
   if (getLangOpts().HLSL && HLSL().CheckBuiltinFunctionCall(BuiltinID, TheCall))
