@@ -15,11 +15,8 @@
 namespace khr = sycl::khr;
 namespace syclexp = sycl::ext::oneapi::experimental;
 
-// 0 properties: must compile and carry no free-function kernel attributes.
-SYCL_KHR_KERNEL()
-void k0(int *) {}
-
-// 1 property.
+// Kind only, no modifiers: the mandatory kind is the sole argument. Verifies the
+// zero-modifier (leading-fixed-arg, trailing-comma) case compiles in C++17.
 SYCL_KHR_KERNEL(khr::nd_kernel<1>)
 void k1(int *) {}
 
@@ -50,9 +47,8 @@ void k5(int *) {}
 // We bind each definition to its attribute-group number, then assert the
 // contents of that group below.
 
-// Only free function kernels (those carrying a kind property) are emitted as
-// device kernel wrappers named __sycl_kernel_<fn>. k0 has no kind property and
-// is therefore not emitted as a kernel -- it only needs to compile.
+// Each free function kernel (every SYCL_KHR_KERNEL carries a mandatory kind) is
+// emitted as a device kernel wrapper named __sycl_kernel_<fn>.
 // CHECK: define {{.*}} @{{.*}}__sycl_kernel_k1{{.*}} #[[#K1:]]
 // CHECK: define {{.*}} @{{.*}}__sycl_kernel_k1b{{.*}} #[[#K1B:]]
 // CHECK: define {{.*}} @{{.*}}__sycl_kernel_k2{{.*}} #[[#K2:]]

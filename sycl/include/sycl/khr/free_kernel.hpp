@@ -57,6 +57,59 @@ template <typename... Props> struct property_bundle {
 template <typename... Props>
 property_bundle<Props...> make_property_bundle(Props...);
 
+// Concatenate two property bundles. SYCL_KHR_KERNEL builds the kind slot and the
+// modifier slots as two separate bundles -- so the zero-modifier case expands to
+// make_property_bundle() with no trailing comma (C++17-safe) -- then joins them
+// here into the single kind-first bundle the slot machinery indexes over.
+template <typename A, typename B> struct concat_bundles;
+template <typename... A, typename... B>
+struct concat_bundles<property_bundle<A...>, property_bundle<B...>> {
+  using type = property_bundle<A..., B...>;
+};
+
+// True for the two kernel-kind property values (nd_kernel<Dims> /
+// single_task_kernel); false for tuning properties (work_group_size, ...). Used
+// to enforce that the kind occupies slot 0 and only slot 0.
+template <typename P> struct is_kind_property : std::false_type {};
+template <int Dims>
+struct is_kind_property<
+    ::sycl::ext::oneapi::experimental::nd_range_kernel_key::value_t<Dims>>
+    : std::true_type {};
+template <>
+struct is_kind_property<
+    ::sycl::ext::oneapi::experimental::single_task_kernel_key::value_t>
+    : std::true_type {};
+
+// Compile-time validation of the SYCL_KHR_KERNEL property list. The primary
+// template catches the empty list (no kind given); the partial specialization
+// checks that slot 0 is a kind and no later slot is. Instantiated by naming
+// kernel_property_bundle<...>::type from the macro expansion, so the diagnostics
+// fire at the kernel's declaration.
+template <typename... Props> struct validate_kernel_properties {
+  static_assert(sizeof...(Props) != 0,
+                "SYCL_KHR_KERNEL requires a kernel kind (single_task_kernel or "
+                "nd_kernel<Dims>) as its first, mandatory argument.");
+};
+template <typename First, typename... Rest>
+struct validate_kernel_properties<First, Rest...> {
+  static_assert(is_kind_property<exp_detail::remove_cvref_t<First>>::value,
+                "SYCL_KHR_KERNEL: the first argument must be a kernel kind "
+                "(single_task_kernel or nd_kernel<Dims>).");
+  static_assert(
+      (... && !is_kind_property<exp_detail::remove_cvref_t<Rest>>::value),
+      "SYCL_KHR_KERNEL: a kernel kind may appear only as the first argument; "
+      "the remaining arguments must be tuning properties.");
+};
+
+// Validates the concatenated bundle and re-exposes it as ::type. Naming ::type
+// from each slot is what triggers validate_kernel_properties.
+template <typename Bundle> struct kernel_property_bundle;
+template <typename... Props>
+struct kernel_property_bundle<property_bundle<Props...>>
+    : validate_kernel_properties<Props...> {
+  using type = property_bundle<Props...>;
+};
+
 template <std::size_t I, typename First, typename... Rest>
 struct pack_element {
   using type = typename pack_element<I - 1, Rest...>::type;
@@ -129,28 +182,41 @@ inline constexpr bool is_single_task_kernel_v =
 } // namespace _V1
 } // namespace sycl
 
-// Bundle type for the forwarded property values. The values are captured by a
-// single decltype(make_property_bundle(...)) so nested template-argument commas
-// survive macro expansion.
-#define __SYCL_KHR_KERNEL_BUNDLE(...)                                          \
-  decltype(::sycl::khr::detail::make_property_bundle(__VA_ARGS__))
+// Bundle type for the forwarded property values. The mandatory KIND is captured
+// as its own bundle and the optional MODIFIERS as a second bundle, then the two
+// are concatenated into one kind-first bundle and validated. Splitting them this
+// way means the zero-modifier case expands to make_property_bundle() with no
+// trailing comma, so SYCL_KHR_KERNEL(nd_kernel<1>) is C++17-safe. Each KIND /
+// MODIFIER list is forwarded whole into a single make_property_bundle(...) call
+// so nested template-argument commas (work_group_size<8, 8>) survive expansion.
+#define __SYCL_KHR_KERNEL_BUNDLE(KIND, ...)                                    \
+  ::sycl::khr::detail::kernel_property_bundle<                                 \
+      typename ::sycl::khr::detail::concat_bundles<                            \
+          decltype(::sycl::khr::detail::make_property_bundle(KIND)),           \
+          decltype(::sycl::khr::detail::make_property_bundle(                  \
+              __VA_ARGS__))>::type>::type
 
-#define __SYCL_KHR_KERNEL_SLOT_NAME(I, ...)                                    \
-  ::sycl::khr::detail::property_slot<I,                                        \
-                                    __SYCL_KHR_KERNEL_BUNDLE(__VA_ARGS__)>::name
-
-#define __SYCL_KHR_KERNEL_SLOT_VALUE(I, ...)                                   \
+#define __SYCL_KHR_KERNEL_SLOT_NAME(I, KIND, ...)                              \
   ::sycl::khr::detail::property_slot<                                          \
-      I, __SYCL_KHR_KERNEL_BUNDLE(__VA_ARGS__)>::value
+      I, __SYCL_KHR_KERNEL_BUNDLE(KIND, __VA_ARGS__)>::name
 
-// Variadic, pure-forwarding decoration macro. Properties are the arguments; the
-// list may be empty. Because there is no leading fixed argument there is no
-// trailing-comma problem, so SYCL_KHR_KERNEL() is C++17-safe.
+#define __SYCL_KHR_KERNEL_SLOT_VALUE(I, KIND, ...)                             \
+  ::sycl::khr::detail::property_slot<                                          \
+      I, __SYCL_KHR_KERNEL_BUNDLE(KIND, __VA_ARGS__)>::value
+
+// Decoration macro with a MANDATORY kernel KIND followed by optional tuning
+// MODIFIERS: SYCL_KHR_KERNEL(kind, modifiers...) where `kind` is
+// single_task_kernel or nd_kernel<Dims> and the modifiers are tuning properties
+// (work_group_size<...>, sub_group_size<...>, ...). The kind is mandatory by
+// construction -- SYCL_KHR_KERNEL() with no kind is a COMPILE ERROR (there is no
+// such thing as a kindless free function kernel entry point), and a
+// validate_kernel_properties static_assert additionally diagnoses a non-kind in
+// slot 0 or a kind in the modifier tail.
 //
-// The expansion emits MaxKernelProperties name slots followed by
-// MaxKernelProperties value slots into ONE add_ir_attributes_function, matching
-// its required N-names-then-N-values shape. Unused trailing slots have empty
-// names and are dropped.
+// The kind is just property slot 0: it flows into the same N-names-then-N-values
+// add_ir_attributes_function expansion as every modifier (the attribute reads
+// name/value pairs unordered, so the macro-positional order is irrelevant to the
+// emitted IR). Unused trailing slots have empty names and are dropped.
 //
 // NOTE (Step 4 dissolution-chain change): the attribute is emitted in BOTH the
 // host and device compilations. add_ir_attributes_function only GENERATES LLVM
