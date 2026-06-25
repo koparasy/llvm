@@ -36,6 +36,30 @@ inline constexpr auto nd_kernel =
 inline constexpr auto single_task_kernel =
     ext::oneapi::experimental::single_task_kernel;
 
+// The free_function_kernel PROPERTY TAG (spec "Kernel properties" section,
+// "=== The free_function_kernel property tag").
+//
+// An incomplete, never-instantiated tag type. It is the concrete artifact the
+// spec introduces so that the sycl_khr_properties (#980) applicability trait,
+// which is keyed on a CLASS type, has something to key on for a free function
+// kernel -- a decorated FUNCTION has no class object of its own. The spec
+// defines a property P as "applicable to a free function kernel" iff
+// `khr::is_property_for_v<P, khr::free_function_kernel>` is true.
+//
+// #980-BLOCKED -- USE IS DEFERRED, NAME IS RESERVED NOW:
+//   `is_property_for` / `is_property_key_compile_time` come from
+//   sycl_khr_properties (SYCL-Docs PR #980), which is NOT in this tree
+//   (unmerged). Until #980 lands, the prototype CANNOT implement the spec's
+//   tag-keyed applicability (`is_property_for_v<P, free_function_kernel>`) nor
+//   the CT/RT split (`is_property_key_compile_time`). It continues to use the
+//   experimental `compile_time_property_key_base_tag` CT/RT detection (see
+//   launch.hpp `is_runtime_launch_property_v`, and the SYCL_KHR_KERNEL kind
+//   validator above) as the pre-#980 stand-in. This tag type is added now ONLY
+//   so the public name exists; its USE as the `Class` operand of
+//   `is_property_for` is deferred to #980. Do NOT vendor a local fake
+//   `is_property_for` to wire it up early (user decision).
+struct free_function_kernel; // incomplete tag, never instantiated
+
 namespace detail {
 namespace exp_detail = ::sycl::ext::oneapi::experimental::detail;
 

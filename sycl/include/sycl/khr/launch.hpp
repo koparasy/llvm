@@ -77,6 +77,15 @@ namespace detail {
 // querying `Ps::key_t` and testing the base tag is uniform across both.
 
 // True iff property element P's key is a runtime (launch-time) property key.
+//
+// #980-BLOCKED: the spec phrases this as "a runtime property, i.e.
+// khr::is_property_key_compile_time_v<key-of-P> is false," using the
+// sycl_khr_properties (#980) discriminator. That trait is NOT in this tree, so
+// this is the pre-#980 STAND-IN: it reads the experimental
+// compile_time_property_key_base_tag directly. When #980 lands, replace this
+// base-tag test with khr::is_property_key_compile_time (and add the tag-keyed
+// is_property_for_v<P, free_function_kernel> applicability check the spec
+// requires alongside the CT/RT split).
 template <typename P>
 inline constexpr bool is_runtime_launch_property_v = !std::is_base_of_v<
     ext::oneapi::experimental::detail::compile_time_property_key_base_tag,
