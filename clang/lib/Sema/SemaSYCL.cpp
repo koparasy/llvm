@@ -955,7 +955,22 @@ class SingleDeviceFunctionTracker {
     // Collect attributes for functions that aren't the root kernel.
     if (!CallStack.empty()) {
       bool DirectlyCalled = CallStack.size() == 1;
-      collectSYCLAttributes(CurrentDecl, CollectedAttributes, DirectlyCalled);
+      // A free function kernel launched via nd_launch/single_task is enqueued
+      // through a compiler-generated lambda kernel body that merely calls the
+      // decorated free function. That wrapper carries none of the free
+      // function's decoration (reqd_work_group_size, sub_group_size, ...), so
+      // the runtime's must-match check sees no requirement. Reach one frame
+      // deeper to propagate the free function's attributes onto the enqueued
+      // wrapper kernel, scoped PRECISELY to that shape: the depth-2 callee is
+      // itself a free function kernel reached directly from the kernel body
+      // lambda. (Mirrors the depth-2 range-rounding special case below.) This
+      // does not affect ordinary kernels: a non-FFK depth-2 callee is not
+      // isFreeFunction, so its attributes are still not propagated.
+      bool IsWrappedFreeFunctionKernel =
+          CallStack.size() == 2 && KernelBody == CallStack.back() &&
+          Parent.SemaSYCLRef.isFreeFunction(CurrentDecl);
+      collectSYCLAttributes(CurrentDecl, CollectedAttributes,
+                            DirectlyCalled || IsWrappedFreeFunctionKernel);
     }
 
     // Calculate the kernel body.  Note the 'isSYCLKernelBodyFunction' only
@@ -5768,9 +5783,37 @@ static void PropagateAndDiagnoseDeviceAttr(SemaSYCL &S, Attr *A,
   case attr::Kind::SYCLIntelMinWorkGroupsPerComputeUnit:
   case attr::Kind::SYCLIntelMaxWorkGroupsPerMultiprocessor:
   case attr::Kind::SYCLDeviceHas:
-  case attr::Kind::SYCLAddIRAttributesFunction:
     SYCLKernel->addAttr(A);
     break;
+  case attr::Kind::SYCLAddIRAttributesFunction: {
+    // A free function kernel launched via nd_launch/single_task is enqueued
+    // through a compiler-generated wrapper kernel that merely calls the
+    // decorated free function (see VisitCallNode). The wrapper already carries
+    // its own SYCLAddIRAttributesFunctionAttr, but it is an EMPTY placeholder
+    // (the launch site passes no compile-time kernel properties). CodeGen reads
+    // only the FIRST SYCLAddIRAttributesFunctionAttr (getAttr), so the free
+    // function's propagated decoration (sycl-work-group-size, ...) would be
+    // ignored if simply appended behind the empty placeholder. When the
+    // propagated attribute actually carries name/value pairs and the kernel's
+    // existing attributes are all empty placeholders, drop those placeholders
+    // so the populated attribute becomes the one CodeGen emits. This is inert
+    // for ordinary kernels: an empty placeholder produces no IR attributes, and
+    // a kernel that already carries a populated attribute is left untouched.
+    auto *AddIR = cast<SYCLAddIRAttributesFunctionAttr>(A);
+    if (!AddIR->getAttributeNameValuePairs(S.getASTContext()).empty()) {
+      bool AllExistingEmpty = true;
+      for (auto *Existing :
+           SYCLKernel->specific_attrs<SYCLAddIRAttributesFunctionAttr>())
+        if (!Existing->getAttributeNameValuePairs(S.getASTContext()).empty()) {
+          AllExistingEmpty = false;
+          break;
+        }
+      if (AllExistingEmpty)
+        SYCLKernel->dropAttr<SYCLAddIRAttributesFunctionAttr>();
+    }
+    SYCLKernel->addAttr(A);
+    break;
+  }
   case attr::Kind::IntelNamedSubGroupSize:
     // Nothing to do here, handled in the SYCL2020 spelling.
     break;

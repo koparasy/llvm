@@ -5,32 +5,24 @@
 // RUN: %{build} -o %t.out
 // RUN: %{run} %t.out
 
-// XFAIL: *
-// XFAIL-TRACKER: FFK-KHR-prototype-step7-must-match-gap
-
-// FFK KHR prototype, Step 7 -- end-to-end NEGATIVE must-match verification.
+// FFK KHR prototype, Step 8 -- end-to-end NEGATIVE must-match verification.
 //
 // A kernel decorated with work_group_size<32> launched through the sycl::khr
-// free function kernel launcher with a MISMATCHED local size (64 != 32) SHOULD
-// throw sycl::exception(errc::nd_range) from the existing runtime reqd-WG-size
-// check (sycl/source/detail/error_handling/error_handling.cpp:151-163).
+// free function kernel launcher with a MISMATCHED local size (64 != 32) throws
+// sycl::exception(errc::nd_range) from the existing runtime reqd-WG-size check
+// (sycl/source/detail/error_handling/error_handling.cpp:151-163).
 //
-// *** KNOWN GAP -- this is why the test is XFAIL. ***
-// The kernel_function<Func> launch path (BOTH sycl::khr AND the experimental
-// extension it forwards to) enqueues a WRAPPER kernel
-// (experimental::detail::NdRangeFreeFunctionKernelWrapper<&vadd,...>,
-// enqueue_functions.hpp:444-462) that wraps Func in a lambda. The decoration's
-// reqd_work_group_size is emitted only on `vadd` and its native
-// `__sycl_kernel_vadd` entry; the WRAPPER device symbol carries NO
-// !reqd_work_group_size metadata and NO "sycl-work-group-size" attribute, so
-// the runtime reads CompileWGSize=0 and skips the must-match check -> no throw.
-// The NATIVE by-name path (handler::parallel_for with the kernel object) DOES
-// enforce it. This defect is UPSTREAM of the khr forward, not in the khr path.
-// See playground/ffk-proto-step-7-RESULT.md for full IR/runtime evidence.
+// Step 7 found that the kernel_function<Func> launch path enqueues a WRAPPER
+// kernel (experimental::detail::NdRangeFreeFunctionKernelWrapper<&vadd,...>,
+// enqueue_functions.hpp:444-462) that wraps Func in a lambda, and the wrapper
+// did NOT carry the free function's decoration -> the runtime read
+// CompileWGSize=0 and skipped the must-match check (the test was XFAIL).
 //
-// When the wrapper-codegen gap is fixed this test will start throwing as
-// expected and flip to XPASS, signalling that the XFAIL marker should be
-// removed.
+// Step 8 (Option 1) propagates the free function's decoration onto the enqueued
+// wrapper kernel in Sema (collectSYCLAttributes / VisitCallNode), so the wrapper
+// now carries "sycl-work-group-size"="32" and !reqd_work_group_size {32,1,1}.
+// The runtime must-match check now fires and the mismatched local size throws,
+// so this test PASSES (XFAIL removed).
 
 #include <cassert>
 #include <cstddef>
