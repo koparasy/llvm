@@ -54,7 +54,7 @@ inline constexpr auto kernel_function =
 // `experimental::properties{...}` does.
 using ext::oneapi::experimental::properties;
 
-namespace free_kernel_detail {
+namespace detail {
 
 // --- launch-property-list introspection (Step 6) --------------------------
 //
@@ -106,7 +106,7 @@ template <typename PropsT>
 inline constexpr bool is_empty_launch_props_v =
     std::is_same_v<PropsT, ext::oneapi::experimental::empty_properties_t>;
 
-} // namespace free_kernel_detail
+} // namespace detail
 
 // nd_launch -- queue form.
 template <auto *Func, int Dims, typename... ArgsT>
@@ -136,7 +136,7 @@ void nd_launch(queue Q, nd_range<Dims> Range, PropsT Props,
                ext::oneapi::experimental::kernel_function_s<Func> KF,
                ArgsT &&...Args) {
   static_assert(
-      free_kernel_detail::launch_props_are_runtime_only_v<PropsT>,
+      detail::launch_props_are_runtime_only_v<PropsT>,
       "khr::nd_launch: only runtime launch properties may be passed here; "
       "compile-time properties belong on the kernel's SYCL_KHR_KERNEL "
       "decoration");
@@ -158,7 +158,7 @@ void nd_launch(queue Q, nd_range<Dims> Range, PropsT Props,
   // count). `if constexpr` makes the forward a DISCARDED branch when the list
   // is not runtime-only, so launch_config is never instantiated and our
   // runtime-only assert is the single, clear diagnostic.
-  if constexpr (free_kernel_detail::launch_props_are_runtime_only_v<PropsT>) {
+  if constexpr (detail::launch_props_are_runtime_only_v<PropsT>) {
     ext::oneapi::experimental::nd_launch<Func>(
         std::move(Q), ext::oneapi::experimental::launch_config{Range, Props},
         KF, std::forward<ArgsT>(Args)...);
@@ -189,7 +189,7 @@ void nd_launch(handler &CGH, nd_range<Dims> Range, PropsT Props,
                ext::oneapi::experimental::kernel_function_s<Func> KF,
                ArgsT &&...Args) {
   static_assert(
-      free_kernel_detail::launch_props_are_runtime_only_v<PropsT>,
+      detail::launch_props_are_runtime_only_v<PropsT>,
       "khr::nd_launch: only runtime launch properties may be passed here; "
       "compile-time properties belong on the kernel's SYCL_KHR_KERNEL "
       "decoration");
@@ -204,7 +204,7 @@ void nd_launch(handler &CGH, nd_range<Dims> Range, PropsT Props,
   // instantiates launch_config (which has its own compile-time-effect assert),
   // so gate the forward on the same predicate -- our runtime-only assert stays
   // the single diagnostic for a rejected compile-time property list.
-  if constexpr (free_kernel_detail::launch_props_are_runtime_only_v<PropsT>) {
+  if constexpr (detail::launch_props_are_runtime_only_v<PropsT>) {
     ext::oneapi::experimental::nd_launch<Func>(
         CGH, ext::oneapi::experimental::launch_config{Range, Props}, KF,
         std::forward<ArgsT>(Args)...);
@@ -238,7 +238,7 @@ void single_task(queue Q, PropsT Props,
                  ext::oneapi::experimental::kernel_function_s<Func> KF,
                  ArgsT &&...Args) {
   static_assert(
-      free_kernel_detail::launch_props_are_runtime_only_v<PropsT>,
+      detail::launch_props_are_runtime_only_v<PropsT>,
       "khr::single_task: only runtime launch properties may be passed here; "
       "compile-time properties belong on the kernel's SYCL_KHR_KERNEL "
       "decoration");
@@ -250,9 +250,9 @@ void single_task(queue Q, PropsT Props,
   // the runtime-only diagnostic; the "not yet supported" assert is then
   // reserved for a (well-formed) runtime list, which single_task has no
   // prop-carrying forwardee for today.
-  if constexpr (free_kernel_detail::launch_props_are_runtime_only_v<PropsT>) {
+  if constexpr (detail::launch_props_are_runtime_only_v<PropsT>) {
     static_assert(
-        free_kernel_detail::is_empty_launch_props_v<PropsT>,
+        detail::is_empty_launch_props_v<PropsT>,
         "khr::single_task: launch properties are not yet supported for "
         "single_task (no experimental launch_config single_task forwardee); "
         "pass an empty property list");
@@ -290,16 +290,16 @@ void single_task(handler &CGH, PropsT Props,
                  ext::oneapi::experimental::kernel_function_s<Func> KF,
                  ArgsT &&...Args) {
   static_assert(
-      free_kernel_detail::launch_props_are_runtime_only_v<PropsT>,
+      detail::launch_props_are_runtime_only_v<PropsT>,
       "khr::single_task: only runtime launch properties may be passed here; "
       "compile-time properties belong on the kernel's SYCL_KHR_KERNEL "
       "decoration");
   // See the queue form: static_asserts don't short-circuit, so nest the rest
   // behind the runtime-only predicate -- a compile-time list then yields only
   // the runtime-only diagnostic above, not also the "not yet supported" one.
-  if constexpr (free_kernel_detail::launch_props_are_runtime_only_v<PropsT>) {
+  if constexpr (detail::launch_props_are_runtime_only_v<PropsT>) {
     static_assert(
-        free_kernel_detail::is_empty_launch_props_v<PropsT>,
+        detail::is_empty_launch_props_v<PropsT>,
         "khr::single_task: launch properties are not yet supported for "
         "single_task (no experimental launch_config single_task forwardee); "
         "pass an empty property list");

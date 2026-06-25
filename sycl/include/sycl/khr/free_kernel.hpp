@@ -36,13 +36,7 @@ inline constexpr auto nd_kernel =
 inline constexpr auto single_task_kernel =
     ext::oneapi::experimental::single_task_kernel;
 
-// NOTE: this implementation namespace is deliberately NOT named
-// `sycl::khr::detail`. Other khr headers (e.g. group_interface.hpp) refer to
-// `::sycl::_V1::detail` via the unqualified spelling `detail::...` from inside
-// `namespace khr`, relying on `khr::detail` not existing. Introducing a
-// `khr::detail` here would shadow that lookup and break those headers when
-// included in the same translation unit.
-namespace free_kernel_detail {
+namespace detail {
 namespace exp_detail = ::sycl::ext::oneapi::experimental::detail;
 
 // Upper bound on the number of properties a single SYCL_KHR_KERNEL(...) may
@@ -101,7 +95,7 @@ struct property_slot<I, property_bundle<Props...>>
     : property_slot_impl<I, property_bundle<Props...>,
                          (I < sizeof...(Props))> {};
 
-} // namespace free_kernel_detail
+} // namespace detail
 
 // Host-evaluable, compile-time kernel-property queries (Step 4).
 //
@@ -139,14 +133,14 @@ inline constexpr bool is_single_task_kernel_v =
 // single decltype(make_property_bundle(...)) so nested template-argument commas
 // survive macro expansion.
 #define __SYCL_KHR_KERNEL_BUNDLE(...)                                          \
-  decltype(::sycl::khr::free_kernel_detail::make_property_bundle(__VA_ARGS__))
+  decltype(::sycl::khr::detail::make_property_bundle(__VA_ARGS__))
 
 #define __SYCL_KHR_KERNEL_SLOT_NAME(I, ...)                                    \
-  ::sycl::khr::free_kernel_detail::property_slot<I,                                        \
+  ::sycl::khr::detail::property_slot<I,                                        \
                                     __SYCL_KHR_KERNEL_BUNDLE(__VA_ARGS__)>::name
 
 #define __SYCL_KHR_KERNEL_SLOT_VALUE(I, ...)                                   \
-  ::sycl::khr::free_kernel_detail::property_slot<                                          \
+  ::sycl::khr::detail::property_slot<                                          \
       I, __SYCL_KHR_KERNEL_BUNDLE(__VA_ARGS__)>::value
 
 // Variadic, pure-forwarding decoration macro. Properties are the arguments; the

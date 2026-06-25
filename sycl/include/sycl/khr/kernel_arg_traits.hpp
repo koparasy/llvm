@@ -16,11 +16,6 @@
 // trait cannot introspect struct members (no portable reflection pre-C++26),
 // so the trait is backed by the clang type-trait builtin
 // __is_valid_sycl_kernel_arg, which Sema folds to a bool constant expression.
-//
-// NOTE: do NOT introduce a sycl::khr::detail namespace here. group_interface.hpp
-// writes unqualified detail::is_khr_group from inside namespace khr relying on
-// khr::detail NOT existing (it falls through to ::sycl::_V1::detail). The trait
-// below needs no helper namespace anyway.
 
 namespace sycl {
 inline namespace _V1 {
