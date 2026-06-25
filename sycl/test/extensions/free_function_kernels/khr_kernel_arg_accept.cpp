@@ -1,13 +1,15 @@
 // RUN: %clangxx -fsycl                   -fsyntax-only %s
 // RUN: %clangxx -fsycl -fsycl-device-only -fsyntax-only %s
 
-// Over-rejection guard for the __is_valid_sycl_kernel_arg layout-unstable-scalar
-// walk. The walk rejects a RAW builtin scalar (e.g. bare _Float16) because its
-// representation is not guaranteed stable across toolchains. But a SYCL library
-// numeric wrapper (sycl::half, sycl::vec, sycl::marray) has an
-// implementation-guaranteed representation and MUST stay valid -- even though
-// sycl::half wraps _Float16 internally on the device pass. This test uses the
-// real SYCL headers (unlike the clang SemaSYCL test) and runs in BOTH passes.
+// Acceptance guard: SYCL library numeric wrappers (sycl::half, sycl::vec,
+// sycl::marray, and aggregates containing them) are valid free function kernel
+// arguments under the spec rule -- each is <<device-copyable>> (trivially
+// copyable, or device-copyable through its element type) so the
+// is_device_copyable_v alias backing is_valid_kernel_arg_v reports true. These
+// stay valid on BOTH passes. (The retained off-spec __is_valid_sycl_kernel_arg
+// builtin has a stricter layout-unstable-scalar walk that needs an explicit
+// half allowlist to accept these; that walk is NOT on the spec path here.) This
+// test uses the real SYCL headers and runs in BOTH passes.
 #include <sycl/sycl.hpp>
 
 #include <sycl/khr/kernel_arg_traits.hpp>

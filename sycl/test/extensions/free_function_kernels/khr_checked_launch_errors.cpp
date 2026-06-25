@@ -21,11 +21,14 @@ void vadd(float *a, float *b, float *c) {}
 SYCL_KHR_KERNEL(khr::single_task_kernel)
 void init(float *p) {}
 
-// Trivially copyable but carries a layout-unstable scalar (long double), so
-// is_valid_kernel_arg_v<Bad> is false. Dimensionality matches the kernel here,
-// so the argument-type static_assert is the one that fires.
+// Not device-copyable: a user-provided copy constructor makes Bad neither
+// trivially copyable nor implicitly device copyable, and it is not opted in via
+// is_device_copyable, so is_valid_kernel_arg_v<Bad> is false. Dimensionality
+// matches the kernel here, so the argument-type static_assert is the one that
+// fires.
 struct Bad {
-  long double x;
+  Bad(const Bad &) {}
+  int x;
 };
 
 SYCL_KHR_KERNEL(khr::nd_kernel<1>)

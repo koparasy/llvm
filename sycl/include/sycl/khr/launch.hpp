@@ -120,8 +120,17 @@ void nd_launch(queue Q, nd_range<Dims> Range,
   static_assert((is_valid_kernel_arg_v<std::decay_t<ArgsT>> && ...),
                 "khr::nd_launch: a kernel argument type is not a valid free "
                 "function kernel argument");
-  ext::oneapi::experimental::nd_launch<Func>(std::move(Q), Range, KF,
-                                             std::forward<ArgsT>(Args)...);
+  // Guard the forward behind the same arg-validity predicate. The arg-type rule
+  // is core device-copyability (is_valid_kernel_arg_v aliases
+  // is_device_copyable_v), so the experimental forwardee's own
+  // CheckDeviceCopyable would ALSO reject a non-device-copyable arg -- emitting
+  // a second diagnostic (plus a core template backtrace) for the one mistake our
+  // static_assert already reports. `if constexpr` discards the forward on the
+  // bad path, leaving our message as the single, clear diagnostic.
+  if constexpr ((is_valid_kernel_arg_v<std::decay_t<ArgsT>> && ...)) {
+    ext::oneapi::experimental::nd_launch<Func>(std::move(Q), Range, KF,
+                                               std::forward<ArgsT>(Args)...);
+  }
 }
 
 // nd_launch -- queue form WITH a launch-property list (Step 6).
@@ -177,8 +186,12 @@ void nd_launch(handler &CGH, nd_range<Dims> Range,
   static_assert((is_valid_kernel_arg_v<std::decay_t<ArgsT>> && ...),
                 "khr::nd_launch: a kernel argument type is not a valid free "
                 "function kernel argument");
-  ext::oneapi::experimental::nd_launch<Func>(CGH, Range, KF,
-                                             std::forward<ArgsT>(Args)...);
+  // See the queue form: gate the forward so a non-device-copyable arg yields
+  // only our diagnostic, not also the forwardee's CheckDeviceCopyable assert.
+  if constexpr ((is_valid_kernel_arg_v<std::decay_t<ArgsT>> && ...)) {
+    ext::oneapi::experimental::nd_launch<Func>(CGH, Range, KF,
+                                               std::forward<ArgsT>(Args)...);
+  }
 }
 
 // nd_launch -- handler form WITH a launch-property list (Step 6).
@@ -221,8 +234,12 @@ void single_task(queue Q,
   static_assert((is_valid_kernel_arg_v<std::decay_t<ArgsT>> && ...),
                 "khr::single_task: a kernel argument type is not a valid free "
                 "function kernel argument");
-  ext::oneapi::experimental::single_task<Func>(std::move(Q), KF,
-                                               std::forward<ArgsT>(Args)...);
+  // See nd_launch: gate the forward so a non-device-copyable arg yields only our
+  // diagnostic, not also the forwardee's CheckDeviceCopyable assert.
+  if constexpr ((is_valid_kernel_arg_v<std::decay_t<ArgsT>> && ...)) {
+    ext::oneapi::experimental::single_task<Func>(std::move(Q), KF,
+                                                 std::forward<ArgsT>(Args)...);
+  }
 }
 
 // single_task -- queue form WITH a launch-property list (Step 6).
@@ -277,8 +294,12 @@ void single_task(handler &CGH,
   static_assert((is_valid_kernel_arg_v<std::decay_t<ArgsT>> && ...),
                 "khr::single_task: a kernel argument type is not a valid free "
                 "function kernel argument");
-  ext::oneapi::experimental::single_task<Func>(CGH, KF,
-                                               std::forward<ArgsT>(Args)...);
+  // See nd_launch: gate the forward so a non-device-copyable arg yields only our
+  // diagnostic, not also the forwardee's CheckDeviceCopyable assert.
+  if constexpr ((is_valid_kernel_arg_v<std::decay_t<ArgsT>> && ...)) {
+    ext::oneapi::experimental::single_task<Func>(CGH, KF,
+                                                 std::forward<ArgsT>(Args)...);
+  }
 }
 
 // single_task -- handler form WITH a launch-property list (Step 6).

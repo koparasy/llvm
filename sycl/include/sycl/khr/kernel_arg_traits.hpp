@@ -10,19 +10,32 @@
 
 // Validity trait for arguments passed to a sycl::khr free function kernel.
 //
-// Trivial-copyability is NECESSARY but NOT SUFFICIENT: an implementation may
-// reject even a trivially-copyable type whose representation it cannot
-// guarantee stable across the host/device toolchain boundary. A pure-header
-// trait cannot introspect struct members (no portable reflection pre-C++26),
-// so the trait is backed by the clang type-trait builtin
-// __is_valid_sycl_kernel_arg, which Sema folds to a bool constant expression.
+// SPEC RULE (sycl_khr_free_function_kernels.adoc, "Restrictions on kernel
+// argument types"): each free function kernel parameter must be
+// <<device-copyable>> -- the SAME rule as every other SYCL kernel argument
+// (<<sec:kernel.parameter.passing>>). A free function kernel receives every
+// parameter positionally and does not get the special non-positional allowance
+// for accessor / local_accessor / image accessors / stream / reducer /
+// kernel_handler, so those (and any other non-device-copyable type) are ill
+// formed as a parameter.
+//
+// We therefore reuse the core sycl::is_device_copyable_v trait directly rather
+// than introduce a new kernel-arg notion: is_valid_kernel_arg_v is an ALIAS of
+// is_device_copyable_v, so the launch.hpp call sites are unchanged.
+//
+// NOTE: the clang builtin __is_valid_sycl_kernel_arg (a stricter,
+// cross-ABI-narrowing trait) is RETAINED in the tree as the off-spec flag-mode
+// tier for the native-name / OpenVINO consumer, but it is NOT on the spec path
+// and is deliberately not used here.
+
+#include <sycl/detail/is_device_copyable.hpp>
 
 namespace sycl {
 inline namespace _V1 {
 namespace khr {
 
 template <typename T>
-inline constexpr bool is_valid_kernel_arg_v = __is_valid_sycl_kernel_arg(T);
+inline constexpr bool is_valid_kernel_arg_v = is_device_copyable_v<T>;
 
 } // namespace khr
 } // namespace _V1
