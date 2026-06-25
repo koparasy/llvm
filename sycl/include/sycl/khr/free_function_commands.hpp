@@ -57,13 +57,13 @@ void launch(const queue &q, range<1> r, const KernelType &k,
   using LambdaArgType = sycl::detail::lambda_arg_type<KernelType, item<1>>;
   using TransformedArgType = std::conditional_t<
       std::is_integral<LambdaArgType>::value, item<1>,
-      typename detail::TransformUserItemType<1, LambdaArgType>::type>;
+      typename _V1::detail::TransformUserItemType<1, LambdaArgType>::type>;
 
   // TODO The handler-less path does not support kernel functions with the
   // kernel_handler type argument yet.
-  if constexpr (!(detail::KernelLambdaHasKernelHandlerArgT<
+  if constexpr (!(_V1::detail::KernelLambdaHasKernelHandlerArgT<
                     KernelType, TransformedArgType>::value)) {
-    detail::submit_kernel_direct_parallel_for(q, r, k);
+    _V1::detail::submit_kernel_direct_parallel_for(q, r, k);
   } else {
     submit(q, [&](handler &h) { launch<KernelType>(h, r, k); }, codeLoc);
   }
@@ -74,13 +74,13 @@ void launch(const queue &q, range<2> r, const KernelType &k,
                 sycl::detail::code_location::current()) {
   using LambdaArgType = sycl::detail::lambda_arg_type<KernelType, item<2>>;
   using TransformedArgType =
-      typename detail::TransformUserItemType<2, LambdaArgType>::type;
+      typename _V1::detail::TransformUserItemType<2, LambdaArgType>::type;
 
   // TODO The handler-less path does not support kernel functions with the
   // kernel_handler type argument yet.
-  if constexpr (!(detail::KernelLambdaHasKernelHandlerArgT<
+  if constexpr (!(_V1::detail::KernelLambdaHasKernelHandlerArgT<
                     KernelType, TransformedArgType>::value)) {
-    detail::submit_kernel_direct_parallel_for(q, r, k);
+    _V1::detail::submit_kernel_direct_parallel_for(q, r, k);
   } else {
     submit(q, [&](handler &h) { launch<KernelType>(h, r, k); }, codeLoc);
   }
@@ -91,13 +91,13 @@ void launch(const queue &q, range<3> r, const KernelType &k,
                 sycl::detail::code_location::current()) {
   using LambdaArgType = sycl::detail::lambda_arg_type<KernelType, item<3>>;
   using TransformedArgType =
-      typename detail::TransformUserItemType<3, LambdaArgType>::type;
+      typename _V1::detail::TransformUserItemType<3, LambdaArgType>::type;
 
   // TODO The handler-less path does not support kernel functions with the
   // kernel_handler type argument yet.
-  if constexpr (!(detail::KernelLambdaHasKernelHandlerArgT<
+  if constexpr (!(_V1::detail::KernelLambdaHasKernelHandlerArgT<
                     KernelType, TransformedArgType>::value)) {
-    detail::submit_kernel_direct_parallel_for(q, r, k);
+    _V1::detail::submit_kernel_direct_parallel_for(q, r, k);
   } else {
     submit(q, [&](handler &h) { launch<KernelType>(h, r, k); }, codeLoc);
   }
@@ -206,9 +206,9 @@ void launch_grouped(const queue &q, range<1> r, range<1> size, KernelType &&k,
                         sycl::detail::code_location::current()) {
   // TODO The handler-less path does not support kernel functions with the
   // kernel_handler type argument yet.
-  if constexpr (!(detail::KernelLambdaHasKernelHandlerArgT<
+  if constexpr (!(_V1::detail::KernelLambdaHasKernelHandlerArgT<
                     KernelType, sycl::nd_item<1>>::value)) {
-    detail::submit_kernel_direct_parallel_for(q, nd_range<1>(r, size),
+    _V1::detail::submit_kernel_direct_parallel_for(q, nd_range<1>(r, size),
                                               std::forward<KernelType>(k));
   } else {
     submit(
@@ -223,9 +223,9 @@ void launch_grouped(const queue &q, range<2> r, range<2> size, KernelType &&k,
                         sycl::detail::code_location::current()) {
   // TODO The handler-less path does not support kernel functions with the
   // kernel_handler type argument yet.
-  if constexpr (!(detail::KernelLambdaHasKernelHandlerArgT<
+  if constexpr (!(_V1::detail::KernelLambdaHasKernelHandlerArgT<
                     KernelType, sycl::nd_item<2>>::value)) {
-    detail::submit_kernel_direct_parallel_for(q, nd_range<2>(r, size),
+    _V1::detail::submit_kernel_direct_parallel_for(q, nd_range<2>(r, size),
                                               std::forward<KernelType>(k));
   } else {
     submit(
@@ -240,9 +240,9 @@ void launch_grouped(const queue &q, range<3> r, range<3> size, KernelType &&k,
                         sycl::detail::code_location::current()) {
   // TODO The handler-less path does not support kernel functions with the
   // kernel_handler type argument yet.
-  if constexpr (!(detail::KernelLambdaHasKernelHandlerArgT<
+  if constexpr (!(_V1::detail::KernelLambdaHasKernelHandlerArgT<
                     KernelType, sycl::nd_item<3>>::value)) {
-    detail::submit_kernel_direct_parallel_for(q, nd_range<3>(r, size),
+    _V1::detail::submit_kernel_direct_parallel_for(q, nd_range<3>(r, size),
                                               std::forward<KernelType>(k));
   } else {
     submit(
@@ -361,9 +361,9 @@ void launch_task(const sycl::queue &q, KernelType &&k,
                      sycl::detail::code_location::current()) {
   // TODO The handler-less path does not support  kernel functions with the
   // kernel_handler type argument yet.
-  if constexpr (!(detail::KernelLambdaHasKernelHandlerArgT<KernelType,
+  if constexpr (!(_V1::detail::KernelLambdaHasKernelHandlerArgT<KernelType,
                                                            void>::value)) {
-    detail::submit_kernel_direct_single_task(
+    _V1::detail::submit_kernel_direct_single_task(
         q, std::forward<KernelType>(k), {},
         ext::oneapi::experimental::empty_properties_t{}, codeLoc);
   } else {

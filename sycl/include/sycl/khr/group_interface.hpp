@@ -56,7 +56,7 @@ namespace khr {
 
 // Forward declaration for friend function.
 template <typename ParentGroup>
-std::enable_if_t<detail::is_khr_group<ParentGroup>::value,
+std::enable_if_t<_V1::detail::is_khr_group<ParentGroup>::value,
                  member_item<ParentGroup>>
 get_member_item(ParentGroup g) noexcept;
 
@@ -189,7 +189,7 @@ public:
   using linear_id_type = typename ParentGroup::linear_id_type;
   using range_type = typename ParentGroup::range_type;
 #if defined(__cpp_lib_mdspan)
-  using extents_type = typename detail::single_extents<
+  using extents_type = typename _V1::detail::single_extents<
       typename ParentGroup::extents_type::index_type,
       ParentGroup::dimensions>::type;
 #endif
@@ -247,7 +247,7 @@ protected:
 };
 
 template <typename ParentGroup>
-std::enable_if_t<detail::is_khr_group<ParentGroup>::value,
+std::enable_if_t<_V1::detail::is_khr_group<ParentGroup>::value,
                  member_item<ParentGroup>>
 get_member_item(ParentGroup) noexcept {
   return member_item<ParentGroup>{};
