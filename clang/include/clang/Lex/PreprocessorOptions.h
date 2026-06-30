@@ -240,6 +240,13 @@ public:
     Includes.clear();
     MacroIncludes.clear();
     ChainedIncludes.clear();
+    // The SYCL integration header/footer are implicitly included into the
+    // main translation unit only. They must not propagate into implicitly
+    // built modules: their driver-generated paths are unique per invocation
+    // (and the files are transient), so recording them as module inputs makes
+    // every module fail validation on the next compile, defeating the cache.
+    IncludeHeader.clear();
+    IncludeFooter.clear();
     DumpDeserializedPCHDecls = false;
     ImplicitPCHInclude.clear();
     SingleFileParseMode = false;
