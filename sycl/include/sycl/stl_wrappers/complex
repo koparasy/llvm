@@ -41,6 +41,18 @@
 
 // Now that we have std::complex available, implement SYCL functionality related
 // to it.
+//
+// Do not emit any of the SYCL-specific additions while the C++ standard library
+// module itself is being compiled with -fmodules. libc++'s <complex>/<cmath>
+// internally include <cmath>/<complex> by name, which resolve to these wrappers
+// (they precede libc++ on the include search path). If the SYCL additions below
+// were pulled into the 'std' module build, SYCL headers (access.hpp, the SPIR-V
+// declarations, ...) would be absorbed into the std module and later become
+// invisible to the SYCL module, producing spurious "declaration is not visible"
+// / "__SYCL_EXPORT incomplete" errors. Emitting them only when we are NOT
+// building the std module keeps the wrapper a pure pass-through there, while the
+// user translation unit and the SYCL module still get the full specializations.
+#if !__building_module(std) && !__building_module(std_core)
 
 #include <type_traits>
 
@@ -129,3 +141,5 @@ struct select_cl_scalar_complex_or_T<T,
 } // namespace detail
 } // namespace _V1
 } // namespace sycl
+
+#endif // !__building_module(std) && !__building_module(std_core)

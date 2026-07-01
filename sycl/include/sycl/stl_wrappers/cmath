@@ -35,6 +35,12 @@ _dsign(double x);
 
 // *** <sycl/builtins.hpp> ***
 
+// See the explanation in stl_wrappers/complex: do not emit SYCL additions (nor
+// pull in any SYCL headers) while the C++ standard library module is being
+// compiled with -fmodules, otherwise SYCL headers get absorbed into the 'std'
+// module. The wrapper stays a pure pass-through around libc++'s <cmath> there.
+#if !__building_module(std) && !__building_module(std_core)
+
 #if defined(__NVPTX__) || defined(__AMDGCN__)
 #include "__sycl_cmath_wrapper_impl.hpp"
 #else
@@ -250,3 +256,5 @@ extern __DPCPP_SYCL_EXTERNAL_LIBC float _hypotf(float x, float y);
 #endif
 #endif // __SYCL_DEVICE_ONLY__
 #endif
+
+#endif // !__building_module(std) && !__building_module(std_core)
