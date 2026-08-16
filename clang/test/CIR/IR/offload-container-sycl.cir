@@ -1,0 +1,46 @@
+// RUN: cir-opt %s --verify-roundtrip | FileCheck %s
+
+// A SYCL offload container: an x86-64 host module alongside a spir64 device
+// module. Both carry their offload kind and triple; the device kernel is
+// cc(spir_kernel) with addrspace(1) pointer arguments. This proves the
+// container schema is SYCL-ready.
+
+!s8i = !cir.int<s, 8>
+module {
+  cir.offload.container {
+    builtin.module @host attributes {
+        cir.offload.bundle_id = "host-x86_64-unknown-linux-gnu",
+        cir.offload.kind = #cir.offload_kind<host>,
+        cir.triple = "x86_64-unknown-linux-gnu"} {
+      // The device kernel name, as SYCL records it host-side.
+      cir.global "private" constant internal @".str.kname" =
+          #cir.const_array<"_Z21__sycl_kernel_vec_addPKfS0_Pf" : !cir.array<!s8i x 33>, trailing_zeros>
+          : !cir.array<!s8i x 34>
+    }
+    builtin.module @device_sycl_spir64 attributes {
+        cir.offload.bundle_id = "sycl-spir64-unknown-unknown",
+        cir.offload.kind = #cir.offload_kind<device>,
+        cir.triple = "spir64-unknown-unknown"} {
+      cir.func @_Z21__sycl_kernel_vec_addPKfS0_Pf(
+          %arg0: !cir.ptr<!cir.float, target_address_space(1)>,
+          %arg1: !cir.ptr<!cir.float, target_address_space(1)>,
+          %arg2: !cir.ptr<!cir.float, target_address_space(1)>) cc(spir_kernel) {
+        cir.return
+      }
+    }
+  }
+}
+
+// CHECK:      cir.offload.container {
+// CHECK:        builtin.module @host
+// CHECK-SAME:     cir.offload.kind = #cir.offload_kind<host>
+// CHECK-SAME:     cir.triple = "x86_64-unknown-linux-gnu"
+// CHECK:          cir.global "private" constant internal @".str.kname"
+// CHECK:        builtin.module @device_sycl_spir64
+// CHECK-SAME:     cir.offload.kind = #cir.offload_kind<device>
+// CHECK-SAME:     cir.triple = "spir64-unknown-unknown"
+// CHECK:          cir.func @_Z21__sycl_kernel_vec_addPKfS0_Pf(
+// CHECK-SAME:       !cir.ptr<!cir.float, target_address_space(1)>
+// CHECK-SAME:       !cir.ptr<!cir.float, target_address_space(1)>
+// CHECK-SAME:       !cir.ptr<!cir.float, target_address_space(1)>
+// CHECK-SAME:       cc(spir_kernel)

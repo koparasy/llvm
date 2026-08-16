@@ -1,0 +1,39 @@
+// RUN: cir-opt %s \
+// RUN:   -pass-pipeline="builtin.module(cir.offload.container(test-print-kernel-bindings))" \
+// RUN:   2>&1 | FileCheck %s --check-prefix=BIND
+// RUN: cir-opt %s \
+// RUN:   -pass-pipeline="builtin.module(cir.offload.container(cir-offload-dead-kernel-elimination))" \
+// RUN:   | FileCheck %s --check-prefix=DKE
+
+// Baseline: combine-CIR passes are CUDA-shaped and do not yet recognize SYCL
+// launches (KernelBindingTable is keyed on cu.kernel_name; isDeviceKernel lacks
+// SpirKernel). These CHECKs document current no-op behavior and must be updated
+// when SYCL launch-binding lands (Phase 3).
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.offload.container {
+    builtin.module @host attributes {cir.offload.kind = #cir.offload_kind<host>, cir.triple = "x86_64-unknown-linux-gnu"} {
+      cir.func @main() -> !s32i {
+        %0 = cir.const #cir.int<0> : !s32i
+        cir.return %0 : !s32i
+      }
+    }
+    builtin.module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload_kind<device>, cir.triple = "spir64-unknown-unknown"} {
+      cir.func @_Z21__sycl_kernel_vec_addPKfS0_Pf(
+          %arg0: !cir.ptr<!cir.float, target_address_space(1)>,
+          %arg1: !cir.ptr<!cir.float, target_address_space(1)>,
+          %arg2: !cir.ptr<!cir.float, target_address_space(1)>) cc(spir_kernel) {
+        cir.return
+      }
+    }
+  }
+}
+
+// No SYCL launch is recognized, so the binding table is empty.
+// BIND: KernelBindingTable
+// BIND-NEXT: size 0 empty true
+
+// The SYCL kernel is not seen as a device kernel, so it survives untouched.
+// DKE-LABEL: cir.offload.container
+// DKE: cir.func @_Z21__sycl_kernel_vec_addPKfS0_Pf({{.*}}) cc(spir_kernel)
