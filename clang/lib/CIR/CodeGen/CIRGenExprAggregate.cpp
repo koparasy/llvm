@@ -724,8 +724,9 @@ void AggExprEmitter::emitArrayInit(Address destPtr, cir::ArrayType arrayTy,
   const QualType elementPtrType = cgf.getContext().getPointerType(elementType);
 
   const mlir::Type cirElementType = cgf.convertType(elementType);
+  // The decayed element pointer inherits the array's address space (OG parity).
   const cir::PointerType cirElementPtrType =
-      builder.getPointerTo(cirElementType);
+      builder.getPointerTo(cirElementType, destPtr.getAddressSpace());
 
   auto begin = cir::CastOp::create(builder, loc, cirElementPtrType,
                                    cir::CastKind::array_to_ptrdecay,
