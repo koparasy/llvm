@@ -548,6 +548,11 @@ void CIRGenAction::ExecuteAction() {
   if (linkInModules(CI, CI.getCodeGenOpts(), *LLVMModule, LinkModules))
     return;
 
+  // Embed the offload object (e.g. for --offload-new-driver), matching classic
+  // CodeGen; the linker-wrapper needs the .llvm.offloading section.
+  clang::EmbedObject(LLVMModule.get(), CI.getCodeGenOpts(),
+                     CI.getVirtualFileSystem(), CI.getDiagnostics());
+
   BackendAction BEAction = getBackendActionFromOutputType(Action);
   emitBackendOutput(CI, CI.getCodeGenOpts(), LLVMModule.get(), BEAction,
                     CI.getFileManager().getVirtualFileSystemPtr(),
