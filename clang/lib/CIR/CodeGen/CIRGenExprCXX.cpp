@@ -169,24 +169,31 @@ RValue CIRGenFunction::emitCXXMemberOrOperatorMemberCallExpr(
     }
   }
 
-  // Note on trivial assignment
-  // --------------------------
-  // Classic codegen avoids generating the trivial copy/move assignment operator
-  // when it isn't necessary, choosing instead to just produce IR with an
-  // equivalent effect. We have chosen not to do that in CIR, instead emitting
-  // trivial copy/move assignment operators and allowing later transformations
-  // to optimize them away if appropriate.
+  bool trivialForCodegen =
+      md->isTrivial() || (md->isDefaulted() && md->getParent()->isUnion());
+  // Unlike classic codegen, CIR intentionally emits ordinary trivial
+  // copy/move assignment operators (see note above) and only takes the
+  // call-site shortcut for defaulted union assignment, whose body is empty.
+  bool trivialAssignment =
+      md->isDefaulted() && md->getParent()->isUnion() &&
+      (md->isCopyAssignmentOperator() || md->isMoveAssignmentOperator()) &&
+      !md->getParent()->mayInsertExtraPadding();
 
   // C++17 demands that we evaluate the RHS of a (possibly-compound) assignment
   // operator before the LHS.
   CallArgList rtlArgStorage;
   CallArgList *rtlArgs = nullptr;
+  LValue trivialAssignmentRHS;
   if (auto *oce = dyn_cast<CXXOperatorCallExpr>(ce)) {
     if (oce->isAssignmentOp()) {
-      rtlArgs = &rtlArgStorage;
-      emitCallArgs(*rtlArgs, md->getType()->castAs<FunctionProtoType>(),
-                   drop_begin(ce->arguments(), 1), ce->getDirectCallee(),
-                   /*ParamsToSkip*/ 0);
+      if (trivialAssignment) {
+        trivialAssignmentRHS = emitLValue(ce->getArg(1));
+      } else {
+        rtlArgs = &rtlArgStorage;
+        emitCallArgs(*rtlArgs, md->getType()->castAs<FunctionProtoType>(),
+                     drop_begin(ce->arguments(), 1), ce->getDirectCallee(),
+                     /*ParamsToSkip*/ 0);
+      }
     }
   }
 
@@ -206,9 +213,18 @@ RValue CIRGenFunction::emitCXXMemberOrOperatorMemberCallExpr(
     return RValue::get(nullptr);
   }
 
-  if ((md->isTrivial() || (md->isDefaulted() && md->getParent()->isUnion())) &&
-      isa<CXXDestructorDecl>(md))
+  if (trivialForCodegen && isa<CXXDestructorDecl>(md))
     return RValue::get(nullptr);
+
+  if (trivialAssignment) {
+    // The defaulted union assignment operator has an empty body; produce its
+    // effect at the call site via an aggregate copy and return the LHS lvalue.
+    LValue rhs = isa<CXXOperatorCallExpr>(ce) ? trivialAssignmentRHS
+                                              : emitLValue(*ce->arg_begin());
+    emitAggregateCopy(thisPtr, rhs, ce->getType(), AggValueSlot::MayOverlap,
+                      hasVolatileMember(ce->getType()));
+    return RValue::get(thisPtr.getPointer());
+  }
 
   // Compute the function type we're calling
   const CXXMethodDecl *calleeDecl =
