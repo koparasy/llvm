@@ -11,14 +11,15 @@
 // During device compilation a SYCL free-function kernel is outlined into a
 // __sycl_kernel_ entry point carrying an implicit device_kernel attribute. It
 // must be emitted with the SPIR-V kernel calling convention so that
-// sycl-post-link recognizes it as a kernel.
+// sycl-post-link recognizes it as a kernel. Its USM pointer arguments are
+// rewritten to the global address space (SPIR-V CrossWorkGroup / addrspace(1)).
 
 __attribute__((sycl_device))
 [[__sycl_detail__::add_ir_attributes_function("sycl-single-task-kernel", 0)]]
 void ff(int *p) { *p = 42; }
 
-// CIR: cir.func{{.*}} @_Z16__sycl_kernel_ffPi{{.*}} cc(spir_kernel)
+// CIR: cir.func{{.*}} @_Z16__sycl_kernel_ffPi(%arg0: !cir.ptr<!s32i, target_address_space(1)>{{.*}}) {{.*}}cc(spir_kernel)
 
-// LLVM: define {{.*}}spir_kernel void @_Z16__sycl_kernel_ffPi
+// LLVM: define {{.*}}spir_kernel void @_Z16__sycl_kernel_ffPi(ptr addrspace(1)
 
-// OGCG: define {{.*}}spir_kernel void @_Z16__sycl_kernel_ffPi
+// OGCG: define {{.*}}spir_kernel void @_Z16__sycl_kernel_ffPi(ptr addrspace(1)
