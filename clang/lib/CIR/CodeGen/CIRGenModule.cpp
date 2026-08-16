@@ -3392,9 +3392,12 @@ void CIRGenModule::setCIRFunctionAttributesForDefinition(
       f.setAlignment(2);
   }
 
-  // Attach "sycl-module-id" to sycl_external function definitions to mark
-  // them as entry points for per-translation-unit device-code splitting.
-  if (getLangOpts().SYCLIsDevice && decl->hasAttr<SYCLExternalAttr>())
+  // Attach "sycl-module-id" to SYCL device entry points (kernels and
+  // sycl_external functions) to mark them for per-translation-unit device-code
+  // splitting, mirroring classic CodeGen.
+  if (getLangOpts().SYCLIsDevice &&
+      (decl->hasAttr<SYCLExternalAttr>() || decl->hasAttr<DeviceKernelAttr>() ||
+       decl->hasAttr<CUDAGlobalAttr>() || decl->hasAttr<SYCLDeviceAttr>()))
     addSYCLModuleIdAttr(f);
 }
 

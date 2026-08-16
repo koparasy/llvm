@@ -20,6 +20,8 @@ void ff(int *p) { *p = 42; }
 
 // CIR: cir.func{{.*}} @_Z16__sycl_kernel_ffPi(%arg0: !cir.ptr<!s32i, target_address_space(1)>{{.*}}) {{.*}}cc(spir_kernel)
 
-// LLVM: define {{.*}}spir_kernel void @_Z16__sycl_kernel_ffPi(ptr addrspace(1)
+// LLVM: define {{.*}}spir_kernel void @_Z16__sycl_kernel_ffPi(ptr addrspace(1){{.*}}#[[ATTRS:[0-9]+]]
+// LLVM: attributes #[[ATTRS]] = {{.*}}"sycl-module-id"="{{.*}}free-function-kernel-cc.cpp"
 
-// OGCG: define {{.*}}spir_kernel void @_Z16__sycl_kernel_ffPi(ptr addrspace(1)
+// OGCG: define {{.*}}spir_kernel void @_Z16__sycl_kernel_ffPi(ptr addrspace(1){{.*}}#[[ATTRS:[0-9]+]]
+// OGCG: attributes #[[ATTRS]] = {{.*}}"sycl-module-id"="{{.*}}free-function-kernel-cc.cpp"
