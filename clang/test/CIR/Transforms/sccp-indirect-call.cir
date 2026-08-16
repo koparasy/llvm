@@ -1,0 +1,19 @@
+// Regression test: SCCP (and any MLIR analysis using CallOpInterface) must not
+// crash on an indirect cir.call. cir::CallOp::getCallableForCallee() must
+// return the callee Value for indirect calls, not a null SymbolRefAttr.
+// RUN: cir-opt %s --sccp | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+
+module {
+  cir.func @indirect(%arg0: !cir.ptr<!cir.func<(!s32i, !s32i) -> !s32i>>) -> !s32i {
+    %0 = cir.const #cir.int<1> : !s32i
+    %1 = cir.const #cir.int<2> : !s32i
+    %2 = cir.call %arg0(%0, %1) : (!cir.ptr<!cir.func<(!s32i, !s32i) -> !s32i>>, !s32i, !s32i) -> !s32i
+    cir.return %2 : !s32i
+  }
+}
+
+// CHECK: cir.func{{.*}} @indirect(%[[ptr:.+]]: !cir.ptr<!cir.func<(!s32i, !s32i) -> !s32i>>) -> !s32i
+// CHECK:   %[[#ret:]] = cir.call %[[ptr]](%{{.+}}, %{{.+}}) : (!cir.ptr<!cir.func<(!s32i, !s32i) -> !s32i>>, !s32i, !s32i) -> !s32i
+// CHECK:   cir.return %[[#ret]] : !s32i

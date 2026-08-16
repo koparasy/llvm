@@ -4639,15 +4639,24 @@ class CIR_CallOpBase<string mnemonic, list<Trait> extra_traits = []>
     mlir::OperandRange getArgOperands();
     mlir::MutableOperandRange getArgOperandsMutable();
 
-    /// Return the callee of this operation
+    /// Return the callee of this operation. Direct calls return the `callee`
+    /// symbol; indirect calls return the callee pointer Value (first operand),
+    /// matching the func/llvm dialect contract expected by MLIR analyses.
     mlir::CallInterfaceCallable getCallableForCallee() {
-      return (*this)->getAttrOfType<mlir::SymbolRefAttr>("callee");
+      if (auto calleeAttr = getCalleeAttr())
+        return calleeAttr;
+      return getOperand(0);
     }
 
     /// Set the callee for this operation.
     void setCalleeFromCallable(::mlir::CallInterfaceCallable callee) {
-      (*this)->setAttr(getCalleeAttrName(),
-                       mlir::cast<mlir::SymbolRefAttr>(callee));
+      if (getCalleeAttr()) {
+        (*this)->setAttr(getCalleeAttrName(),
+                         mlir::cast<mlir::SymbolRefAttr>(callee));
+        return;
+      }
+      // Indirect call: the callee pointer is the first operand.
+      setOperand(0, mlir::cast<mlir::Value>(callee));
     }
 
     /// Returns the `cir.func` being called or null if the call is indirect or
