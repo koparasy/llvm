@@ -7404,13 +7404,14 @@ static void extractPCH(bool UseNewOffloadingDriver,
 }
 
 // True when the ClangIR host/device offload-merge pipeline is requested for a
-// CUDA/HIP compilation.
+// CUDA/HIP or SYCL compilation.
 static bool isCIROffloadMerge(const Compilation &C,
                               const llvm::opt::ArgList &Args) {
   return Args.hasArg(options::OPT_fclangir) &&
          Args.hasArg(options::OPT_clangir_offload_merge) &&
          (C.isOffloadingHostKind(Action::OFK_Cuda) ||
-          C.isOffloadingHostKind(Action::OFK_HIP));
+          C.isOffloadingHostKind(Action::OFK_HIP) ||
+          C.isOffloadingHostKind(Action::OFK_SYCL));
 }
 
 void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
@@ -7603,7 +7604,10 @@ void Driver::BuildActions(Compilation &C, DerivedArgList &Args,
       Action *NewCurrent = nullptr;
       // CIR offload split produces host/device CIR dependences under one
       // OffloadAction. Apply backend phases to each dependence separately.
+      // SYCL resumes its device branch inside BuildOffloadingActions instead,
+      // so this CUDA/HIP fatbin resume is skipped for SYCL.
       if (isCIROffloadMerge(C, Args) &&
+          !C.isOffloadingHostKind(Action::OFK_SYCL) &&
           (Phase == phases::Backend || Phase == phases::Assemble)) {
         if (auto *OA = dyn_cast<OffloadAction>(Current)) {
           OffloadAction::DeviceDependences DDeps;
@@ -8282,8 +8286,12 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
         getFinalPhase(Args) == phases::Preprocess))
     return HostAction;
 
-  // For CUDA/HIP with ClangIR, merge serialized host/device CIR modules and
-  // split them again before the backend consumes each module with -x cir.
+  // When set, the OFK_SYCL packaging tail below resumes its device backend from
+  // this split CIR (post cir-offload-merge) instead of a fresh device compile.
+  Action *CIRSplitForSYCL = nullptr;
+
+  // For CUDA/HIP/SYCL with ClangIR, merge serialized host/device CIR modules
+  // and split them again before the backend consumes each module with -x cir.
   if (isCIROffloadMerge(C, Args) && !Args.hasArg(options::OPT_emit_cir) &&
       isa<CompileJobAction>(HostAction) &&
       HostAction->getType() == types::TY_CIR) {
@@ -8299,11 +8307,13 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
     Deps.push_back({C.getSingleOffloadToolChain<Action::OFK_Host>(),
                     BoundArch(), Action::OFK_Host});
 
-    const Action::OffloadKind CIRKinds[] = {Action::OFK_Cuda,
-                                            Action::OFK_HIP};
+    const Action::OffloadKind CIRKinds[] = {Action::OFK_Cuda, Action::OFK_HIP,
+                                            Action::OFK_SYCL};
     for (Action::OffloadKind Kind : CIRKinds) {
       if ((Kind == Action::OFK_Cuda && !types::isCuda(Input.first)) ||
-          (Kind == Action::OFK_HIP && !types::isHIP(Input.first)))
+          (Kind == Action::OFK_HIP && !types::isHIP(Input.first)) ||
+          (Kind == Action::OFK_SYCL &&
+           !C.isOffloadingHostKind(Action::OFK_SYCL)))
         continue;
 
       SmallVector<const ToolChain *, 2> ToolChains;
@@ -8313,9 +8323,12 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
 
       for (const ToolChain *TC : ToolChains) {
         for (BoundArch Arch : getOffloadArchs(C, Args, Kind, *TC)) {
+          // SYCL's device "input" is the same source compiled under OFK_SYCL to
+          // a spir64 device CIR (no dedicated TY_*_DEVICE file type).
           types::ID DeviceInputType =
-              Kind == Action::OFK_HIP ? types::TY_HIP_DEVICE
-                                      : types::TY_CUDA_DEVICE;
+              Kind == Action::OFK_HIP    ? types::TY_HIP_DEVICE
+              : Kind == Action::OFK_Cuda ? types::TY_CUDA_DEVICE
+                                         : Input.first;
           Action *DeviceAction =
               C.MakeAction<InputAction>(*Input.second, DeviceInputType, CUID);
           DeviceAction->propagateDeviceOffloadInfo(Kind, Arch, TC);
@@ -8344,7 +8357,7 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
 
     // The host CIR compile sits below the split barrier, so host offload-kind
     // propagation never reaches it. Stamp it directly so the host cc1 gets the
-    // CUDA setup (AddCudaIncludeArgs, -aux-triple) the stock host compile gets.
+    // CUDA/SYCL setup (aux-triple, includes) the stock host compile gets.
     unsigned HostKinds = 0;
     for (const CIROffloadDep &Dep : ArrayRef(Deps).drop_front())
       HostKinds |= Dep.Kind;
@@ -8358,14 +8371,23 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
     for (const CIROffloadDep &Dep : Deps)
       Split->registerDependentActionInfo(Dep.TC, Dep.Arch, Dep.Kind);
 
-    OffloadAction::DeviceDependences DDeps;
-    for (const CIROffloadDep &Dep : ArrayRef(Deps).drop_front())
-      DDeps.add(*Split, *Dep.TC, Dep.Arch, Dep.Kind);
+    // SYCL: do NOT early-return the host-only graph. Resume both host and
+    // device from the split CIR and fall through to the SYCL device/packaging
+    // tail (llvm-offload-binary -> clang-linker-wrapper) below.
+    if (C.isOffloadingHostKind(Action::OFK_SYCL)) {
+      CIRSplitForSYCL = Split;
+      HostAction = Split; // host backend resumes from the split host CIR
+    } else {
+      // CUDA/HIP: the outer phase loop resumes both branches from the split.
+      OffloadAction::DeviceDependences DDeps;
+      for (const CIROffloadDep &Dep : ArrayRef(Deps).drop_front())
+        DDeps.add(*Split, *Dep.TC, Dep.Arch, Dep.Kind);
 
-    OffloadAction::HostDependence HDep(
-        *Split, *C.getSingleOffloadToolChain<Action::OFK_Host>(),
-        /*BoundArch=*/BoundArch(), DDeps);
-    return C.MakeAction<OffloadAction>(HDep, DDeps);
+      OffloadAction::HostDependence HDep(
+          *Split, *C.getSingleOffloadToolChain<Action::OFK_Host>(),
+          /*BoundArch=*/BoundArch(), DDeps);
+      return C.MakeAction<OffloadAction>(HDep, DDeps);
+    }
   }
 
   bool UsesLLVMOffloading = Args.hasArg(
@@ -8422,6 +8444,13 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
           DeviceActions.push_back(PackagerAction);
           continue;
         }
+        // SYCL CIR offload-merge: resume the device backend from the split CIR
+        // instead of compiling the source afresh (preprocess/compile skipped
+        // in the phase loop below).
+        if (CIRSplitForSYCL && Kind == Action::OFK_SYCL) {
+          DeviceActions.push_back(CIRSplitForSYCL);
+          continue;
+        }
         DeviceActions.push_back(
             C.MakeAction<InputAction>(*InputArg, InputType, CUID));
       }
@@ -8461,6 +8490,12 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
       // Assemble actions are not used for the SYCL device side.  Both compile
       // and backend actions are used to generate IR and textual IR if needed.
       if (Kind == Action::OFK_SYCL && Phase == phases::Assemble)
+        continue;
+
+      // SYCL CIR offload-merge: the device module is already compiled to CIR
+      // (the split output), so only the backend phase applies.
+      if (CIRSplitForSYCL && Kind == Action::OFK_SYCL &&
+          (Phase == phases::Preprocess || Phase == phases::Compile))
         continue;
 
       auto *TCAndArch = TCAndArchs.begin();
@@ -8751,9 +8786,13 @@ Driver::BuildOffloadingActions(Compilation &C, llvm::opt::DerivedArgList &Args,
 
   // If we are unable to embed a single device output into the host, we need to
   // add each device output as a host dependency to ensure they are still built.
-  bool SingleDeviceOutput = !llvm::any_of(OffloadActions, [](Action *A) {
-    return A->getType() == types::TY_Nothing;
-  }) && isa<CompileJobAction>(HostAction);
+  bool SingleDeviceOutput =
+      !llvm::any_of(
+          OffloadActions,
+          [](Action *A) { return A->getType() == types::TY_Nothing; }) &&
+      (isa<CompileJobAction>(HostAction) ||
+       // SYCL CIR offload-merge: the host resumes from the split CIR.
+       isa<CIRSplitJobAction>(HostAction));
   OffloadAction::HostDependence HDep(
       *HostAction, *C.getSingleOffloadToolChain<Action::OFK_Host>(),
       /*BA=*/{}, SingleDeviceOutput ? DDep : DDeps);
