@@ -3399,6 +3399,13 @@ void CIRGenModule::setCIRFunctionAttributesForDefinition(
       (decl->hasAttr<SYCLExternalAttr>() || decl->hasAttr<DeviceKernelAttr>() ||
        decl->hasAttr<CUDAGlobalAttr>() || decl->hasAttr<SYCLDeviceAttr>()))
     addSYCLModuleIdAttr(f);
+
+  // Collect registered-kernel name pairs (mirrors classic EmitKernelMetadata /
+  // SYCLAddRegKernelNamePairs); materialized in release().
+  if (langOpts.SYCLIsDevice)
+    if (const auto *rkna = decl->getAttr<SYCLRegisteredKernelNameAttr>())
+      syclRegisteredKernels.emplace_back(rkna->getRegName().str(),
+                                         f.getSymName().str());
 }
 
 // Maps an AST address space to the OpenCL logical address space kind recorded
@@ -3903,6 +3910,15 @@ void CIRGenModule::release() {
     theModule->setAttr(
         cir::CIRDialect::getRecordLayoutsAttrName(),
         mlir::DictionaryAttr::get(&getMLIRContext(), recordLayoutEntries));
+
+  if (!syclRegisteredKernels.empty()) {
+    llvm::SmallVector<mlir::Attribute> entries;
+    for (const auto &[user, mangled] : syclRegisteredKernels)
+      entries.push_back(builder.getArrayAttr(
+          {builder.getStringAttr(user), builder.getStringAttr(mangled)}));
+    theModule->setAttr(cir::CIRDialect::getSYCLRegisteredKernelsAttrName(),
+                       builder.getArrayAttr(entries));
+  }
 
   if (getTriple().isAMDGPU() ||
       (getTriple().isSPIRV() && getTriple().getVendor() == llvm::Triple::AMD))

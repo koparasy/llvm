@@ -113,6 +113,11 @@ private:
   /// Accumulated record layout entries, materialized in release().
   llvm::SmallVector<mlir::NamedAttribute> recordLayoutEntries;
 
+  /// (user-facing name, mangled kernel name) pairs for FFKs registered via
+  /// __registered_kernels__; materialized as sycl_registered_kernels MD.
+  llvm::SmallVector<std::pair<std::string, std::string>, 4>
+      syclRegisteredKernels;
+
   llvm::DenseSet<clang::GlobalDecl> diagnosedConflictingDefinitions;
 
   /// -------

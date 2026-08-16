@@ -144,6 +144,25 @@ private:
       }
     }
 
+    if (attribute.getName() == "cir.sycl_registered_kernels") {
+      if (auto arr = mlir::dyn_cast<mlir::ArrayAttr>(attribute.getValue())) {
+        llvm::SmallVector<llvm::Metadata *> nodes;
+        for (mlir::Attribute e : arr) {
+          auto pair = mlir::cast<mlir::ArrayAttr>(e);
+          llvm::Metadata *vals[] = {
+              llvm::MDString::get(
+                  llvmContext,
+                  mlir::cast<mlir::StringAttr>(pair[0]).getValue()),
+              llvm::MDString::get(
+                  llvmContext,
+                  mlir::cast<mlir::StringAttr>(pair[1]).getValue())};
+          nodes.push_back(llvm::MDTuple::get(llvmContext, vals));
+        }
+        llvmModule->getOrInsertNamedMetadata("sycl_registered_kernels")
+            ->addOperand(llvm::MDNode::get(llvmContext, nodes));
+      }
+    }
+
     if (attribute.getName() == "cir.amdgpu_printf_kind") {
       if (auto strAttr =
               mlir::dyn_cast<mlir::StringAttr>(attribute.getValue())) {
