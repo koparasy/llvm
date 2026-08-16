@@ -21,6 +21,8 @@
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
 #include "clang/CIR/Dialect/Passes.h"
 #include "clang/CIR/Dialect/Transforms/CIRTransformUtils.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 
 using namespace mlir;
 using namespace cir;
@@ -218,6 +220,36 @@ static void convertSyncScopeIfPresent(mlir::Operation *op,
   }
 }
 
+/// True if any pointer reachable from \p type carries a LangAddressSpaceAttr
+/// and thus needs its address space lowered. Recursion-safe for identified
+/// (possibly self-recursive) records via \p seen: records only need rewriting
+/// when a lang address space actually flows through them.
+static bool typeNeedsASLowering(mlir::Type type,
+                                llvm::SmallPtrSetImpl<mlir::Type> &seen) {
+  if (auto ptr = mlir::dyn_cast<cir::PointerType>(type)) {
+    if (mlir::isa_and_present<cir::LangAddressSpaceAttr>(ptr.getAddrSpace()))
+      return true;
+    return typeNeedsASLowering(ptr.getPointee(), seen);
+  }
+  if (auto arr = mlir::dyn_cast<cir::ArrayType>(type))
+    return typeNeedsASLowering(arr.getElementType(), seen);
+  if (auto rec = mlir::dyn_cast<cir::RecordType>(type)) {
+    if (!seen.insert(rec).second)
+      return false;
+    return llvm::any_of(rec.getMembers(), [&](mlir::Type m) {
+      return typeNeedsASLowering(m, seen);
+    });
+  }
+  if (auto fn = mlir::dyn_cast<cir::FuncType>(type)) {
+    if (typeNeedsASLowering(fn.getReturnType(), seen))
+      return true;
+    return llvm::any_of(fn.getInputs(), [&](mlir::Type m) {
+      return typeNeedsASLowering(m, seen);
+    });
+  }
+  return false;
+}
+
 /// Prepare the type converter for the target lowering pass.
 /// Converts LangAddressSpaceAttr → TargetAddressSpaceAttr inside pointer types.
 static void
@@ -264,6 +296,81 @@ prepareTargetLoweringTypeConverter(mlir::TypeConverter &converter,
 
     return cir::FuncType::get(loweredInputTypes, loweredReturnType,
                               /*isVarArg=*/type.getVarArg());
+  });
+
+  // Records must lower their member pointer address spaces in lockstep with the
+  // outer pointers and get_member results. RecordType is mutable and may be
+  // self-recursive (a member pointing back at the record), so track records
+  // being converted and hand back the renamed shell on re-entry, mirroring
+  // MLIR's LLVMStructType converter.
+  auto recordStack = std::make_shared<llvm::SmallVector<cir::RecordType, 8>>();
+  converter.addConversion([&converter,
+                           recordStack](cir::RecordType type) -> mlir::Type {
+    // Incomplete records have no members to lower.
+    if (type.isIncomplete())
+      return type;
+
+    // Leave records with no address-space-bearing members untouched. This
+    // keeps them legal (identity) and, crucially, avoids renaming a
+    // self-recursive record whose recursive edge would otherwise make its
+    // members compare unequal to themselves.
+    llvm::SmallPtrSet<mlir::Type, 8> seen;
+    if (!typeNeedsASLowering(type, seen))
+      return type;
+
+    mlir::MLIRContext *ctx = type.getContext();
+
+    // Anonymous records are structurally uniqued and cannot be self-recursive,
+    // so rebuild directly.
+    if (!type.getName()) {
+      llvm::SmallVector<mlir::Type> members;
+      if (mlir::failed(converter.convertTypes(type.getMembers(), members)))
+        return {};
+      if (llvm::ArrayRef<mlir::Type>(members) == type.getMembers())
+        return type;
+      if (auto unionTy = mlir::dyn_cast<cir::UnionType>(type))
+        return cir::UnionType::get(ctx, members, unionTy.getPacked(),
+                                   unionTy.getPadding(), type.getMemberKinds());
+      return cir::StructType::get(ctx, members, type.getPacked(),
+                                  type.isClass(), type.getMemberKinds());
+    }
+
+    // Identified record: build a renamed shell first so recursive references
+    // resolve without re-entering. Identified records unique by name only, so
+    // reusing the name would just hand back the original (unconverted) body.
+    auto convertedName = mlir::StringAttr::get(
+        ctx, ("__cir_lowered." + type.getName().getValue()).str());
+    cir::RecordType shell =
+        mlir::isa<cir::UnionType>(type)
+            ? cir::RecordType(cir::UnionType::get(ctx, convertedName))
+            : cir::RecordType(
+                  cir::StructType::get(ctx, convertedName, type.isClass()));
+
+    if (llvm::is_contained(*recordStack, type))
+      return shell;
+    recordStack->push_back(type);
+    llvm::scope_exit pop([&] { recordStack->pop_back(); });
+
+    llvm::SmallVector<mlir::Type> members;
+    if (mlir::failed(converter.convertTypes(type.getMembers(), members)))
+      return {};
+
+    // No member changed: keep the original record and drop the unused shell.
+    if (llvm::ArrayRef<mlir::Type>(members) == type.getMembers())
+      return type;
+
+    if (auto unionShell = mlir::dyn_cast<cir::UnionType>(shell)) {
+      if (unionShell.isIncomplete())
+        unionShell.complete(members,
+                            mlir::cast<cir::UnionType>(type).getPacked(),
+                            mlir::cast<cir::UnionType>(type).getPadding(),
+                            type.getMemberKinds());
+      return unionShell;
+    }
+    auto structShell = mlir::cast<cir::StructType>(shell);
+    if (structShell.isIncomplete())
+      structShell.complete(members, type.getPacked(), type.getMemberKinds());
+    return structShell;
   });
 }
 
