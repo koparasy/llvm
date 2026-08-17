@@ -7,11 +7,19 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Inliner.h"
+#include "mlir/Transforms/InliningUtils.h"
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
+#include "clang/CIR/Dialect/Passes.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
@@ -429,6 +437,448 @@ static cir::CallOp traceLaunchCall(mlir::Value deviceKernelInfo) {
   return {};
 }
 
+//===----------------------------------------------------------------------===//
+// SYCL launch-geometry recovery (nd_range global/local work-group sizes)
+//===----------------------------------------------------------------------===//
+//
+// The constant work-group sizes are not SSA-visible at the runtime launch
+// call. CIRGen threads the nd_range object through a chain of launch shims
+//   queue::parallel_for
+//     -> detail::submit_kernel_direct_parallel_for
+//        -> detail::submit_kernel_direct
+//           -> submit_kernel_direct_with_event_impl   (the runtime launch)
+// and the sizes live only in that object's memory, written by the range/array
+// constructors up in the user function. mem2reg/SCCP cannot recover them: the
+// nd_range object's address is taken (the nd_range_view constructor stores
+// interior pointers to its array slots), so it never promotes to SSA.
+//
+// Recovery therefore (1) clones the host module, (2) flattens it so cir.return
+// is a block terminator, (3) force-inlines the launch-shim chain and the
+// geometry constructors into the user function, collapsing everything into one
+// function, then (4) walks the nd_range_view object's memory back to the
+// constant stores. The clone is discarded, so results are plain integers.
+
+// Whether `fn` is a launch shim or a geometry constructor/accessor on the
+// nd_range launch path -- a callee the recovery clone force-inlines. Matched by
+// mangled-name shape so it is dimension-agnostic. Excludes the
+// getDeviceKernelInfo marker (it names the kernel and must survive to identify
+// the launch) and the __SYCL_EXPORT submit_kernel_direct_with_event_impl
+// boundary (decl-only anyway). array::check_dimension, a throwing bounds check
+// off the value path, is left as a call.
+static bool isLaunchChainCallee(cir::FuncOp fn) {
+  llvm::StringRef n = fn.getName();
+  if (n.starts_with("_ZN4sycl3_V136submit_kernel_direct_with_event_impl"))
+    return false;
+  if (n.starts_with("_ZN4sycl3_V16detail19getDeviceKernelInfoI"))
+    return false;
+  // queue::parallel_for and the submit_kernel_direct* shims.
+  if (n.contains("submit_kernel_direct") || n.contains("parallel_for"))
+    return true;
+  // Geometry constructors, dimension-agnostic. The length digits in front of
+  // each name keep "range" from matching inside "nd_range".
+  bool isCtor = n.contains("C1") || n.contains("C2");
+  if (n.contains("nd_range_view") && isCtor)
+    return true;
+  if (n.contains("8nd_rangeILi") && isCtor)
+    return true;
+  if (n.contains("5rangeILi") && isCtor)
+    return true;
+  // detail::array constructor and operator[] (but not check_dimension).
+  if (n.contains("6detail5arrayILi") && (isCtor || n.contains("ixEi")))
+    return true;
+  return false;
+}
+
+// Force-inline the launch-shim chain into the user function(s) on `clone`.
+// `clone` must already be flattened. Iterates to a fixpoint because inlining a
+// shim exposes the calls nested inside it. Uses region cloning (not splicing)
+// so a shim called from several sites -- e.g. the range/array constructors that
+// build both the global and local sizes -- stays intact for every site.
+static void inlineLaunchChain(mlir::ModuleOp clone) {
+  mlir::InlinerInterface interface(clone.getContext());
+  mlir::InlinerConfig config;
+  auto cloneCallback = config.getCloneCallback();
+
+  bool changed = true;
+  // The chain is ~4 shims deep plus the geometry ctors; 16 sweeps is plenty and
+  // guards against an unexpected cycle.
+  for (unsigned iter = 0; changed && iter < 16; ++iter) {
+    changed = false;
+    llvm::SmallVector<cir::CallOp> worklist;
+    clone.walk([&](cir::CallOp call) {
+      if (call.isIndirect())
+        return;
+      mlir::FlatSymbolRefAttr callee = call.getCalleeAttr();
+      if (!callee)
+        return;
+      auto fn =
+          mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(call, callee);
+      if (!fn || !isLaunchChainCallee(fn))
+        return;
+      mlir::Region *region = fn.getCallableRegion();
+      if (!region || region->empty())
+        return;
+      worklist.push_back(call);
+    });
+    for (cir::CallOp call : worklist) {
+      auto callee = call.getCalleeAttr();
+      auto fn =
+          mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(call, callee);
+      if (!fn)
+        continue;
+      auto callable = mlir::cast<mlir::CallableOpInterface>(fn.getOperation());
+      auto callInterface =
+          mlir::cast<mlir::CallOpInterface>(call.getOperation());
+      if (mlir::succeeded(
+              mlir::inlineCall(interface, cloneCallback, callInterface,
+                               callable, callable.getCallableRegion(),
+                               /*shouldCloneInlinedRegion=*/true))) {
+        call.erase();
+        changed = true;
+      }
+    }
+  }
+}
+
+// A memory-access path step, root-to-leaf: a named struct member or a constant
+// array index.
+namespace {
+struct PathStep {
+  llvm::StringRef member;
+  int64_t index = 0;
+  bool isIndex = false;
+};
+using AccessPath = llvm::SmallVector<PathStep, 6>;
+} // namespace
+
+// The constant integer `v` holds, seeing through integral/bitcast reinterprets,
+// or nullopt if it is not a compile-time constant integer.
+static std::optional<int64_t> asConstInt(mlir::Value v) {
+  for (unsigned i = 0; i < 16 && v; ++i) {
+    if (auto c = v.getDefiningOp<cir::ConstantOp>()) {
+      if (auto ia = mlir::dyn_cast<cir::IntAttr>(c.getValue()))
+        return ia.getValue().getSExtValue();
+      return std::nullopt;
+    }
+    auto cast = v.getDefiningOp<cir::CastOp>();
+    if (cast && (cast.getKind() == cir::CastKind::integral ||
+                 cast.getKind() == cir::CastKind::bitcast)) {
+      v = cast.getSrc();
+      continue;
+    }
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+// Peel pointer-navigation ops off `ptr`, recording the access path from the
+// root object down to `ptr`. base_class_addr and bitcast are offset-0
+// reinterprets (the base subobject shares the head), so they add no step;
+// array_to_ptrdecay yields element 0. Returns the root pointer (an alloca or an
+// opaque value) with `path` filled root-to-leaf.
+static mlir::Value decomposePointer(mlir::Value ptr, AccessPath &path) {
+  AccessPath rev;
+  while (mlir::Operation *def = ptr.getDefiningOp()) {
+    if (auto gm = mlir::dyn_cast<cir::GetMemberOp>(def)) {
+      PathStep s;
+      s.member = gm.getName();
+      rev.push_back(s);
+      ptr = gm.getAddr();
+      continue;
+    }
+    if (auto ge = mlir::dyn_cast<cir::GetElementOp>(def)) {
+      PathStep s;
+      s.isIndex = true;
+      s.index = asConstInt(ge.getIndex()).value_or(-1);
+      rev.push_back(s);
+      ptr = ge.getBase();
+      continue;
+    }
+    if (auto bca = mlir::dyn_cast<cir::BaseClassAddrOp>(def)) {
+      ptr = bca.getSrcAddr();
+      continue;
+    }
+    if (auto cast = mlir::dyn_cast<cir::CastOp>(def)) {
+      if (cast.getKind() == cir::CastKind::bitcast) {
+        ptr = cast.getSrc();
+        continue;
+      }
+      if (cast.getKind() == cir::CastKind::array_to_ptrdecay) {
+        PathStep s;
+        s.isIndex = true;
+        s.index = 0;
+        rev.push_back(s);
+        ptr = cast.getSrc();
+        continue;
+      }
+    }
+    break;
+  }
+  for (auto it = rev.rbegin(); it != rev.rend(); ++it)
+    path.push_back(*it);
+  return ptr;
+}
+
+static bool stepEq(const PathStep &a, const PathStep &b) {
+  if (a.isIndex != b.isIndex)
+    return false;
+  return a.isIndex ? a.index == b.index : a.member == b.member;
+}
+
+// If `pre` is a prefix of `full`, returns the remaining suffix; else nullopt.
+static std::optional<AccessPath> matchPrefix(const AccessPath &pre,
+                                             const AccessPath &full) {
+  if (pre.size() > full.size())
+    return std::nullopt;
+  for (size_t i = 0; i < pre.size(); ++i)
+    if (!stepEq(pre[i], full[i]))
+      return std::nullopt;
+  return AccessPath(full.begin() + pre.size(), full.end());
+}
+
+// Resolve the constant integer stored at memory cell (`root` + `target` path),
+// following whole-object and sub-object writes back through the aggregate
+// load/store/copy/bitcast chain the launch shims build. Returns nullopt if the
+// cell is not written by a compile-time constant.
+static std::optional<int64_t>
+resolveScalarAt(mlir::Value root, const AccessPath &target, unsigned depth) {
+  if (depth > 64 || !root)
+    return std::nullopt;
+
+  // A loaded value carries the bytes of the object it was loaded from; read the
+  // same path within that object.
+  if (auto load = root.getDefiningOp<cir::LoadOp>()) {
+    AccessPath p;
+    mlir::Value r = decomposePointer(load.getAddr(), p);
+    p.append(target.begin(), target.end());
+    return resolveScalarAt(r, p, depth + 1);
+  }
+
+  // Gather every pointer that addresses into `root`'s storage: `root` itself
+  // and the results of the navigation ops (get_member / get_element /
+  // base_class / bitcast) applied to it, transitively. A store into a subfield
+  // writes through such a navigation result, so it is a user of that result,
+  // not of `root`.
+  llvm::SmallVector<mlir::Value, 16> aliases{root};
+  llvm::SmallPtrSet<mlir::Operation *, 32> seen;
+  for (unsigned ai = 0; ai < aliases.size(); ++ai) {
+    mlir::Value ptr = aliases[ai];
+    for (mlir::Operation *user : ptr.getUsers()) {
+      if (mlir::isa<cir::GetMemberOp, cir::GetElementOp, cir::BaseClassAddrOp>(
+              user)) {
+        aliases.push_back(user->getResult(0));
+        continue;
+      }
+      if (auto cast = mlir::dyn_cast<cir::CastOp>(user)) {
+        if (cast.getKind() == cir::CastKind::bitcast ||
+            cast.getKind() == cir::CastKind::array_to_ptrdecay)
+          aliases.push_back(cast.getResult());
+        continue;
+      }
+      mlir::Value destPtr, srcVal;
+      bool isCopy = false;
+      if (auto st = mlir::dyn_cast<cir::StoreOp>(user)) {
+        destPtr = st.getAddr();
+        srcVal = st.getValue();
+      } else if (auto cp = mlir::dyn_cast<cir::CopyOp>(user)) {
+        destPtr = cp.getDst();
+        srcVal = cp.getSrc();
+        isCopy = true;
+      } else {
+        continue;
+      }
+      // Only a write *through this pointer* (not one that merely uses it as a
+      // stored value) writes the aggregate here.
+      if (destPtr != ptr)
+        continue;
+      if (!seen.insert(user).second)
+        continue;
+      AccessPath sp;
+      mlir::Value sroot = decomposePointer(destPtr, sp);
+      if (sroot != root)
+        continue;
+      std::optional<AccessPath> rem = matchPrefix(sp, target);
+      if (!rem)
+        continue;
+
+      if (isCopy) {
+        // cir.copy transfers a subobject from a source pointer; read the
+        // remaining path within that source.
+        AccessPath p;
+        mlir::Value r = decomposePointer(srcVal, p);
+        p.append(rem->begin(), rem->end());
+        if (auto v = resolveScalarAt(r, p, depth + 1))
+          return v;
+        continue;
+      }
+      if (rem->empty()) {
+        // Exact scalar cell.
+        if (auto v = asConstInt(srcVal))
+          return v;
+        if (auto load = srcVal.getDefiningOp<cir::LoadOp>()) {
+          AccessPath p;
+          mlir::Value r = decomposePointer(load.getAddr(), p);
+          if (auto v = resolveScalarAt(r, p, depth + 1))
+            return v;
+        }
+        continue;
+      }
+      // The store wrote an enclosing aggregate; its value must be a loaded
+      // aggregate -- read the remaining path within its source object.
+      if (auto load = srcVal.getDefiningOp<cir::LoadOp>()) {
+        AccessPath p;
+        mlir::Value r = decomposePointer(load.getAddr(), p);
+        p.append(rem->begin(), rem->end());
+        if (auto v = resolveScalarAt(r, p, depth + 1))
+          return v;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// Follow a spill slot: `v = load(slot)` where `slot` was `store(ptr, slot)`.
+// Returns the stored pointer, so a value reloaded before the launch resolves to
+// the object it names. CIRGen spills the nd_range_view pointer into a
+// "RangeView" slot and reloads it at the call.
+static mlir::Value stripToPointerObject(mlir::Value v) {
+  for (unsigned i = 0; i < 8 && v; ++i) {
+    auto load = v.getDefiningOp<cir::LoadOp>();
+    if (!load)
+      break;
+    mlir::Value slot = load.getAddr();
+    mlir::Value found;
+    for (mlir::Operation *u : slot.getUsers())
+      if (auto st = mlir::dyn_cast<cir::StoreOp>(u))
+        if (st.getAddr() == slot &&
+            mlir::isa<cir::PointerType>(st.getValue().getType()))
+          found = st.getValue();
+    if (!found)
+      break;
+    v = found;
+  }
+  return v;
+}
+
+// The value stored into `view`'s named field, or null. Matches the get_member
+// naming the field and the store into it.
+static mlir::Value findFieldStoredValue(mlir::Value view,
+                                        llvm::StringRef field) {
+  for (mlir::Operation *u : view.getUsers()) {
+    auto gm = mlir::dyn_cast<cir::GetMemberOp>(u);
+    if (!gm || gm.getName() != field)
+      continue;
+    for (mlir::Operation *gu : gm.getResult().getUsers())
+      if (auto st = mlir::dyn_cast<cir::StoreOp>(gu))
+        if (st.getAddr() == gm.getResult())
+          return st.getValue();
+  }
+  return {};
+}
+
+// Recover the constant nd_range geometry from the nd_range_view pointer operand
+// of a runtime launch call (on the inlined clone). The view constructor stored
+// interior pointers into its MGlobalSize/MLocalSize fields that alias the
+// nd_range object's array slots; trace those back to the constant stores.
+static SyclGeometry traceNDRange(mlir::Value viewOperand) {
+  SyclGeometry g;
+  mlir::Value view = stripToPointerObject(viewOperand);
+  if (!view)
+    return g;
+
+  unsigned dims = 0;
+  if (mlir::Value d = findFieldStoredValue(view, "MDims"))
+    if (auto dv = asConstInt(d))
+      dims = static_cast<unsigned>(*dv);
+  if (dims == 0 || dims > 3)
+    dims = 1;
+  g.dims = dims;
+
+  // Read `dims` consecutive elements of the size array a field points at. The
+  // field holds &common_array[0]; vary the trailing constant index per dim.
+  auto readSizes =
+      [&](llvm::StringRef field,
+          llvm::SmallVectorImpl<std::optional<int64_t>> &out) -> bool {
+    mlir::Value interior = findFieldStoredValue(view, field);
+    if (!interior)
+      return false;
+    // A plain-range launch stores a null pointer for MLocalSize (no explicit
+    // local work-group size): that field is absent, not unrecovered.
+    if (auto c = interior.getDefiningOp<cir::ConstantOp>())
+      if (auto p = mlir::dyn_cast<cir::ConstPtrAttr>(c.getValue()))
+        if (p.isNullValue())
+          return false;
+    AccessPath base;
+    mlir::Value root = decomposePointer(interior, base);
+    for (unsigned i = 0; i < dims; ++i) {
+      AccessPath p = base;
+      if (!p.empty() && p.back().isIndex)
+        p.back().index = static_cast<int64_t>(i);
+      out.push_back(resolveScalarAt(root, p, 0));
+    }
+    return true;
+  };
+
+  bool haveGlobal = readSizes("MGlobalSize", g.global);
+  bool haveLocal = readSizes("MLocalSize", g.local);
+  // A plain-range launch (RoundedRangeKernel) carries no explicit local size;
+  // do not fabricate one.
+  if (!haveLocal)
+    g.local.clear();
+  g.valid = haveGlobal;
+  return g;
+}
+
+// Recover per-kernel constant nd_range geometry for the whole container. Clones
+// the host module, collapses the launch chain, then for each surviving
+// getDeviceKernelInfo marker resolves the kernel it names and traces the launch
+// it feeds. Keyed by the kernel's _ZTS mangled name so the result maps straight
+// onto the SYCL bindings, which are keyed the same way.
+static llvm::StringMap<SyclGeometry>
+computeSYCLGeometry(mlir::ModuleOp container) {
+  llvm::StringMap<SyclGeometry> result;
+  mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
+
+  // Throwaway clone -- the real emitted module is never mutated.
+  mlir::OwningOpRef<mlir::ModuleOp> clone(
+      mlir::cast<mlir::ModuleOp>(hostModule->clone()));
+
+  // This is a throwaway analysis clone, so exception edges do not matter. Mark
+  // every call nothrow before flattening: otherwise FlattenCFG lowers throwing
+  // calls inside cleanup scopes into cir.try_call terminators, which the
+  // call-based inliner below cannot collapse (the launch shims call each other
+  // from inside cleanup scopes). With nothrow set, the cleanup scopes flatten
+  // to plain control flow and every launch-chain call stays a cir.call.
+  clone->walk([](cir::CallOp call) { call.setNothrow(true); });
+
+  // Flatten so cir.return becomes a block terminator (the inliner's
+  // handleTerminator only rewrites top-level return terminators).
+  mlir::PassManager pm(clone->getContext(), mlir::ModuleOp::getOperationName());
+  pm.addPass(mlir::createCIRFlattenCFGPass());
+  if (mlir::failed(pm.run(*clone)))
+    return result;
+
+  inlineLaunchChain(*clone);
+
+  clone->walk([&](cir::CallOp call) {
+    if (!isGetDeviceKernelInfoCall(call))
+      return;
+    cir::GlobalOp nameString = resolveLaunchedNameString(call);
+    if (!nameString)
+      return;
+    cir::CallOp launch = traceLaunchCall(call->getResult(0));
+    if (!launch)
+      return;
+    mlir::OperandRange args = launch.getArgOperands();
+    if (args.size() <= SyclDeviceKernelInfoOperand)
+      return;
+    SyclGeometry geom = traceNDRange(args[SyclGeometryOperand]);
+    result[getGlobalStringValue(nameString)] = geom;
+  });
+
+  return result;
+}
+
 // SYCL binding: there is no host stub and no cu.kernel_name. Bind each device
 // spir_kernel to the host string constant equal to its mangled name, counting
 // it only if that string is actually referenced by host code. Classify each
@@ -498,6 +948,11 @@ void KernelBindingTable::recordSYCLLaunchSites(
   if (byNameString.empty())
     return;
 
+  // Recover constant nd_range work-group sizes once for the whole container
+  // (inline the launch-shim chain on a throwaway clone, then trace memory).
+  // Keyed by _ZTS mangled name, the same key the bindings use.
+  llvm::StringMap<SyclGeometry> geometry = computeSYCLGeometry(container);
+
   hostModule.walk([&](cir::CallOp call) {
     if (!isGetDeviceKernelInfoCall(call))
       return;
@@ -525,6 +980,9 @@ void KernelBindingTable::recordSYCLLaunchSites(
       site.syclGeometry = args[SyclGeometryOperand];
       site.syclClosure = args[SyclClosureOperand];
     }
+    auto geomIt = geometry.find(it->second);
+    if (geomIt != geometry.end())
+      site.syclNDRange = geomIt->second;
     binding.launchSites.push_back(site);
   });
 }
@@ -582,9 +1040,32 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
       if (launch.kind == BindingKind::SYCLName) {
         os << " (sycl, "
            << (launch.allLaunchesVisible ? "all-visible" : "partial")
-           << "), geometry " << (launch.getSYCLGeometry() ? "traced" : "none")
-           << ", closure " << (launch.getSYCLClosure() ? "traced" : "none")
-           << "\n";
+           << "), closure " << (launch.getSYCLClosure() ? "traced" : "none");
+        // Recovered constant nd_range sizes, per dimension. "?" is a dimension
+        // that was not a compile-time constant; an empty local list is a plain
+        // range launch with no explicit work-group size.
+        const cir::SyclGeometry &geom = launch.getSYCLNDRange();
+        auto emit = [&](llvm::StringRef tag,
+                        llvm::ArrayRef<std::optional<int64_t>> sizes) {
+          os << ", " << tag << "=[";
+          for (auto [i, s] : llvm::enumerate(sizes)) {
+            if (i)
+              os << ",";
+            if (s)
+              os << *s;
+            else
+              os << "?";
+          }
+          os << "]";
+        };
+        if (!geom.valid) {
+          os << ", geometry none";
+        } else {
+          emit("global", geom.global);
+          if (!geom.local.empty())
+            emit("local", geom.local);
+        }
+        os << "\n";
         continue;
       }
       os << " : " << launch.getNumArgs() << " args";

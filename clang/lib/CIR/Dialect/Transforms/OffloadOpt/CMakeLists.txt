@@ -11,7 +11,9 @@ add_clang_library(MLIRCIROffloadOpt
 
   LINK_LIBS PUBLIC
   MLIRCIR
+  MLIRCIRTransforms
   MLIRIR
   MLIRPass
   MLIRSupport
+  MLIRTransformUtils
   )

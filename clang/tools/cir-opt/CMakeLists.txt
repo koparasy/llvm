@@ -28,8 +28,10 @@ target_link_libraries(cir-opt
   PRIVATE
   MLIRAnalysis
   MLIRDialect
+  MLIRFuncInlinerExtension
   MLIRIR
   MLIRLLVMDialect
+  MLIRLLVMIRTransforms
   MLIRMemRefDialect
   MLIROpenMPTransforms
   MLIROptLib

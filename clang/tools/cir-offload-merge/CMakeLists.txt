@@ -19,7 +19,9 @@ clang_target_link_libraries(cir-offload-merge
 target_link_libraries(cir-offload-merge
   PRIVATE
   ${dialect_libs}
+  MLIRFuncInlinerExtension
   MLIRIR
+  MLIRLLVMIRTransforms
   MLIRParser
   MLIRPass
   MLIRSupport

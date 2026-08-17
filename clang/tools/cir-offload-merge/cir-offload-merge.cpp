@@ -15,7 +15,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/IR/Builders.h"
@@ -261,6 +263,12 @@ void registerDialects(mlir::DialectRegistry &registry) {
                   mlir::memref::MemRefDialect, mlir::LLVM::LLVMDialect,
                   mlir::DLTIDialect, mlir::omp::OpenMPDialect>();
   cir::omp::registerOpenMPExtensions(registry);
+  // The KernelBindingTable analysis (built by the offload-container passes)
+  // uses MLIR's generic inliner for SYCL launch-geometry recovery; its
+  // InlinerInterface collection requires every loaded dialect that promised a
+  // DialectInlinerInterface to have registered one. LLVM and Func promise it.
+  mlir::LLVM::registerInlinerInterface(registry);
+  mlir::func::registerInlinerExtension(registry);
 }
 
 mlir::OwningOpRef<mlir::ModuleOp> parseCIRInput(llvm::StringRef inputFileName,

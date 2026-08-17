@@ -158,4 +158,226 @@ module attributes {cir.offload.container} {
 // CHECK-NEXT: kernel _ZTSZ4mainEUlvE_
 // CHECK-NEXT: host-name @.str (sycl, optimizable)
 // CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
-// CHECK-NEXT: launch in @launch (sycl, all-visible), geometry traced, closure traced
+// The geometry operand here is an opaque pointer (not an nd_range_view whose
+// constructor stores interior pointers), so nd_range recovery finds nothing.
+// CHECK-NEXT: launch in @launch (sycl, all-visible), closure traced, geometry none
+
+// -----
+
+// nd_range launch with CONSTANT global (1024) and local (256) work-group sizes.
+// The sizes are not SSA-visible at the runtime launch: they live in the
+// nd_range object's memory, reached through the nd_range_view's interior
+// pointers. Recovery clones the host module, force-inlines the launch shim
+// (name carries "submit_kernel_direct") into @main so the constant stores and
+// the launch call co-locate, then traces the nd_range_view memory back to the
+// constants. A full queue::parallel_for shim chain is far too large for a lit
+// fixture, so this is a reduced, pre-shaped equivalent: one shim frame plus the
+// range/nd_range aggregate copies that make the trace non-trivial.
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!rec_arr = !cir.struct<"arr" {data !cir.array<!u64i x 1>}>
+!rec_range = !cir.struct<"range" {data !rec_arr}>
+!rec_ndr = !cir.struct<"ndr" {data !rec_range, data !rec_range, data !rec_range}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !cir.ptr<!u64i>, data !cir.ptr<!u64i>, data !u64i}>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!s8i>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @_ZN4sycl3_V16detail20submit_kernel_directE(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %ndr: !cir.ptr<!rec_ndr>, %clos: !cir.ptr<!s8i>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
+      %g0 = cir.get_member %ndr[0] {name = "globalSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      %ga = cir.base_class_addr %g0 : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %gc = cir.get_member %ga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %gp = cir.cast array_to_ptrdecay %gc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      %mg = cir.get_member %view[0] {name = "MGlobalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
+      cir.store %gp, %mg : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
+      %l0 = cir.get_member %ndr[1] {name = "localSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      %la = cir.base_class_addr %l0 : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %lc = cir.get_member %la[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %lp = cir.cast array_to_ptrdecay %lc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      %ml = cir.get_member %view[1] {name = "MLocalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
+      cir.store %lp, %ml : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
+      %md = cir.get_member %view[3] {name = "MDims"} : !cir.ptr<!rec_view> -> !cir.ptr<!u64i>
+      %one = cir.const #cir.int<1> : !u64i
+      cir.store %one, %md : !u64i, !cir.ptr<!u64i>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.store %dki, %slot : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
+      %r = cir.load %slot : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %clos, %r) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %clos: !cir.ptr<!s8i>) {
+      %ndr = cir.alloca "ndr" align(8) : !cir.ptr<!rec_ndr>
+      %rg = cir.alloca "rg" align(8) : !cir.ptr<!rec_range>
+      %rl = cir.alloca "rl" align(8) : !cir.ptr<!rec_range>
+      %c1024 = cir.const #cir.int<1024> : !u64i
+      %c256 = cir.const #cir.int<256> : !u64i
+      %rga = cir.base_class_addr %rg : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %rgc = cir.get_member %rga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %rgp = cir.cast array_to_ptrdecay %rgc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      cir.store %c1024, %rgp : !u64i, !cir.ptr<!u64i>
+      %rla = cir.base_class_addr %rl : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %rlc = cir.get_member %rla[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %rlp = cir.cast array_to_ptrdecay %rlc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      cir.store %c256, %rlp : !u64i, !cir.ptr<!u64i>
+      %ng = cir.get_member %ndr[0] {name = "globalSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      cir.copy %rg to %ng : !cir.ptr<!rec_range>
+      %nl = cir.get_member %ndr[1] {name = "localSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      cir.copy %rl to %nl : !cir.ptr<!rec_range>
+      cir.call @_ZN4sycl3_V16detail20submit_kernel_directE(%ev, %q, %ndr, %clos) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_ndr>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTSZ4mainEUlvE_
+// CHECK-NEXT: host-name @.str (sycl, optimizable)
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
+// CHECK-NEXT: launch in @_ZN4sycl3_V16detail20submit_kernel_directE (sycl, all-visible), closure traced, global=[1024], local=[256]
+
+// -----
+
+// A plain-range launch (RoundedRangeKernel shape): the nd_range_view's
+// MLocalSize is a null pointer -- there is no explicit local work-group size.
+// Recovery reports the constant global size and omits local entirely rather
+// than fabricating one.
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!rec_arr = !cir.struct<"arr" {data !cir.array<!u64i x 1>}>
+!rec_range = !cir.struct<"range" {data !rec_arr}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !cir.ptr<!u64i>, data !cir.ptr<!u64i>, data !u64i}>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!s8i>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @_ZN4sycl3_V16detail20submit_kernel_directE(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %rng: !cir.ptr<!rec_range>, %clos: !cir.ptr<!s8i>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
+      %ga = cir.base_class_addr %rng : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %gc = cir.get_member %ga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %gp = cir.cast array_to_ptrdecay %gc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      %mg = cir.get_member %view[0] {name = "MGlobalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
+      cir.store %gp, %mg : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
+      %ml = cir.get_member %view[1] {name = "MLocalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
+      %null = cir.const #cir.ptr<null> : !cir.ptr<!u64i>
+      cir.store %null, %ml : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
+      %md = cir.get_member %view[3] {name = "MDims"} : !cir.ptr<!rec_view> -> !cir.ptr<!u64i>
+      %one = cir.const #cir.int<1> : !u64i
+      cir.store %one, %md : !u64i, !cir.ptr<!u64i>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.store %dki, %slot : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
+      %r = cir.load %slot : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %clos, %r) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %clos: !cir.ptr<!s8i>) {
+      %rg = cir.alloca "rg" align(8) : !cir.ptr<!rec_range>
+      %c2048 = cir.const #cir.int<2048> : !u64i
+      %rga = cir.base_class_addr %rg : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %rgc = cir.get_member %rga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %rgp = cir.cast array_to_ptrdecay %rgc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      cir.store %c2048, %rgp : !u64i, !cir.ptr<!u64i>
+      cir.call @_ZN4sycl3_V16detail20submit_kernel_directE(%ev, %q, %rg, %clos) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_range>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTSZ4mainEUlvE_
+// CHECK-NEXT: host-name @.str (sycl, optimizable)
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
+// CHECK-NEXT: launch in @_ZN4sycl3_V16detail20submit_kernel_directE (sycl, all-visible), closure traced, global=[2048]
+
+// -----
+
+// A non-constant global size: the value stored into the range comes from a
+// runtime argument, so the dimension is reported as "?" (recovery ran, but the
+// size is not a compile-time constant).
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!rec_arr = !cir.struct<"arr" {data !cir.array<!u64i x 1>}>
+!rec_range = !cir.struct<"range" {data !rec_arr}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !cir.ptr<!u64i>, data !cir.ptr<!u64i>, data !u64i}>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!s8i>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @_ZN4sycl3_V16detail20submit_kernel_directE(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %rng: !cir.ptr<!rec_range>, %clos: !cir.ptr<!s8i>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
+      %ga = cir.base_class_addr %rng : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %gc = cir.get_member %ga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %gp = cir.cast array_to_ptrdecay %gc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      %mg = cir.get_member %view[0] {name = "MGlobalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
+      cir.store %gp, %mg : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
+      %md = cir.get_member %view[3] {name = "MDims"} : !cir.ptr<!rec_view> -> !cir.ptr<!u64i>
+      %one = cir.const #cir.int<1> : !u64i
+      cir.store %one, %md : !u64i, !cir.ptr<!u64i>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.store %dki, %slot : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
+      %r = cir.load %slot : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %clos, %r) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %clos: !cir.ptr<!s8i>, %n: !u64i) {
+      %rg = cir.alloca "rg" align(8) : !cir.ptr<!rec_range>
+      %rga = cir.base_class_addr %rg : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %rgc = cir.get_member %rga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %rgp = cir.cast array_to_ptrdecay %rgc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      cir.store %n, %rgp : !u64i, !cir.ptr<!u64i>
+      cir.call @_ZN4sycl3_V16detail20submit_kernel_directE(%ev, %q, %rg, %clos) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_range>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTSZ4mainEUlvE_
+// CHECK-NEXT: host-name @.str (sycl, optimizable)
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
+// CHECK-NEXT: launch in @_ZN4sycl3_V16detail20submit_kernel_directE (sycl, all-visible), closure traced, global=[?]

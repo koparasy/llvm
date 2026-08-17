@@ -33,6 +33,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <optional>
+
 namespace llvm {
 class raw_ostream;
 } // namespace llvm
@@ -43,6 +45,27 @@ namespace cir {
 // FuncOp carrying cu.kernel_name; SYCL has no stub -- the host names the device
 // kernel through a mangled-name string constant.
 enum class BindingKind { CUDAStub, SYCLName };
+
+// Recovered constant nd_range geometry for a SYCL launch: the per-dimension
+// global and (optionally) local work-group sizes.
+//
+// The sizes do not survive as SSA constants at the launch call -- CIRGen buries
+// them in the nd_range object's memory behind a chain of launch shims. They are
+// recovered by inlining that shim chain on a throwaway clone of the host module
+// and tracing the nd_range_view object's memory back to the constant stores
+// (see SYCL geometry recovery in KernelBindingTable.cpp). Because the clone is
+// discarded, the result is held as plain integers, not IR values.
+//
+// A per-dimension entry is nullopt when that component was not a compile-time
+// constant. `local` is empty for a plain `range` launch (RoundedRangeKernel),
+// which carries no explicit local size. `valid` is false when recovery did not
+// run or could not locate the geometry at all.
+struct SyclGeometry {
+  llvm::SmallVector<std::optional<int64_t>, 3> global;
+  llvm::SmallVector<std::optional<int64_t>, 3> local;
+  unsigned dims = 0;
+  bool valid = false;
+};
 
 // One host-side launch of a kernel.
 //
@@ -79,8 +102,15 @@ struct LaunchSite {
   llvm::StringRef syclKernelName;
   bool allLaunchesVisible = false;
 
+  // SYCL only. Constant nd_range work-group sizes recovered for this launch by
+  // the geometry-recovery pre-analysis (inline the launch-shim chain on a
+  // throwaway clone, then trace the nd_range object memory). Default-invalid
+  // when recovery did not run or found nothing.
+  SyclGeometry syclNDRange;
+
   mlir::Value getSYCLGeometry() const { return syclGeometry; }
   mlir::Value getSYCLClosure() const { return syclClosure; }
+  const SyclGeometry &getSYCLNDRange() const { return syclNDRange; }
 
   llvm::StringRef getKernelName() const;
 
