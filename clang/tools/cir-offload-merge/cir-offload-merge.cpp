@@ -364,6 +364,12 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   // constants the geometry recovery reads.
   pm.addPass(mlir::createOffloadStampReqdWorkGroupSizePass());
 
+  // Infer llvm.noalias on SYCL device kernel pointer parameters whose captured
+  // USM allocations are pairwise distinct at every visible launch. Runs at
+  // container level (needs the host<->device binding table) after mem2reg/sccp
+  // have exposed the host allocation sources the analysis traces.
+  pm.addPass(mlir::createOffloadInferKernelParamNoAliasPass());
+
   if (mlir::failed(pm.run(module)))
     return reportError("offload-container passes failed");
   return 0;

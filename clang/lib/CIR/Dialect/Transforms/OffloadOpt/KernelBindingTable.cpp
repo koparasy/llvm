@@ -913,14 +913,181 @@ static SyclGeometry traceNDRange(mlir::Value viewOperand) {
   return g;
 }
 
-// Recover per-kernel constant nd_range geometry for the whole container. Clones
-// the host module, collapses the launch chain, then for each surviving
-// getDeviceKernelInfo marker resolves the kernel it names and traces the launch
-// it feeds. Keyed by the kernel's _ZTS mangled name so the result maps straight
-// onto the SYCL bindings, which are keyed the same way.
+//===----------------------------------------------------------------------===//
+// SYCL closure-pointer allocation distinctness (llvm.noalias inference)
+//===----------------------------------------------------------------------===//
+//
+// A device kernel pointer parameter is bound to a closure capture field (see
+// the spir_kernel prologue: arg -> slot -> address_space cast -> store into a
+// cir.get_member of the closure). On the host, the same field is written the
+// captured pointer value. If two captured pointers come from two DISTINCT USM
+// allocations then their device parameters cannot alias, so each may carry
+// `llvm.noalias`. This runs on the same collapsed clone as the geometry
+// recovery: the field stores live in the user function, ahead of the launch
+// chain, so a single inline exposes them.
+
+// Whether `call` is a SYCL USM allocation (malloc_device / malloc_shared /
+// malloc_host). Two distinct such calls return provably non-overlapping
+// storage.
+static bool isUSMAllocCall(cir::CallOp call) {
+  std::optional<llvm::StringRef> callee = call.getCallee();
+  if (!callee)
+    return false;
+  return callee->contains("malloc_device") ||
+         callee->contains("malloc_shared") || callee->contains("malloc_host");
+}
+
+// Follow a captured-pointer field's stored value back to the USM allocation
+// that produced it, seeing through spill slots and offset-0 reinterprets. Only
+// a value that resolves to a USM allocation call is an allocation identity;
+// pointer arithmetic (a + offset), an opaque parameter, a global or a buffer
+// stops the walk and yields null -- conservatively "not a distinct allocation".
+static cir::CallOp resolveUSMAllocation(mlir::Value v) {
+  for (unsigned i = 0; i < 16 && v; ++i) {
+    v = stripToPointerObject(v);
+    mlir::Operation *def = v.getDefiningOp();
+    if (!def)
+      return {};
+    if (auto call = mlir::dyn_cast<cir::CallOp>(def))
+      return isUSMAllocCall(call) ? call : cir::CallOp{};
+    if (auto cast = mlir::dyn_cast<cir::CastOp>(def)) {
+      if (cast.getKind() == cir::CastKind::bitcast ||
+          cast.getKind() == cir::CastKind::address_space) {
+        v = cast.getSrc();
+        continue;
+      }
+    }
+    return {};
+  }
+  return {};
+}
+
+// Peel base_class_addr / bitcast / address_space reinterprets and spill slots
+// off `v` to reach the record object it addresses.
+static mlir::Value stripToRecordObject(mlir::Value v) {
+  for (unsigned i = 0; i < 16 && v; ++i) {
+    v = stripToPointerObject(v);
+    mlir::Operation *def = v.getDefiningOp();
+    if (!def)
+      break;
+    if (auto bca = mlir::dyn_cast<cir::BaseClassAddrOp>(def)) {
+      v = bca.getSrcAddr();
+      continue;
+    }
+    if (auto cast = mlir::dyn_cast<cir::CastOp>(def)) {
+      if (cast.getKind() == cir::CastKind::bitcast ||
+          cast.getKind() == cir::CastKind::address_space) {
+        v = cast.getSrc();
+        continue;
+      }
+    }
+    break;
+  }
+  return v;
+}
+
+// The lambda closure object a runtime launch captures, reached from the
+// HostKernelRefBase* closure operand: strip to the HostKernelRef record, then
+// take the lambda pointer its constructor stored (constructor arg 1). Null if
+// the shape is not the HostKernelRef wrapper (e.g. a free-function kernel).
+static mlir::Value traceClosureObject(mlir::Value closureOperand) {
+  mlir::Value hostKernelRef = stripToRecordObject(closureOperand);
+  if (!hostKernelRef)
+    return {};
+  for (mlir::Operation *user : hostKernelRef.getUsers()) {
+    auto call = mlir::dyn_cast<cir::CallOp>(user);
+    if (!call)
+      continue;
+    std::optional<llvm::StringRef> callee = call.getCallee();
+    mlir::OperandRange args = call.getArgOperands();
+    if (!callee || !callee->contains("HostKernelRef") || args.size() < 2 ||
+        args[0] != hostKernelRef)
+      continue;
+    // A HostKernelRef constructor stores the captured lambda (arg 1).
+    if (!(callee->contains("C1") || callee->contains("C2")))
+      continue;
+    return stripToRecordObject(args[1]);
+  }
+  return {};
+}
+
+// The captured pointer fields of a closure object and the value written into
+// each: every cir.get_member whose field is a pointer capture (its pointee is
+// itself a pointer) and which is stored a value.
+static void collectClosurePointerFields(
+    mlir::Value closure,
+    llvm::SmallVectorImpl<std::pair<llvm::StringRef, mlir::Value>> &out) {
+  if (!closure)
+    return;
+  for (mlir::Operation *user : closure.getUsers()) {
+    auto gm = mlir::dyn_cast<cir::GetMemberOp>(user);
+    if (!gm)
+      continue;
+    auto ptrType = mlir::dyn_cast<cir::PointerType>(gm.getResult().getType());
+    if (!ptrType || !mlir::isa<cir::PointerType>(ptrType.getPointee()))
+      continue;
+    if (mlir::Value stored = findFieldStoredValue(closure, gm.getName()))
+      out.emplace_back(gm.getName(), stored);
+  }
+}
+
+// Fold one launch site's closure into the running noalias eligibility for a
+// kernel. A field is eligible at this site iff it resolves to a USM allocation
+// distinct from every other captured pointer of the same closure; a source
+// that does not resolve (pointer arithmetic, shared base, opaque) poisons
+// itself and, being possibly-aliasing, every other field. Eligibility is ANDed
+// across sites, so a field kept here must have held at every earlier site.
+static void foldClosureNoAlias(mlir::Value closureOperand, bool &seenAnySite,
+                               llvm::StringMap<bool> &eligible) {
+  mlir::Value closure = traceClosureObject(closureOperand);
+  llvm::SmallVector<std::pair<llvm::StringRef, mlir::Value>, 4> fields;
+  collectClosurePointerFields(closure, fields);
+
+  // Assign a dense id per distinct allocation; -1 marks an unresolved source.
+  llvm::SmallVector<int> allocId(fields.size(), -1);
+  llvm::DenseMap<mlir::Operation *, int> ids;
+  for (auto [i, f] : llvm::enumerate(fields)) {
+    if (cir::CallOp alloc = resolveUSMAllocation(f.second))
+      allocId[i] =
+          ids.try_emplace(alloc.getOperation(), ids.size()).first->second;
+  }
+
+  llvm::StringMap<bool> here;
+  for (auto [i, f] : llvm::enumerate(fields)) {
+    bool ok = allocId[i] >= 0;
+    for (auto [j, g] : llvm::enumerate(fields))
+      if (i != j && (allocId[j] < 0 || allocId[j] == allocId[i]))
+        ok = false;
+    // A field appearing twice (should not happen) is treated conservatively.
+    here[f.first] = ok && !here.count(f.first);
+  }
+
+  if (!seenAnySite) {
+    eligible = std::move(here);
+    seenAnySite = true;
+    return;
+  }
+  // AND across sites: a field must be eligible here and previously, and any
+  // field missing from either side drops out.
+  llvm::StringMap<bool> merged;
+  for (auto &e : eligible)
+    merged[e.first()] = e.second && here.lookup(e.first());
+  eligible = std::move(merged);
+}
+
+// Recover per-kernel constant nd_range geometry for the whole container, and
+// (out) the closure capture fields whose USM allocations are pairwise distinct
+// at every launch site. Clones the host module, collapses the launch chain,
+// then for each surviving getDeviceKernelInfo marker resolves the kernel it
+// names and traces the launch it feeds. Keyed by the kernel's _ZTS mangled name
+// so the results map straight onto the SYCL bindings, which are keyed the same.
 static llvm::StringMap<SyclGeometry>
-computeSYCLGeometry(mlir::ModuleOp container) {
+computeSYCLGeometry(mlir::ModuleOp container,
+                    llvm::StringMap<llvm::StringSet<>> &noAliasFields) {
   llvm::StringMap<SyclGeometry> result;
+  // Per-kernel running noalias eligibility, ANDed across the kernel's sites.
+  llvm::StringMap<bool> seenSite;
+  llvm::StringMap<llvm::StringMap<bool>> eligible;
   mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
 
   // Throwaway clone -- the real emitted module is never mutated.
@@ -956,9 +1123,30 @@ computeSYCLGeometry(mlir::ModuleOp container) {
     mlir::OperandRange args = launch.getArgOperands();
     if (args.size() <= SyclDeviceKernelInfoOperand)
       return;
+    llvm::StringRef kernel = getGlobalStringValue(nameString);
     SyclGeometry geom = traceNDRange(args[SyclGeometryOperand]);
-    result[getGlobalStringValue(nameString)] = geom;
+    result[kernel] = geom;
+    // Fold this launch's closure into the kernel's noalias eligibility, but
+    // only for the collapsed launch sites in user code. Inlining leaves a copy
+    // of each marker inside the still-present launch-shim bodies too, where the
+    // closure is only a by-reference parameter (a block argument) with no
+    // visible capture stores; folding those would spuriously poison every
+    // field. The real launch sites are the inlined ones in non-shim functions.
+    auto enclosing = call->getParentOfType<cir::FuncOp>();
+    if (enclosing && !isLaunchChainCallee(enclosing)) {
+      bool seen = seenSite.lookup(kernel);
+      foldClosureNoAlias(args[SyclClosureOperand], seen, eligible[kernel]);
+      seenSite[kernel] = seen;
+    }
   });
+
+  // Publish the surviving distinct-allocation fields per kernel.
+  for (auto &e : eligible) {
+    llvm::StringSet<> &fields = noAliasFields[e.first()];
+    for (auto &f : e.second)
+      if (f.second)
+        fields.insert(f.first());
+  }
 
   return result;
 }
@@ -1034,8 +1222,20 @@ void KernelBindingTable::recordSYCLLaunchSites(
 
   // Recover constant nd_range work-group sizes once for the whole container
   // (inline the launch-shim chain on a throwaway clone, then trace memory).
-  // Keyed by _ZTS mangled name, the same key the bindings use.
-  llvm::StringMap<SyclGeometry> geometry = computeSYCLGeometry(container);
+  // Keyed by _ZTS mangled name, the same key the bindings use. The same clone
+  // also yields the closure capture fields backed by pairwise-distinct USM
+  // allocations, so noalias can be inferred without cloning twice.
+  llvm::StringMap<llvm::StringSet<>> noAliasFields;
+  llvm::StringMap<SyclGeometry> geometry =
+      computeSYCLGeometry(container, noAliasFields);
+
+  for (auto &binding : bindings) {
+    if (binding.second.kind != BindingKind::SYCLName)
+      continue;
+    auto it = noAliasFields.find(binding.first);
+    if (it != noAliasFields.end())
+      binding.second.syclNoAliasFields = std::move(it->second);
+  }
 
   hostModule.walk([&](cir::CallOp call) {
     if (!isGetDeviceKernelInfoCall(call))
@@ -1071,7 +1271,8 @@ void KernelBindingTable::recordSYCLLaunchSites(
   });
 }
 
-const KernelBinding *KernelBindingTable::lookup(llvm::StringRef kernelName) const {
+const KernelBinding *
+KernelBindingTable::lookup(llvm::StringRef kernelName) const {
   auto it = bindings.find(kernelName);
   return it == bindings.end() ? nullptr : &it->second;
 }

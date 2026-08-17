@@ -399,4 +399,27 @@ def OffloadStampReqdWorkGroupSize
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def OffloadInferKernelParamNoAlias
+    : Pass<"cir-offload-infer-kernel-param-noalias", "mlir::ModuleOp"> {
+  let summary = "Infer llvm.noalias on SYCL kernel params from distinct USM allocs";
+  let description = [{
+    Runs over a `cir.offload.container`. A SYCL device kernel pointer parameter
+    is bound to a closure capture field. When, at every visible launch site,
+    that field's captured pointer is backed by a USM allocation
+    (malloc_device / malloc_shared / malloc_host) provably distinct from every
+    other captured pointer of the same closure, the parameter cannot alias the
+    others and is stamped `llvm.noalias`, using the host<->device correspondence
+    and closure-allocation analysis from `KernelBindingTable`.
+
+    Only TU-local/optimizable bindings (every launch visible) are touched, and
+    the shared device kernel is annotated in place -- never cloned. A parameter
+    whose source is not a distinct allocation (pointer arithmetic, a shared
+    base, an opaque value, a buffer/accessor) is left conservatively untouched,
+    as is a parameter that already carries `llvm.noalias`. The LLVM `noalias`
+    param attribute is emitted from this arg attribute later, at LLVM lowering.
+  }];
+  let constructor = "mlir::createOffloadInferKernelParamNoAliasPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
 #endif // CLANG_CIR_DIALECT_PASSES_TD

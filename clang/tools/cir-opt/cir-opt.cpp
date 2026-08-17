@@ -116,6 +116,10 @@ int main(int argc, char **argv) {
     return mlir::createOffloadStampReqdWorkGroupSizePass();
   });
 
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::createOffloadInferKernelParamNoAliasPass();
+  });
+
   mlir::omp::registerOpenMPPasses();
   mlir::registerTransformsPasses();
 

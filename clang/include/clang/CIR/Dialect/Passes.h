@@ -41,6 +41,7 @@ std::unique_ptr<Pass> createHoistAllocasPass();
 std::unique_ptr<Pass> createLoweringPreparePass();
 std::unique_ptr<Pass> createOffloadLaunchBoundsPropagationPass();
 std::unique_ptr<Pass> createOffloadStampReqdWorkGroupSizePass();
+std::unique_ptr<Pass> createOffloadInferKernelParamNoAliasPass();
 std::unique_ptr<Pass> createGotoSolverPass();
 std::unique_ptr<Pass> createIdiomRecognizerPass();
 std::unique_ptr<Pass> createLibOptPass();

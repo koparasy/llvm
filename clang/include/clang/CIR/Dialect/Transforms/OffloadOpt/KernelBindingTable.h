@@ -32,6 +32,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <optional>
 
@@ -142,9 +143,7 @@ struct LaunchSite {
   mlir::Value getStream() const;
   bool isDefaultStream() const;
 
-  bool hasGeometry() const {
-    return pushConfigCall != nullptr;
-  }
+  bool hasGeometry() const { return pushConfigCall != nullptr; }
 };
 
 // Binding for one kernel, keyed by its device mangled name. A name may resolve
@@ -178,6 +177,15 @@ struct KernelBinding {
   // cross-TU/by-name reachable and stays conservative (false). Always false for
   // CUDA (stub-anchored).
   bool isTULocalOptimizable = false;
+
+  // SYCL only: names of closure capture fields whose captured pointer is, at
+  // EVERY visible launch site, backed by a USM allocation (malloc_device /
+  // malloc_shared / malloc_host) that is provably distinct from every other
+  // captured pointer of the same closure. The device kernel parameter bound to
+  // such a field can carry `llvm.noalias`. Populated only for TU-local
+  // optimizable bindings; empty when recovery could not prove distinctness
+  // (unresolved source, shared base, pointer arithmetic -> conservatively out).
+  llvm::StringSet<> syclNoAliasFields;
 
   llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
   llvm::SmallVector<LaunchSite, 2> launchSites;

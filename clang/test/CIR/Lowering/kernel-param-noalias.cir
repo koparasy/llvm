@@ -1,0 +1,16 @@
+// RUN: cir-opt %s -cir-to-llvm -o - | FileCheck %s -check-prefix=MLIR
+// RUN: cir-translate %s -cir-to-llvmir --disable-cc-lowering | FileCheck %s -check-prefix=LLVM
+
+// An `llvm.noalias` argument attribute on a spir_kernel cir.func -- as stamped
+// by cir-offload-infer-kernel-param-noalias -- lowers verbatim to a `noalias`
+// LLVM parameter attribute; a parameter without it stays plain.
+
+!s32i = !cir.int<s, 32>
+module {
+  // MLIR: llvm.func spir_kernelcc @k(%arg0: !llvm.ptr<1> {llvm.noalias}, %arg1: !llvm.ptr<1>)
+  // LLVM: define spir_kernel void @k(ptr addrspace(1) noalias %0, ptr addrspace(1) %1)
+  cir.func @k(%arg0: !cir.ptr<!s32i, target_address_space(1)> {llvm.noalias},
+              %arg1: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
+    cir.return
+  }
+}
