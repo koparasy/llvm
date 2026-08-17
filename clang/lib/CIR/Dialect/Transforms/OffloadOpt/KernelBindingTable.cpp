@@ -11,6 +11,7 @@
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
@@ -125,6 +126,8 @@ static cir::LaunchSite::Dim3 traceDim3(mlir::Value dim) {
 }
 
 llvm::StringRef cir::LaunchSite::getKernelName() const {
+  if (kind == BindingKind::SYCLName)
+    return syclKernelName;
   cir::CallOp call = stubCall;
   return cir::getLaunchedKernel(call).getKernelName();
 }
@@ -315,8 +318,10 @@ KernelBindingTable::KernelBindingTable(mlir::ModuleOp container) {
     if (it == bindings.end())
       return;
     cir::CallOp stubCall = mlir::cast<cir::CallOp>(op);
-    it->second.launchSites.push_back(
-        LaunchSite{stubCall, tracePushConfiguration(stubCall)});
+    LaunchSite site;
+    site.stubCall = stubCall;
+    site.pushConfigCall = tracePushConfiguration(stubCall);
+    it->second.launchSites.push_back(site);
   });
 
   for (mlir::ModuleOp deviceMod : cir::getOffloadContainerDeviceModules(container)) {
@@ -329,6 +334,99 @@ KernelBindingTable::KernelBindingTable(mlir::ModuleOp container) {
   }
 
   bindSYCLKernels(container);
+}
+
+// Operand roles of the runtime launch call
+// `submit_kernel_direct_with_event_impl(event& sret, queue&, nd_range_view&,
+// HostKernelRefBase&, DeviceKernelInfo*, span, PropsHolder&, code_location&,
+// bool)` -- a stable __SYCL_EXPORT ABI, so positions are fixed.
+enum : unsigned {
+  SyclGeometryOperand = 2,        // nd_range_view*
+  SyclClosureOperand = 3,         // HostKernelRefBase*
+  SyclDeviceKernelInfoOperand = 4 // DeviceKernelInfo*
+};
+
+// Whether `call` is the templated `sycl::detail::getDeviceKernelInfo<Kernel>()`
+// launch marker: the template-args ('I') follow the name and it takes no
+// operands. The non-templated overload taking a CompileTimeKernelInfo ref
+// ('...InfoE...') is reached from inside it and is not a marker.
+static bool isGetDeviceKernelInfoCall(cir::CallOp call) {
+  std::optional<llvm::StringRef> callee = call.getCallee();
+  if (!callee)
+    return false;
+  return callee->starts_with("_ZN4sycl3_V16detail19getDeviceKernelInfoI") &&
+         call.getArgOperands().empty() && call->getNumResults() == 1;
+}
+
+// Whether `call` is the runtime launch `submit_kernel_direct_with_event_impl`.
+static bool isSubmitKernelDirectImpl(cir::CallOp call) {
+  std::optional<llvm::StringRef> callee = call.getCallee();
+  return callee && callee->starts_with(
+                       "_ZN4sycl3_V136submit_kernel_direct_with_event_impl");
+}
+
+// The `.str` char-array GlobalOp a CompileTimeKernelInfo record names as its
+// kernel-name string_view -- its first member `{global_view<@.str>, len}`.
+static cir::GlobalOp getCompileTimeKernelName(cir::GlobalOp info) {
+  std::optional<mlir::Attribute> init = info.getInitialValue();
+  if (!init)
+    return {};
+  auto rec = mlir::dyn_cast<cir::ConstRecordAttr>(*init);
+  if (!rec || rec.getMembers().empty())
+    return {};
+  auto view = mlir::dyn_cast<cir::ConstRecordAttr>(rec.getMembers()[0]);
+  if (!view || view.getMembers().empty())
+    return {};
+  auto strView = mlir::dyn_cast<cir::GlobalViewAttr>(view.getMembers()[0]);
+  if (!strView)
+    return {};
+  return mlir::SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
+      info, strView.getSymbol());
+}
+
+// The _ZTS name-string GlobalOp a `getDeviceKernelInfo<Kernel>()` call targets.
+// Its callee body references a `CompileTimeKernelInfo<Kernel>` global whose
+// first field is the kernel-name string_view -- purely an IR/symbol walk, no
+// AST and no callee-name substring matching.
+static cir::GlobalOp resolveLaunchedNameString(cir::CallOp call) {
+  mlir::FlatSymbolRefAttr callee = call.getCalleeAttr();
+  if (!callee)
+    return {};
+  auto fn =
+      mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(call, callee);
+  if (!fn)
+    return {};
+  cir::GlobalOp nameString;
+  fn.walk([&](cir::GetGlobalOp getGlobal) {
+    auto global = mlir::SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
+        getGlobal, getGlobal.getNameAttr());
+    if (!global || !global.getName().contains("CompileTimeKernelInfo"))
+      return;
+    if (cir::GlobalOp name = getCompileTimeKernelName(global))
+      nameString = name;
+  });
+  return nameString;
+}
+
+// Follow the DeviceKernelInfo* result of a getDeviceKernelInfo call to the
+// runtime launch call that consumes it. CIRGen spills the pointer into a stack
+// slot and reloads it before the call, so hop store->slot->load once.
+static cir::CallOp traceLaunchCall(mlir::Value deviceKernelInfo) {
+  llvm::SmallVector<mlir::Value, 2> reachable{deviceKernelInfo};
+  for (mlir::Operation *user : deviceKernelInfo.getUsers()) {
+    auto store = mlir::dyn_cast<cir::StoreOp>(user);
+    if (!store || store.getValue() != deviceKernelInfo)
+      continue;
+    for (mlir::Operation *slotUser : store.getAddr().getUsers())
+      if (auto load = mlir::dyn_cast<cir::LoadOp>(slotUser))
+        reachable.push_back(load.getResult());
+  }
+  for (mlir::Value v : reachable)
+    for (mlir::Operation *user : v.getUsers())
+      if (auto call = mlir::dyn_cast<cir::CallOp>(user))
+        if (isSubmitKernelDirectImpl(call))
+          return call;
+  return {};
 }
 
 // SYCL binding: there is no host stub and no cu.kernel_name. Bind each device
@@ -378,6 +476,57 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
       binding.deviceKernels.push_back(kernel);
     });
   }
+
+  recordSYCLLaunchSites(container);
+}
+
+// Records one launch site per host `getDeviceKernelInfo<Kernel>()` marker,
+// resolving the kernel it names through the CompileTimeKernelInfo chain and the
+// runtime launch call it feeds. Bindings already carry their name-strings.
+void KernelBindingTable::recordSYCLLaunchSites(
+    mlir::ModuleOp container) {
+  mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
+
+  // Index SYCL bindings by their name-string global, so a marker's resolved
+  // string maps straight to the kernel it launches.
+  llvm::DenseMap<mlir::Operation *, llvm::StringRef> byNameString;
+  for (auto &binding : bindings)
+    if (binding.second.kind == BindingKind::SYCLName &&
+        binding.second.hostNameString)
+      byNameString[binding.second.hostNameString.getOperation()] =
+          binding.first;
+  if (byNameString.empty())
+    return;
+
+  hostModule.walk([&](cir::CallOp call) {
+    if (!isGetDeviceKernelInfoCall(call))
+      return;
+    cir::GlobalOp nameString = resolveLaunchedNameString(call);
+    if (!nameString)
+      return;
+    auto it = byNameString.find(nameString.getOperation());
+    if (it == byNameString.end())
+      return;
+    // The launch op consumes the DeviceKernelInfo* this marker produced. A
+    // marker whose result never reaches a launch (e.g. inlined away) records
+    // nothing rather than a site with no call.
+    cir::CallOp launch = traceLaunchCall(call->getResult(0));
+    if (!launch)
+      return;
+
+    KernelBinding &binding = bindings[it->second];
+    LaunchSite site;
+    site.kind = BindingKind::SYCLName;
+    site.stubCall = launch;
+    site.syclKernelName = it->second;
+    site.allLaunchesVisible = binding.isTULocalOptimizable;
+    mlir::OperandRange args = launch.getArgOperands();
+    if (args.size() > SyclDeviceKernelInfoOperand) {
+      site.syclGeometry = args[SyclGeometryOperand];
+      site.syclClosure = args[SyclClosureOperand];
+    }
+    binding.launchSites.push_back(site);
+  });
 }
 
 const KernelBinding *KernelBindingTable::lookup(llvm::StringRef kernelName) const {
@@ -429,8 +578,16 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
     for (const cir::LaunchSite &launch : binding.second.launchSites) {
       cir::CallOp stubCall = launch.stubCall;
       auto caller = stubCall->getParentOfType<cir::FuncOp>();
-      os << "//   launch in @" << caller.getName() << " : "
-         << launch.getNumArgs() << " args";
+      os << "//   launch in @" << caller.getName();
+      if (launch.kind == BindingKind::SYCLName) {
+        os << " (sycl, "
+           << (launch.allLaunchesVisible ? "all-visible" : "partial")
+           << "), geometry " << (launch.getSYCLGeometry() ? "traced" : "none")
+           << ", closure " << (launch.getSYCLClosure() ? "traced" : "none")
+           << "\n";
+        continue;
+      }
+      os << " : " << launch.getNumArgs() << " args";
       if (!launch.hasGeometry()) {
         os << ", <no geometry>\n";
         continue;

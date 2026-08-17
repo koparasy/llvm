@@ -108,3 +108,54 @@ module attributes {cir.offload.container} {
 
 // CHECK: KernelBindingTable
 // CHECK-NEXT: size 0 empty true
+
+// -----
+
+// A launched anonymous-lambda kernel. The host reaches it through the
+// `getDeviceKernelInfo<Kernel>()` marker, whose callee body names a
+// CompileTimeKernelInfo global embedding the kernel's _ZTS string (the same
+// string bindSYCLKernels binds). The DeviceKernelInfo* result is spilled to a
+// slot and reloaded, then fed to the runtime launch
+// `submit_kernel_direct_with_event_impl`; the recorder walks that chain and
+// captures the launch, its nd_range_view (geometry) and HostKernelRef (closure)
+// operands. The closure identity is TU-local, so all launches are visible.
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    // First field is the kernel-name string_view {@.str, len}.
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>)
+    // The templated marker: template-args follow the name, no operands.
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    // Mimics submit_kernel_direct: geometry + closure in, DeviceKernelInfo*
+    // spilled to a slot and reloaded before the runtime launch.
+    cir.func @launch(%geom: !cir.ptr<!s8i>, %clos: !cir.ptr<!s8i>, %queue: !cir.ptr<!s8i>, %event: !cir.ptr<!s8i>) {
+      %slot = cir.alloca "DeviceKernelInfoPtr" align(8) : !cir.ptr<!cir.ptr<!s8i>>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.store %dki, %slot : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
+      %reload = cir.load %slot : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%event, %queue, %geom, %clos, %reload) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTSZ4mainEUlvE_
+// CHECK-NEXT: host-name @.str (sycl, optimizable)
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
+// CHECK-NEXT: launch in @launch (sycl, all-visible), geometry traced, closure traced

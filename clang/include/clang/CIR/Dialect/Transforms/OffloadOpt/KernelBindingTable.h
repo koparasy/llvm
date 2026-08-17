@@ -39,19 +39,48 @@ class raw_ostream;
 
 namespace cir {
 
-// One host-side launch of a kernel: the call to the device stub, which carries
-// the kernel arguments, and the `__cudaPushCallConfiguration` /
-// `__hipPushCallConfiguration` call preceding it, which carries the geometry.
+// How a binding's host side was discovered. CUDA/HIP anchors on a device-stub
+// FuncOp carrying cu.kernel_name; SYCL has no stub -- the host names the device
+// kernel through a mangled-name string constant.
+enum class BindingKind { CUDAStub, SYCLName };
+
+// One host-side launch of a kernel.
 //
-// Only the two anchor calls are stored. Argument values, launch dimensions and
+// CUDA: `stubCall` is the call to the device stub, which carries the kernel
+// arguments, and `pushConfigCall` is the `__cudaPushCallConfiguration` /
+// `__hipPushCallConfiguration` call preceding it, which carries the geometry.
+// Only the two anchor calls are stored; argument values, launch dimensions and
 // their constants are read back out of the IR on demand, so a descriptor can
 // never report a value the IR has since stopped holding.
+//
+// SYCL: `stubCall` is the runtime launch call
+// (`submit_kernel_direct_with_event_impl`) reached from a
+// `getDeviceKernelInfo<Kernel>()` marker; `syclGeometry`/`syclClosure` are the
+// nd_range_view and HostKernelRef pointer operands of that call. The CUDA
+// geometry accessors do not apply (`hasGeometry()` is false).
 struct LaunchSite {
+  BindingKind kind = BindingKind::CUDAStub;
+
   cir::CallOp stubCall;
 
   // Null when the geometry could not be traced: the launch was not emitted in
-  // the shape CIRGen produces, or the CFG has already been flattened.
+  // the shape CIRGen produces, or the CFG has already been flattened. Always
+  // null for SYCL.
   cir::CallOp pushConfigCall;
+
+  // SYCL only. Operands of the runtime launch call, kept as Values so constants
+  // are read back on demand (mirrors the CUDA accessors). Null for CUDA.
+  mlir::Value syclGeometry; // nd_range_view* operand
+  mlir::Value syclClosure;  // HostKernelRef(Base)* operand
+
+  // SYCL only. The bound _ZTS mangled-name string this launch targets, and
+  // whether every launch of it is visible in this TU (the binding is
+  // TU-local/optimizable) so the combine may const-fold across all sites.
+  llvm::StringRef syclKernelName;
+  bool allLaunchesVisible = false;
+
+  mlir::Value getSYCLGeometry() const { return syclGeometry; }
+  mlir::Value getSYCLClosure() const { return syclClosure; }
 
   llvm::StringRef getKernelName() const;
 
@@ -88,11 +117,6 @@ struct LaunchSite {
   }
 };
 
-// How a binding's host side was discovered. CUDA/HIP anchors on a device-stub
-// FuncOp carrying cu.kernel_name; SYCL has no stub -- the host names the device
-// kernel through a mangled-name string constant.
-enum class BindingKind { CUDAStub, SYCLName };
-
 // Binding for one kernel, keyed by its device mangled name. A name may resolve
 // in several device modules (multi-arch); the owning module of each kernel is
 // recoverable via k->getParentOfType<mlir::ModuleOp>().
@@ -102,7 +126,8 @@ enum class BindingKind { CUDAStub, SYCLName };
 //
 // SYCL: `hostNameString` is the host string global whose value equals the
 // device kernel's mangled name and which host code references; there is no
-// stub. `launchSites` is not populated for SYCL yet (later step).
+// stub. `launchSites` are the runtime launch calls reached from each
+// `getDeviceKernelInfo<Kernel>()` marker naming this kernel.
 struct KernelBinding {
   BindingKind kind = BindingKind::CUDAStub;
 
@@ -172,6 +197,11 @@ public:
 private:
   // Adds the SYCL name-string <-> spir_kernel bindings and their eligibility.
   void bindSYCLKernels(mlir::ModuleOp container);
+
+  // Records a launch site on each SYCL binding for every host
+  // `getDeviceKernelInfo<Kernel>()` marker that names it. Runs after
+  // bindSYCLKernels, so every binding already has its name-string.
+  void recordSYCLLaunchSites(mlir::ModuleOp container);
 
   // Keys are StringRefs into the `cu.kernel_name` attribute storage (CUDA) or
   // the device kernel's symbol-name storage (SYCL), so the table's lifetime is
