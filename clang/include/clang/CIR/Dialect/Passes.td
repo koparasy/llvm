@@ -374,4 +374,29 @@ def OffloadLaunchBoundsPropagation
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def OffloadStampReqdWorkGroupSize
+    : Pass<"cir-offload-stamp-reqd-work-group-size", "mlir::ModuleOp"> {
+  let summary = "Stamp reqd_work_group_size from constant nd_range local sizes";
+  let description = [{
+    Runs over a `cir.offload.container` and, for each SYCL device kernel whose
+    launches all use the same compile-time-constant nd_range local work-group
+    size, records that size on the kernel as a `cir.reqd_work_group_size`
+    attribute (natural {X,Y,Z} order, length == number of dims), using the
+    host<->device correspondence and recovered geometry from
+    `KernelBindingTable`.
+
+    A kernel is stamped only when it is TU-local/optimizable (every launch is
+    visible in this TU) and every launch site agrees on a fully-constant,
+    non-empty local size. Plain-`range` launches (no explicit local size),
+    runtime local sizes, and disagreeing sites are left untouched. An existing
+    `cir.reqd_work_group_size` is never overridden.
+
+    The SYCL-shaped metadata (`!work_group_num_dim` and the reversed/padded
+    `!reqd_work_group_size`) is emitted from this attribute later, at LLVM
+    lowering.
+  }];
+  let constructor = "mlir::createOffloadStampReqdWorkGroupSizePass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
 #endif // CLANG_CIR_DIALECT_PASSES_TD

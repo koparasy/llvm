@@ -358,6 +358,12 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   if (!DisableCirInferLaunchBounds)
     pm.addPass(mlir::createOffloadLaunchBoundsPropagationPass());
 
+  // Specialize SYCL device kernels with a required work-group size recovered
+  // from their host-side constant nd_range local size. Runs at container level
+  // (needs the host<->device binding table) after mem2reg/sccp have exposed the
+  // constants the geometry recovery reads.
+  pm.addPass(mlir::createOffloadStampReqdWorkGroupSizePass());
+
   if (mlir::failed(pm.run(module)))
     return reportError("offload-container passes failed");
   return 0;
