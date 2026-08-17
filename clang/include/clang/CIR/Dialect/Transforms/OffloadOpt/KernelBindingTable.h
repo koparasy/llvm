@@ -168,10 +168,13 @@ struct KernelBinding {
   // for CUDA.
   cir::GlobalOp hostNameString;
 
-  // SYCL only: true iff the kernel identity is anonymous (an unnamed closure)
-  // and not by-name/bundle-exposed (absent from sycl_registered_kernels), so
-  // its launches are fully TU-local and the combine may optimize/eliminate it.
-  // A named free function, named kernel type, or registered kernel is
+  // SYCL only: true iff the kernel's CLOSURE is a lambda (a compiler-generated,
+  // TU-unique, unspellable type) and it is not by-name/bundle-exposed (absent
+  // from sycl_registered_kernels), so its launches are fully TU-local and the
+  // combine may optimize/eliminate it. This keys on the closure type, not the
+  // kernel-name tag: `parallel_for<class Tag>(lambda)` has a named `_ZTS<Tag>`
+  // symbol but a lambda closure, and is still TU-local. A genuine functor
+  // (named struct with operator()), a free function, or a registered kernel is
   // cross-TU/by-name reachable and stays conservative (false). Always false for
   // CUDA (stub-anchored).
   bool isTULocalOptimizable = false;

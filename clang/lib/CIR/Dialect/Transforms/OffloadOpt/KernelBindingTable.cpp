@@ -20,6 +20,7 @@
 #include "clang/CIR/Dialect/Passes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
@@ -220,9 +221,12 @@ static llvm::StringRef getGlobalStringValue(cir::GlobalOp global) {
 // A mangled name embeds an unnamed closure when it carries the Itanium
 // unnamed-lambda encoding `Ul...E` (closure-type) or clang's `$_` local-lambda
 // spelling. Named free functions (e.g. `__sycl_kernel_vec_add`) and named
-// kernel types never do. This is the identity test for TU-local optimizability:
-// a full demangle would be more precise, but the closure marker is enough to
-// tell an anonymous kernel from a nameable one.
+// kernel types never do. This is a name-only fallback for TU-local
+// optimizability: it fires when the kernel NAME is itself an anonymous lambda
+// mangling, but it cannot see a named tag (`parallel_for<class Tag>(lambda)`)
+// whose symbol is `_ZTS<Tag>` even though the closure is a lambda. The closure
+// signal below (isLambdaClosureKernel) supersedes it whenever the device
+// kernel body is available.
 static bool hasAnonymousClosure(llvm::StringRef name) {
   if (name.contains("$_"))
     return true;
@@ -236,6 +240,86 @@ static bool hasAnonymousClosure(llvm::StringRef name) {
       return true;
   }
   return false;
+}
+
+// Whether a CIR record type NAME denotes a lambda / anonymous closure rather
+// than a spellable class. CIRGen names a record with no C++ identifier (a
+// lambda closure, an anonymous struct) `anon` or `anon.<N>` -- see
+// CIRGenBuilder::getUniqueAnonRecordName -- whereas a named struct/functor
+// keeps its printed qualified name. The AS-lowering pass may prefix an
+// identified record that carries address-space members with `__cir_lowered.`
+// (see TargetLowering.cpp); at the combine stage the device closure has already
+// been through it, so strip that prefix before testing. This is what tells a
+// lambda closure apart from a genuine functor: a functor has a nameable type
+// and could be launched from another TU, so it must stay non-TU-local.
+static bool isAnonymousClosureRecordName(llvm::StringRef name) {
+  name.consume_front("__cir_lowered.");
+  if (name == "anon")
+    return true;
+  if (!name.consume_front("anon."))
+    return false;
+  return !name.empty() && llvm::all_of(name, llvm::isDigit);
+}
+
+// Whether `v`, followed through the offset-0 reinterprets CIRGen inserts on a
+// closure `this` (address-space cast, bitcast, base_class_addr), is passed as
+// the receiver (operand 0) of some call. The kernel object is the one local
+// record whose operator() the entry point invokes, so it is the record alloca
+// reaching a call in receiver position; the SYCL item/id temporaries are passed
+// by value (loaded first), never as a pointer receiver.
+static bool valueFeedsCallReceiver(mlir::Value v) {
+  llvm::SmallVector<mlir::Value, 4> worklist{v};
+  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+  while (!worklist.empty()) {
+    mlir::Value cur = worklist.pop_back_val();
+    for (mlir::Operation *user : cur.getUsers()) {
+      if (auto call = mlir::dyn_cast<cir::CallOp>(user)) {
+        mlir::OperandRange args = call.getArgOperands();
+        if (!args.empty() && args[0] == cur)
+          return true;
+        continue;
+      }
+      if (mlir::isa<cir::CastOp, cir::BaseClassAddrOp>(user))
+        if (seen.insert(user).second)
+          worklist.push_back(user->getResult(0));
+    }
+  }
+  return false;
+}
+
+// The closure record type a SYCL device kernel reconstructs and invokes, or a
+// null type if the kernel has no closure object (a named free-function kernel,
+// or a minimal fixture with an empty body). The kernel entry point materializes
+// the kernel-object clone as a local alloca and calls its operator(); that
+// alloca -- named `__SYCLKernel` for a lambda or after the functor otherwise --
+// is the sole record alloca reaching a call as its receiver.
+static cir::RecordType getSYCLClosureRecord(cir::FuncOp kernel) {
+  cir::RecordType found;
+  kernel.walk([&](cir::AllocaOp alloca) {
+    if (found)
+      return;
+    auto rec = mlir::dyn_cast<cir::RecordType>(alloca.getAllocaType());
+    if (!rec || !rec.getName())
+      return;
+    if (valueFeedsCallReceiver(alloca.getResult()))
+      found = rec;
+  });
+  return found;
+}
+
+// The TU-local identity test: a kernel is optimizable when its CLOSURE is a
+// lambda (a compiler-generated, TU-unique, unspellable type), regardless of the
+// kernel-name tag. `parallel_for<class Tag>(lambda)` has a named `_ZTS<Tag>`
+// symbol but an anonymous closure record, and is TU-local; a genuine functor
+// (a named struct with operator(), possibly defined in a header and launchable
+// from other TUs) has a nameable closure record and stays conservative. When
+// the device kernel body carries no closure object -- an empty lit fixture, or
+// a free-function kernel -- fall back to the name-only heuristic.
+static bool isLambdaClosureKernel(cir::FuncOp kernel,
+                                  llvm::StringRef symbolName) {
+  if (cir::RecordType closure = getSYCLClosureRecord(kernel))
+    return isAnonymousClosureRecordName(closure.getName().getValue());
+  return hasAnonymousClosure(symbolName);
 }
 
 // Whether `name` appears as a registered (by-name / bundle-exposed) kernel in
@@ -920,8 +1004,8 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
       if (binding.deviceKernels.empty()) {
         binding.kind = BindingKind::SYCLName;
         binding.hostNameString = nameString;
-        binding.isTULocalOptimizable =
-            hasAnonymousClosure(name) && !isRegisteredKernel(container, name);
+        binding.isTULocalOptimizable = isLambdaClosureKernel(kernel, name) &&
+                                       !isRegisteredKernel(container, name);
       }
       binding.deviceKernels.push_back(kernel);
     });

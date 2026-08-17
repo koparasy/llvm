@@ -5,8 +5,13 @@
 // SYCL has no host device-stub and no cu.kernel_name: the host<->device link is
 // the kernel's mangled-name string constant. A device spir_kernel binds to the
 // host string equal to its symbol, counted only if that string is referenced by
-// host code. Each binding records whether the kernel is TU-local/optimizable
-// (anonymous closure, not registered) or conservative (named / registered).
+// host code. Each binding records whether the kernel is TU-local/optimizable.
+// The classifier keys on the CLOSURE TYPE, not the kernel-name tag: a kernel is
+// optimizable when its closure is a lambda (an anonymous, unspellable type) and
+// it is not registered, so `parallel_for<class Tag>(lambda)` -- a named _ZTS
+// tag over a lambda -- is optimizable, while a genuine named functor stays
+// conservative. When no closure body is present (a minimal fixture or a free
+// function), it falls back to the kernel-name lambda mangling.
 
 !s8i = !cir.int<s, 8>
 
@@ -381,3 +386,78 @@ module attributes {cir.offload.container} {
 // CHECK-NEXT: host-name @.str (sycl, optimizable)
 // CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
 // CHECK-NEXT: launch in @_ZN4sycl3_V16detail20submit_kernel_directE (sycl, all-visible), closure traced, global=[?]
+
+// -----
+
+// A NAMED-TAG-over-lambda kernel: `parallel_for<class NamedTag>(lambda)`. The
+// device symbol is `_ZTS8NamedTag` -- the NAME is not an anonymous-lambda
+// mangling, so the old name-only heuristic would call it conservative. But the
+// closure the kernel reconstructs and invokes is a lambda (`__cir_lowered.anon`
+// record), so its identity is TU-local and it is now optimizable. This is the
+// case the closure-based classifier recovers.
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!rec_anon = !cir.struct<class "__cir_lowered.anon.0" {data !cir.ptr<!s32i>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTS8NamedTag" : !cir.array<!s8i x 13>, trailing_zeros> : !cir.array<!s8i x 14>
+    cir.func @getName() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @".str" : !cir.ptr<!cir.array<!s8i x 14>>
+      %1 = cir.cast array_to_ptrdecay %0 : !cir.ptr<!cir.array<!s8i x 14>> -> !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // The kernel entry reconstructs its closure (a lambda: anon record) and
+    // invokes operator() with the closure object as receiver (operand 0).
+    cir.func private @_ZZ4mainENKUlvE_clEv(!cir.ptr<!rec_anon>)
+    cir.func @_ZTS8NamedTag() cc(spir_kernel) {
+      %0 = cir.alloca "__SYCLKernel" align(8) : !cir.ptr<!rec_anon>
+      cir.call @_ZZ4mainENKUlvE_clEv(%0) : (!cir.ptr<!rec_anon>) -> ()
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTS8NamedTag
+// CHECK-NEXT: host-name @.str (sycl, optimizable)
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTS8NamedTag
+// CHECK-NEXT: <no launch site>
+
+// -----
+
+// A genuine FUNCTOR kernel: a named struct with operator(), possibly defined in
+// a header and launchable from other TUs. Its closure record has a spellable
+// name (`MyFunctor`), so it is NOT TU-local and stays conservative -- even
+// though the mechanical shape (alloca + operator() call) matches the lambda
+// case. The classifier keys on the closure TYPE, so it distinguishes the two.
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!rec_func = !cir.struct<class "MyFunctor" {data !cir.ptr<!s32i>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTS9MyFunctor" : !cir.array<!s8i x 14>, trailing_zeros> : !cir.array<!s8i x 15>
+    cir.func @getName() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @".str" : !cir.ptr<!cir.array<!s8i x 15>>
+      %1 = cir.cast array_to_ptrdecay %0 : !cir.ptr<!cir.array<!s8i x 15>> -> !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func private @_ZNK9MyFunctorclEv(!cir.ptr<!rec_func>)
+    cir.func @_ZTS9MyFunctor() cc(spir_kernel) {
+      %0 = cir.alloca "MyFunctor" align(8) : !cir.ptr<!rec_func>
+      cir.call @_ZNK9MyFunctorclEv(%0) : (!cir.ptr<!rec_func>) -> ()
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTS9MyFunctor
+// CHECK-NEXT: host-name @.str (sycl, conservative)
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTS9MyFunctor
+// CHECK-NEXT: <no launch site>
