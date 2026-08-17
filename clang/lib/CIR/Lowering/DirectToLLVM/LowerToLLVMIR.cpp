@@ -112,6 +112,62 @@ private:
     return mlir::success();
   }
 
+  // Emit the SYCL-shaped required-work-group-size metadata onto `llvmFunc`
+  // from a `cir.reqd_work_group_size` attribute. The attribute value is the
+  // logical work-group sizes in natural {X,Y,Z} order (length == dims); the
+  // reversal and padding to three entries is applied here so it matches the
+  // metadata classic clang emits for SYCLReqdWorkGroupSizeAttr
+  // (clang/lib/CodeGen/CodeGenFunction.cpp).
+  mlir::LogicalResult amendReqdWorkGroupSize(
+      mlir::LLVM::LLVMFuncOp func, llvm::Function *llvmFunc,
+      mlir::NamedAttribute attribute,
+      mlir::LLVM::ModuleTranslation &moduleTranslation) const {
+    // Collect the natural-order dimensions from an ArrayAttr of ints or a
+    // DenseI32ArrayAttr.
+    llvm::SmallVector<int64_t, 3> dims;
+    if (auto arr = mlir::dyn_cast<mlir::ArrayAttr>(attribute.getValue())) {
+      for (mlir::Attribute e : arr) {
+        auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(e);
+        if (!intAttr)
+          return func.emitError()
+                 << "expected cir.reqd_work_group_size to be an array of "
+                    "integers";
+        dims.push_back(intAttr.getInt());
+      }
+    } else if (auto dense = mlir::dyn_cast<mlir::DenseI32ArrayAttr>(
+                   attribute.getValue())) {
+      for (int32_t v : dense.asArrayRef())
+        dims.push_back(v);
+    } else {
+      return func.emitError()
+             << "expected cir.reqd_work_group_size to be an integer array";
+    }
+
+    if (dims.empty() || dims.size() > 3)
+      return func.emitError()
+             << "cir.reqd_work_group_size must have between 1 and 3 entries";
+
+    llvm::LLVMContext &llvmContext = moduleTranslation.getLLVMContext();
+    llvm::Type *i32Ty = llvm::Type::getInt32Ty(llvmContext);
+    auto mdI32 = [&](int64_t v) -> llvm::Metadata * {
+      return llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, v));
+    };
+
+    // !work_group_num_dim: a single i32 equal to the number of dimensions.
+    llvmFunc->setMetadata("work_group_num_dim",
+                          llvm::MDNode::get(llvmContext, mdI32(dims.size())));
+
+    // !reqd_work_group_size: reversed {Z,Y,X}, padded to three entries with 1s.
+    llvm::SmallVector<llvm::Metadata *, 3> reqd;
+    for (auto it = dims.rbegin(), e = dims.rend(); it != e; ++it)
+      reqd.push_back(mdI32(*it));
+    while (reqd.size() < 3)
+      reqd.push_back(mdI32(1));
+    llvmFunc->setMetadata("reqd_work_group_size",
+                          llvm::MDNode::get(llvmContext, reqd));
+    return mlir::success();
+  }
+
   // Translate CIR function attributes to LLVM function attributes.
   mlir::LogicalResult
   amendFunction(mlir::LLVM::LLVMFuncOp func,
@@ -120,6 +176,18 @@ private:
                 mlir::LLVM::ModuleTranslation &moduleTranslation) const {
     llvm::Function *llvmFunc = moduleTranslation.lookupFunction(func.getName());
     llvm::StringRef attrName = attribute.getName().strref();
+
+    // A SYCL required work-group size, stamped by the offload combine on
+    // spir_kernel device kernels. The attribute value is the logical
+    // work-group sizes in natural {X,Y,Z} order (length == number of dims).
+    // Emit the SYCL-shaped kernel metadata, matching classic clang exactly
+    // (see clang/lib/CodeGen/CodeGenFunction.cpp, SYCLReqdWorkGroupSizeAttr):
+    //   !work_group_num_dim  = single i32 (number of dims)
+    //   !reqd_work_group_size = i32 list in REVERSED order {Z,Y,X}, padded to
+    //                           three entries with 1s.
+    if (attrName == "cir.reqd_work_group_size")
+      return amendReqdWorkGroupSize(func, llvmFunc, attribute,
+                                    moduleTranslation);
 
     // Strip the "cir." prefix to get the LLVM attribute name.
     llvm::StringRef llvmAttrName = attrName.substr(strlen("cir."));

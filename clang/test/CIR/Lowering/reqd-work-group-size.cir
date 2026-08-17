@@ -1,0 +1,33 @@
+// RUN: cir-translate %s -cir-to-llvmir --disable-cc-lowering | FileCheck %s
+
+// A `cir.reqd_work_group_size` attribute on a spir_kernel lowers to the
+// SYCL-shaped kernel metadata: a single-i32 !work_group_num_dim and a
+// !reqd_work_group_size list in reversed {Z,Y,X} order, padded to three
+// entries with 1s (matching classic clang's SYCLReqdWorkGroupSizeAttr path).
+
+module {
+  // 1D: natural [256] -> num_dim 1, reversed/padded {256, 1, 1}.
+  // CHECK: define spir_kernel void @k1d() !work_group_num_dim ![[D1:[0-9]+]] !reqd_work_group_size ![[R1:[0-9]+]]
+  cir.func @k1d() cc(spir_kernel) attributes {cir.reqd_work_group_size = [256 : i32]} {
+    cir.return
+  }
+
+  // 2D: natural [16, 8] -> num_dim 2, reversed/padded {8, 16, 1}.
+  // CHECK: define spir_kernel void @k2d() !work_group_num_dim ![[D2:[0-9]+]] !reqd_work_group_size ![[R2:[0-9]+]]
+  cir.func @k2d() cc(spir_kernel) attributes {cir.reqd_work_group_size = [16 : i32, 8 : i32]} {
+    cir.return
+  }
+
+  // 3D: natural [4, 5, 6] -> num_dim 3, reversed {6, 5, 4}.
+  // CHECK: define spir_kernel void @k3d() !work_group_num_dim ![[D3:[0-9]+]] !reqd_work_group_size ![[R3:[0-9]+]]
+  cir.func @k3d() cc(spir_kernel) attributes {cir.reqd_work_group_size = [4 : i32, 5 : i32, 6 : i32]} {
+    cir.return
+  }
+}
+
+// CHECK-DAG: ![[D1]] = !{i32 1}
+// CHECK-DAG: ![[R1]] = !{i32 256, i32 1, i32 1}
+// CHECK-DAG: ![[D2]] = !{i32 2}
+// CHECK-DAG: ![[R2]] = !{i32 8, i32 16, i32 1}
+// CHECK-DAG: ![[D3]] = !{i32 3}
+// CHECK-DAG: ![[R3]] = !{i32 6, i32 5, i32 4}
