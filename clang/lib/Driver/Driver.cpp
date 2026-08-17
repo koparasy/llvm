@@ -10104,18 +10104,41 @@ InputInfoList Driver::BuildJobsForActionNoCache(
     auto DepInfo = MA->getDependentActionsInfo();
     assert(Inputs.size() == DepInfo.size() &&
            "Expected one target for each CIR merge input");
-    for (unsigned I = 0; I < Inputs.size(); ++I) {
+    // SYCL: the device -emit-cir compile writes the integration header that the
+    // host -emit-cir compile reads (-include-internal-header). Emit the device
+    // (non-host) merge-input jobs before the host job so the header exists when
+    // the host reads it. Only job emission order shifts; the merge -input/
+    // -targets order (host first) is unchanged. CUDA/HIP have no such
+    // cross-dependency and keep their original order.
+    bool SYCLMerge = llvm::any_of(DepInfo, [](const auto &D) {
+      return D.DependentOffloadKind == Action::OFK_SYCL;
+    });
+    SmallVector<InputInfoList, 6> PerInput(Inputs.size());
+    auto BuildMergeInput = [&](unsigned I) {
       const auto &Dep = DepInfo[I];
       Action::OffloadKind BuildKind =
           Dep.DependentOffloadKind == Action::OFK_Host
               ? Action::OFK_None
               : Dep.DependentOffloadKind;
-      InputInfos.append(BuildJobsForAction(
+      PerInput[I] = BuildJobsForAction(
           C, Inputs[I], Dep.DependentToolChain, Dep.DependentBoundArch,
           /*AtTopLevel=*/false,
-          /*MultipleArchs=*/!Dep.DependentBoundArch.empty(),
-          LinkingOutput, CachedResults, BuildKind));
+          /*MultipleArchs=*/!Dep.DependentBoundArch.empty(), LinkingOutput,
+          CachedResults, BuildKind);
+    };
+    if (SYCLMerge) {
+      for (unsigned I = 0; I < Inputs.size(); ++I)
+        if (DepInfo[I].DependentOffloadKind != Action::OFK_Host)
+          BuildMergeInput(I);
+      for (unsigned I = 0; I < Inputs.size(); ++I)
+        if (DepInfo[I].DependentOffloadKind == Action::OFK_Host)
+          BuildMergeInput(I);
+    } else {
+      for (unsigned I = 0; I < Inputs.size(); ++I)
+        BuildMergeInput(I);
     }
+    for (unsigned I = 0; I < Inputs.size(); ++I)
+      InputInfos.append(PerInput[I].begin(), PerInput[I].end());
   } else {
     for (const Action *Input : Inputs) {
       // Treat dsymutil and verify sub-jobs as being at the top-level too, they
