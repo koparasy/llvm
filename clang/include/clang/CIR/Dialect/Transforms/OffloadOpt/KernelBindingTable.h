@@ -6,11 +6,19 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Resolves the host device-stub <-> device kernel correspondence inside a
+// Resolves the host <-> device kernel correspondence inside a
 // cir.offload.container, along with the host call sites that launch each
-// kernel. The bridge is the `cu.kernel_name` attribute, whose value is the
-// device kernel's mangled symbol name; both the host stub and the calls to it
-// carry it.
+// kernel.
+//
+// Two binding shapes are recognized:
+//   - CUDA/HIP: the bridge is the `cu.kernel_name` attribute, whose value is
+//     the device kernel's mangled symbol name; both the host device-stub and
+//     the calls to it carry it.
+//   - SYCL: there is no host stub. The host references a device kernel by its
+//     mangled-name string constant (a `cir.global` char array whose value
+//     equals the device kernel's symbol, e.g. the string returned by
+//     `FreeFunctionInfoData<Func>::getFunctionName()`). The bridge is that
+//     string, matched by equality against a `cc(spir_kernel)` device func.
 //
 // Usable as an MLIR analysis: getAnalysis<KernelBindingTable>() on a pass
 // anchored at the offload container module.
@@ -80,14 +88,39 @@ struct LaunchSite {
   }
 };
 
+// How a binding's host side was discovered. CUDA/HIP anchors on a device-stub
+// FuncOp carrying cu.kernel_name; SYCL has no stub -- the host names the device
+// kernel through a mangled-name string constant.
+enum class BindingKind { CUDAStub, SYCLName };
+
 // Binding for one kernel, keyed by its device mangled name. A name may resolve
 // in several device modules (multi-arch); the owning module of each kernel is
 // recoverable via k->getParentOfType<mlir::ModuleOp>().
 //
-// `launchSites` are the host calls to `hostStub`, which carry the same
-// `cu.kernel_name` key as the stub itself.
+// CUDA: `hostStub` is the device stub, and `launchSites` are the host calls to
+// it, which carry the same `cu.kernel_name` key as the stub itself.
+//
+// SYCL: `hostNameString` is the host string global whose value equals the
+// device kernel's mangled name and which host code references; there is no
+// stub. `launchSites` is not populated for SYCL yet (later step).
 struct KernelBinding {
+  BindingKind kind = BindingKind::CUDAStub;
+
+  // CUDA: the host device-stub carrying cu.kernel_name. Null for SYCL.
   cir::FuncOp hostStub;
+
+  // SYCL: the host mangled-name string global naming the device kernel. Null
+  // for CUDA.
+  cir::GlobalOp hostNameString;
+
+  // SYCL only: true iff the kernel identity is anonymous (an unnamed closure)
+  // and not by-name/bundle-exposed (absent from sycl_registered_kernels), so
+  // its launches are fully TU-local and the combine may optimize/eliminate it.
+  // A named free function, named kernel type, or registered kernel is
+  // cross-TU/by-name reachable and stays conservative (false). Always false for
+  // CUDA (stub-anchored).
+  bool isTULocalOptimizable = false;
+
   llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
   llvm::SmallVector<LaunchSite, 2> launchSites;
 };
@@ -137,8 +170,12 @@ public:
   void print(llvm::raw_ostream &os) const;
 
 private:
-  // Keys are StringRefs into the `cu.kernel_name` attribute storage, so the
-  // table's lifetime is tied to the container IR it was built from.
+  // Adds the SYCL name-string <-> spir_kernel bindings and their eligibility.
+  void bindSYCLKernels(mlir::ModuleOp container);
+
+  // Keys are StringRefs into the `cu.kernel_name` attribute storage (CUDA) or
+  // the device kernel's symbol-name storage (SYCL), so the table's lifetime is
+  // tied to the container IR it was built from.
   llvm::MapVector<llvm::StringRef, KernelBinding> bindings;
   // The scope the stubs and launch sites live in, so a visibility question
   // about a binding does not depend on the caller passing the right module.

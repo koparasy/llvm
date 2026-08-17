@@ -11,6 +11,7 @@
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -192,6 +193,68 @@ cir::CUDAKernelNameAttr cir::getLaunchedKernel(mlir::Operation *op) {
       cir::CUDAKernelNameAttr::getMnemonic());
 }
 
+// The character-array value a `cir.global` string constant holds, or empty if
+// it is not a plain char-array constant. Trailing NUL is not part of the value.
+static llvm::StringRef getGlobalStringValue(cir::GlobalOp global) {
+  std::optional<mlir::Attribute> init = global.getInitialValue();
+  if (!init)
+    return {};
+  auto arr = mlir::dyn_cast<cir::ConstArrayAttr>(*init);
+  if (!arr)
+    return {};
+  auto str = mlir::dyn_cast<mlir::StringAttr>(arr.getElts());
+  return str ? str.getValue() : llvm::StringRef{};
+}
+
+// A mangled name embeds an unnamed closure when it carries the Itanium
+// unnamed-lambda encoding `Ul...E` (closure-type) or clang's `$_` local-lambda
+// spelling. Named free functions (e.g. `__sycl_kernel_vec_add`) and named
+// kernel types never do. This is the identity test for TU-local optimizability:
+// a full demangle would be more precise, but the closure marker is enough to
+// tell an anonymous kernel from a nameable one.
+static bool hasAnonymousClosure(llvm::StringRef name) {
+  if (name.contains("$_"))
+    return true;
+  // A closure prefix `Ul` sits at a mangling boundary (after a scope or
+  // substitution terminator), never inside a length-counted source name, so
+  // require the preceding char to be one -- this rejects identifiers like
+  // "Full" or "Ultra".
+  for (size_t pos = name.find("Ul"); pos != llvm::StringRef::npos;
+       pos = name.find("Ul", pos + 2)) {
+    if (pos == 0 || name[pos - 1] == 'E' || name[pos - 1] == '_')
+      return true;
+  }
+  return false;
+}
+
+// Whether `name` appears as a registered (by-name / bundle-exposed) kernel in
+// any module's `cir.sycl_registered_kernels` attribute -- an array of
+// [user-name, mangled-name] string pairs. Such a kernel is reachable by name
+// across TUs, so it can never be treated as TU-local.
+static bool isRegisteredKernel(mlir::ModuleOp container,
+                               llvm::StringRef name) {
+  auto inModule = [&](mlir::ModuleOp mod) {
+    auto arr = mod->getAttrOfType<mlir::ArrayAttr>(
+        cir::CIRDialect::getSYCLRegisteredKernelsAttrName());
+    if (!arr)
+      return false;
+    for (mlir::Attribute e : arr) {
+      auto pair = mlir::dyn_cast<mlir::ArrayAttr>(e);
+      if (pair && pair.size() == 2)
+        if (auto mangled = mlir::dyn_cast<mlir::StringAttr>(pair[1]))
+          if (mangled.getValue() == name)
+            return true;
+    }
+    return false;
+  };
+  if (inModule(cir::getOffloadContainerHostModule(container)))
+    return true;
+  for (mlir::ModuleOp deviceMod : cir::getOffloadContainerDeviceModules(container))
+    if (inModule(deviceMod))
+      return true;
+  return false;
+}
+
 bool cir::hasUseOutsideSelf(cir::FuncOp fn, mlir::Operation *scope) {
   auto uses = mlir::SymbolTable::getSymbolUses(fn, scope);
   if (!uses)
@@ -264,6 +327,57 @@ KernelBindingTable::KernelBindingTable(mlir::ModuleOp container) {
       }
     }
   }
+
+  bindSYCLKernels(container);
+}
+
+// SYCL binding: there is no host stub and no cu.kernel_name. Bind each device
+// spir_kernel to the host string constant equal to its mangled name, counting
+// it only if that string is actually referenced by host code. Classify each
+// binding's eligibility for TU-local optimization.
+void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
+  mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
+
+  // Host string constants indexed by their char-array value, so a device
+  // kernel's mangled name can be matched by string equality. A false positive
+  // is impossible: only a string equal to a real device-kernel symbol matches.
+  llvm::StringMap<cir::GlobalOp> nameStrings;
+  hostModule.walk([&](cir::GlobalOp global) {
+    llvm::StringRef value = getGlobalStringValue(global);
+    if (!value.empty())
+      nameStrings.try_emplace(value, global);
+  });
+
+  for (mlir::ModuleOp deviceMod : cir::getOffloadContainerDeviceModules(container)) {
+    deviceMod.walk([&](cir::FuncOp kernel) {
+      if (kernel.getCallingConv() != cir::CallingConv::SpirKernel)
+        return;
+      llvm::StringRef name = kernel.getName();
+      // CUDA/HIP already own this name -- do not also bind it as SYCL.
+      if (bindings.count(name))
+        return;
+      auto it = nameStrings.find(name);
+      if (it == nameStrings.end())
+        return;
+      cir::GlobalOp nameString = it->second;
+      // A device kernel the host never names by string launches nothing this
+      // TU describes; skip it rather than record a host-less binding.
+      auto uses = mlir::SymbolTable::getSymbolUses(nameString, hostModule);
+      if (!uses || uses->empty())
+        return;
+
+      KernelBinding &binding = bindings[name];
+      // First device module to reach this name owns the SYCL classification;
+      // later modules (multi-arch) only append their kernel copy.
+      if (binding.deviceKernels.empty()) {
+        binding.kind = BindingKind::SYCLName;
+        binding.hostNameString = nameString;
+        binding.isTULocalOptimizable =
+            hasAnonymousClosure(name) && !isRegisteredKernel(container, name);
+      }
+      binding.deviceKernels.push_back(kernel);
+    });
+  }
 }
 
 const KernelBinding *KernelBindingTable::lookup(llvm::StringRef kernelName) const {
@@ -292,9 +406,17 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
   os << "// size " << size() << " empty " << (empty() ? "true" : "false")
      << "\n";
   for (const auto &binding : bindings) {
-    cir::FuncOp stub = binding.second.hostStub;
     os << "// - kernel " << binding.first << "\n";
-    os << "//   host-stub @" << stub.getName() << "\n";
+    if (binding.second.kind == BindingKind::SYCLName) {
+      cir::GlobalOp nameString = binding.second.hostNameString;
+      os << "//   host-name @" << nameString.getName() << " (sycl, "
+         << (binding.second.isTULocalOptimizable ? "optimizable"
+                                                 : "conservative")
+         << ")\n";
+    } else {
+      cir::FuncOp stub = binding.second.hostStub;
+      os << "//   host-stub @" << stub.getName() << "\n";
+    }
     if (binding.second.deviceKernels.empty())
       os << "//   <no device kernel>\n";
     for (cir::FuncOp kernel : binding.second.deviceKernels) {

@@ -1,0 +1,110 @@
+// RUN: cir-opt %s -split-input-file \
+// RUN:   -pass-pipeline="builtin.module(test-print-kernel-bindings)" \
+// RUN:   2>&1 | FileCheck %s
+
+// SYCL has no host device-stub and no cu.kernel_name: the host<->device link is
+// the kernel's mangled-name string constant. A device spir_kernel binds to the
+// host string equal to its symbol, counted only if that string is referenced by
+// host code. Each binding records whether the kernel is TU-local/optimizable
+// (anonymous closure, not registered) or conservative (named / registered).
+
+!s8i = !cir.int<s, 8>
+
+// A named free-function kernel (FFK): nameable across TUs, so conservative.
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_Z21__sycl_kernel_vec_addPKfS0_Pf" : !cir.array<!s8i x 33>, trailing_zeros> : !cir.array<!s8i x 34>
+    cir.func @getName() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @".str" : !cir.ptr<!cir.array<!s8i x 34>>
+      %1 = cir.cast array_to_ptrdecay %0 : !cir.ptr<!cir.array<!s8i x 34>> -> !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_Z21__sycl_kernel_vec_addPKfS0_Pf() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _Z21__sycl_kernel_vec_addPKfS0_Pf
+// CHECK-NEXT: host-name @.str (sycl, conservative)
+// CHECK-NEXT: device @device_sycl_spir64 : @_Z21__sycl_kernel_vec_addPKfS0_Pf
+// CHECK-NEXT: <no launch site>
+
+// -----
+
+// An unnamed-lambda kernel: the mangled name embeds a closure type (Ul...E_),
+// nothing registers it, so its identity is TU-local and optimizable.
+!s8i = !cir.int<s, 8>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZZ4mainENKUlRN4sycl3_V17handlerEE_clES2_EUlNS0_2idILi1EEEE_" : !cir.array<!s8i x 63>, trailing_zeros> : !cir.array<!s8i x 64>
+    cir.func @getName() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @".str" : !cir.ptr<!cir.array<!s8i x 64>>
+      %1 = cir.cast array_to_ptrdecay %0 : !cir.ptr<!cir.array<!s8i x 64>> -> !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZZ4mainENKUlRN4sycl3_V17handlerEE_clES2_EUlNS0_2idILi1EEEE_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTSZZ4mainENKUlRN4sycl3_V17handlerEE_clES2_EUlNS0_2idILi1EEEE_
+// CHECK-NEXT: host-name @.str (sycl, optimizable)
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZZ4mainENKUlRN4sycl3_V17handlerEE_clES2_EUlNS0_2idILi1EEEE_
+// CHECK-NEXT: <no launch site>
+
+// -----
+
+// An anonymous-closure kernel that IS registered by name: reachable by name /
+// bundle across TUs, so it stays conservative despite the closure identity.
+!s8i = !cir.int<s, 8>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.func @getName() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @".str" : !cir.ptr<!cir.array<!s8i x 17>>
+      %1 = cir.cast array_to_ptrdecay %0 : !cir.ptr<!cir.array<!s8i x 17>> -> !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>, cir.sycl_registered_kernels = [["my_kernel", "_ZTSZ4mainEUlvE_"]]} {
+    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTSZ4mainEUlvE_
+// CHECK-NEXT: host-name @.str (sycl, conservative)
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
+// CHECK-NEXT: <no launch site>
+
+// -----
+
+// A device spir_kernel whose mangled-name string is never referenced by host
+// code binds nothing: the string exists but has no host use.
+!s8i = !cir.int<s, 8>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_Z21__sycl_kernel_vec_addPKfS0_Pf" : !cir.array<!s8i x 33>, trailing_zeros> : !cir.array<!s8i x 34>
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_Z21__sycl_kernel_vec_addPKfS0_Pf() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 0 empty true

@@ -79,6 +79,10 @@ void OffloadDeadKernelEliminationPass::runOnOperation() {
   LDBG() << "container has " << table.size() << " kernel binding(s)";
 
   for (const auto &binding : table) {
+    // SYCL bindings have no host stub and no launch discovery yet; leave their
+    // kernels alone until SYCL DKE lands.
+    if (binding.second.kind != cir::BindingKind::CUDAStub)
+      continue;
     cir::FuncOp stub = binding.second.hostStub;
     bool localLinkage = cir::isLocalLinkage(stub.getLinkage());
     bool stubDead =
