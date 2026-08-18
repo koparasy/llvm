@@ -33,6 +33,7 @@
 namespace cir::test {
 void registerTestCIRAliasAnalysisPass();
 void registerPrintKernelBindingsPass();
+void registerCopyKernelPass();
 } // namespace cir::test
 #endif
 
@@ -52,6 +53,7 @@ int main(int argc, char **argv) {
 #ifdef CLANG_INCLUDE_TESTS
   cir::test::registerTestCIRAliasAnalysisPass();
   cir::test::registerPrintKernelBindingsPass();
+  cir::test::registerCopyKernelPass();
 #endif
   registry.insert<mlir::memref::MemRefDialect, mlir::LLVM::LLVMDialect>();
 

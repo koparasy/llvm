@@ -1,0 +1,64 @@
+// RUN: cir-opt %s -split-input-file \
+// RUN:   -pass-pipeline="builtin.module(test-copy-kernel)" \
+// RUN:   | FileCheck %s
+
+// Exercises the copyKernel primitive (cir::specializeSYCLKernelForLaunches) via
+// the test-copy-kernel pass, which specializes each launched SYCL binding by
+// cloning it and redirecting its first launch site. The structural contract:
+//   - a device spir_kernel clone under a fresh unique _ZTS name, keeping the
+//     original's linkage and tagged cir.specialization_private (NOT internal);
+//   - host artifacts naming it: a name-string global (H1), a
+//     CompileTimeKernelInfo clone repointed at H1 (H2), a getDeviceKernelInfo
+//     getter clone (H3);
+//   - the launch marker call repointed at the getter clone (H4);
+//   - the original kernel, name-string, info and getter left untouched.
+
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @launch(%geom: !cir.ptr<!s8i>, %clos: !cir.ptr<!s8i>, %queue: !cir.ptr<!s8i>, %event: !cir.ptr<!s8i>) {
+      %slot = cir.alloca "DeviceKernelInfoPtr" align(8) : !cir.ptr<!cir.ptr<!s8i>>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.store %dki, %slot : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
+      %reload = cir.load %slot : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%event, %queue, %geom, %clos, %reload) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// The launch marker is redirected at a cloned getter (numeric suffix).
+// CHECK-LABEL: cir.func @launch(
+// CHECK: cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv_{{[0-9]+}}()
+
+// H1: a name-string global holding the fresh clone name.
+// CHECK: cir.global {{.*}}#cir.const_array<"_ZTSZ4mainEUlvE_.spec.0"
+
+// H2: a CompileTimeKernelInfo clone whose string_view reports the clone name
+// length (23 = strlen("_ZTSZ4mainEUlvE_.spec.0")) and carries a fresh symbol.
+// CHECK: cir.global {{.*}}@_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE{{[._0-9]+}} = #cir.const_record<{#cir.const_record<{#cir.global_view<{{.*}}> : !cir.ptr<!s8i>, #cir.int<23>
+
+// H3: a getDeviceKernelInfo getter clone reading the H2 clone.
+// CHECK: cir.func {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv_{{[0-9]+}}()
+
+// The device clone: fresh _ZTS name, spir_kernel, combine-private marker; the
+// original stays a plain external spir_kernel.
+// CHECK: cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel)
+// CHECK-NOT: cir.specialization_private
+// CHECK: cir.func @_ZTSZ4mainEUlvE_.spec.0() cc(spir_kernel) attributes {cir.specialization_private}

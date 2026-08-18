@@ -98,6 +98,13 @@ struct LaunchSite {
   mlir::Value syclGeometry; // nd_range_view* operand
   mlir::Value syclClosure;  // HostKernelRef(Base)* operand
 
+  // SYCL only. The `getDeviceKernelInfo<Kernel>()` marker call that names this
+  // launch's kernel and whose DeviceKernelInfo* result feeds `stubCall`. This
+  // is the single edit point for redirecting the launch to a specialized clone:
+  // its callee is repointed at a cloned getter naming the clone (see
+  // specializeSYCLKernelForLaunch). Null for CUDA.
+  cir::CallOp syclMarkerCall;
+
   // SYCL only. The bound _ZTS mangled-name string this launch targets, and
   // whether every launch of it is visible in this TU (the binding is
   // TU-local/optimizable) so the combine may const-fold across all sites.
@@ -201,6 +208,48 @@ struct KernelBinding {
   llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
   llvm::SmallVector<LaunchSite, 2> launchSites;
 };
+
+// A SYCL kernel specialized by cloning ("copyKernel"): a fresh device kernel
+// under a unique _ZTS name plus the host artifacts that name it, minted so that
+// one launch site can be redirected to it while the original stays generic for
+// every other (possibly cross-TU) launch. `deviceKernels` are the device clones
+// (one per arch module, parallel to the source KernelBinding::deviceKernels);
+// an optimization applies its device-side change to these, not to the shared
+// original.
+struct SpecializedKernel {
+  std::string name;
+  llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
+};
+
+// Specialize a SYCL kernel by clone-and-redirect, the residual path for opts
+// whose soundness is not whole-program (a cross-TU functor, or a kernel whose
+// launch sites do not all agree). Mints, in `container`:
+//   - a device spir_kernel clone of each of the binding's device kernels, under
+//     a fresh unique _ZTS name, keeping the original's (external) linkage and
+//     tagged `cir.specialization_private` -- a combine-private "single caller,
+//     safe to mutate in place, do not re-clone" marker, NOT internal linkage
+//     (an internal clone is dead-stripped at sycl-post-link);
+//   - the host artifacts that make the runtime resolve it: a mangled-name
+//   string
+//     global (H1), a CompileTimeKernelInfo clone repointed at that string (H2),
+//     and a getDeviceKernelInfo getter clone plus its per-instantiation
+//     static-local/guard cluster (H3);
+// then repoints the getDeviceKernelInfo marker call of every launch in `sites`
+// at the getter clone (H4), so exactly those launches resolve the clone at
+// runtime while every other launch (this TU's or another's) keeps the generic
+// original. `sites` must all belong to `binding` (they share one getter
+// instantiation, so H1-H3 are minted once); pass the full launchSites list to
+// specialize a cross-TU functor for this TU, or an agreeing subset to split a
+// kernel launched several ways. `uniqueTag` disambiguates the minted symbol
+// names within the TU.
+//
+// Returns the minted clone, or nullopt if the binding/sites are not a
+// redirectable SYCL launch (not SYCL, no marker call, no name string, or no
+// device kernel). The KernelBindingTable is not updated in place; rebuild it to
+// see the clone.
+std::optional<SpecializedKernel> specializeSYCLKernelForLaunches(
+    mlir::ModuleOp container, const KernelBinding &binding,
+    llvm::ArrayRef<LaunchSite> sites, llvm::StringRef uniqueTag);
 
 // The kernel `op` launches, or a null attribute if it is not a launch site.
 // This is what the table records as a launch site, and what a pass must accept

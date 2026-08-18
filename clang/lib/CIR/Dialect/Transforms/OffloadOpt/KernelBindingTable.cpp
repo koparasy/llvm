@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/SymbolTable.h"
@@ -1373,6 +1374,7 @@ void KernelBindingTable::recordSYCLLaunchSites(
     LaunchSite site;
     site.kind = BindingKind::SYCLName;
     site.stubCall = launch;
+    site.syclMarkerCall = call;
     site.syclKernelName = it->second;
     site.allLaunchesVisible = binding.isTULocalOptimizable;
     mlir::OperandRange args = launch.getArgOperands();
@@ -1501,4 +1503,204 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
     os << "//\n";
   }
   os << "// ----------------------------\n";
+}
+
+//===----------------------------------------------------------------------===//
+// copyKernel: specialize a SYCL kernel by clone-and-redirect
+//===----------------------------------------------------------------------===//
+
+// The CompileTimeKernelInfo global a getDeviceKernelInfo getter reads to name
+// its kernel: the (only) global it `cir.get_global`s whose symbol carries the
+// CompileTimeKernelInfo tag. Mirrors resolveLaunchedNameString's walk.
+static cir::GlobalOp findGetterCompileTimeInfo(cir::FuncOp getter) {
+  cir::GlobalOp info;
+  getter.walk([&](cir::GetGlobalOp gg) {
+    auto g = mlir::SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
+        gg, gg.getNameAttr());
+    if (g && g.getName().contains("CompileTimeKernelInfo"))
+      info = g;
+  });
+  return info;
+}
+
+// Rebuild a CompileTimeKernelInfo initializer so its kernel-name string_view
+// (the first member's `{global_view<@name>, len}`) points at `nameGlobal` and
+// reports `nameLen`. Every other member -- notably the kernel_param_desc_t
+// table -- is reused verbatim, since the clone has the original's signature.
+static mlir::Attribute repointCompileTimeInfo(mlir::Attribute init,
+                                              mlir::StringAttr nameGlobal,
+                                              uint64_t nameLen,
+                                              mlir::MLIRContext *ctx) {
+  auto outer = mlir::dyn_cast<cir::ConstRecordAttr>(init);
+  if (!outer || outer.getMembers().empty())
+    return {};
+  llvm::SmallVector<mlir::Attribute> members(outer.getMembers().begin(),
+                                             outer.getMembers().end());
+  auto sv = mlir::dyn_cast<cir::ConstRecordAttr>(members[0]);
+  if (!sv || sv.getMembers().size() < 2)
+    return {};
+  auto view = mlir::dyn_cast<cir::GlobalViewAttr>(sv.getMembers()[0]);
+  auto len = mlir::dyn_cast<cir::IntAttr>(sv.getMembers()[1]);
+  if (!view || !len)
+    return {};
+
+  llvm::SmallVector<mlir::Attribute> svMembers(sv.getMembers().begin(),
+                                               sv.getMembers().end());
+  svMembers[0] = cir::GlobalViewAttr::get(
+      view.getType(), mlir::FlatSymbolRefAttr::get(nameGlobal),
+      view.getIndices());
+  svMembers[1] = cir::IntAttr::get(len.getType(), nameLen);
+  members[0] =
+      cir::ConstRecordAttr::get(mlir::cast<cir::RecordType>(sv.getType()),
+                                mlir::ArrayAttr::get(ctx, svMembers));
+  return cir::ConstRecordAttr::get(mlir::cast<cir::RecordType>(outer.getType()),
+                                   mlir::ArrayAttr::get(ctx, members));
+}
+
+std::optional<cir::SpecializedKernel> cir::specializeSYCLKernelForLaunches(
+    mlir::ModuleOp container, const cir::KernelBinding &binding,
+    llvm::ArrayRef<cir::LaunchSite> sites, llvm::StringRef uniqueTag) {
+  // Only a SYCL launch we can redirect: it needs at least one marker call (the
+  // redirect edit point), a device kernel to clone, and a host name-string to
+  // re-mint. The mint is driven by the first site's marker; every site in
+  // `sites` shares that kernel's getter instantiation.
+  if (binding.kind != cir::BindingKind::SYCLName || sites.empty() ||
+      !sites.front().syclMarkerCall || binding.deviceKernels.empty() ||
+      !binding.hostNameString)
+    return std::nullopt;
+  const cir::LaunchSite &site = sites.front();
+
+  mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
+  mlir::MLIRContext *ctx = container.getContext();
+
+  // A fresh, unique clone name. The name is an arbitrary raw string key
+  // downstream (sycl-post-link enumerates spir_kernels by calling-convention +
+  // getName, no demangling), so ".spec.<tag>" is fine; keep it unique across
+  // every device module's kernel symbols. (MLIR op handles are value wrappers
+  // whose accessors are non-const, so copy out of the const binding first.)
+  cir::FuncOp firstKernel = binding.deviceKernels.front();
+  std::string cloneName = (firstKernel.getName() + ".spec." + uniqueTag).str();
+  auto deviceCollides = [&](llvm::StringRef n) {
+    for (mlir::ModuleOp dm : cir::getOffloadContainerDeviceModules(container))
+      if (mlir::SymbolTable::lookupSymbolIn(dm, n))
+        return true;
+    return false;
+  };
+  for (unsigned n = 0; deviceCollides(cloneName); ++n)
+    cloneName =
+        (firstKernel.getName() + ".spec." + uniqueTag + "." + llvm::Twine(n))
+            .str();
+
+  cir::SpecializedKernel spec;
+  spec.name = cloneName;
+
+  // 1. Device clone(s): one per arch module, external linkage inherited from
+  // the original (an internal clone is dead-stripped at sycl-post-link), tagged
+  // with the combine-private single-caller provenance marker.
+  auto specPrivate = mlir::UnitAttr::get(ctx);
+  for (cir::FuncOp kernel : binding.deviceKernels) {
+    auto clone = mlir::cast<cir::FuncOp>(kernel->clone());
+    mlir::SymbolTable::setSymbolName(clone, cloneName);
+    clone->setAttr("cir.specialization_private", specPrivate);
+    mlir::OpBuilder b(kernel.getOperation());
+    b.setInsertionPointAfter(kernel.getOperation());
+    b.insert(clone);
+    spec.deviceKernels.push_back(clone);
+  }
+
+  mlir::SymbolTable hostSyms(hostModule);
+
+  // 2. H1: a mangled-name string global holding the clone name. Cloned from the
+  // original name-string so linkage/visibility match, then retyped and
+  // re-inited for the (different-length) clone name.
+  cir::GlobalOp nameStr = binding.hostNameString;
+  cir::GlobalOp h1 = mlir::cast<cir::GlobalOp>(nameStr->clone());
+  auto origArrTy = mlir::cast<cir::ArrayType>(nameStr.getSymType());
+  mlir::Type eltTy = origArrTy.getElementType();
+  uint64_t nameLen = cloneName.size();
+  auto fullTy = cir::ArrayType::get(eltTy, nameLen + 1);
+  auto strAttr =
+      mlir::StringAttr::get(cloneName, cir::ArrayType::get(eltTy, nameLen));
+  h1.setSymType(fullTy);
+  h1.setInitialValueAttr(cir::ConstArrayAttr::get(fullTy, strAttr));
+  mlir::StringAttr h1Name = hostSyms.insert(h1);
+
+  // 3. Resolve the getter this launch marker calls and the
+  // CompileTimeKernelInfo it names.
+  cir::CallOp marker = site.syclMarkerCall;
+  auto getter = mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
+      marker, marker.getCalleeAttr());
+  if (!getter)
+    return std::nullopt;
+  cir::GlobalOp ctki = findGetterCompileTimeInfo(getter);
+  if (!ctki || !ctki.getInitialValue())
+    return std::nullopt;
+
+  // 4. H2: a CompileTimeKernelInfo clone repointed at H1.
+  cir::GlobalOp h2 = mlir::cast<cir::GlobalOp>(ctki->clone());
+  mlir::Attribute h2Init =
+      repointCompileTimeInfo(*ctki.getInitialValue(), h1Name, nameLen, ctx);
+  if (!h2Init)
+    return std::nullopt;
+  h2.setInitialValueAttr(h2Init);
+  mlir::StringAttr h2Name = hostSyms.insert(h2);
+
+  // 5. Clone the getter's per-instantiation private cluster (the static-local
+  // DeviceKernelInfo* singleton and its guard) so the clone lazily registers
+  // its OWN DeviceKernelInfo keyed to H2/H1 -- sharing the original's would
+  // cache the wrong (original-named) kernel. A cluster global is one the getter
+  // references by get_global, that is not the CompileTimeKernelInfo, and whose
+  // every use in the host module is inside the getter (i.e. a function-local
+  // static / guard).
+  llvm::DenseMap<mlir::StringAttr, mlir::StringAttr> remap;
+  remap[ctki.getSymNameAttr()] = h2Name;
+  llvm::SmallVector<cir::GlobalOp, 2> clonedCluster;
+  llvm::SmallPtrSet<mlir::Operation *, 4> seen;
+  getter.walk([&](cir::GetGlobalOp gg) {
+    auto g = mlir::SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
+        gg, gg.getNameAttr());
+    if (!g || g == ctki || !seen.insert(g).second)
+      return;
+    auto uses = mlir::SymbolTable::getSymbolUses(g, hostModule);
+    if (!uses)
+      return;
+    for (const mlir::SymbolTable::SymbolUse &u : *uses)
+      if (!getter->isAncestor(u.getUser()))
+        return; // Referenced outside the getter: shared, do not clone.
+    auto c = mlir::cast<cir::GlobalOp>(g->clone());
+    mlir::StringAttr cName = hostSyms.insert(c);
+    remap[g.getSymNameAttr()] = cName;
+    clonedCluster.push_back(c);
+  });
+
+  // Repoint each cloned static-local's guard association to the cloned guard.
+  for (cir::GlobalOp c : clonedCluster) {
+    if (auto guard = c.getStaticLocalGuard()) {
+      auto it = remap.find(guard->getName());
+      if (it != remap.end())
+        c.setStaticLocalGuardAttr(
+            cir::StaticLocalGuardAttr::get(ctx, it->second));
+    }
+  }
+
+  // 6. H3: a getter clone whose get_global references are remapped onto H2 and
+  // the cloned cluster.
+  cir::FuncOp h3 = mlir::cast<cir::FuncOp>(getter->clone());
+  mlir::StringAttr h3Name = hostSyms.insert(h3);
+  h3.walk([&](cir::GetGlobalOp gg) {
+    auto it = remap.find(gg.getNameAttr().getAttr());
+    if (it != remap.end())
+      gg.setNameAttr(mlir::FlatSymbolRefAttr::get(it->second));
+  });
+
+  // 7. H4: redirect every requested launch's marker call at the getter clone,
+  // moving exactly those launches to the clone while every other launch (this
+  // TU's or another's) keeps the original. All sites share the kernel's getter
+  // instantiation, so they repoint to the one H3.
+  auto h3Ref = mlir::FlatSymbolRefAttr::get(h3Name);
+  for (const cir::LaunchSite &s : sites)
+    if (cir::CallOp siteMarker = s.syclMarkerCall)
+      siteMarker.setCalleeAttr(h3Ref);
+
+  return spec;
 }

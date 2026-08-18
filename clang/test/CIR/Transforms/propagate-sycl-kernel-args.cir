@@ -240,11 +240,12 @@ module attributes {cir.offload.container} {
 // -----
 
 // Non-TU-local kernel: a genuine named functor closure (spellable type,
-// launchable from other TUs) stays conservative even though the same-shaped
-// lambda case would propagate. The captures are compile-time constants on the
-// host, but the binding is not TU-local, so NOTHING is propagated: every
-// parameter is still the block argument. The only change from the first case is
-// the kernel's mangled name and closure type.
+// launchable from other TUs) is not folded in place. The captures are
+// compile-time constants on the host, so the pass specializes by clone
+// (copyKernel): it mints a fresh kernel with the constants propagated, redirects
+// this TU's launch to it, and leaves the shared original generic (parameters
+// still the block arguments) for launches this TU cannot see. The only change
+// from the first case is the kernel's mangled name and closure type.
 
 !s8i = !cir.int<s, 8>
 !s32i = !cir.int<s, 32>
@@ -284,11 +285,23 @@ module attributes {cir.offload.container} {
     }
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
-    // CHECK-LABEL: cir.func @_ZTS9MyFunctor
+    // This TU's launch marker is repointed at a cloned getter (numeric suffix).
+    // CHECK: cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv_{{[0-9]+}}()
+    //
+    // The shared original stays generic: parameters are still the block
+    // arguments, nothing propagated.
+    // CHECK-LABEL: cir.func @_ZTS9MyFunctor(
     // CHECK: cir.store %arg0, %{{.*}}
     // CHECK: cir.store %arg1, %{{.*}}
     // CHECK: cir.store %arg2, %{{.*}}
     // CHECK: cir.cast int_to_bool %arg0
+    //
+    // The specialized clone carries the combine-private provenance marker and
+    // has the constant flag/coeff propagated in.
+    // CHECK: cir.func @_ZTS9MyFunctor.spec.constprop.0(
+    // CHECK-SAME: attributes {cir.specialization_private}
+    // CHECK-DAG: cir.const #cir.int<1> : !s32i
+    // CHECK-DAG: cir.const #cir.int<7> : !s32i
     cir.func @_ZTS9MyFunctor(%arg0: !s32i, %arg1: !s32i, %arg2: !s32i, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
       %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
       %sflag = cir.alloca "flag.addr" align(4) : !cir.ptr<!s32i>

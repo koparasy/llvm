@@ -1,6 +1,7 @@
 add_clang_library(CIRTestAnalysis
   TestCIRAliasAnalysis.cpp
   TestKernelBindings.cpp
+  TestCopyKernel.cpp
 
   LINK_LIBS PUBLIC
   MLIRCIRAnalysis

@@ -18,8 +18,14 @@
 // device parameter to its field and stamps `llvm.noalias` on the parameters
 // whose field is in that set.
 //
-// In-place only: it annotates the shared device kernel and never clones it, so
-// it is limited to TU-local/optimizable bindings whose every launch is visible.
+// Two paths. For a TU-local/optimizable binding (every launch visible, closure
+// is a lambda) it annotates the shared device kernel in place. For the residual
+// -- a cross-TU functor or a by-name-reachable kernel whose shared body another
+// TU could launch with aliasing pointers -- it specializes by clone: mint a
+// fresh kernel (copyKernel), redirect this TU's launches to it, and annotate
+// the clone, leaving the generic original untouched. syclNoAliasFields already
+// ANDs the distinctness across every launch this TU sees, so it holds at all
+// the redirected sites.
 //
 //===----------------------------------------------------------------------===//
 
@@ -97,36 +103,58 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
   llvm::StringRef noAliasName = mlir::LLVM::LLVMDialect::getNoAliasAttrName();
   bool changed = false;
 
-  for (const auto &entry : table) {
-    const cir::KernelBinding &binding = entry.second;
-
-    // Only SYCL, TU-local kernels whose every launch this TU can see: another
-    // TU could launch a cross-TU kernel with aliasing pointers. An empty field
-    // set means host-side recovery could not prove any pair distinct.
-    if (!binding.isTULocalOptimizable || binding.launchSites.empty())
-      continue;
-    if (binding.syclNoAliasFields.empty())
-      continue;
-
-    for (cir::FuncOp kernel : binding.deviceKernels) {
+  // Stamp llvm.noalias on each kernel parameter bound to a distinct-USM capture
+  // field. Returns whether any parameter was newly annotated.
+  auto applyNoAlias = [&](llvm::ArrayRef<cir::FuncOp> kernels,
+                          const llvm::StringSet<> &fields) {
+    bool did = false;
+    for (cir::FuncOp kernel : kernels) {
       if (kernel.getCallingConv() != cir::CallingConv::SpirKernel)
         continue;
       if (kernel.getBody().empty())
         continue;
-
       for (mlir::BlockArgument arg : kernel.getBody().front().getArguments()) {
-        auto ptrType = mlir::dyn_cast<cir::PointerType>(arg.getType());
-        if (!ptrType)
+        if (!mlir::isa<cir::PointerType>(arg.getType()))
           continue;
         // Already noalias (e.g. a restrict-qualified capture): leave it.
         if (kernel.getArgAttr(arg.getArgNumber(), noAliasName))
           continue;
         llvm::StringRef field = closureFieldForArg(arg);
-        if (field.empty() || !binding.syclNoAliasFields.contains(field))
+        if (field.empty() || !fields.contains(field))
           continue;
         kernel.setArgAttr(arg.getArgNumber(), noAliasName,
                           mlir::UnitAttr::get(ctx));
-        changed = true;
+        did = true;
+      }
+    }
+    return did;
+  };
+
+  unsigned specTag = 0;
+  for (const auto &entry : table) {
+    const cir::KernelBinding &binding = entry.second;
+
+    // An empty field set means host-side recovery could not prove any pair
+    // distinct at the launches this TU sees.
+    if (binding.kind != cir::BindingKind::SYCLName ||
+        binding.launchSites.empty() || binding.syclNoAliasFields.empty())
+      continue;
+
+    if (binding.isTULocalOptimizable) {
+      // Every launch is visible and the kernel is TU-local: safe to annotate
+      // the shared device kernel in place.
+      changed |= applyNoAlias(binding.deviceKernels, binding.syclNoAliasFields);
+    } else {
+      // Residual: the shared kernel is cross-TU / by-name reachable, so another
+      // TU could launch it with aliasing pointers. Specialize by clone --
+      // redirect this TU's launches to a fresh kernel and annotate only the
+      // clone, leaving the generic original for unseen launches.
+      auto spec = cir::specializeSYCLKernelForLaunches(
+          container, binding, binding.launchSites,
+          "noalias." + std::to_string(specTag++));
+      if (spec) {
+        applyNoAlias(spec->deviceKernels, binding.syclNoAliasFields);
+        changed = true; // The clone + redirect mutated the IR regardless.
       }
     }
   }

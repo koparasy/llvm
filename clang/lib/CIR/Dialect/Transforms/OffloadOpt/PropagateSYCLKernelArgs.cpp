@@ -105,23 +105,16 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
   cir::KernelBindingTable &table = getAnalysis<cir::KernelBindingTable>();
   bool changed = false;
 
-  for (const auto &entry : table) {
-    const cir::KernelBinding &binding = entry.second;
-
-    // Only SYCL, TU-local kernels whose every launch this TU can see: another
-    // TU could launch a cross-TU kernel with a different argument. An empty
-    // const-arg set means host-side recovery found no agreed constant.
-    if (!binding.isTULocalOptimizable || binding.launchSites.empty())
-      continue;
-    if (binding.syclConstArgs.empty())
-      continue;
-
-    for (cir::FuncOp kernel : binding.deviceKernels) {
+  // Replace each scalar kernel parameter bound to an agreed-constant capture
+  // field with a materialized cir.const. Returns whether anything was replaced.
+  auto applyConstArgs = [&](llvm::ArrayRef<cir::FuncOp> kernels,
+                            const llvm::StringMap<mlir::TypedAttr> &consts) {
+    bool did = false;
+    for (cir::FuncOp kernel : kernels) {
       if (kernel.getCallingConv() != cir::CallingConv::SpirKernel)
         continue;
       if (kernel.getBody().empty())
         continue;
-
       for (mlir::BlockArgument arg : kernel.getBody().front().getArguments()) {
         // Only scalar parameters carry a by-value capture; a pointer/accessor
         // parameter is handled by the noalias pass, not here.
@@ -133,7 +126,7 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
         llvm::StringRef field = closureFieldForArg(arg);
         if (field.empty())
           continue;
-        mlir::TypedAttr value = binding.syclConstArgs.lookup(field);
+        mlir::TypedAttr value = consts.lookup(field);
         // A field with no agreed constant, or a constant whose type does not
         // match the parameter (an unexpected reinterpret), is left alone.
         if (!value || value.getType() != arg.getType())
@@ -144,7 +137,37 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
         auto constant =
             cir::ConstantOp::create(builder, kernel.getLoc(), value);
         arg.replaceAllUsesWith(constant);
-        changed = true;
+        did = true;
+      }
+    }
+    return did;
+  };
+
+  unsigned specTag = 0;
+  for (const auto &entry : table) {
+    const cir::KernelBinding &binding = entry.second;
+
+    // An empty const-arg set means host-side recovery found no agreed constant
+    // across the launches this TU sees.
+    if (binding.kind != cir::BindingKind::SYCLName ||
+        binding.launchSites.empty() || binding.syclConstArgs.empty())
+      continue;
+
+    if (binding.isTULocalOptimizable) {
+      // Every launch is visible and the kernel is TU-local: safe to fold the
+      // constant into the shared device kernel in place.
+      changed |= applyConstArgs(binding.deviceKernels, binding.syclConstArgs);
+    } else {
+      // Residual: the shared kernel is cross-TU / by-name reachable, so another
+      // TU could launch it with a different argument. Specialize by clone --
+      // redirect this TU's launches to a fresh kernel and fold the constant
+      // only into the clone, leaving the generic original for unseen launches.
+      auto spec = cir::specializeSYCLKernelForLaunches(
+          container, binding, binding.launchSites,
+          "constprop." + std::to_string(specTag++));
+      if (spec) {
+        applyConstArgs(spec->deviceKernels, binding.syclConstArgs);
+        changed = true; // The clone + redirect mutated the IR regardless.
       }
     }
   }

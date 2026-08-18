@@ -127,8 +127,12 @@ module attributes {cir.offload.container} {
 // -----
 
 // Non-TU-local kernel: a named (non-closure) kernel is reachable across TUs, so
-// even with distinct USM allocations it stays conservative -- not marked. The
-// only change from the first case is the kernel's mangled name.
+// the shared body is NOT mutated in place. With distinct USM allocations the
+// pass instead specializes by clone (copyKernel): it mints a fresh kernel with
+// llvm.noalias, redirects this TU's launch to it (the getDeviceKernelInfo marker
+// callee is repointed at a cloned getter), and leaves the generic original
+// untouched for launches this TU cannot see. The only change from the first
+// case is the kernel's mangled name.
 
 !s8i = !cir.int<s, 8>
 !s32i = !cir.int<s, 32>
@@ -170,7 +174,21 @@ module attributes {cir.offload.container} {
     }
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // This TU's launch marker is repointed at a cloned getter (a numeric
+    // suffix distinguishes it from the shared original), so this launch
+    // resolves the specialized clone at runtime.
+    // CHECK: cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv_{{[0-9]+}}()
+    //
+    // The shared original stays generic -- no llvm.noalias on its parameters.
+    // CHECK-LABEL: cir.func @_Z9addKernelv(
     // CHECK-NOT: llvm.noalias
+    //
+    // The specialized clone carries llvm.noalias on both distinct-USM
+    // parameters and the combine-private provenance marker.
+    // CHECK: cir.func @_Z9addKernelv.spec.noalias.0(
+    // CHECK-SAME: %arg0: !cir.ptr<!s32i, target_address_space(1)> {llvm.noalias}
+    // CHECK-SAME: %arg1: !cir.ptr<!s32i, target_address_space(1)> {llvm.noalias}
+    // CHECK-SAME: attributes {cir.specialization_private}
     cir.func @_Z9addKernelv(%arg0: !cir.ptr<!s32i, target_address_space(1)>, %arg1: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
       %0 = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam>
       %fa = cir.get_member %0[0] {name = "a"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
