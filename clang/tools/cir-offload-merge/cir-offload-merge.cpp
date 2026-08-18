@@ -370,6 +370,22 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   // have exposed the host allocation sources the analysis traces.
   pm.addPass(mlir::createOffloadInferKernelParamNoAliasPass());
 
+  // Propagate SYCL scalar captures that are the same compile-time constant at
+  // every visible launch into the device kernel body. Runs at container level
+  // (needs the host<->device binding table) after mem2reg/sccp have exposed the
+  // host-side constant capture stores the analysis traces.
+  pm.addPass(mlir::createOffloadPropagateSYCLKernelArgsPass());
+
+  // Simplify the nested modules again after the propagation above: mem2reg/sccp
+  // promote the scalar spill slots the substituted constant now feeds, folding
+  // any code (a captured-flag branch, a coefficient) that reaches the constant
+  // through a promotable slot; the closure record itself is left to the device
+  // backend's inline + SROA. Also cleans up the const-prop leftovers.
+  mlir::OpPassManager &simplifyPM = pm.nest<mlir::ModuleOp>();
+  simplifyPM.addPass(mlir::createMem2Reg());
+  simplifyPM.addPass(mlir::createSCCPPass());
+  simplifyPM.addPass(mlir::createCIRSimplifyPass());
+
   if (mlir::failed(pm.run(module)))
     return reportError("offload-container passes failed");
   return 0;

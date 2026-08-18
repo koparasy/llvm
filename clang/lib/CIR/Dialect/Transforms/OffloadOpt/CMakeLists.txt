@@ -6,6 +6,7 @@ add_clang_library(MLIRCIROffloadOpt
   LaunchBoundsPropagation.cpp
   StampReqdWorkGroupSize.cpp
   InferKernelParamNoAlias.cpp
+  PropagateSYCLKernelArgs.cpp
 
   DEPENDS
   MLIRCIROpsIncGen

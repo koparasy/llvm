@@ -1,0 +1,320 @@
+// RUN: cir-opt %s -split-input-file \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-propagate-sycl-kernel-args,builtin.module(mem2reg,sccp,cir-simplify))" \
+// RUN:   | FileCheck %s
+
+// A SYCL captured SCALAR that is the SAME compile-time constant at every visible
+// launch is propagated into the device kernel body. The propagation pass maps
+// each spir_kernel scalar parameter to its closure capture field (see the
+// prologue: arg -> spill slot -> reload -> store into a cir.get_member of the
+// closure), and, when the host-side recovery agreed a constant for that field
+// (KernelBinding::syclConstArgs), replaces the parameter's uses with a
+// cir.const. The follow-up device-module mem2reg/sccp/cir-simplify -- the same
+// passes cir-offload-merge runs after propagation -- then fold the constant
+// through the promotable spill slot. The kernel signature is untouched; the
+// argument simply becomes unused. This mirrors infer-kernel-param-noalias.cir.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_lam = !cir.struct<"lam" {data !s32i, data !s32i, data !s32i}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>)
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    // The captured flag (1) and coefficient (7) are compile-time constants;
+    // N is a runtime argument.
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>, %n: !s32i) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      %cflag = cir.const #cir.int<1> : !s32i
+      %ccoeff = cir.const #cir.int<7> : !s32i
+      %fflag = cir.get_member %lam[0] {name = "flag"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %cflag, %fflag : !s32i, !cir.ptr<!s32i>
+      %fcoeff = cir.get_member %lam[1] {name = "coeff"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %ccoeff, %fcoeff : !s32i, !cir.ptr<!s32i>
+      %fn = cir.get_member %lam[2] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %n, %fn : !s32i, !cir.ptr<!s32i>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // The flag/coeff parameters (%arg0/%arg1) are replaced by their agreed
+    // constants; the runtime N parameter (%arg2) is untouched, so the
+    // N-dependent store survives. The coefficient constant folds into the
+    // guarded store and the flag constant reaches the branch condition. The
+    // structured branch itself is finalized (flattened + eliminated) later by
+    // the device backend.
+    // CHECK-LABEL: cir.func @_ZTSZ4mainEUlvE_
+    // CHECK-DAG: %[[FLAG:.*]] = cir.const #cir.int<1> : !s32i
+    // CHECK-DAG: %[[COEFF:.*]] = cir.const #cir.int<7> : !s32i
+    // CHECK: cir.store %arg2, %arg3
+    // CHECK: cir.cast int_to_bool %[[FLAG]]
+    // CHECK: cir.if
+    // CHECK: cir.store %[[COEFF]], %arg3
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !s32i, %arg1: !s32i, %arg2: !s32i, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %sflag = cir.alloca "flag.addr" align(4) : !cir.ptr<!s32i>
+      %scoeff = cir.alloca "coeff.addr" align(4) : !cir.ptr<!s32i>
+      %sn = cir.alloca "n.addr" align(4) : !cir.ptr<!s32i>
+      cir.store %arg0, %sflag : !s32i, !cir.ptr<!s32i>
+      cir.store %arg1, %scoeff : !s32i, !cir.ptr<!s32i>
+      cir.store %arg2, %sn : !s32i, !cir.ptr<!s32i>
+      %vf = cir.load %sflag : !cir.ptr<!s32i>, !s32i
+      %ff = cir.get_member %clos[0] {name = "flag"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %vf, %ff : !s32i, !cir.ptr<!s32i>
+      %vc = cir.load %scoeff : !cir.ptr<!s32i>, !s32i
+      %fc = cir.get_member %clos[1] {name = "coeff"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %vc, %fc : !s32i, !cir.ptr<!s32i>
+      %vn = cir.load %sn : !cir.ptr<!s32i>, !s32i
+      %fn = cir.get_member %clos[2] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %vn, %fn : !s32i, !cir.ptr<!s32i>
+      %vn2 = cir.load %sn : !cir.ptr<!s32i>, !s32i
+      cir.store %vn2, %out : !s32i, !cir.ptr<!s32i, target_address_space(1)>
+      %bf = cir.load %sflag : !cir.ptr<!s32i>, !s32i
+      %cond = cir.cast int_to_bool %bf : !s32i -> !cir.bool
+      cir.if %cond {
+        %bc = cir.load %scoeff : !cir.ptr<!s32i>, !s32i
+        cir.store %bc, %out : !s32i, !cir.ptr<!s32i, target_address_space(1)>
+      }
+      cir.return
+    }
+  }
+}
+
+// -----
+
+// Runtime scalars are NOT propagated. Here the flag/coeff captures are runtime
+// values (host arguments), so host-side recovery agrees no constant and the
+// pass is a no-op: the block arguments themselves still drive the condition and
+// the guarded store.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_lam = !cir.struct<"lam" {data !s32i, data !s32i, data !s32i}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>)
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>, %flag: !s32i, %coeff: !s32i, %n: !s32i) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      %fflag = cir.get_member %lam[0] {name = "flag"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %flag, %fflag : !s32i, !cir.ptr<!s32i>
+      %fcoeff = cir.get_member %lam[1] {name = "coeff"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %coeff, %fcoeff : !s32i, !cir.ptr<!s32i>
+      %fn = cir.get_member %lam[2] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %n, %fn : !s32i, !cir.ptr<!s32i>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // CHECK-LABEL: cir.func @_ZTSZ4mainEUlvE_
+    // CHECK: cir.cast int_to_bool %arg0
+    // CHECK: cir.store %arg1, %arg3
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !s32i, %arg1: !s32i, %arg2: !s32i, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
+      %sflag = cir.alloca "flag.addr" align(4) : !cir.ptr<!s32i>
+      %scoeff = cir.alloca "coeff.addr" align(4) : !cir.ptr<!s32i>
+      cir.store %arg0, %sflag : !s32i, !cir.ptr<!s32i>
+      cir.store %arg1, %scoeff : !s32i, !cir.ptr<!s32i>
+      %bf = cir.load %sflag : !cir.ptr<!s32i>, !s32i
+      %cond = cir.cast int_to_bool %bf : !s32i -> !cir.bool
+      cir.if %cond {
+        %bc = cir.load %scoeff : !cir.ptr<!s32i>, !s32i
+        cir.store %bc, %out : !s32i, !cir.ptr<!s32i, target_address_space(1)>
+      }
+      cir.return
+    }
+  }
+}
+
+// -----
+
+// Disagreeing launch sites: the coefficient is 7 at both sites (agreed ->
+// propagated), but the flag is 1 at one site and 2 at the other (disagreement
+// -> dropped from the agreed set). The pass therefore substitutes coeff but
+// leaves flag as the block argument.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_lam = !cir.struct<"lam" {data !s32i, data !s32i}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>)
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @site_a(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      %f = cir.const #cir.int<1> : !s32i
+      %c = cir.const #cir.int<7> : !s32i
+      %ff = cir.get_member %lam[0] {name = "flag"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %f, %ff : !s32i, !cir.ptr<!s32i>
+      %fc = cir.get_member %lam[1] {name = "coeff"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %c, %fc : !s32i, !cir.ptr<!s32i>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func @site_b(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      %f = cir.const #cir.int<2> : !s32i
+      %c = cir.const #cir.int<7> : !s32i
+      %ff = cir.get_member %lam[0] {name = "flag"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %f, %ff : !s32i, !cir.ptr<!s32i>
+      %fc = cir.get_member %lam[1] {name = "coeff"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %c, %fc : !s32i, !cir.ptr<!s32i>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // CHECK-LABEL: cir.func @_ZTSZ4mainEUlvE_
+    // CHECK: %[[COEFF:.*]] = cir.const #cir.int<7> : !s32i
+    // CHECK: cir.store %arg0, %{{.*}}
+    // CHECK: cir.store %[[COEFF]], %{{.*}}
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !s32i, %arg1: !s32i) cc(spir_kernel) {
+      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %sflag = cir.alloca "flag.addr" align(4) : !cir.ptr<!s32i>
+      %scoeff = cir.alloca "coeff.addr" align(4) : !cir.ptr<!s32i>
+      cir.store %arg0, %sflag : !s32i, !cir.ptr<!s32i>
+      cir.store %arg1, %scoeff : !s32i, !cir.ptr<!s32i>
+      %vf = cir.load %sflag : !cir.ptr<!s32i>, !s32i
+      %ff = cir.get_member %clos[0] {name = "flag"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %vf, %ff : !s32i, !cir.ptr<!s32i>
+      %vc = cir.load %scoeff : !cir.ptr<!s32i>, !s32i
+      %fc = cir.get_member %clos[1] {name = "coeff"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %vc, %fc : !s32i, !cir.ptr<!s32i>
+      cir.return
+    }
+  }
+}
+
+// -----
+
+// Non-TU-local kernel: a genuine named functor closure (spellable type,
+// launchable from other TUs) stays conservative even though the same-shaped
+// lambda case would propagate. The captures are compile-time constants on the
+// host, but the binding is not TU-local, so NOTHING is propagated: every
+// parameter is still the block argument. The only change from the first case is
+// the kernel's mangled name and closure type.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_lam = !cir.struct<"lam" {data !s32i, data !s32i, data !s32i}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTS9MyFunctor" : !cir.array<!s8i x 14>, trailing_zeros> : !cir.array<!s8i x 15>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<14> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>)
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>, %n: !s32i) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      %cflag = cir.const #cir.int<1> : !s32i
+      %ccoeff = cir.const #cir.int<7> : !s32i
+      %fflag = cir.get_member %lam[0] {name = "flag"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %cflag, %fflag : !s32i, !cir.ptr<!s32i>
+      %fcoeff = cir.get_member %lam[1] {name = "coeff"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %ccoeff, %fcoeff : !s32i, !cir.ptr<!s32i>
+      %fn = cir.get_member %lam[2] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %n, %fn : !s32i, !cir.ptr<!s32i>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // CHECK-LABEL: cir.func @_ZTS9MyFunctor
+    // CHECK: cir.store %arg0, %{{.*}}
+    // CHECK: cir.store %arg1, %{{.*}}
+    // CHECK: cir.store %arg2, %{{.*}}
+    // CHECK: cir.cast int_to_bool %arg0
+    cir.func @_ZTS9MyFunctor(%arg0: !s32i, %arg1: !s32i, %arg2: !s32i, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %sflag = cir.alloca "flag.addr" align(4) : !cir.ptr<!s32i>
+      %scoeff = cir.alloca "coeff.addr" align(4) : !cir.ptr<!s32i>
+      %sn = cir.alloca "n.addr" align(4) : !cir.ptr<!s32i>
+      cir.store %arg0, %sflag : !s32i, !cir.ptr<!s32i>
+      cir.store %arg1, %scoeff : !s32i, !cir.ptr<!s32i>
+      cir.store %arg2, %sn : !s32i, !cir.ptr<!s32i>
+      %vf = cir.load %sflag : !cir.ptr<!s32i>, !s32i
+      %ff = cir.get_member %clos[0] {name = "flag"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %vf, %ff : !s32i, !cir.ptr<!s32i>
+      %vc = cir.load %scoeff : !cir.ptr<!s32i>, !s32i
+      %fc = cir.get_member %clos[1] {name = "coeff"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %vc, %fc : !s32i, !cir.ptr<!s32i>
+      %vn = cir.load %sn : !cir.ptr<!s32i>, !s32i
+      %fn = cir.get_member %clos[2] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %vn, %fn : !s32i, !cir.ptr<!s32i>
+      %vn2 = cir.load %sn : !cir.ptr<!s32i>, !s32i
+      cir.store %vn2, %out : !s32i, !cir.ptr<!s32i, target_address_space(1)>
+      %bf = cir.load %sflag : !cir.ptr<!s32i>, !s32i
+      %cond = cir.cast int_to_bool %bf : !s32i -> !cir.bool
+      cir.if %cond {
+        %bc = cir.load %scoeff : !cir.ptr<!s32i>, !s32i
+        cir.store %bc, %out : !s32i, !cir.ptr<!s32i, target_address_space(1)>
+      }
+      cir.return
+    }
+  }
+}

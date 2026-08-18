@@ -1031,6 +1031,102 @@ static void collectClosurePointerFields(
   }
 }
 
+//===----------------------------------------------------------------------===//
+// SYCL scalar-capture constant propagation
+//===----------------------------------------------------------------------===//
+//
+// A closure SCALAR capture field (int/float/bool, not a pointer/accessor) is
+// written the captured value on the host. When that value is the SAME
+// compile-time constant at every visible launch site, the device kernel
+// parameter bound to the field can be replaced by the constant. This mirrors
+// the noalias fold above, but over scalar fields, and records the agreed
+// constant attribute rather than a distinctness bit. Runs on the same collapsed
+// clone as the geometry / noalias recovery.
+
+// The scalar constant `v` holds, seeing through integral/bitcast reinterprets
+// CIRGen inserts around a captured scalar, or null if it is not a compile-time
+// scalar constant. Only int/float/bool constants qualify (a pointer/aggregate
+// constant is not a scalar capture we propagate).
+static mlir::TypedAttr asConstScalar(mlir::Value v) {
+  for (unsigned i = 0; i < 16 && v; ++i) {
+    if (auto c = v.getDefiningOp<cir::ConstantOp>()) {
+      mlir::TypedAttr attr = c.getValue();
+      if (mlir::isa<cir::IntAttr, cir::FPAttr, cir::BoolAttr>(attr))
+        return attr;
+      return {};
+    }
+    auto cast = v.getDefiningOp<cir::CastOp>();
+    if (cast && (cast.getKind() == cir::CastKind::integral ||
+                 cast.getKind() == cir::CastKind::bitcast)) {
+      v = cast.getSrc();
+      continue;
+    }
+    return {};
+  }
+  return {};
+}
+
+// The scalar capture fields of a closure object and the value written into
+// each: every cir.get_member whose field is a scalar (its pointee is an
+// int/float/bool, i.e. not a pointer capture) and which is stored a value.
+static void collectClosureScalarFields(
+    mlir::Value closure,
+    llvm::SmallVectorImpl<std::pair<llvm::StringRef, mlir::Value>> &out) {
+  if (!closure)
+    return;
+  for (mlir::Operation *user : closure.getUsers()) {
+    auto gm = mlir::dyn_cast<cir::GetMemberOp>(user);
+    if (!gm)
+      continue;
+    auto ptrType = mlir::dyn_cast<cir::PointerType>(gm.getResult().getType());
+    if (!ptrType)
+      continue;
+    mlir::Type pointee = ptrType.getPointee();
+    if (!mlir::isa<cir::IntType, cir::FPTypeInterface, cir::BoolType>(pointee))
+      continue;
+    if (mlir::Value stored = findFieldStoredValue(closure, gm.getName()))
+      out.emplace_back(gm.getName(), stored);
+  }
+}
+
+// Fold one launch site's closure into the running constant-argument agreement
+// for a kernel. A field maps here to the constant it is stored; a field stored
+// a non-constant is simply absent. Agreement is ANDed across sites: a field
+// survives only if present with the SAME constant at this site and every
+// earlier one, so a disagreeing or non-constant store at any site drops it.
+static void foldClosureConstArgs(mlir::Value closureOperand, bool &seenAnySite,
+                                 llvm::StringMap<mlir::TypedAttr> &consts) {
+  mlir::Value closure = traceClosureObject(closureOperand);
+  llvm::SmallVector<std::pair<llvm::StringRef, mlir::Value>, 4> fields;
+  collectClosureScalarFields(closure, fields);
+
+  llvm::StringMap<mlir::TypedAttr> here;
+  for (auto &f : fields) {
+    mlir::TypedAttr c = asConstScalar(f.second);
+    // A field appearing twice, or a non-constant store, is not a clean
+    // single-constant source: drop it for this site.
+    if (!c || here.count(f.first))
+      here[f.first] = nullptr;
+    else
+      here[f.first] = c;
+  }
+
+  if (!seenAnySite) {
+    consts = std::move(here);
+    seenAnySite = true;
+    return;
+  }
+  // AND across sites: keep a field only when it is present with the same
+  // constant here and previously.
+  llvm::StringMap<mlir::TypedAttr> merged;
+  for (auto &e : consts) {
+    mlir::TypedAttr hereVal = here.lookup(e.first());
+    if (e.second && hereVal && e.second == hereVal)
+      merged[e.first()] = e.second;
+  }
+  consts = std::move(merged);
+}
+
 // Fold one launch site's closure into the running noalias eligibility for a
 // kernel. A field is eligible at this site iff it resolves to a USM allocation
 // distinct from every other captured pointer of the same closure; a source
@@ -1081,13 +1177,17 @@ static void foldClosureNoAlias(mlir::Value closureOperand, bool &seenAnySite,
 // then for each surviving getDeviceKernelInfo marker resolves the kernel it
 // names and traces the launch it feeds. Keyed by the kernel's _ZTS mangled name
 // so the results map straight onto the SYCL bindings, which are keyed the same.
-static llvm::StringMap<SyclGeometry>
-computeSYCLGeometry(mlir::ModuleOp container,
-                    llvm::StringMap<llvm::StringSet<>> &noAliasFields) {
+static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
+    mlir::ModuleOp container,
+    llvm::StringMap<llvm::StringSet<>> &noAliasFields,
+    llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> &constArgs) {
   llvm::StringMap<SyclGeometry> result;
   // Per-kernel running noalias eligibility, ANDed across the kernel's sites.
   llvm::StringMap<bool> seenSite;
   llvm::StringMap<llvm::StringMap<bool>> eligible;
+  // Per-kernel running constant-argument agreement, ANDed across the sites.
+  llvm::StringMap<bool> constSeenSite;
+  llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> constEligible;
   mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
 
   // Throwaway clone -- the real emitted module is never mutated.
@@ -1137,6 +1237,10 @@ computeSYCLGeometry(mlir::ModuleOp container,
       bool seen = seenSite.lookup(kernel);
       foldClosureNoAlias(args[SyclClosureOperand], seen, eligible[kernel]);
       seenSite[kernel] = seen;
+      bool constSeen = constSeenSite.lookup(kernel);
+      foldClosureConstArgs(args[SyclClosureOperand], constSeen,
+                           constEligible[kernel]);
+      constSeenSite[kernel] = constSeen;
     }
   });
 
@@ -1146,6 +1250,14 @@ computeSYCLGeometry(mlir::ModuleOp container,
     for (auto &f : e.second)
       if (f.second)
         fields.insert(f.first());
+  }
+
+  // Publish the surviving agreed-constant scalar fields per kernel.
+  for (auto &e : constEligible) {
+    llvm::StringMap<mlir::TypedAttr> &fields = constArgs[e.first()];
+    for (auto &f : e.second)
+      if (f.second)
+        fields[f.first()] = f.second;
   }
 
   return result;
@@ -1226,8 +1338,9 @@ void KernelBindingTable::recordSYCLLaunchSites(
   // also yields the closure capture fields backed by pairwise-distinct USM
   // allocations, so noalias can be inferred without cloning twice.
   llvm::StringMap<llvm::StringSet<>> noAliasFields;
+  llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> constArgs;
   llvm::StringMap<SyclGeometry> geometry =
-      computeSYCLGeometry(container, noAliasFields);
+      computeSYCLGeometry(container, noAliasFields, constArgs);
 
   for (auto &binding : bindings) {
     if (binding.second.kind != BindingKind::SYCLName)
@@ -1235,6 +1348,9 @@ void KernelBindingTable::recordSYCLLaunchSites(
     auto it = noAliasFields.find(binding.first);
     if (it != noAliasFields.end())
       binding.second.syclNoAliasFields = std::move(it->second);
+    auto cit = constArgs.find(binding.first);
+    if (cit != constArgs.end())
+      binding.second.syclConstArgs = std::move(cit->second);
   }
 
   hostModule.walk([&](cir::CallOp call) {
@@ -1305,6 +1421,19 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
          << (binding.second.isTULocalOptimizable ? "optimizable"
                                                  : "conservative")
          << ")\n";
+      if (!binding.second.syclConstArgs.empty()) {
+        // Sorted for deterministic output (StringMap iteration is unordered).
+        llvm::SmallVector<llvm::StringRef, 4> names;
+        for (auto &c : binding.second.syclConstArgs)
+          names.push_back(c.first());
+        llvm::sort(names);
+        os << "//   const-args";
+        for (llvm::StringRef n : names) {
+          os << " " << n << "=";
+          binding.second.syclConstArgs.lookup(n).print(os);
+        }
+        os << "\n";
+      }
     } else {
       cir::FuncOp stub = binding.second.hostStub;
       os << "//   host-stub @" << stub.getName() << "\n";

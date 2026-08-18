@@ -422,4 +422,32 @@ def OffloadInferKernelParamNoAlias
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def OffloadPropagateSYCLKernelArgs
+    : Pass<"cir-offload-propagate-sycl-kernel-args", "mlir::ModuleOp"> {
+  let summary = "Propagate constant SYCL scalar captures into device kernels";
+  let description = [{
+    Runs over a `cir.offload.container`. A SYCL device kernel scalar parameter
+    (int/float/bool) is bound to a closure capture field. When, at every visible
+    launch site, that field is written the SAME compile-time constant, the uses
+    of the parameter inside the device kernel are replaced by the constant,
+    using the host<->device correspondence and closure-constant analysis from
+    `KernelBindingTable`.
+
+    Only device code is rewritten, and the kernel signature/ABI is left alone:
+    the host still passes the argument, which simply becomes unused on the
+    device side. Only TU-local/optimizable bindings (every launch visible) are
+    touched, and the shared device kernel is annotated in place -- never cloned.
+    A parameter that is a pointer/accessor, whose field has no agreed constant,
+    or whose sites disagree, is left untouched.
+
+    The captured value is stored into the closure record and read back inside
+    the always_inline operator(), so the branch/arithmetic a captured flag or
+    coefficient feeds only folds once the value reaches it: this pass makes the
+    closure-field store a constant, and a follow-up device-module mem2reg/SCCP
+    (or the device backend's inline + SROA) performs the fold.
+  }];
+  let constructor = "mlir::createOffloadPropagateSYCLKernelArgsPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
 #endif // CLANG_CIR_DIALECT_PASSES_TD

@@ -120,6 +120,10 @@ int main(int argc, char **argv) {
     return mlir::createOffloadInferKernelParamNoAliasPass();
   });
 
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::createOffloadPropagateSYCLKernelArgsPass();
+  });
+
   mlir::omp::registerOpenMPPasses();
   mlir::registerTransformsPasses();
 

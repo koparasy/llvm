@@ -31,6 +31,7 @@
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -186,6 +187,16 @@ struct KernelBinding {
   // optimizable bindings; empty when recovery could not prove distinctness
   // (unresolved source, shared base, pointer arithmetic -> conservatively out).
   llvm::StringSet<> syclNoAliasFields;
+
+  // SYCL only: closure capture fields whose stored SCALAR value is, at EVERY
+  // visible launch site, the SAME compile-time constant. Maps the field name to
+  // that constant (an int/float/bool cir.const value). The device kernel
+  // parameter bound to such a field can have its uses replaced by the constant
+  // (the argument becomes unused; the signature/ABI is preserved). Populated
+  // only for TU-local optimizable bindings; a field whose value is non-constant
+  // at any site, or whose sites disagree, is absent (conservatively out). This
+  // is the scalar analogue of syclNoAliasFields.
+  llvm::StringMap<mlir::TypedAttr> syclConstArgs;
 
   llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
   llvm::SmallVector<LaunchSite, 2> launchSites;
