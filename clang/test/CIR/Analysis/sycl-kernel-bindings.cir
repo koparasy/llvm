@@ -574,3 +574,89 @@ module attributes {cir.offload.container} {
 // CHECK-NEXT: no-alias f0 f1
 // CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
 // CHECK-NEXT: launch in @cg (sycl, all-visible), closure traced, global=[512], local=[128]
+
+// -----
+
+// A handler-submit closure captured BY REFERENCE. `q.submit([&](handler& h){
+// h.parallel_for(...) })` captures the enclosing `[&]` variables by reference,
+// so the two USM pointers reach the device closure as `load(load(&local))`: the
+// command-group functor is copied by value (a whole-struct load+store), the
+// closure field holds `&local`, and the kernel dereferences it twice. This is
+// the shape that severs the pointer from its malloc_device on the direct trace
+// (the allocations live in the caller). Recovery follows the reference through
+// the by-value aggregate copy back to each distinct allocation, so both fields
+// are still proven distinct-USM and get noalias. Models the shape after the
+// launch chain is collapsed into the caller.
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!rec_outer = !cir.struct<"outer" {data !cir.ptr<!cir.ptr<!cir.float>>, data !cir.ptr<!cir.ptr<!cir.float>>}>
+!rec_clos = !cir.struct<"clos" {data !cir.ptr<!cir.float>, data !cir.ptr<!cir.float>}>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!s8i>, !cir.ptr<!s8i>)
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(!cir.ptr<!s8i>, !cir.ptr<!rec_clos>)
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPvm(!u64i) -> !cir.ptr<!cir.float>
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @cg(%h: !cir.ptr<!s8i>, %hk: !cir.ptr<!s8i>) {
+      %n = cir.const #cir.int<8> : !u64i
+      // Two distinct USM allocations, held in caller locals (loc0/loc1).
+      %m0 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPvm(%n) : (!u64i) -> !cir.ptr<!cir.float>
+      %m1 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPvm(%n) : (!u64i) -> !cir.ptr<!cir.float>
+      %loc0 = cir.alloca "loc0" align(8) : !cir.ptr<!cir.ptr<!cir.float>>
+      %loc1 = cir.alloca "loc1" align(8) : !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %m0, %loc0 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %m1, %loc1 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      // The [&] functor holds references (&loc0, &loc1).
+      %outer = cir.alloca "outer" align(8) : !cir.ptr<!rec_outer>
+      %or0 = cir.get_member %outer[0] {name = "f0"} : !cir.ptr<!rec_outer> -> !cir.ptr<!cir.ptr<!cir.ptr<!cir.float>>>
+      cir.store %loc0, %or0 : !cir.ptr<!cir.ptr<!cir.float>>, !cir.ptr<!cir.ptr<!cir.ptr<!cir.float>>>
+      %or1 = cir.get_member %outer[1] {name = "f1"} : !cir.ptr<!rec_outer> -> !cir.ptr<!cir.ptr<!cir.ptr<!cir.float>>>
+      cir.store %loc1, %or1 : !cir.ptr<!cir.ptr<!cir.float>>, !cir.ptr<!cir.ptr<!cir.ptr<!cir.float>>>
+      // By-value copy of the functor (queue::submit takes it byval): whole
+      // struct load + store.
+      %ocopy = cir.alloca "ocopy" align(8) : !cir.ptr<!rec_outer>
+      %ov = cir.load %outer : !cir.ptr<!rec_outer>, !rec_outer
+      cir.store %ov, %ocopy : !rec_outer, !cir.ptr<!rec_outer>
+      // Inner closure captures: load(load(&local)) -- one reference deref.
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_clos>
+      %cr0 = cir.get_member %ocopy[0] {name = "f0"} : !cir.ptr<!rec_outer> -> !cir.ptr<!cir.ptr<!cir.ptr<!cir.float>>>
+      %ref0 = cir.load %cr0 : !cir.ptr<!cir.ptr<!cir.ptr<!cir.float>>>, !cir.ptr<!cir.ptr<!cir.float>>
+      %v0 = cir.load %ref0 : !cir.ptr<!cir.ptr<!cir.float>>, !cir.ptr<!cir.float>
+      %cf0 = cir.get_member %clos[0] {name = "c0"} : !cir.ptr<!rec_clos> -> !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %v0, %cf0 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      %cr1 = cir.get_member %ocopy[1] {name = "f1"} : !cir.ptr<!rec_outer> -> !cir.ptr<!cir.ptr<!cir.ptr<!cir.float>>>
+      %ref1 = cir.load %cr1 : !cir.ptr<!cir.ptr<!cir.ptr<!cir.float>>>, !cir.ptr<!cir.ptr<!cir.float>>
+      %v1 = cir.load %ref1 : !cir.ptr<!cir.ptr<!cir.float>>, !cir.ptr<!cir.float>
+      %cf1 = cir.get_member %clos[1] {name = "c1"} : !cir.ptr<!rec_clos> -> !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %v1, %cf1 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(%hk, %clos) : (!cir.ptr<!s8i>, !cir.ptr<!rec_clos>) -> ()
+      %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.store %dki, %slot : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
+      %r = cir.load %slot : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %r) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTSZ4mainEUlvE_
+// CHECK-NEXT: host-name @.str (sycl, optimizable)
+// CHECK-NEXT: no-alias c0 c1
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
+// CHECK-NEXT: launch in @cg (sycl, all-visible), closure traced, geometry none
