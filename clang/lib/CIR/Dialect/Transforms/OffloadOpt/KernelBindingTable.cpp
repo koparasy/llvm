@@ -948,6 +948,12 @@ static std::optional<AccessPath> matchPrefix(const AccessPath &pre,
   return AccessPath(full.begin() + pre.size(), full.end());
 }
 
+// The SSA value stored into memory cell (`root` + `target` path) -- defined
+// below; forward-declared so resolveScalarAt can dereference a by-reference
+// capture (read the pointer a closure field holds, then read through it).
+static mlir::Value storedValueAt(mlir::Value root, const AccessPath &target,
+                                 unsigned depth);
+
 // Resolve the constant integer stored at memory cell (`root` + `target` path),
 // following whole-object and sub-object writes back through the aggregate
 // load/store/copy/bitcast chain the launch shims build. Returns nullopt if the
@@ -960,8 +966,26 @@ resolveScalarAt(mlir::Value root, const AccessPath &target, unsigned depth) {
   // A loaded value carries the bytes of the object it was loaded from; read the
   // same path within that object.
   if (auto load = root.getDefiningOp<cir::LoadOp>()) {
+    mlir::Value addr = load.getAddr();
+    // A `[&]`-captured aggregate (e.g. an nd_range built from a captured range)
+    // reaches the kernel as `load(load(&local))`: the address is itself a
+    // loaded reference. Resolve the pointer it holds (through the by-value
+    // closure copies) and read within the object it points at -- one
+    // dereference beyond the plain aggregate-copy chain. This is what recovers
+    // geometry / scalar captures on the q.submit(handler) path, where the sizes
+    // live in the caller and reach the launch only by reference.
+    if (auto ref = addr.getDefiningOp<cir::LoadOp>()) {
+      AccessPath rp;
+      mlir::Value rr = decomposePointer(ref.getAddr(), rp);
+      if (mlir::Value real = storedValueAt(rr, rp, depth + 1)) {
+        AccessPath p;
+        mlir::Value r = decomposePointer(real, p);
+        p.append(target.begin(), target.end());
+        return resolveScalarAt(r, p, depth + 1);
+      }
+    }
     AccessPath p;
-    mlir::Value r = decomposePointer(load.getAddr(), p);
+    mlir::Value r = decomposePointer(addr, p);
     p.append(target.begin(), target.end());
     return resolveScalarAt(r, p, depth + 1);
   }
@@ -1027,23 +1051,21 @@ resolveScalarAt(mlir::Value root, const AccessPath &target, unsigned depth) {
         // Exact scalar cell.
         if (auto v = asConstInt(srcVal))
           return v;
-        if (auto load = srcVal.getDefiningOp<cir::LoadOp>()) {
-          AccessPath p;
-          mlir::Value r = decomposePointer(load.getAddr(), p);
-          if (auto v = resolveScalarAt(r, p, depth + 1))
+        // A loaded scalar: re-resolve it as a root so the load handling (and
+        // its by-reference dereference) applies.
+        if (srcVal.getDefiningOp<cir::LoadOp>())
+          if (auto v = resolveScalarAt(srcVal, {}, depth + 1))
             return v;
-        }
         continue;
       }
       // The store wrote an enclosing aggregate; its value must be a loaded
-      // aggregate -- read the remaining path within its source object.
-      if (auto load = srcVal.getDefiningOp<cir::LoadOp>()) {
-        AccessPath p;
-        mlir::Value r = decomposePointer(load.getAddr(), p);
-        p.append(rem->begin(), rem->end());
-        if (auto v = resolveScalarAt(r, p, depth + 1))
+      // aggregate -- read the remaining path within its source object. Recurse
+      // with the loaded value as the root (rather than decomposing its address
+      // here) so the top-level load handling dereferences a by-reference
+      // capture.
+      if (srcVal.getDefiningOp<cir::LoadOp>())
+        if (auto v = resolveScalarAt(srcVal, *rem, depth + 1))
           return v;
-      }
     }
   }
   return std::nullopt;
@@ -1072,6 +1094,33 @@ static mlir::Value stripToPointerObject(mlir::Value v) {
   return v;
 }
 
+// Follow a by-value aggregate copy back to the original object: an alloca whose
+// whole-object content is written by `store (load %orig), %alloca` or
+// `cir.copy %orig to %alloca`. handler::setNDRangeDescriptor takes the
+// nd_range_view BY VALUE, so the launch operand is a copy while the field
+// stores (MGlobalSize/MLocalSize/MDims) live on the original; strip to it.
+static mlir::Value stripAggregateCopy(mlir::Value v) {
+  for (unsigned i = 0; i < 8 && v; ++i) {
+    mlir::Value src;
+    for (mlir::Operation *u : v.getUsers()) {
+      if (auto st = mlir::dyn_cast<cir::StoreOp>(u)) {
+        if (st.getAddr() != v)
+          continue;
+        // A whole-object store of a loaded aggregate is a by-value copy.
+        if (auto load = st.getValue().getDefiningOp<cir::LoadOp>())
+          src = load.getAddr();
+      } else if (auto cp = mlir::dyn_cast<cir::CopyOp>(u)) {
+        if (cp.getDst() == v)
+          src = cp.getSrc();
+      }
+    }
+    if (!src)
+      break;
+    v = src;
+  }
+  return v;
+}
+
 // The value stored into `view`'s named field, or null. Matches the get_member
 // naming the field and the store into it.
 static mlir::Value findFieldStoredValue(mlir::Value view,
@@ -1094,7 +1143,7 @@ static mlir::Value findFieldStoredValue(mlir::Value view,
 // nd_range object's array slots; trace those back to the constant stores.
 static SyclGeometry traceNDRange(mlir::Value viewOperand) {
   SyclGeometry g;
-  mlir::Value view = stripToPointerObject(viewOperand);
+  mlir::Value view = stripAggregateCopy(stripToPointerObject(viewOperand));
   if (!view)
     return g;
 

@@ -660,3 +660,111 @@ module attributes {cir.offload.container} {
 // CHECK-NEXT: no-alias c0 c1
 // CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
 // CHECK-NEXT: launch in @cg (sycl, all-visible), closure traced, geometry none
+
+// -----
+
+// Handler-submit GEOMETRY captured BY REFERENCE. The nd_range's global/local
+// ranges are built in the caller and captured `[&]`, so the command-group body
+// reads them as `load(load(&range))`, and handler::setNDRangeDescriptor takes
+// the nd_range_view BY VALUE (a whole-struct copy). Recovery strips the by-value
+// view copy back to the original, then dereferences the captured ranges through
+// the by-value functor copy to reach the constant sizes -- so a launch whose
+// geometry is captured by reference still recovers const work-group sizes
+// (global=512, local=256). Models the collapsed-into-caller shape.
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!rec_arr = !cir.struct<"arr" {data !cir.array<!u64i x 1>}>
+!rec_range = !cir.struct<"range" {data !rec_arr}>
+!rec_ndr = !cir.struct<"ndr" {data !rec_range, data !rec_range}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !cir.ptr<!u64i>, data !cir.ptr<!u64i>, data !u64i}>
+!rec_outer = !cir.struct<"outer" {data !cir.ptr<!rec_range>, data !cir.ptr<!rec_range>}>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!s8i>, !cir.ptr<!s8i>)
+    cir.func private @_ZN4sycl3_V17handler20setNDRangeDescriptorENS0_6detail13nd_range_viewEb(!cir.ptr<!s8i>, !cir.ptr<!rec_view>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @cg(%h: !cir.ptr<!s8i>) {
+      %g = cir.const #cir.int<512> : !u64i
+      %l = cir.const #cir.int<256> : !u64i
+      %one = cir.const #cir.int<1> : !u64i
+      // Caller-local global/local ranges with constant sizes.
+      %rgG = cir.alloca "rgG" align(8) : !cir.ptr<!rec_range>
+      %rgL = cir.alloca "rgL" align(8) : !cir.ptr<!rec_range>
+      %gGa = cir.base_class_addr nonnull %rgG [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
+      %gGc = cir.get_member %gGa[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %gGp = cir.cast array_to_ptrdecay %gGc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      cir.store %g, %gGp : !u64i, !cir.ptr<!u64i>
+      %gLa = cir.base_class_addr nonnull %rgL [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
+      %gLc = cir.get_member %gLa[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %gLp = cir.cast array_to_ptrdecay %gLc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      cir.store %l, %gLp : !u64i, !cir.ptr<!u64i>
+      // The [&] functor holds references to the ranges.
+      %outer = cir.alloca "outer" align(8) : !cir.ptr<!rec_outer>
+      %og = cir.get_member %outer[0] {name = "gref"} : !cir.ptr<!rec_outer> -> !cir.ptr<!cir.ptr<!rec_range>>
+      cir.store %rgG, %og : !cir.ptr<!rec_range>, !cir.ptr<!cir.ptr<!rec_range>>
+      %ol = cir.get_member %outer[1] {name = "lref"} : !cir.ptr<!rec_outer> -> !cir.ptr<!cir.ptr<!rec_range>>
+      cir.store %rgL, %ol : !cir.ptr<!rec_range>, !cir.ptr<!cir.ptr<!rec_range>>
+      // By-value functor copy.
+      %ocopy = cir.alloca "ocopy" align(8) : !cir.ptr<!rec_outer>
+      %ov = cir.load %outer : !cir.ptr<!rec_outer>, !rec_outer
+      cir.store %ov, %ocopy : !rec_outer, !cir.ptr<!rec_outer>
+      // Build the nd_range by loading each range THROUGH the reference.
+      %ndr = cir.alloca "ndr" align(8) : !cir.ptr<!rec_ndr>
+      %cg0 = cir.get_member %ocopy[0] {name = "gref"} : !cir.ptr<!rec_outer> -> !cir.ptr<!cir.ptr<!rec_range>>
+      %gref = cir.load %cg0 : !cir.ptr<!cir.ptr<!rec_range>>, !cir.ptr<!rec_range>
+      %gval = cir.load %gref : !cir.ptr<!rec_range>, !rec_range
+      %ng = cir.get_member %ndr[0] {name = "globalSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      cir.store %gval, %ng : !rec_range, !cir.ptr<!rec_range>
+      %cl0 = cir.get_member %ocopy[1] {name = "lref"} : !cir.ptr<!rec_outer> -> !cir.ptr<!cir.ptr<!rec_range>>
+      %lref = cir.load %cl0 : !cir.ptr<!cir.ptr<!rec_range>>, !cir.ptr<!rec_range>
+      %lval = cir.load %lref : !cir.ptr<!rec_range>, !rec_range
+      %nl = cir.get_member %ndr[1] {name = "localSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      cir.store %lval, %nl : !rec_range, !cir.ptr<!rec_range>
+      // nd_range_view with interior pointers into the nd_range arrays.
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %vga = cir.base_class_addr nonnull %ng [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
+      %vgc = cir.get_member %vga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %vgp = cir.cast array_to_ptrdecay %vgc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      %mg = cir.get_member %view[0] {name = "MGlobalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
+      cir.store %vgp, %mg : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
+      %vla = cir.base_class_addr nonnull %nl [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
+      %vlc = cir.get_member %vla[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %vlp = cir.cast array_to_ptrdecay %vlc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      %ml = cir.get_member %view[1] {name = "MLocalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
+      cir.store %vlp, %ml : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
+      %md = cir.get_member %view[3] {name = "MDims"} : !cir.ptr<!rec_view> -> !cir.ptr<!u64i>
+      cir.store %one, %md : !u64i, !cir.ptr<!u64i>
+      // setNDRangeDescriptor takes the view BY VALUE (whole-struct copy).
+      %vcopy = cir.alloca "vcopy" align(8) : !cir.ptr<!rec_view>
+      %vv = cir.load %view : !cir.ptr<!rec_view>, !rec_view
+      cir.store %vv, %vcopy : !rec_view, !cir.ptr<!rec_view>
+      cir.call @_ZN4sycl3_V17handler20setNDRangeDescriptorENS0_6detail13nd_range_viewEb(%h, %vcopy) : (!cir.ptr<!s8i>, !cir.ptr<!rec_view>) -> ()
+      %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.store %dki, %slot : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
+      %r = cir.load %slot : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %r) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTSZ4mainEUlvE_
+// CHECK-NEXT: host-name @.str (sycl, optimizable)
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
+// CHECK-NEXT: launch in @cg (sycl, all-visible), closure none, global=[512], local=[256]
