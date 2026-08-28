@@ -458,6 +458,146 @@ static bool isSubmitKernelDirectImpl(cir::CallOp call) {
                        "_ZN4sycl3_V136submit_kernel_direct_with_event_impl");
 }
 
+//===----------------------------------------------------------------------===//
+// SYCL handler-submit launch shape
+//===----------------------------------------------------------------------===//
+//
+// The direct `q.parallel_for(...)` shortcut launches through
+// submit_kernel_direct_with_event_impl. The far more common
+// `q.submit([&](handler& h){ h.parallel_for(...); })` form launches through a
+// set of handler methods instead, tied together by the shared `handler* this`:
+//
+//   handler::setDeviceKernelInfo<K>(this, closurePtr):     // templated,
+//   inlined
+//       handler::setKernelFunc(this, closurePtr)
+//       %dki = detail::getDeviceKernelInfo<K>()            // SAME name marker
+//       handler::setDeviceKernelInfoPtr(this, %dki)        // the dki sink
+//   handler::setNDRangeDescriptor(this, nd_range_view)     // the geometry sink
+//
+// setDeviceKernelInfoPtr / setKernelFunc / setNDRangeDescriptor are
+// __SYCL_EXPORT decl-only ABI boundaries, so they survive inlining as calls and
+// their operands can be read directly. The name anchor (getDeviceKernelInfo) is
+// identical to the direct path, so resolveLaunchedNameString is unchanged.
+
+// Whether `call` is `handler::setDeviceKernelInfoPtr(handler,
+// DeviceKernelInfo*)`
+// -- the handler-path sink the marker's result flows into (arg0 is the handler,
+// the join key for the launch's sibling calls).
+static bool isHandlerSetDeviceKernelInfoPtr(cir::CallOp call) {
+  std::optional<llvm::StringRef> callee = call.getCallee();
+  return callee &&
+         callee->starts_with("_ZN4sycl3_V17handler22setDeviceKernelInfoPtr");
+}
+
+// Whether `call` is `handler::setNDRangeDescriptor(handler, nd_range_view)` --
+// the handler-path geometry sink (arg1 is the nd_range_view, same object
+// traceNDRange consumes on the direct path).
+static bool isHandlerSetNDRangeDescriptor(cir::CallOp call) {
+  std::optional<llvm::StringRef> callee = call.getCallee();
+  return callee && callee->contains("7handler20setNDRangeDescriptor");
+}
+
+// Whether `call` constructs a `detail::HostKernel<...>` -- the wrapper the
+// handler path builds around the user lambda. Its arg1 is the lambda object
+// carrying the capture stores, which no surviving handler-method sink
+// references.
+// (`10HostKernelI` is the templated wrapper; it excludes `14HostKernelBase`.)
+static bool isHostKernelCtor(cir::CallOp call) {
+  std::optional<llvm::StringRef> callee = call.getCallee();
+  if (!callee)
+    return false;
+  return callee->contains("6detail10HostKernelI") &&
+         (callee->contains("C1") || callee->contains("C2"));
+}
+
+// The operands of a recovered SYCL launch, from either launch shape. The direct
+// path reads them from fixed positions of the runtime launch call; the handler
+// path recovers them from sibling handler-method calls sharing the handler.
+namespace {
+struct RecoveredLaunch {
+  cir::CallOp anchor;   // stored as LaunchSite::stubCall (launch-in @caller)
+  mlir::Value geometry; // nd_range_view* operand
+  mlir::Value
+      closure; // HostKernelRef* (direct) / lambda-bearing value (handler)
+};
+} // namespace
+
+// The nd_range_view a handler-path launch feeds setNDRangeDescriptor, found by
+// the shared handler operand.
+static mlir::Value findHandlerNDRangeView(mlir::Value handler) {
+  for (mlir::Operation *user : handler.getUsers()) {
+    auto call = mlir::dyn_cast<cir::CallOp>(user);
+    if (!call || !isHandlerSetNDRangeDescriptor(call))
+      continue;
+    mlir::OperandRange args = call.getArgOperands();
+    if (args.size() >= 2 && args[0] == handler)
+      return args[1];
+  }
+  return {};
+}
+
+// The user lambda a handler-path launch captures, taken from the HostKernel
+// constructor's arg1. Searched within the launch-rooted function (the marker's
+// enclosing function after inlining), where the wrapper construction and the
+// capture stores have been co-located. Returns the ctor's lambda operand; the
+// closure trace strips it to the record object.
+static mlir::Value findHandlerClosure(mlir::Operation *rootedAt) {
+  auto fn = rootedAt->getParentOfType<cir::FuncOp>();
+  if (!fn)
+    return {};
+  mlir::Value found;
+  fn.walk([&](cir::CallOp call) {
+    if (found || !isHostKernelCtor(call))
+      return;
+    mlir::OperandRange args = call.getArgOperands();
+    if (args.size() >= 2)
+      found = args[1];
+  });
+  return found;
+}
+
+// Follow the DeviceKernelInfo* result of a getDeviceKernelInfo call to the
+// launch it drives, recognizing both launch shapes. CIRGen spills the pointer
+// into a stack slot and reloads it before the consuming call, so hop
+// store->slot->load once. Direct path: the pointer reaches
+// submit_kernel_direct_with_event_impl, whose fixed operands carry the geometry
+// and closure. Handler path: it reaches handler::setDeviceKernelInfoPtr, and
+// the geometry/closure are recovered from the sibling handler calls.
+static std::optional<RecoveredLaunch>
+recoverLaunch(mlir::Value deviceKernelInfo) {
+  llvm::SmallVector<mlir::Value, 2> reachable{deviceKernelInfo};
+  for (mlir::Operation *user : deviceKernelInfo.getUsers()) {
+    auto store = mlir::dyn_cast<cir::StoreOp>(user);
+    if (!store || store.getValue() != deviceKernelInfo)
+      continue;
+    for (mlir::Operation *slotUser : store.getAddr().getUsers())
+      if (auto load = mlir::dyn_cast<cir::LoadOp>(slotUser))
+        reachable.push_back(load.getResult());
+  }
+  for (mlir::Value v : reachable)
+    for (mlir::Operation *user : v.getUsers()) {
+      auto call = mlir::dyn_cast<cir::CallOp>(user);
+      if (!call)
+        continue;
+      if (isSubmitKernelDirectImpl(call)) {
+        mlir::OperandRange args = call.getArgOperands();
+        if (args.size() <= SyclDeviceKernelInfoOperand)
+          return std::nullopt;
+        return RecoveredLaunch{call, args[SyclGeometryOperand],
+                               args[SyclClosureOperand]};
+      }
+      if (isHandlerSetDeviceKernelInfoPtr(call)) {
+        mlir::OperandRange args = call.getArgOperands();
+        if (args.empty())
+          return std::nullopt;
+        mlir::Value handler = args[0];
+        return RecoveredLaunch{call, findHandlerNDRangeView(handler),
+                               findHandlerClosure(call)};
+      }
+    }
+  return std::nullopt;
+}
+
 // The `.str` char-array GlobalOp a CompileTimeKernelInfo record names as its
 // kernel-name string_view -- its first member `{global_view<@.str>, len}`.
 static cir::GlobalOp getCompileTimeKernelName(cir::GlobalOp info) {
@@ -501,27 +641,6 @@ static cir::GlobalOp resolveLaunchedNameString(cir::CallOp call) {
   return nameString;
 }
 
-// Follow the DeviceKernelInfo* result of a getDeviceKernelInfo call to the
-// runtime launch call that consumes it. CIRGen spills the pointer into a stack
-// slot and reloads it before the call, so hop store->slot->load once.
-static cir::CallOp traceLaunchCall(mlir::Value deviceKernelInfo) {
-  llvm::SmallVector<mlir::Value, 2> reachable{deviceKernelInfo};
-  for (mlir::Operation *user : deviceKernelInfo.getUsers()) {
-    auto store = mlir::dyn_cast<cir::StoreOp>(user);
-    if (!store || store.getValue() != deviceKernelInfo)
-      continue;
-    for (mlir::Operation *slotUser : store.getAddr().getUsers())
-      if (auto load = mlir::dyn_cast<cir::LoadOp>(slotUser))
-        reachable.push_back(load.getResult());
-  }
-  for (mlir::Value v : reachable)
-    for (mlir::Operation *user : v.getUsers())
-      if (auto call = mlir::dyn_cast<cir::CallOp>(user))
-        if (isSubmitKernelDirectImpl(call))
-          return call;
-  return {};
-}
-
 //===----------------------------------------------------------------------===//
 // SYCL launch-geometry recovery (nd_range global/local work-group sizes)
 //===----------------------------------------------------------------------===//
@@ -559,6 +678,17 @@ static bool isLaunchChainCallee(cir::FuncOp fn) {
   // queue::parallel_for and the submit_kernel_direct* shims.
   if (n.contains("submit_kernel_direct") || n.contains("parallel_for"))
     return true;
+  // The handler-submit launch chain (see the handler-submit shape above):
+  // queue::submit builds the command-group functor object, and the handler
+  // methods below thread the closure/geometry down to the surviving sinks. The
+  // getDeviceKernelInfo marker (excluded first) and the __SYCL_EXPORT decl-only
+  // sinks (setDeviceKernelInfoPtr / setNDRangeDescriptor / setKernelFunc, no
+  // body) are left as calls; the HostKernel wrapper ctor is left as a call so
+  // findHandlerClosure can read the lambda from it.
+  if (n.contains("5queue6submit") || n.contains("wrap_kernel") ||
+      n.contains("StoreLambda") || n.contains("setDeviceKernelInfoI") ||
+      n.contains("convertToRangeViewAndSetDescriptor"))
+    return true;
   // Geometry constructors, dimension-agnostic. The length digits in front of
   // each name keep "range" from matching inside "nd_range".
   bool isCtor = n.contains("C1") || n.contains("C2");
@@ -572,6 +702,91 @@ static bool isLaunchChainCallee(cir::FuncOp fn) {
   if (n.contains("6detail5arrayILi") && (isCtor || n.contains("ixEi")))
     return true;
   return false;
+}
+
+// Bridge SYCL's type-erased command-group submit so the launch it performs can
+// be inlined beside the user's allocations and geometry constants.
+//
+// `q.submit(cgf)` stores the command-group functor object and a static
+// `invoker` trampoline into a `type_erased_cgfo_ty`, then hands it to the
+// opaque runtime, which later calls `invoker(&cgf, handler)` ->
+// `cgf.operator()(handler)`. No static call edge runs `operator()` from user
+// code, so a generic inliner cannot reach it and the launch (with its
+// getDeviceKernelInfo marker) never co-locates with the caller's USM
+// allocations / nd_range constants. But the shape is a fixed SYCL contract: for
+// each cgfo constructor on the clone, resolve the functor's `operator()` (via
+// the invoker global the ctor stores) and synthesize the missing edge -- a
+// direct `operator()(cgf, <fresh handler>)` call right after the ctor, tagged
+// so inlineLaunchChain collapses it. The synthesized handler is an unused
+// placeholder: it is only the receiver of the handler-method sinks, whose
+// operands are read for recovery, never its value.
+static void bridgeSubmitCGF(mlir::ModuleOp clone) {
+  mlir::MLIRContext *ctx = clone.getContext();
+  llvm::SmallVector<cir::CallOp> ctors;
+  clone.walk([&](cir::CallOp call) {
+    std::optional<llvm::StringRef> callee = call.getCallee();
+    if (callee && callee->contains("19type_erased_cgfo_tyC2") &&
+        call.getArgOperands().size() >= 2)
+      ctors.push_back(call);
+  });
+
+  for (cir::CallOp ctor : ctors) {
+    auto ctorFn = mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
+        ctor, ctor.getCalleeAttr());
+    if (!ctorFn)
+      continue;
+    // The invoker trampoline: the (only) func-typed global the ctor stores.
+    cir::FuncOp invoker;
+    ctorFn.walk([&](cir::GetGlobalOp gg) {
+      if (invoker)
+        return;
+      if (auto f = mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
+              gg, gg.getNameAttr()))
+        invoker = f;
+    });
+    if (!invoker)
+      continue;
+    // operator(): the (only) bodied function the invoker calls.
+    cir::FuncOp cgOperator;
+    invoker.walk([&](cir::CallOp inner) {
+      if (cgOperator || inner.isIndirect())
+        return;
+      auto f = mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
+          inner, inner.getCalleeAttr());
+      if (f && f.getCallableRegion() && !f.getCallableRegion()->empty())
+        cgOperator = f;
+    });
+    if (!cgOperator || cgOperator.getNumArguments() != 2)
+      continue;
+
+    auto handlerPtrTy =
+        mlir::dyn_cast<cir::PointerType>(cgOperator.getArgumentTypes()[1]);
+    if (!handlerPtrTy)
+      continue;
+    auto parentFn = ctor->getParentOfType<cir::FuncOp>();
+    if (!parentFn || !parentFn.getCallableRegion())
+      continue;
+
+    // The functor object the ctor wraps. Bitcast if the ctor's reference type
+    // differs from operator()'s receiver type.
+    mlir::Value cgf = ctor.getArgOperands()[1];
+    mlir::Type receiverTy = cgOperator.getArgumentTypes()[0];
+
+    mlir::OpBuilder b(ctor);
+    b.setInsertionPointToStart(&parentFn.getCallableRegion()->front());
+    auto placeholder =
+        cir::AllocaOp::create(b, ctor.getLoc(), handlerPtrTy,
+                              "cg.handler.placeholder", b.getI64IntegerAttr(8));
+
+    b.setInsertionPointAfter(ctor);
+    if (cgf.getType() != receiverTy)
+      cgf = cir::CastOp::create(b, ctor.getLoc(), receiverTy,
+                                cir::CastKind::bitcast, cgf);
+    auto invoke = cir::CallOp::create(
+        b, ctor.getLoc(), mlir::FlatSymbolRefAttr::get(cgOperator),
+        cir::VoidType::get(ctx), mlir::ValueRange{cgf, placeholder});
+    invoke->setAttr("cir.sycl.cg_invoke", mlir::UnitAttr::get(ctx));
+  }
 }
 
 // Force-inline the launch-shim chain into the user function(s) on `clone`.
@@ -598,7 +813,11 @@ static void inlineLaunchChain(mlir::ModuleOp clone) {
         return;
       auto fn =
           mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(call, callee);
-      if (!fn || !isLaunchChainCallee(fn))
+      // The synthetic command-group operator() call (see bridgeSubmitCGF) is
+      // inlined by its tag rather than its name -- the lambda operator() has no
+      // stable mangled shape to match.
+      if (!fn ||
+          (!isLaunchChainCallee(fn) && !call->hasAttr("cir.sycl.cg_invoke")))
         return;
       mlir::Region *region = fn.getCallableRegion();
       if (!region || region->empty())
@@ -987,10 +1206,14 @@ static mlir::Value stripToRecordObject(mlir::Value v) {
   return v;
 }
 
-// The lambda closure object a runtime launch captures, reached from the
-// HostKernelRefBase* closure operand: strip to the HostKernelRef record, then
-// take the lambda pointer its constructor stored (constructor arg 1). Null if
-// the shape is not the HostKernelRef wrapper (e.g. a free-function kernel).
+// The lambda closure object a runtime launch captures. Direct path: the operand
+// is a HostKernelRefBase*; strip to the HostKernelRef record and take the
+// lambda pointer its constructor stored (constructor arg 1). Handler path: the
+// operand is already the lambda-bearing value (the HostKernel ctor's arg1, see
+// findHandlerClosure), which strips straight to the lambda record and has no
+// HostKernelRef wrapper -- so when no such wrapper ctor is found, the stripped
+// record is itself the closure. Null only if the operand does not reach a
+// record object (e.g. a free-function kernel).
 static mlir::Value traceClosureObject(mlir::Value closureOperand) {
   mlir::Value hostKernelRef = stripToRecordObject(closureOperand);
   if (!hostKernelRef)
@@ -1009,7 +1232,7 @@ static mlir::Value traceClosureObject(mlir::Value closureOperand) {
       continue;
     return stripToRecordObject(args[1]);
   }
-  return {};
+  return hostKernelRef;
 }
 
 // The captured pointer fields of a closure object and the value written into
@@ -1210,6 +1433,9 @@ static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
   if (mlir::failed(pm.run(*clone)))
     return result;
 
+  // Synthesize the type-erased-submit call edge (handler path) before inlining,
+  // so the handler-submit launch collapses into the user function too.
+  bridgeSubmitCGF(*clone);
   inlineLaunchChain(*clone);
 
   clone->walk([&](cir::CallOp call) {
@@ -1218,14 +1444,11 @@ static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
     cir::GlobalOp nameString = resolveLaunchedNameString(call);
     if (!nameString)
       return;
-    cir::CallOp launch = traceLaunchCall(call->getResult(0));
+    std::optional<RecoveredLaunch> launch = recoverLaunch(call->getResult(0));
     if (!launch)
       return;
-    mlir::OperandRange args = launch.getArgOperands();
-    if (args.size() <= SyclDeviceKernelInfoOperand)
-      return;
     llvm::StringRef kernel = getGlobalStringValue(nameString);
-    SyclGeometry geom = traceNDRange(args[SyclGeometryOperand]);
+    SyclGeometry geom = traceNDRange(launch->geometry);
     result[kernel] = geom;
     // Fold this launch's closure into the kernel's noalias eligibility, but
     // only for the collapsed launch sites in user code. Inlining leaves a copy
@@ -1234,13 +1457,12 @@ static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
     // visible capture stores; folding those would spuriously poison every
     // field. The real launch sites are the inlined ones in non-shim functions.
     auto enclosing = call->getParentOfType<cir::FuncOp>();
-    if (enclosing && !isLaunchChainCallee(enclosing)) {
+    if (enclosing && !isLaunchChainCallee(enclosing) && launch->closure) {
       bool seen = seenSite.lookup(kernel);
-      foldClosureNoAlias(args[SyclClosureOperand], seen, eligible[kernel]);
+      foldClosureNoAlias(launch->closure, seen, eligible[kernel]);
       seenSite[kernel] = seen;
       bool constSeen = constSeenSite.lookup(kernel);
-      foldClosureConstArgs(args[SyclClosureOperand], constSeen,
-                           constEligible[kernel]);
+      foldClosureConstArgs(launch->closure, constSeen, constEligible[kernel]);
       constSeenSite[kernel] = constSeen;
     }
   });
@@ -1363,25 +1585,28 @@ void KernelBindingTable::recordSYCLLaunchSites(
     auto it = byNameString.find(nameString.getOperation());
     if (it == byNameString.end())
       return;
-    // The launch op consumes the DeviceKernelInfo* this marker produced. A
-    // marker whose result never reaches a launch (e.g. inlined away) records
-    // nothing rather than a site with no call.
-    cir::CallOp launch = traceLaunchCall(call->getResult(0));
+    // The launch consumes the DeviceKernelInfo* this marker produced -- either
+    // submit_kernel_direct_with_event_impl (direct) or handler::
+    // setDeviceKernelInfoPtr (handler submit). A marker whose result never
+    // reaches a launch (e.g. inlined away) records nothing rather than a site
+    // with no call. On the real (un-inlined) module the geometry/closure
+    // operands are co-located with the marker only on the direct path; on the
+    // handler path they are recovered on the analysis clone (see
+    // computeSYCLGeometry) and read back from the per-kernel maps below, so
+    // leaving the Values null here is expected.
+    std::optional<RecoveredLaunch> launch = recoverLaunch(call->getResult(0));
     if (!launch)
       return;
 
     KernelBinding &binding = bindings[it->second];
     LaunchSite site;
     site.kind = BindingKind::SYCLName;
-    site.stubCall = launch;
+    site.stubCall = launch->anchor;
     site.syclMarkerCall = call;
     site.syclKernelName = it->second;
     site.allLaunchesVisible = binding.isTULocalOptimizable;
-    mlir::OperandRange args = launch.getArgOperands();
-    if (args.size() > SyclDeviceKernelInfoOperand) {
-      site.syclGeometry = args[SyclGeometryOperand];
-      site.syclClosure = args[SyclClosureOperand];
-    }
+    site.syclGeometry = launch->geometry;
+    site.syclClosure = launch->closure;
     auto geomIt = geometry.find(it->second);
     if (geomIt != geometry.end())
       site.syclNDRange = geomIt->second;
@@ -1434,6 +1659,17 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
           os << " " << n << "=";
           binding.second.syclConstArgs.lookup(n).print(os);
         }
+        os << "\n";
+      }
+      if (!binding.second.syclNoAliasFields.empty()) {
+        // Sorted for deterministic output (StringSet iteration is unordered).
+        llvm::SmallVector<llvm::StringRef, 4> names;
+        for (const auto &f : binding.second.syclNoAliasFields)
+          names.push_back(f.getKey());
+        llvm::sort(names);
+        os << "//   no-alias";
+        for (llvm::StringRef n : names)
+          os << " " << n;
         os << "\n";
       }
     } else {

@@ -461,3 +461,116 @@ module attributes {cir.offload.container} {
 // CHECK-NEXT: host-name @.str (sycl, conservative)
 // CHECK-NEXT: device @device_sycl_spir64 : @_ZTS9MyFunctor
 // CHECK-NEXT: <no launch site>
+
+// -----
+
+// A HANDLER-submit launch: `q.submit([&](handler& h){ h.parallel_for(...) })`.
+// This is the far more common launch form; unlike the direct
+// `q.parallel_for` shortcut it does not launch through
+// submit_kernel_direct_with_event_impl but through a set of handler methods
+// tied by the shared `handler* this`:
+//   handler::setKernelFunc(this, closure)          -- (kernel func ptr sink)
+//   %dki = detail::getDeviceKernelInfo<K>()        -- SAME name marker
+//   handler::setDeviceKernelInfoPtr(this, %dki)    -- the dki sink the marker feeds
+//   handler::setNDRangeDescriptor(this, view)      -- the geometry sink
+// and the user lambda is wrapped by a detail::HostKernel constructor, whose
+// arg1 is the closure object carrying the capture stores. This fixture models
+// the shape after the launch-shim chain has been collapsed into one function
+// (as computeSYCLGeometry's inliner does), so the recorder can walk it: the
+// marker anchors the name, setDeviceKernelInfoPtr is the launch sink, the
+// nd_range_view (const global=512/local=128) comes from setNDRangeDescriptor,
+// and the closure (two distinct USM allocations -> noalias; one const scalar
+// capture -> const-arg) from the HostKernel ctor.
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_arr = !cir.struct<"arr" {data !cir.array<!u64i x 1>}>
+!rec_range = !cir.struct<"range" {data !rec_arr}>
+!rec_ndr = !cir.struct<"ndr" {data !rec_range, data !rec_range}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !cir.ptr<!u64i>, data !cir.ptr<!u64i>, data !u64i}>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_clos = !cir.struct<"clos" {data !cir.ptr<!cir.float>, data !cir.ptr<!cir.float>, data !s32i}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    // Handler-method sinks: __SYCL_EXPORT decl-only ABI boundaries, so they
+    // survive as calls and their operands are read directly.
+    cir.func private @_ZN4sycl3_V17handler13setKernelFuncEPv(!cir.ptr<!s8i>, !cir.ptr<!s8i>)
+    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!s8i>, !cir.ptr<!s8i>)
+    cir.func private @_ZN4sycl3_V17handler20setNDRangeDescriptorENS0_6detail13nd_range_viewEb(!cir.ptr<!s8i>, !cir.ptr<!rec_view>)
+    // The HostKernel wrapper ctor: its arg1 is the user lambda closure.
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(!cir.ptr<!s8i>, !cir.ptr<!rec_clos>)
+    // Two distinct USM allocations backing the two pointer captures.
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPvm(!u64i) -> !cir.ptr<!cir.float>
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    // The command-group body after the launch-shim chain is collapsed into it:
+    // the nd_range_view, the closure capture stores, the HostKernel wrap, and
+    // the handler-method sinks all co-located and tied by the handler %h.
+    cir.func @cg(%h: !cir.ptr<!s8i>, %hk: !cir.ptr<!s8i>) {
+      %n = cir.const #cir.int<8> : !u64i
+      %g = cir.const #cir.int<512> : !u64i
+      %l = cir.const #cir.int<128> : !u64i
+      %one = cir.const #cir.int<1> : !u64i
+      %seven = cir.const #cir.int<7> : !s32i
+      // --- geometry: nd_range with const global=512, local=128 ---
+      %ndr = cir.alloca "ndr" align(8) : !cir.ptr<!rec_ndr>
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %ng = cir.get_member %ndr[0] {name = "globalSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      %nga = cir.base_class_addr nonnull %ng [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
+      %ngc = cir.get_member %nga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %ngp = cir.cast array_to_ptrdecay %ngc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      cir.store %g, %ngp : !u64i, !cir.ptr<!u64i>
+      %nl = cir.get_member %ndr[1] {name = "localSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      %nla = cir.base_class_addr nonnull %nl [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
+      %nlc = cir.get_member %nla[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %nlp = cir.cast array_to_ptrdecay %nlc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      cir.store %l, %nlp : !u64i, !cir.ptr<!u64i>
+      %mg = cir.get_member %view[0] {name = "MGlobalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
+      cir.store %ngp, %mg : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
+      %ml = cir.get_member %view[1] {name = "MLocalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
+      cir.store %nlp, %ml : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
+      %md = cir.get_member %view[3] {name = "MDims"} : !cir.ptr<!rec_view> -> !cir.ptr<!u64i>
+      cir.store %one, %md : !u64i, !cir.ptr<!u64i>
+      // --- closure: two distinct USM captures + one const scalar capture ---
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_clos>
+      %p0 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPvm(%n) : (!u64i) -> !cir.ptr<!cir.float>
+      %p1 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPvm(%n) : (!u64i) -> !cir.ptr<!cir.float>
+      %f0 = cir.get_member %clos[0] {name = "f0"} : !cir.ptr<!rec_clos> -> !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %p0, %f0 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      %f1 = cir.get_member %clos[1] {name = "f1"} : !cir.ptr<!rec_clos> -> !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %p1, %f1 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      %fs = cir.get_member %clos[2] {name = "s"} : !cir.ptr<!rec_clos> -> !cir.ptr<!s32i>
+      cir.store %seven, %fs : !s32i, !cir.ptr<!s32i>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(%hk, %clos) : (!cir.ptr<!s8i>, !cir.ptr<!rec_clos>) -> ()
+      // --- launch sinks tied by the handler %h ---
+      cir.call @_ZN4sycl3_V17handler13setKernelFuncEPv(%h, %hk) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+      %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.store %dki, %slot : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
+      %r = cir.load %slot : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %r) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+      cir.call @_ZN4sycl3_V17handler20setNDRangeDescriptorENS0_6detail13nd_range_viewEb(%h, %view) : (!cir.ptr<!s8i>, !cir.ptr<!rec_view>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK-NEXT: size 1 empty false
+// CHECK-NEXT: kernel _ZTSZ4mainEUlvE_
+// CHECK-NEXT: host-name @.str (sycl, optimizable)
+// CHECK-NEXT: const-args s=#cir.int<7> : !cir.int<s, 32>
+// CHECK-NEXT: no-alias f0 f1
+// CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
+// CHECK-NEXT: launch in @cg (sycl, all-visible), closure traced, global=[512], local=[128]
