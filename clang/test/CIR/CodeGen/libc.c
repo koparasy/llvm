@@ -12,10 +12,9 @@
 // RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -emit-llvm %s -o %t-ogcg-wrapv.ll -fwrapv
 // RUN: FileCheck --check-prefix=OGCG_NO_POISON --input-file=%t-ogcg-wrapv.ll %s
 
-// Note: In the final implementation, we will want these to generate
-// CIR-specific libc operations. This test is just a placeholder
-// to make sure we can compile these to normal function calls
-// until the special handling is implemented.
+// Note: memcpy/memmove are lowered to dedicated CIR ops (matching classic
+// CodeGen's llvm.memcpy/llvm.memmove intrinsics). memset is still emitted as a
+// normal function call until its special handling is implemented.
 
 void *memcpy(void *, const void *, unsigned long);
 void testMemcpy(void *dst, const void *src, unsigned long size) {
@@ -33,7 +32,9 @@ void *testMempcpy(void *dst, const void *src, unsigned long size) {
 void *memmove(void *, const void *, unsigned long);
 void testMemmove(void *src, const void *dst, unsigned long size) {
   memmove(dst, src, size);
-  // CHECK: cir.call @memmove
+  // CHECK: cir.libc.memmove
+  // LLVM: call void @llvm.memmove.p0.p0.i64
+  // OGCG: call void @llvm.memmove.p0.p0.i64
 }
 
 void *memset(void *, int, unsigned long);

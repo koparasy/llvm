@@ -2460,13 +2460,26 @@ RValue CIRGenFunction::emitBuiltinExpr(const GlobalDecl &gd, unsigned builtinID,
     }
     return RValue::get(dest.getPointer());
   }
+  case Builtin::BImemmove:
+  case Builtin::BI__builtin_memmove: {
+    // Emit llvm.memmove rather than a library call, as for memcpy above. On
+    // SPIR the library `memmove` resolves to a devicelib `spir_func` whose
+    // calling-convention mismatch the optimizer treats as undefined behavior.
+    mlir::Location loc = getLoc(e->getSourceRange());
+    Address dest = emitPointerWithAlignment(e->getArg(0));
+    Address src = emitPointerWithAlignment(e->getArg(1));
+    mlir::Value sizeVal = emitScalarExpr(e->getArg(2));
+    Address destCast = dest.withElementType(builder, cgm.voidTy);
+    Address srcCast = src.withElementType(builder, cgm.voidTy);
+    builder.createMemMove(loc, destCast.getPointer(), srcCast.getPointer(),
+                          sizeVal);
+    return RValue::get(dest.getPointer());
+  }
   case Builtin::BI__builtin_memcpy_inline:
   case Builtin::BI__builtin___memcpy_chk:
   case Builtin::BI__builtin_objc_memmove_collectable:
   case Builtin::BI__builtin___memmove_chk:
   case Builtin::BI__builtin_trivially_relocate:
-  case Builtin::BImemmove:
-  case Builtin::BI__builtin_memmove:
   case Builtin::BImemset:
   case Builtin::BI__builtin_memset:
   case Builtin::BI__builtin_memset_inline:
