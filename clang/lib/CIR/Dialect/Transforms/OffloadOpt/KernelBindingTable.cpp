@@ -497,19 +497,6 @@ static bool isHandlerSetNDRangeDescriptor(cir::CallOp call) {
   return callee && callee->contains("7handler20setNDRangeDescriptor");
 }
 
-// Whether `call` constructs a `detail::HostKernel<...>` -- the wrapper the
-// handler path builds around the user lambda. Its arg1 is the lambda object
-// carrying the capture stores, which no surviving handler-method sink
-// references.
-// (`10HostKernelI` is the templated wrapper; it excludes `14HostKernelBase`.)
-static bool isHostKernelCtor(cir::CallOp call) {
-  std::optional<llvm::StringRef> callee = call.getCallee();
-  if (!callee)
-    return false;
-  return callee->contains("6detail10HostKernelI") &&
-         (callee->contains("C1") || callee->contains("C2"));
-}
-
 // The operands of a recovered SYCL launch, from either launch shape. The direct
 // path reads them from fixed positions of the runtime launch call; the handler
 // path recovers them from sibling handler-method calls sharing the handler.
@@ -536,24 +523,74 @@ static mlir::Value findHandlerNDRangeView(mlir::Value handler) {
   return {};
 }
 
-// The user lambda a handler-path launch captures, taken from the HostKernel
-// constructor's arg1. Searched within the launch-rooted function (the marker's
-// enclosing function after inlining), where the wrapper construction and the
-// capture stores have been co-located. Returns the ctor's lambda operand; the
-// closure trace strips it to the record object.
-static mlir::Value findHandlerClosure(mlir::Operation *rootedAt) {
-  auto fn = rootedAt->getParentOfType<cir::FuncOp>();
-  if (!fn)
-    return {};
-  mlir::Value found;
-  fn.walk([&](cir::CallOp call) {
-    if (found || !isHostKernelCtor(call))
-      return;
-    mlir::OperandRange args = call.getArgOperands();
-    if (args.size() >= 2)
-      found = args[1];
-  });
-  return found;
+// Defined below; follows `v = load(slot)` back to the pointer stored into the
+// slot, so a value reloaded before use resolves to the object it names.
+static mlir::Value stripToPointerObject(mlir::Value v);
+
+// Whether `call` constructs a `detail::HostKernel<...>` -- the wrapper the
+// handler path builds around the user lambda. Its arg1 is the lambda object
+// carrying the capture stores. (`10HostKernelI` is the templated wrapper; it
+// excludes `14HostKernelBase`.)
+static bool isHostKernelCtor(cir::CallOp call) {
+  std::optional<llvm::StringRef> callee = call.getCallee();
+  if (!callee)
+    return false;
+  return callee->contains("6detail10HostKernelI") &&
+         (callee->contains("C1") || callee->contains("C2"));
+}
+
+// Whether `call` is `std::unique_ptr<HostKernelBase>::reset(HostKernelBase*)`
+// -- the write that installs the wrapped kernel into handler.MHostKernel. Its
+// arg1 is the freshly-built HostKernel object (as a HostKernelBase* base
+// pointer).
+static bool isHostKernelReset(cir::CallOp call) {
+  std::optional<llvm::StringRef> callee = call.getCallee();
+  return callee && callee->contains("HostKernelBase") &&
+         callee->contains("5reset");
+}
+
+// The user lambda a handler-path launch captures, recovered from the handler.
+// StoreLambda installs the wrapped kernel with
+// `handler.MHostKernel.reset(new HostKernel<KernelType,...>(lambda))`, so the
+// launch's lambda is reached structurally: the reset writing THIS handler's
+// MHostKernel member gives the freshly-built HostKernel object, and that
+// object's HostKernel constructor took the user lambda as arg1 (the temp
+// carrying the capture stores). Keying off the handler's own member -- rather
+// than scanning the enclosing function for the first HostKernel ctor -- is what
+// disambiguates the launch when several q.submit(handler) sites were inlined
+// into one caller: each has its own handler and its own MHostKernel. Returns
+// the lambda operand; the closure trace strips it to the record object.
+static mlir::Value findHandlerClosure(mlir::Value handler) {
+  for (mlir::Operation *hu : handler.getUsers()) {
+    auto member = mlir::dyn_cast<cir::GetMemberOp>(hu);
+    if (!member || member.getName() != "MHostKernel")
+      continue;
+    for (mlir::Operation *mu : member.getResult().getUsers()) {
+      auto reset = mlir::dyn_cast<cir::CallOp>(mu);
+      if (!reset || !isHostKernelReset(reset))
+        continue;
+      mlir::OperandRange resetArgs = reset.getArgOperands();
+      if (resetArgs.size() < 2)
+        continue;
+      // The new'd HostKernel<KernelType,...> object. Peel the HostKernelBase
+      // base-class view off the base pointer the reset consumes, then follow
+      // the spill slot the pointer was stored into and reloaded from, back to
+      // the operator-new result the constructor ran on.
+      mlir::Value hostKernel = resetArgs[1];
+      while (auto bca = hostKernel.getDefiningOp<cir::BaseClassAddrOp>())
+        hostKernel = bca.getSrcAddr();
+      hostKernel = stripToPointerObject(hostKernel);
+      for (mlir::Operation *hku : hostKernel.getUsers()) {
+        auto ctor = mlir::dyn_cast<cir::CallOp>(hku);
+        if (!ctor || !isHostKernelCtor(ctor))
+          continue;
+        mlir::OperandRange ctorArgs = ctor.getArgOperands();
+        if (ctorArgs.size() >= 2 && ctorArgs[0] == hostKernel)
+          return ctorArgs[1];
+      }
+    }
+  }
+  return {};
 }
 
 // Follow the DeviceKernelInfo* result of a getDeviceKernelInfo call to the
@@ -592,7 +629,7 @@ recoverLaunch(mlir::Value deviceKernelInfo) {
           return std::nullopt;
         mlir::Value handler = args[0];
         return RecoveredLaunch{call, findHandlerNDRangeView(handler),
-                               findHandlerClosure(call)};
+                               findHandlerClosure(handler)};
       }
     }
   return std::nullopt;
@@ -683,8 +720,10 @@ static bool isLaunchChainCallee(cir::FuncOp fn) {
   // methods below thread the closure/geometry down to the surviving sinks. The
   // getDeviceKernelInfo marker (excluded first) and the __SYCL_EXPORT decl-only
   // sinks (setDeviceKernelInfoPtr / setNDRangeDescriptor / setKernelFunc, no
-  // body) are left as calls; the HostKernel wrapper ctor is left as a call so
-  // findHandlerClosure can read the lambda from it.
+  // body) are left as calls. The HostKernel wrapper ctor is likewise left as a
+  // call: StoreLambda installs it into handler.MHostKernel, so
+  // findHandlerClosure recovers this launch's lambda by following that member
+  // back to the ctor.
   if (n.contains("5queue6submit") || n.contains("wrap_kernel") ||
       n.contains("StoreLambda") || n.contains("setDeviceKernelInfoI") ||
       n.contains("convertToRangeViewAndSetDescriptor"))

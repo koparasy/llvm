@@ -469,18 +469,22 @@ module attributes {cir.offload.container} {
 // `q.parallel_for` shortcut it does not launch through
 // submit_kernel_direct_with_event_impl but through a set of handler methods
 // tied by the shared `handler* this`:
-//   handler::setKernelFunc(this, closure)          -- (kernel func ptr sink)
 //   %dki = detail::getDeviceKernelInfo<K>()        -- SAME name marker
 //   handler::setDeviceKernelInfoPtr(this, %dki)    -- the dki sink the marker feeds
 //   handler::setNDRangeDescriptor(this, view)      -- the geometry sink
-// and the user lambda is wrapped by a detail::HostKernel constructor, whose
-// arg1 is the closure object carrying the capture stores. This fixture models
-// the shape after the launch-shim chain has been collapsed into one function
-// (as computeSYCLGeometry's inliner does), so the recorder can walk it: the
-// marker anchors the name, setDeviceKernelInfoPtr is the launch sink, the
-// nd_range_view (const global=512/local=128) comes from setNDRangeDescriptor,
-// and the closure (two distinct USM allocations -> noalias; one const scalar
-// capture -> const-arg) from the HostKernel ctor.
+// The user lambda is wrapped by StoreLambda as
+// `this->MHostKernel.reset(new detail::HostKernel<KernelType,...>(lambda))`, so
+// the closure is recovered structurally through the handler: the reset writing
+// this handler's MHostKernel member gives the new HostKernel object (reached
+// through its HostKernelBase base pointer, spilled and reloaded), and that
+// object's HostKernel constructor took the user lambda as arg1. This fixture
+// models the shape after the launch-shim chain has been collapsed into one
+// function (as computeSYCLGeometry's inliner does), so the recorder can walk
+// it: the marker anchors the name, setDeviceKernelInfoPtr is the launch sink,
+// the nd_range_view (const global=512/local=128) comes from
+// setNDRangeDescriptor, and the closure (two distinct USM allocations ->
+// noalias; one const scalar capture -> const-arg) from the HostKernel ctor
+// reached via MHostKernel.
 !s8i = !cir.int<s, 8>
 !s32i = !cir.int<s, 32>
 !u64i = !cir.int<u, 64>
@@ -491,17 +495,22 @@ module attributes {cir.offload.container} {
 !rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
 !rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
 !rec_clos = !cir.struct<"clos" {data !cir.ptr<!cir.float>, data !cir.ptr<!cir.float>, data !s32i}>
+!rec_hkbase = !cir.struct<"hkbase" {data !cir.ptr<!s8i>}>
+!rec_hk = !cir.struct<"hk" {data !rec_hkbase, data !rec_clos}>
+!rec_handler = !cir.struct<"handler" {data !cir.ptr<!rec_hkbase>}>
 module attributes {cir.offload.container} {
   module @host attributes {cir.offload.kind = #cir.offload<host>} {
     cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
     cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
     // Handler-method sinks: __SYCL_EXPORT decl-only ABI boundaries, so they
     // survive as calls and their operands are read directly.
-    cir.func private @_ZN4sycl3_V17handler13setKernelFuncEPv(!cir.ptr<!s8i>, !cir.ptr<!s8i>)
-    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!s8i>, !cir.ptr<!s8i>)
-    cir.func private @_ZN4sycl3_V17handler20setNDRangeDescriptorENS0_6detail13nd_range_viewEb(!cir.ptr<!s8i>, !cir.ptr<!rec_view>)
+    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!rec_handler>, !cir.ptr<!s8i>)
+    cir.func private @_ZN4sycl3_V17handler20setNDRangeDescriptorENS0_6detail13nd_range_viewEb(!cir.ptr<!rec_handler>, !cir.ptr<!rec_view>)
     // The HostKernel wrapper ctor: its arg1 is the user lambda closure.
-    cir.func private @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(!cir.ptr<!s8i>, !cir.ptr<!rec_clos>)
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(!cir.ptr<!rec_hk>, !cir.ptr<!rec_clos>)
+    // unique_ptr<HostKernelBase>::reset installs the wrapped kernel into
+    // handler.MHostKernel; arg1 is the HostKernel object as a base pointer.
+    cir.func private @_ZNSt10unique_ptrIN4sycl3_V16detail14HostKernelBaseESt14default_deleteIS3_EE5resetEPS3_(!cir.ptr<!cir.ptr<!rec_hkbase>>, !cir.ptr<!rec_hkbase>)
     // Two distinct USM allocations backing the two pointer captures.
     cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPvm(!u64i) -> !cir.ptr<!cir.float>
     cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
@@ -512,7 +521,7 @@ module attributes {cir.offload.container} {
     // The command-group body after the launch-shim chain is collapsed into it:
     // the nd_range_view, the closure capture stores, the HostKernel wrap, and
     // the handler-method sinks all co-located and tied by the handler %h.
-    cir.func @cg(%h: !cir.ptr<!s8i>, %hk: !cir.ptr<!s8i>) {
+    cir.func @cg(%h: !cir.ptr<!rec_handler>) {
       %n = cir.const #cir.int<8> : !u64i
       %g = cir.const #cir.int<512> : !u64i
       %l = cir.const #cir.int<128> : !u64i
@@ -547,15 +556,22 @@ module attributes {cir.offload.container} {
       cir.store %p1, %f1 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
       %fs = cir.get_member %clos[2] {name = "s"} : !cir.ptr<!rec_clos> -> !cir.ptr<!s32i>
       cir.store %seven, %fs : !s32i, !cir.ptr<!s32i>
-      cir.call @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(%hk, %clos) : (!cir.ptr<!s8i>, !cir.ptr<!rec_clos>) -> ()
+      // --- wrap: new HostKernel(lambda), spill+reload, reset into MHostKernel ---
+      %hkobj = cir.alloca "hk" align(8) : !cir.ptr<!rec_hk>
+      %hkslot = cir.alloca "hkslot" align(8) : !cir.ptr<!cir.ptr<!rec_hk>>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(%hkobj, %clos) : (!cir.ptr<!rec_hk>, !cir.ptr<!rec_clos>) -> ()
+      cir.store %hkobj, %hkslot : !cir.ptr<!rec_hk>, !cir.ptr<!cir.ptr<!rec_hk>>
+      %hkreload = cir.load %hkslot : !cir.ptr<!cir.ptr<!rec_hk>>, !cir.ptr<!rec_hk>
+      %hkbaseptr = cir.base_class_addr nonnull %hkreload [0] : !cir.ptr<!rec_hk> -> !cir.ptr<!rec_hkbase>
+      %mh = cir.get_member %h[0] {name = "MHostKernel"} : !cir.ptr<!rec_handler> -> !cir.ptr<!cir.ptr<!rec_hkbase>>
+      cir.call @_ZNSt10unique_ptrIN4sycl3_V16detail14HostKernelBaseESt14default_deleteIS3_EE5resetEPS3_(%mh, %hkbaseptr) : (!cir.ptr<!cir.ptr<!rec_hkbase>>, !cir.ptr<!rec_hkbase>) -> ()
       // --- launch sinks tied by the handler %h ---
-      cir.call @_ZN4sycl3_V17handler13setKernelFuncEPv(%h, %hk) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
       %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
       %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
       cir.store %dki, %slot : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
       %r = cir.load %slot : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
-      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %r) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
-      cir.call @_ZN4sycl3_V17handler20setNDRangeDescriptorENS0_6detail13nd_range_viewEb(%h, %view) : (!cir.ptr<!s8i>, !cir.ptr<!rec_view>) -> ()
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %r) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.call @_ZN4sycl3_V17handler20setNDRangeDescriptorENS0_6detail13nd_range_viewEb(%h, %view) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_view>) -> ()
       cir.return
     }
   }
@@ -593,19 +609,23 @@ module attributes {cir.offload.container} {
 !rec_clos = !cir.struct<"clos" {data !cir.ptr<!cir.float>, data !cir.ptr<!cir.float>}>
 !rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
 !rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkbase = !cir.struct<"hkbase" {data !cir.ptr<!s8i>}>
+!rec_hk = !cir.struct<"hk" {data !rec_hkbase, data !rec_clos}>
+!rec_handler = !cir.struct<"handler" {data !cir.ptr<!rec_hkbase>}>
 module attributes {cir.offload.container} {
   module @host attributes {cir.offload.kind = #cir.offload<host>} {
     cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
     cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!s8i>, !cir.ptr<!s8i>)
-    cir.func private @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(!cir.ptr<!s8i>, !cir.ptr<!rec_clos>)
+    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!rec_handler>, !cir.ptr<!s8i>)
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(!cir.ptr<!rec_hk>, !cir.ptr<!rec_clos>)
+    cir.func private @_ZNSt10unique_ptrIN4sycl3_V16detail14HostKernelBaseESt14default_deleteIS3_EE5resetEPS3_(!cir.ptr<!cir.ptr<!rec_hkbase>>, !cir.ptr<!rec_hkbase>)
     cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPvm(!u64i) -> !cir.ptr<!cir.float>
     cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
       %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
       %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
       cir.return %1 : !cir.ptr<!s8i>
     }
-    cir.func @cg(%h: !cir.ptr<!s8i>, %hk: !cir.ptr<!s8i>) {
+    cir.func @cg(%h: !cir.ptr<!rec_handler>) {
       %n = cir.const #cir.int<8> : !u64i
       // Two distinct USM allocations, held in caller locals (loc0/loc1).
       %m0 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPvm(%n) : (!u64i) -> !cir.ptr<!cir.float>
@@ -637,12 +657,20 @@ module attributes {cir.offload.container} {
       %v1 = cir.load %ref1 : !cir.ptr<!cir.ptr<!cir.float>>, !cir.ptr<!cir.float>
       %cf1 = cir.get_member %clos[1] {name = "c1"} : !cir.ptr<!rec_clos> -> !cir.ptr<!cir.ptr<!cir.float>>
       cir.store %v1, %cf1 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
-      cir.call @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(%hk, %clos) : (!cir.ptr<!s8i>, !cir.ptr<!rec_clos>) -> ()
+      // Wrap: new HostKernel(lambda), spill+reload, reset into MHostKernel.
+      %hkobj = cir.alloca "hk" align(8) : !cir.ptr<!rec_hk>
+      %hkslot = cir.alloca "hkslot" align(8) : !cir.ptr<!cir.ptr<!rec_hk>>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE_S2_Li1EEC2ES2_(%hkobj, %clos) : (!cir.ptr<!rec_hk>, !cir.ptr<!rec_clos>) -> ()
+      cir.store %hkobj, %hkslot : !cir.ptr<!rec_hk>, !cir.ptr<!cir.ptr<!rec_hk>>
+      %hkreload = cir.load %hkslot : !cir.ptr<!cir.ptr<!rec_hk>>, !cir.ptr<!rec_hk>
+      %hkbaseptr = cir.base_class_addr nonnull %hkreload [0] : !cir.ptr<!rec_hk> -> !cir.ptr<!rec_hkbase>
+      %mh = cir.get_member %h[0] {name = "MHostKernel"} : !cir.ptr<!rec_handler> -> !cir.ptr<!cir.ptr<!rec_hkbase>>
+      cir.call @_ZNSt10unique_ptrIN4sycl3_V16detail14HostKernelBaseESt14default_deleteIS3_EE5resetEPS3_(%mh, %hkbaseptr) : (!cir.ptr<!cir.ptr<!rec_hkbase>>, !cir.ptr<!rec_hkbase>) -> ()
       %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
       %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
       cir.store %dki, %slot : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
       %r = cir.load %slot : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
-      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %r) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %r) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
       cir.return
     }
   }
@@ -768,3 +796,108 @@ module attributes {cir.offload.container} {
 // CHECK-NEXT: host-name @.str (sycl, optimizable)
 // CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
 // CHECK-NEXT: launch in @cg (sycl, all-visible), closure none, global=[512], local=[256]
+
+// -----
+
+// TWO handler-submit launches of DIFFERENT kernels in ONE function -- the shape
+// a real translation unit produces once the per-launch StoreLambda bodies are
+// inlined into the caller (e.g. HeCBench srad's six q.submit sites collapse into
+// main). Each launch has its OWN handler and installs its OWN wrapped kernel via
+// `handler.MHostKernel.reset(new HostKernel<KernelType,...>(lambda))`. The two
+// closures capture DIFFERENT USM sets: K0 four distinct allocations (a0..a3), K1
+// one (b0). Recovering the closure by scanning the function for the first
+// HostKernel ctor would hand BOTH launches K0's closure, so K1 would wrongly
+// report a0..a3; keying off each launch's handler.MHostKernel member gives each
+// its own closure, so K0 -> a0 a1 a2 a3 and K1 -> b0. This is the many-pointer
+// distinctness case: every provably-distinct capture is marked, per launch.
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_clos0 = !cir.struct<"clos0" {data !cir.ptr<!cir.float>, data !cir.ptr<!cir.float>, data !cir.ptr<!cir.float>, data !cir.ptr<!cir.float>}>
+!rec_clos1 = !cir.struct<"clos1" {data !cir.ptr<!cir.float>}>
+!rec_hkbase = !cir.struct<"hkbase" {data !cir.ptr<!s8i>}>
+!rec_hk0 = !cir.struct<"hk0" {data !rec_hkbase, data !rec_clos0}>
+!rec_hk1 = !cir.struct<"hk1" {data !rec_hkbase, data !rec_clos1}>
+!rec_handler = !cir.struct<"handler" {data !cir.ptr<!rec_hkbase>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str0" = #cir.const_array<"_ZTSZ4mainEUlvE0_" : !cir.array<!s8i x 17>, trailing_zeros> : !cir.array<!s8i x 18>
+    cir.global "private" constant cir_private @".str1" = #cir.const_array<"_ZTSZ4mainEUlvE1_" : !cir.array<!s8i x 17>, trailing_zeros> : !cir.array<!s8i x 18>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE0_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str0"> : !cir.ptr<!s8i>, #cir.int<17> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE1_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str1"> : !cir.ptr<!s8i>, #cir.int<17> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!rec_handler>, !cir.ptr<!s8i>)
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE0_S2_Li1EEC2ES2_(!cir.ptr<!rec_hk0>, !cir.ptr<!rec_clos0>)
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE1_S2_Li1EEC2ES2_(!cir.ptr<!rec_hk1>, !cir.ptr<!rec_clos1>)
+    cir.func private @_ZNSt10unique_ptrIN4sycl3_V16detail14HostKernelBaseESt14default_deleteIS3_EE5resetEPS3_(!cir.ptr<!cir.ptr<!rec_hkbase>>, !cir.ptr<!rec_hkbase>)
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPvm(!u64i) -> !cir.ptr<!cir.float>
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE0_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE0_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE1_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE1_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @cg2(%h0: !cir.ptr<!rec_handler>, %h1: !cir.ptr<!rec_handler>) {
+      %n = cir.const #cir.int<8> : !u64i
+      // --- launch 0: closure with four distinct USM captures a0..a3 ---
+      %c0 = cir.alloca "c0" align(8) : !cir.ptr<!rec_clos0>
+      %a0 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPvm(%n) : (!u64i) -> !cir.ptr<!cir.float>
+      %a1 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPvm(%n) : (!u64i) -> !cir.ptr<!cir.float>
+      %a2 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPvm(%n) : (!u64i) -> !cir.ptr<!cir.float>
+      %a3 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPvm(%n) : (!u64i) -> !cir.ptr<!cir.float>
+      %g0a0 = cir.get_member %c0[0] {name = "a0"} : !cir.ptr<!rec_clos0> -> !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %a0, %g0a0 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      %g0a1 = cir.get_member %c0[1] {name = "a1"} : !cir.ptr<!rec_clos0> -> !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %a1, %g0a1 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      %g0a2 = cir.get_member %c0[2] {name = "a2"} : !cir.ptr<!rec_clos0> -> !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %a2, %g0a2 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      %g0a3 = cir.get_member %c0[3] {name = "a3"} : !cir.ptr<!rec_clos0> -> !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %a3, %g0a3 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      %hk0 = cir.alloca "hk0" align(8) : !cir.ptr<!rec_hk0>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE0_S2_Li1EEC2ES2_(%hk0, %c0) : (!cir.ptr<!rec_hk0>, !cir.ptr<!rec_clos0>) -> ()
+      %hk0b = cir.base_class_addr nonnull %hk0 [0] : !cir.ptr<!rec_hk0> -> !cir.ptr<!rec_hkbase>
+      %mh0 = cir.get_member %h0[0] {name = "MHostKernel"} : !cir.ptr<!rec_handler> -> !cir.ptr<!cir.ptr<!rec_hkbase>>
+      cir.call @_ZNSt10unique_ptrIN4sycl3_V16detail14HostKernelBaseESt14default_deleteIS3_EE5resetEPS3_(%mh0, %hk0b) : (!cir.ptr<!cir.ptr<!rec_hkbase>>, !cir.ptr<!rec_hkbase>) -> ()
+      %s0 = cir.alloca "dki0" align(8) : !cir.ptr<!cir.ptr<!s8i>>
+      %d0 = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE0_EEPv() : () -> !cir.ptr<!s8i>
+      cir.store %d0, %s0 : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
+      %r0 = cir.load %s0 : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h0, %r0) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      // --- launch 1: closure with one USM capture b0 ---
+      %c1 = cir.alloca "c1" align(8) : !cir.ptr<!rec_clos1>
+      %b0 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPvm(%n) : (!u64i) -> !cir.ptr<!cir.float>
+      %g1b0 = cir.get_member %c1[0] {name = "b0"} : !cir.ptr<!rec_clos1> -> !cir.ptr<!cir.ptr<!cir.float>>
+      cir.store %b0, %g1b0 : !cir.ptr<!cir.float>, !cir.ptr<!cir.ptr<!cir.float>>
+      %hk1 = cir.alloca "hk1" align(8) : !cir.ptr<!rec_hk1>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIZ4mainEUlvE1_S2_Li1EEC2ES2_(%hk1, %c1) : (!cir.ptr<!rec_hk1>, !cir.ptr<!rec_clos1>) -> ()
+      %hk1b = cir.base_class_addr nonnull %hk1 [0] : !cir.ptr<!rec_hk1> -> !cir.ptr<!rec_hkbase>
+      %mh1 = cir.get_member %h1[0] {name = "MHostKernel"} : !cir.ptr<!rec_handler> -> !cir.ptr<!cir.ptr<!rec_hkbase>>
+      cir.call @_ZNSt10unique_ptrIN4sycl3_V16detail14HostKernelBaseESt14default_deleteIS3_EE5resetEPS3_(%mh1, %hk1b) : (!cir.ptr<!cir.ptr<!rec_hkbase>>, !cir.ptr<!rec_hkbase>) -> ()
+      %s1 = cir.alloca "dki1" align(8) : !cir.ptr<!cir.ptr<!s8i>>
+      %d1 = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE1_EEPv() : () -> !cir.ptr<!s8i>
+      cir.store %d1, %s1 : !cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s8i>>
+      %r1 = cir.load %s1 : !cir.ptr<!cir.ptr<!s8i>>, !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h1, %r1) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE0_() cc(spir_kernel) {
+      cir.return
+    }
+    cir.func @_ZTSZ4mainEUlvE1_() cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+
+// CHECK: KernelBindingTable
+// CHECK: size 2 empty false
+// Each launch is disambiguated by its own handler.MHostKernel, so the two
+// closures do not bleed: K0 gets its four distinct USM captures, K1 its one.
+// CHECK-DAG: no-alias a0 a1 a2 a3
+// CHECK-DAG: no-alias b0
