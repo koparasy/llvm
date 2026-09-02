@@ -1029,9 +1029,18 @@ LangAS CIRGenModule::getGlobalVarAddressSpace(const VarDecl *d) {
     return as;
   }
 
+  if (langOpts.SYCLIsDevice && d) {
+    auto *scope = d->getAttr<SYCLScopeAttr>();
+    if (!scope)
+      if (auto *rd = d->getType()->getAsCXXRecordDecl())
+        scope = rd->getAttr<SYCLScopeAttr>();
+    if (scope && scope->isWorkGroup())
+      return LangAS::sycl_local;
+  }
+
   if (langOpts.SYCLIsDevice &&
       (!d || d->getType().getAddressSpace() == LangAS::Default))
-    errorNYI("SYCL global address space");
+    return LangAS::sycl_global;
 
   if (langOpts.CUDA && langOpts.CUDAIsDevice) {
     if (d) {
