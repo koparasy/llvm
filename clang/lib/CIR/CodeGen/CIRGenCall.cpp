@@ -777,6 +777,26 @@ void CIRGenModule::constructFunctionArgumentAttributes(
                 getNaturalPointeeTypeAlignment(argType).getQuantity()));
     }
 
+    // From OpenCL spec v3.0.10 section 6.3.5 Alignment of Types:
+    // > For arguments to a __kernel function declared to be a pointer to a
+    // > data type, the OpenCL compiler can assume that the pointee is always
+    // > appropriately aligned as required by the data type.
+    // This also applies to SYCL device kernels, whose decomposed
+    // local_accessor pointer arguments (e.g. a `double4` __local pointer)
+    // rely on the alignment attribute so the backend lays out the local
+    // memory correctly; without it a misaligned fp64 local atomic can be
+    // silently dropped by the SPIR-V/IGC backend.
+    if (targetDecl && targetDecl->hasAttr<DeviceKernelAttr>() &&
+        (getLangOpts().OpenCL || getLangOpts().SYCLIsDevice) &&
+        argType->isPointerType()) {
+      QualType pointeeTy = argType->getPointeeType();
+      if (!pointeeTy->isIncompleteType() && pointeeTy->isConstantSizeType())
+        argAttrList.set(
+            mlir::LLVM::LLVMDialect::getAlignAttrName(),
+            builder.getI64IntegerAttr(
+                getNaturalPointeeTypeAlignment(argType).getQuantity()));
+    }
+
     if (argType->hasFloatingRepresentation())
       if (llvm::FPClassTest mask =
               CodeGenUtils::getNoFPClassTestMask(getLangOpts()))
