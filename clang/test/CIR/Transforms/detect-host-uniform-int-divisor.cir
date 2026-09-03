@@ -275,3 +275,176 @@ module attributes {cir.offload.container} {
     }
   }
 }
+
+// -----
+
+// Generalized to floating-point division and transcendental math. A device
+// computation whose operands are launch-uniform (derived from captured scalars
+// through pure arithmetic and pure `const` math calls) is worth host-hoisting;
+// the pass reports both a uniform DIVISOR (strength-reduce) and a fully-uniform
+// expensive result (host-precompute the scalar). Uses the real device symbols
+// (`__spirv_ocl_*` math, `__spirv_BuiltIn*` invocation state, `side_effect(const)`).
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_gf = !cir.struct<"gf" {data !cir.float, data !cir.float}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_gf>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_gf>)
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>, %t: !cir.float, %p: !cir.float) {
+      %lam = cir.alloca "gf" align(8) : !cir.ptr<!rec_gf>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      %ft = cir.get_member %lam[0] {name = "theta"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
+      cir.store %t, %ft : !cir.float, !cir.ptr<!cir.float>
+      %fp = cir.get_member %lam[1] {name = "phi"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
+      cir.store %p, %fp : !cir.float, !cir.ptr<!cir.float>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_gf>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func private @_Z32__spirv_BuiltInLocalInvocationIdi(!s32i) -> !u64i attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+    cir.func private @_Z15__spirv_ocl_cosf(!cir.float) -> !cir.float attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+    cir.func private @_Z16__spirv_ocl_sqrtf(!cir.float) -> !cir.float attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+    cir.func @_ZTSZ4mainEUlvE_(%argT: !cir.float, %argP: !cir.float, %fout: !cir.ptr<!cir.float, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "gf" align(8) : !cir.ptr<!rec_gf>
+      %fth = cir.get_member %clos[0] {name = "theta"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
+      cir.store %argT, %fth : !cir.float, !cir.ptr<!cir.float>
+      %fph = cir.get_member %clos[1] {name = "phi"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
+      cir.store %argP, %fph : !cir.float, !cir.ptr<!cir.float>
+
+      %z = cir.const #cir.int<0> : !s32i
+      %lid64 = cir.call @_Z32__spirv_BuiltInLocalInvocationIdi(%z) {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>} : (!s32i) -> !u64i
+      %lids = cir.cast integral %lid64 : !u64i -> !s32i
+      %lidf = cir.cast int_to_float %lids : !s32i -> !cir.float
+
+      %vt = cir.load %fth : !cir.ptr<!cir.float>, !cir.float
+      %vp = cir.load %fph : !cir.ptr<!cir.float>, !cir.float
+
+      // (a) cos(theta): whole result launch-uniform -> host-precompute scalar.
+      // expected-remark@+1 {{launch-uniform cos of captured scalar 'theta'; result is invariant across the launch}}
+      %cosv = cir.call @_Z15__spirv_ocl_cosf(%vt) {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>} : (!cir.float) -> !cir.float
+      %ma = cir.fmul %cosv, %lidf : !cir.float
+      cir.store %ma, %fout : !cir.float, !cir.ptr<!cir.float, target_address_space(1)>
+
+      // (b) sqrt(theta*2+1): reported once on the sqrt; the inner uniform
+      // fmul/fadd are cheap and not reported.
+      %two = cir.const #cir.fp<2.000000e+00> : !cir.float
+      %t2 = cir.fmul %vt, %two : !cir.float
+      %one = cir.const #cir.fp<1.000000e+00> : !cir.float
+      %t3 = cir.fadd %t2, %one : !cir.float
+      // expected-remark@+1 {{launch-uniform sqrt of captured scalar 'theta'}}
+      %sq = cir.call @_Z16__spirv_ocl_sqrtf(%t3) {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>} : (!cir.float) -> !cir.float
+      %mb = cir.fmul %sq, %lidf : !cir.float
+      cir.store %mb, %fout : !cir.float, !cir.ptr<!cir.float, target_address_space(1)>
+
+      // (c) theta / phi: both operands uniform -> whole quotient uniform.
+      // expected-remark@+1 {{launch-uniform floating-point division of captured scalar 'theta'}}
+      %adiv = cir.fdiv %vt, %vp : !cir.float
+      %mc = cir.fmul %adiv, %lidf : !cir.float
+      cir.store %mc, %fout : !cir.float, !cir.ptr<!cir.float, target_address_space(1)>
+
+      // (d) lid / theta: only the divisor is uniform -> reciprocal multiply.
+      // expected-remark@+1 {{floating-point division by launch-uniform capture 'theta'; consider host-precomputing a reciprocal multiply (under fast-math)}}
+      %ddiv = cir.fdiv %lidf, %vt : !cir.float
+      cir.store %ddiv, %fout : !cir.float, !cir.ptr<!cir.float, target_address_space(1)>
+
+      cir.return
+    }
+  }
+}
+
+// -----
+
+// Negatives + subsumption. cos of a work-item id is not uniform (no remark); a
+// cheap uniform product is not expensive (no remark); and sqrt(theta/phi) is
+// reported ONCE on the sqrt, with the inner fully-uniform division subsumed.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_gf = !cir.struct<"gf" {data !cir.float, data !cir.float}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_gf>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_gf>)
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>, %t: !cir.float, %p: !cir.float) {
+      %lam = cir.alloca "gf" align(8) : !cir.ptr<!rec_gf>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      %ft = cir.get_member %lam[0] {name = "theta"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
+      cir.store %t, %ft : !cir.float, !cir.ptr<!cir.float>
+      %fp = cir.get_member %lam[1] {name = "phi"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
+      cir.store %p, %fp : !cir.float, !cir.ptr<!cir.float>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_gf>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func private @_Z32__spirv_BuiltInLocalInvocationIdi(!s32i) -> !u64i attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+    cir.func private @_Z15__spirv_ocl_cosf(!cir.float) -> !cir.float attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+    cir.func private @_Z16__spirv_ocl_sqrtf(!cir.float) -> !cir.float attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+    cir.func @_ZTSZ4mainEUlvE_(%argT: !cir.float, %argP: !cir.float, %fout: !cir.ptr<!cir.float, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "gf" align(8) : !cir.ptr<!rec_gf>
+      %fth = cir.get_member %clos[0] {name = "theta"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
+      cir.store %argT, %fth : !cir.float, !cir.ptr<!cir.float>
+      %fph = cir.get_member %clos[1] {name = "phi"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
+      cir.store %argP, %fph : !cir.float, !cir.ptr<!cir.float>
+
+      %z = cir.const #cir.int<0> : !s32i
+      %lid64 = cir.call @_Z32__spirv_BuiltInLocalInvocationIdi(%z) {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>} : (!s32i) -> !u64i
+      %lids = cir.cast integral %lid64 : !u64i -> !s32i
+      %lidf = cir.cast int_to_float %lids : !s32i -> !cir.float
+      %vt = cir.load %fth : !cir.ptr<!cir.float>, !cir.float
+      %vp = cir.load %fph : !cir.ptr<!cir.float>, !cir.float
+
+      // (e) cos(lid): argument is a work-item id -> not uniform, no remark.
+      %cn = cir.call @_Z15__spirv_ocl_cosf(%lidf) {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>} : (!cir.float) -> !cir.float
+      cir.store %cn, %fout : !cir.float, !cir.ptr<!cir.float, target_address_space(1)>
+
+      // (g) cheap uniform product feeding varying: not expensive, no remark.
+      %pm = cir.fmul %vt, %vp : !cir.float
+      %mg = cir.fmul %pm, %lidf : !cir.float
+      cir.store %mg, %fout : !cir.float, !cir.ptr<!cir.float, target_address_space(1)>
+
+      // (f) sqrt(theta/phi): the inner fully-uniform division is subsumed;
+      // only the outermost expensive op (sqrt) is reported.
+      %sd = cir.fdiv %vt, %vp : !cir.float
+      // expected-remark@+1 {{launch-uniform sqrt of captured scalar 'theta'}}
+      %ss = cir.call @_Z16__spirv_ocl_sqrtf(%sd) {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>} : (!cir.float) -> !cir.float
+      %mf = cir.fmul %ss, %lidf : !cir.float
+      cir.store %mf, %fout : !cir.float, !cir.ptr<!cir.float, target_address_space(1)>
+
+      cir.return
+    }
+  }
+}

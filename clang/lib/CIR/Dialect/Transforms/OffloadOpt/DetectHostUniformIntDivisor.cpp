@@ -6,38 +6,49 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Remarks on a SYCL device integer division / remainder whose DIVISOR is
-// kernel-scope-uniform: a value that is invariant across the whole launch
-// because it is derived only from captured SCALAR closure fields and
-// compile-time constants. The motivating case (CMPLRLLVM-76652) is a pytorch
-// kernel `c = lid / C_`, where `lid = item.get_local_id(0)` varies per
-// work-item but `C_` is a captured scalar kernel argument -- the same value at
-// every work-item of the launch. A division by such a uniform value can be
-// strength-reduced to a magic-multiply whose magic/shift constants are a
-// function of C_ only, computable once on the host.
+// Remarks on a SYCL device computation driven by a kernel-scope-uniform value:
+// one that is invariant across the whole launch because it is derived only from
+// captured SCALAR closure fields and compile-time constants, through pure
+// arithmetic and pure (`const`) library calls. The motivating case
+// (CMPLRLLVM-76652) is a pytorch kernel `c = lid / C_`, where
+// `lid = item.get_local_id(0)` varies per work-item but `C_` is a captured
+// scalar kernel argument -- the same value at every work-item of the launch.
+//
+// Two remark kinds:
+//   - a division / remainder (integer or floating-point) whose DIVISOR is
+//     uniform: strength-reduce to a reciprocal magic-multiply (integer) or a
+//     reciprocal multiply (fp, under fast-math) whose constants are a function
+//     of the divisor, precomputed once on the host.
+//   - an expensive FULLY-uniform computation -- a transcendental math call
+//     (cos/sin/exp/pow/sqrt/...) or a division with both operands uniform --
+//     whose entire result is a launch constant: host-precompute it and pass the
+//     scalar. Reported once, at the outermost expensive op of a uniform
+//     expression (a nested `a/b` under a `sqrt` is subsumed by the sqrt).
 //
 // This is analysis + remark ONLY. It never mutates the module, adds no kernel
-// argument, and does not rewrite the division (the auto-transform is Flavor B,
+// argument, and does not rewrite anything (the auto-transform is Flavor B,
 // deliberately out of scope). The point is to demonstrate the combine's unique
-// host+device visibility: the front end cannot see that C_ is uniform across
+// host+device visibility: the front end cannot see the value is uniform across
 // the launch (it sees one work-item's control flow), and the back end cannot
-// see that C_ is a runtime value known on the host (it sees an opaque kernel
+// see it is a runtime value known on the host (it sees an opaque kernel
 // argument). Only the joined host+device container sees both.
 //
 // The uniformity oracle mirrors the scalar-capture classification of
 // PropagateSYCLKernelArgs.cpp: a spir_kernel scalar parameter that the prologue
 // stores into a closure capture field (arg -> [spill slot ->] cir.get_member
-// store) is a captured scalar, and hence uniform. From there a divisor is
-// uniform iff every step back is either such a captured field, a cir.const, or
-// a pure (memory-effect-free, non-call) arithmetic op over uniform operands. A
-// chain that reaches a work-item/index builtin (a cir.call), a load from
-// non-captured memory, or a parameter with no captured-scalar field is NOT
-// uniform. A divisor that is itself a cir.const is skipped -- the backend
-// already strength-reduces compile-time constants; the interesting case is a
-// runtime-but-launch-uniform divisor like C_.
+// store) is a captured scalar, and hence uniform. From there a value is uniform
+// iff every step back is such a captured field, a cir.const, a pure
+// (memory-effect-free) op over uniform operands, or a `const` (readnone) call
+// whose callee is NOT a work-item/index builtin (`__spirv_BuiltIn*`) and whose
+// arguments are uniform -- which admits transcendental math (lowered to
+// `__spirv_ocl_*` const calls) while rejecting the invocation-state builtins. A
+// chain reaching such a builtin, a non-captured memory load, or a parameter
+// with no captured-scalar field is NOT uniform. A constant divisor is skipped
+// (the backend already strength-reduces those); a fully-uniform expression with
+// no runtime capture is skipped (the backend already constant-folds it).
 //
 // A SYCL device kernel calls its functor's `operator()` (an always_inline
-// helper) rather than containing the division directly, so this pass expects
+// helper) rather than containing the computation directly, so this pass expects
 // the CIR inliner to have folded operator() into the kernel first; run it after
 // `-inline` (the lit fixtures model both the pre- and post-inline shapes). It
 // is not part of the default cir-offload-merge pipeline; request it explicitly.
@@ -61,6 +72,13 @@ namespace mlir {
 
 using namespace mlir;
 using namespace cir;
+
+// Whether `call` reads and writes no memory (`memory_effects` is `none`), i.e.
+// the callee is a pure function of its arguments.
+static bool isReadNoneCall(cir::CallOp call) {
+  std::optional<cir::MemoryEffectsAttr> effects = call.getMemoryEffects();
+  return effects && *effects == cir::MemoryEffectsAttr::none(call.getContext());
+}
 
 namespace {
 
@@ -171,10 +189,24 @@ static bool isUniform(mlir::Value v, const llvm::StringMap<mlir::Value> &fields,
     return true;
   }
 
-  // A call (a work-item/index builtin such as get_local_id / __spirv_BuiltIn*,
-  // or any other callee) is not a uniform source.
-  if (mlir::isa<cir::CallOp>(def))
-    return false;
+  // A call is uniform iff it is a pure (`const`, i.e. reads/writes no memory)
+  // function whose callee is NOT an invocation-state builtin, and its data
+  // arguments are all uniform. That admits transcendental math (cos/sin/exp/...
+  // lower to `__spirv_ocl_*` const calls) and other pure library calls, while
+  // rejecting the work-item/index builtins (`__spirv_BuiltIn*`) -- which are
+  // also `const` but read per-work-item invocation state, so their result
+  // varies across the launch.
+  if (auto call = mlir::dyn_cast<cir::CallOp>(def)) {
+    if (!isReadNoneCall(call))
+      return false;
+    std::optional<llvm::StringRef> callee = call.getCallee();
+    if (!callee || callee->contains("__spirv_BuiltIn"))
+      return false;
+    for (mlir::Value arg : call.getArgOperands())
+      if (!isUniform(arg, fields, visited, outField, depth + 1))
+        return false;
+    return true;
+  }
 
   // A pure (memory-effect-free) op is a function of its operands only, so it is
   // uniform iff they all are. This covers cir.const (no operands -> uniform),
@@ -186,6 +218,79 @@ static bool isUniform(mlir::Value v, const llvm::StringMap<mlir::Value> &fields,
     if (!isUniform(operand, fields, visited, outField, depth + 1))
       return false;
   return true;
+}
+
+// The expensive transcendental math builtins whose result, when the argument
+// is launch-uniform, is a launch-invariant constant worth host-precomputing.
+// Cheap library calls (fabs/floor/fmin/...) are intentionally excluded: their
+// device cost does not justify a hint. Returns the human name (e.g. "cos") of
+// the matched builtin, or empty if `call` is not one.
+static llvm::StringRef expensiveMathName(cir::CallOp call) {
+  if (!isReadNoneCall(call))
+    return {};
+  std::optional<llvm::StringRef> callee = call.getCallee();
+  if (!callee)
+    return {};
+  // OpenCL extended-instruction math lowers to `__spirv_ocl_<name><typesuffix>`
+  // under an Itanium `_Z<len>` prefix. Match the bare name in the middle.
+  static constexpr llvm::StringRef kExpensive[] = {
+      "sin",  "cos",   "tan",  "asin", "acos",   "atan",   "atan2",
+      "sinh", "cosh",  "tanh", "exp",  "exp2",   "exp10",  "log",
+      "log2", "log10", "pow",  "powr", "pown",   "sqrt",   "rsqrt",
+      "cbrt", "hypot", "erf",  "erfc", "tgamma", "lgamma", "divide"};
+  llvm::StringRef marker = "__spirv_ocl_";
+  size_t pos = callee->find(marker);
+  if (pos == llvm::StringRef::npos)
+    return {};
+  llvm::StringRef rest = callee->substr(pos + marker.size());
+  for (llvm::StringRef name : kExpensive) {
+    // The mangled tail is `<name>` + a type suffix (f/d/Dh/...); require the
+    // builtin name to be a prefix and the next char to not extend it into a
+    // different identifier (e.g. do not match "cos" inside "cosh").
+    if (rest.starts_with(name)) {
+      char after = rest.size() > name.size() ? rest[name.size()] : '\0';
+      if (!llvm::isAlpha(after) || after == 'f' || after == 'd')
+        return name;
+    }
+  }
+  return {};
+}
+
+// An op whose device cost is high enough to warrant a host-precompute hint:
+// integer/floating-point division or remainder, or a transcendental math call.
+static bool isExpensiveOp(mlir::Operation *op) {
+  if (mlir::isa<cir::DivOp, cir::RemOp, cir::FDivOp, cir::FRemOp>(op))
+    return true;
+  if (auto call = mlir::dyn_cast<cir::CallOp>(op))
+    return !expensiveMathName(call).empty();
+  return false;
+}
+
+// Whether `op`'s (uniform) result flows, through pure uniform arithmetic, into
+// another expensive uniform op. If so, that outer op is the better report site
+// (host-precompute the whole thing), so this inner one is suppressed. This
+// collapses `sqrt(a / b)` to a single hint on the sqrt while still reporting a
+// lone `a / b` that only feeds cheap uniform arithmetic before reaching varying
+// code.
+static bool
+subsumedByExpensiveUniform(mlir::Operation *op,
+                           const llvm::StringMap<mlir::Value> &fields,
+                           llvm::SmallPtrSetImpl<mlir::Operation *> &seen) {
+  for (mlir::Operation *user : op->getUsers()) {
+    if (!seen.insert(user).second)
+      continue;
+    if (user->getNumResults() != 1)
+      continue;
+    llvm::SmallPtrSet<mlir::Value, 16> visited;
+    llvm::StringRef field;
+    if (!isUniform(user->getResult(0), fields, visited, field, 0))
+      continue; // varying consumer: not a subsuming uniform expression.
+    if (isExpensiveOp(user))
+      return true;
+    if (subsumedByExpensiveUniform(user, fields, seen))
+      return true;
+  }
+  return false;
 }
 
 struct OffloadDetectHostUniformIntDivisorPass
@@ -223,27 +328,79 @@ void OffloadDetectHostUniformIntDivisorPass::runOnOperation() {
     if (fields.empty())
       return;
 
-    kernel.getBody().walk([&](mlir::Operation *op) {
-      if (!mlir::isa<cir::DivOp, cir::RemOp>(op))
-        return;
-      mlir::Value divisor = op->getOperand(1);
-      // A compile-time-constant divisor is already handled by the backend's
-      // constant strength reduction; the interesting case is a runtime value
-      // that is nonetheless launch-uniform.
-      if (divisor.getDefiningOp<cir::ConstantOp>())
-        return;
-
+    // A whole-value-uniform expensive computation is worth reporting only where
+    // it crosses into varying code, and only when it actually derives from a
+    // runtime capture (a purely constant one is folded by the backend). Reports
+    // once, at the boundary, naming the driving capture.
+    auto reportFullyUniform = [&](mlir::Operation *op, llvm::StringRef what) {
+      llvm::SmallPtrSet<mlir::Operation *, 16> seen;
+      if (subsumedByExpensiveUniform(op, fields, seen))
+        return; // a larger expensive uniform op is the better report site.
       llvm::SmallPtrSet<mlir::Value, 16> visited;
       llvm::StringRef field;
-      if (!isUniform(divisor, fields, visited, field, 0) || field.empty())
-        return;
-
+      for (mlir::Value operand : op->getOperands())
+        if (isUniform(operand, fields, visited, field, 0) && !field.empty())
+          break;
+      if (field.empty())
+        return; // no runtime capture involved -> a compile-time constant.
       op->emitRemark()
-          << "device kernel '" << kernel.getName() << "': integer "
-          << (mlir::isa<cir::DivOp>(op) ? "division" : "remainder")
-          << " by launch-uniform capture '" << field
-          << "'; consider host-precomputing a reciprocal magic-multiply "
-             "(CMPLRLLVM-76652)";
+          << "device kernel '" << kernel.getName() << "': launch-uniform "
+          << what << " of captured scalar '" << field
+          << "'; result is invariant across the launch -- host-precompute it "
+             "and pass the scalar (CMPLRLLVM-76652)";
+    };
+
+    kernel.getBody().walk([&](mlir::Operation *op) {
+      // Division / remainder (integer and floating-point).
+      if (mlir::isa<cir::DivOp, cir::RemOp, cir::FDivOp, cir::FRemOp>(op)) {
+        bool isRem = mlir::isa<cir::RemOp, cir::FRemOp>(op);
+        bool isFP = mlir::isa<cir::FDivOp, cir::FRemOp>(op);
+        mlir::Value dividend = op->getOperand(0);
+        mlir::Value divisor = op->getOperand(1);
+        // A compile-time-constant divisor is already strength-reduced by the
+        // backend; the interesting case is a runtime, launch-uniform value.
+        if (divisor.getDefiningOp<cir::ConstantOp>())
+          return;
+
+        llvm::SmallPtrSet<mlir::Value, 16> dv, nv;
+        llvm::StringRef dField, nField;
+        bool divisorUniform = isUniform(divisor, fields, dv, dField, 0);
+
+        // Whole quotient uniform (both operands uniform): host-precompute it.
+        if (divisorUniform && isUniform(dividend, fields, nv, nField, 0)) {
+          reportFullyUniform(op, isFP ? "floating-point division"
+                                      : "integer division");
+          return;
+        }
+        // Only the divisor is uniform (the classic `lid / C_`): strength-reduce
+        // to a reciprocal magic-multiply whose constants are a function of the
+        // divisor, precomputed on the host.
+        if (divisorUniform && !dField.empty()) {
+          op->emitRemark() << "device kernel '" << kernel.getName()
+                           << "': " << (isFP ? "floating-point " : "integer ")
+                           << (isRem ? "remainder" : "division")
+                           << " by launch-uniform capture '" << dField
+                           << "'; consider host-precomputing a reciprocal "
+                           << (isFP ? "multiply (under fast-math)"
+                                    : "magic-multiply")
+                           << " (CMPLRLLVM-76652)";
+        }
+        return;
+      }
+
+      // Expensive transcendental math call (cos/sin/exp/pow/sqrt/...) whose
+      // argument is launch-uniform: the whole result is a launch constant.
+      if (auto call = mlir::dyn_cast<cir::CallOp>(op)) {
+        llvm::StringRef name = expensiveMathName(call);
+        if (name.empty())
+          return;
+        llvm::SmallPtrSet<mlir::Value, 16> visited;
+        llvm::StringRef field;
+        for (mlir::Value arg : call.getArgOperands())
+          if (!isUniform(arg, fields, visited, field, 0))
+            return;
+        reportFullyUniform(op, name);
+      }
     });
   };
 
