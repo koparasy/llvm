@@ -1,0 +1,36 @@
+// RUN: cir-opt %s -pass-pipeline="builtin.module(inline)" 2>&1 | FileCheck %s
+
+// Regression test for a CIR inliner assertion crash.
+//
+// The generic MLIR inliner has a single-block fast path (InliningUtils.cpp)
+// that assumes the sole inlined block's terminator yields exactly the callee's
+// results, so it can zip those operands against the callee's `res_attrs`. That
+// does not hold for a value-returning cir.func whose entry-block terminator is
+// cir.unreachable (a genuinely non-returning body, or one whose real cir.return
+// is still nested in a cir.scope because FlattenCFG has not run): the
+// terminator has zero operands while `res_attrs` has result arity, which used
+// to trip `assert(arrayAttr.size() == resAttrs.size())`.
+//
+// CIRInlinerInterface now mirrors the LLVM dialect and declines the single-block
+// fast path when the block is terminated by cir.unreachable, so the inliner
+// takes the generic multi-block path and no longer asserts.
+
+module {
+  // A value-returning callee whose entry block ends in cir.unreachable and
+  // whose result carries a result attribute (`res_attrs` arity 1 vs terminator
+  // operand count 0 -- the shape that used to crash).
+  cir.func @callee(%arg0: !cir.float) -> (!cir.float {llvm.noundef}) {
+    cir.unreachable
+  }
+
+  cir.func @caller(%arg0: !cir.float) -> (!cir.float) {
+    %0 = cir.call @callee(%arg0) : (!cir.float) -> !cir.float
+    cir.return %0 : !cir.float
+  }
+}
+
+// The call is inlined (no cir.call remains) and the unreachable body is spliced
+// into the caller without asserting.
+// CHECK-LABEL: cir.func @caller
+// CHECK-NOT:     cir.call @callee
+// CHECK:         cir.unreachable
