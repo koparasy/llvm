@@ -7,6 +7,7 @@ add_clang_library(MLIRCIROffloadOpt
   StampReqdWorkGroupSize.cpp
   InferKernelParamNoAlias.cpp
   PropagateSYCLKernelArgs.cpp
+  DetectHostUniformIntDivisor.cpp
 
   DEPENDS
   MLIRCIROpsIncGen

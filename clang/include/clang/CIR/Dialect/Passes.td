@@ -450,4 +450,41 @@ def OffloadPropagateSYCLKernelArgs
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def OffloadDetectHostUniformIntDivisor
+    : Pass<"cir-offload-detect-host-uniform-int-divisor",
+           "mlir::ModuleOp"> {
+  let summary = "Remark on device int div/rem by a launch-uniform scalar capture";
+  let description = [{
+    Runs over a `cir.offload.container`. For each SYCL device kernel, walks the
+    kernel body for integer division / remainder (`cir.div` / `cir.rem`) and
+    tests whether the divisor is *kernel-scope-uniform*: invariant across the
+    launch because it is derived only from captured scalar closure fields
+    (classified with the same param->field mapping the scalar-capture
+    propagation pass uses) and `cir.const`, propagated through pure integer
+    arithmetic. A divisor whose chain reaches a work-item/index builtin, a
+    non-captured memory load, or a parameter not backed by a captured scalar is
+    NOT uniform and is skipped, as is a divisor that is already a compile-time
+    constant (the backend already strength-reduces those).
+
+    For each launch-uniform divisor it emits an MLIR *remark* naming the kernel
+    and the capture field, suggesting the value's reciprocal be host-precomputed
+    as a magic-multiply (the strength reduction the front end cannot see -- it
+    lacks the whole-launch view -- and the back end cannot see -- the divisor is
+    a runtime value on the device side). Every SYCL device kernel is a
+    candidate, TU-local or not: a remark is sound cross-TU (unlike the
+    in-place-edit opts), and the motivating case is a named functor. Diagnostic
+    only: the pass never mutates the module and is not part of the default merge
+    pipeline, so it must be requested explicitly (CMPLRLLVM-76652).
+  }];
+  let constructor = "mlir::createOffloadDetectHostUniformIntDivisorPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+  let options = [
+    Option<"scanAllKernels", "scan-all-kernels", "bool", /*default=*/"false",
+           "Scan every device spir_kernel directly, bypassing the "
+           "host<->device binding table. For surveying a device-only module "
+           "(no host side); the default path scans only kernels reached "
+           "through a recovered SYCL launch binding.">,
+  ];
+}
+
 #endif // CLANG_CIR_DIALECT_PASSES_TD
