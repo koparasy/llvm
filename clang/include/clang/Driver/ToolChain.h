@@ -172,6 +172,7 @@ private:
   mutable std::unique_ptr<Tool> IfsMerge;
   mutable std::unique_ptr<Tool> OffloadBundler;
   mutable std::unique_ptr<Tool> OffloadWrapper;
+  mutable std::unique_ptr<Tool> CIROffloadMerge;
   mutable std::unique_ptr<Tool> OffloadPackager;
   mutable std::unique_ptr<Tool> OffloadPackagerExtract;
   mutable std::unique_ptr<Tool> OffloadDeps;
@@ -192,6 +193,7 @@ private:
   Tool *getClangAs() const;
   Tool *getOffloadBundler() const;
   Tool *getOffloadWrapper() const;
+  Tool *getCIROffloadMerge() const;
   Tool *getOffloadPackager() const;
   Tool *getOffloadPackagerExtract() const;
   Tool *getOffloadDeps() const;

@@ -779,6 +779,12 @@ Tool *ToolChain::getOffloadWrapper() const {
   return OffloadWrapper.get();
 }
 
+Tool *ToolChain::getCIROffloadMerge() const {
+  if (!CIROffloadMerge)
+    CIROffloadMerge.reset(new tools::CIROffloadMerge(*this));
+  return CIROffloadMerge.get();
+}
+
 Tool *ToolChain::getOffloadPackager() const {
   if (!OffloadPackager)
     OffloadPackager.reset(new tools::OffloadPackager(*this));
@@ -880,6 +886,9 @@ Tool *ToolChain::getTool(Action::ActionClass AC) const {
 
   case Action::OffloadWrapperJobClass:
     return getOffloadWrapper();
+  case Action::CIRMergeJobClass:
+  case Action::CIRSplitJobClass:
+    return getCIROffloadMerge();
   case Action::OffloadPackagerJobClass:
     return getOffloadPackager();
   case Action::OffloadPackagerExtractJobClass:

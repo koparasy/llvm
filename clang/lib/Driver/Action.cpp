@@ -44,6 +44,10 @@ const char *Action::getClassName(ActionClass AC) {
     return "clang-offload-unbundler";
   case OffloadWrapperJobClass:
     return "clang-offload-wrapper";
+  case CIRMergeJobClass:
+    return "cir-offload-merge";
+  case CIRSplitJobClass:
+    return "cir-offload-split";
   case OffloadPackagerJobClass:
     return "llvm-offload-binary";
   case OffloadPackagerExtractJobClass:
@@ -101,6 +105,16 @@ void Action::propagateDeviceOffloadInfo(OffloadKind OKind, BoundArch OArch,
       });
   if (Kind == OffloadPackagerJobClass && hasPreprocessOrPCHJob)
     return;
+  // Merge/split mix host and device inputs; stamp the node itself but do not
+  // recurse, so device info never bleeds into the host CIR compile.
+  if (Kind == CIRSplitJobClass || Kind == CIRMergeJobClass) {
+    assert((OffloadingDeviceKind == OKind || OffloadingDeviceKind == OFK_None) &&
+           "Setting device kind to a different device??");
+    OffloadingDeviceKind = OKind;
+    OffloadingArch = OArch;
+    OffloadingToolChain = OToolChain;
+    return;
+  }
 
   assert((OffloadingDeviceKind == OKind || OffloadingDeviceKind == OFK_None) &&
          "Setting device kind to a different device??");
@@ -116,6 +130,8 @@ void Action::propagateDeviceOffloadInfo(OffloadKind OKind, BoundArch OArch,
 void Action::propagateHostOffloadInfo(unsigned OKinds, BoundArch OArch) {
   // Offload action set its own kinds on their dependences.
   if (Kind == OffloadClass)
+    return;
+  if (Kind == CIRSplitJobClass)
     return;
 
   assert(OffloadingDeviceKind == OFK_None &&
@@ -237,7 +253,8 @@ OffloadAction::OffloadAction(const HostDependence &HDep)
 
 OffloadAction::OffloadAction(const DeviceDependences &DDeps, types::ID Ty)
     : Action(OffloadClass, DDeps.getActions(), Ty),
-      DevToolChains(DDeps.getToolChains()) {
+      DevToolChains(DDeps.getToolChains()),
+      DevBoundArchs(DDeps.getBoundArchs()) {
   auto &OKinds = DDeps.getOffloadKinds();
   auto &BArchs = DDeps.getBoundArchs();
   auto &OTCs = DDeps.getToolChains();
@@ -258,7 +275,8 @@ OffloadAction::OffloadAction(const DeviceDependences &DDeps, types::ID Ty)
 OffloadAction::OffloadAction(const HostDependence &HDep,
                              const DeviceDependences &DDeps)
     : Action(OffloadClass, HDep.getAction()), HostTC(HDep.getToolChain()),
-      DevToolChains(DDeps.getToolChains()) {
+      DevToolChains(DDeps.getToolChains()),
+      DevBoundArchs(DDeps.getBoundArchs()) {
   // We use the kinds of the host dependence for this action.
   BoundArch BA = HDep.getBoundArch();
   ActiveOffloadKindMask = HDep.getOffloadKinds();
@@ -299,14 +317,17 @@ void OffloadAction::doOnEachDeviceDependence(
   // more dependence than we have device tool chains.
   assert(getInputs().size() == DevToolChains.size() + (HostTC ? 1 : 0) &&
          "Sizes of action dependences and toolchains are not consistent!");
+  assert(DevToolChains.size() == DevBoundArchs.size() &&
+         "Sizes of device toolchains and bound archs are not consistent!");
 
   // Skip host action
   if (HostTC)
     ++I;
 
   auto TI = DevToolChains.begin();
-  for (; I != E; ++I, ++TI)
-    Work(*I, *TI, (*I)->getOffloadingArch());
+  auto BI = DevBoundArchs.begin();
+  for (; I != E; ++I, ++TI, ++BI)
+    Work(*I, *TI, *BI);
 }
 
 void OffloadAction::doOnEachDependence(const OffloadActionWorkTy &Work) const {
@@ -491,6 +512,19 @@ OffloadWrapperJobAction::OffloadWrapperJobAction(ActionList &Inputs,
 OffloadWrapperJobAction::OffloadWrapperJobAction(Action *Input, types::ID Type,
                                                  bool IsEmbeddedIR)
     : JobAction(OffloadWrapperJobClass, Input, Type), EmbedIR(IsEmbeddedIR) {}
+
+void CIRMergeJobAction::anchor() {}
+
+CIRMergeJobAction::CIRMergeJobAction(ActionList &Inputs)
+    : JobActionWithDependentInfo(CIRMergeJobClass, Inputs, types::TY_CIR) {}
+
+void CIRSplitJobAction::anchor() {}
+
+CIRSplitJobAction::CIRSplitJobAction(Action *Input)
+    : JobActionWithDependentInfo(CIRSplitJobClass, Input, Input->getType()) {
+  assert(Input->getType() == types::TY_CIR &&
+         "CIR split expects a CIR container input");
+}
 
 void OffloadPackagerJobAction::anchor() {}
 
