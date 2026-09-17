@@ -1,0 +1,58 @@
+// The host/device closure-layout-mismatch check runs as the first pass of the
+// cir-offload-merge combine pipeline (always on), so a SYCL kernel whose
+// captured closure diverges host vs device produces a warning during the
+// normal combine step -- naming the kernel, the divergent field, and both
+// types. Analysis only: the combine still succeeds and produces its output.
+
+// RUN: rm -rf %t && split-file %s %t
+
+// RUN: cir-offload-merge -combine \
+// RUN:   -input=%t/host.cir \
+// RUN:   -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   -output=%t/combined.cir 2>&1 | FileCheck %s
+// RUN: cir-opt %t/combined.cir --verify-roundtrip -o /dev/null
+
+// CHECK: warning: device kernel '_ZTSZ4mainEUlvE_': closure field 'b' layout differs: host '!cir.double' vs device '!cir.int<s, 32>'; host/device closure ABI mismatch (likely __SYCL_DEVICE_ONLY__ or divergent captures) -- undefined behavior
+
+//--- host.cir
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hlam = !cir.struct<"hlam" {data !cir.ptr<!s32i>, data !cir.double}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module {
+  cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+  cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+  cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>)
+  cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+  cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+    %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+    %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+    cir.return %1 : !cir.ptr<!s8i>
+  }
+  cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+    %lam = cir.alloca "hlam" align(8) : !cir.ptr<!rec_hlam>
+    %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+    cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+    %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+    %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+    cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+    cir.return
+  }
+}
+
+//--- device.cir
+!s32i = !cir.int<s, 32>
+!rec_dlam = !cir.struct<"dlam" {data !cir.ptr<!s32i>, data !s32i}>
+module {
+  cir.func @_ZTSZ4mainEUlvE_(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i) cc(spir_kernel) {
+    %clos = cir.alloca "dlam" align(8) : !cir.ptr<!rec_dlam>
+    %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
+    cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
+    cir.return
+  }
+}

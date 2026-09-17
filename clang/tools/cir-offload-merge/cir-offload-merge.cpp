@@ -24,6 +24,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
@@ -344,6 +345,15 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   mlir::PassManager pm(module.getContext(), mlir::ModuleOp::getOperationName());
   mlir::OpPassManager &modulePM = pm.nest<mlir::ModuleOp>();
 
+  // Warn when a SYCL kernel's captured-closure layout diverges between the host
+  // and device modules (an equal-size / different-type divergence the
+  // sizeof(KernelType)==KernelSize static_assert cannot catch). Runs FIRST, on
+  // the as-emitted container: the mem2reg below promotes the device closure
+  // alloca whose get_member stores this check recovers the device closure
+  // record from, so it must observe the IR before that. Diagnostic only.
+  pm.addPass(
+      mlir::createOffloadDetectHostDeviceClosureLayoutMismatchPass());
+
   // Promote stack slots and propagate constants so that a kernel argument known
   // at compile time reaches the device stub call site as a cir.const. Runs on
   // every nested module, host and device.
@@ -507,6 +517,40 @@ int main(int argc, char **argv) {
                       mlir::LLVM::LLVMDialect, mlir::DLTIDialect,
                       mlir::omp::OpenMPDialect>();
   context.appendDialectRegistry(registry);
+
+  // Without a diagnostic handler MLIR silently drops non-error diagnostics
+  // (DiagnosticEngine::emit only prints errors by default). The combine
+  // pipeline's closure-layout check emits *warnings*, so register a handler
+  // that surfaces every severity to stderr, prefixed with its source location
+  // (a real file:line:col, since CIRGen emits the input .cir with debug locs).
+  context.getDiagEngine().registerHandler([](mlir::Diagnostic &diag) {
+    llvm::StringRef severity;
+    switch (diag.getSeverity()) {
+    case mlir::DiagnosticSeverity::Note:
+      severity = "note";
+      break;
+    case mlir::DiagnosticSeverity::Warning:
+      severity = "warning";
+      break;
+    case mlir::DiagnosticSeverity::Error:
+      severity = "error";
+      break;
+    case mlir::DiagnosticSeverity::Remark:
+      severity = "remark";
+      break;
+    }
+    llvm::raw_ostream &os = llvm::errs();
+    if (!llvm::isa<mlir::UnknownLoc>(diag.getLocation()))
+      os << diag.getLocation() << ": ";
+    os << severity << ": " << diag << '\n';
+    for (const mlir::Diagnostic &note : diag.getNotes()) {
+      if (!llvm::isa<mlir::UnknownLoc>(note.getLocation()))
+        os << note.getLocation() << ": ";
+      os << "note: " << note << '\n';
+    }
+    os.flush();
+    return mlir::success();
+  });
 
   if (Combine) {
     llvm::SmallVector<InputTarget, 4> inputTargets;

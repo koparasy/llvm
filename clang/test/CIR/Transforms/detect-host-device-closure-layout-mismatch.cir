@@ -52,10 +52,11 @@ module attributes {cir.offload.container} {
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
     // The prologue reconstructs the device closure record `dlam` via a
     // get_member store of the decomposed scalar parameter. Field 1 ("b") is
-    // s32i here but double on the host -> ABI mismatch.
-    // expected-warning@+1 {{device kernel '_ZTSZ4mainEUlvE_': closure field 'b' layout differs: host '!cir.double' vs device '!cir.int<s, 32>'; host/device closure ABI mismatch (likely __SYCL_DEVICE_ONLY__ or divergent captures) -- undefined behavior}}
+    // s32i here but double on the host -> ABI mismatch. The warning anchors at
+    // the field's get_member op (its source line).
     cir.func @_ZTSZ4mainEUlvE_(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i) cc(spir_kernel) {
       %clos = cir.alloca "dlam" align(8) : !cir.ptr<!rec_dlam>
+      // expected-warning@+1 {{device kernel '_ZTSZ4mainEUlvE_': closure field 'b' layout differs: host '!cir.double' vs device '!cir.int<s, 32>'; host/device closure ABI mismatch (likely __SYCL_DEVICE_ONLY__ or divergent captures) -- undefined behavior}}
       %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
       cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
       cir.return

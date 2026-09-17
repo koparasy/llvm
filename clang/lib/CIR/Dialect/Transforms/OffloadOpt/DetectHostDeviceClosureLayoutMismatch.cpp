@@ -34,8 +34,11 @@
 // types, flagging it as a host/device closure ABI mismatch (undefined
 // behavior).
 //
-// Analysis + warning ONLY: the pass never mutates the module and is not part of
-// the default cir-offload-merge pipeline, so it must be requested explicitly.
+// Analysis + warning ONLY: the pass never mutates the module. It runs at the
+// head of the cir-offload-merge combine pipeline, BEFORE the mem2reg/sccp that
+// would promote the device closure alloca away (the alloca + get_member stores
+// are how the device closure record is recovered), so the check sees the
+// as-emitted closures.
 //
 //===----------------------------------------------------------------------===//
 
@@ -176,21 +179,32 @@ void OffloadDetectHostDeviceClosureLayoutMismatchPass::runOnOperation() {
         continue;
       llvm::ArrayRef<mlir::Type> devFields = devRec.getMembers();
 
-      // Source-level names for the device closure fields, for the diagnostic.
-      llvm::DenseMap<uint64_t, llvm::StringRef> fieldNames;
+      // Per-field get_member ops of the device closure: their names label the
+      // diagnostic and their locations anchor it at the source line of the
+      // divergent capture (a real file:line:col, since CIRGen emits the .cir
+      // with debug locations) rather than at the whole kernel.
+      llvm::DenseMap<uint64_t, cir::GetMemberOp> fieldOps;
       kernel.walk([&](cir::GetMemberOp gm) {
         if (gm.getAddr().getType().getPointee() == devRec)
-          fieldNames.try_emplace(gm.getIndex(), gm.getName());
+          fieldOps.try_emplace(gm.getIndex(), gm);
       });
       auto nameOf = [&](uint64_t i) -> std::string {
-        auto it = fieldNames.find(i);
-        if (it != fieldNames.end())
-          return "'" + it->second.str() + "'";
+        auto it = fieldOps.find(i);
+        if (it != fieldOps.end())
+          return "'" + it->second.getName().str() + "'";
         return "#" + std::to_string(i);
+      };
+      // The location to anchor a field-`i` diagnostic at: the field's
+      // get_member op when known, else the kernel itself.
+      auto locOf = [&](uint64_t i) -> mlir::Location {
+        auto it = fieldOps.find(i);
+        if (it != fieldOps.end())
+          return it->second.getLoc();
+        return kernel.getLoc();
       };
 
       if (hostFields.size() != devFields.size()) {
-        kernel.emitWarning()
+        mlir::emitWarning(kernel.getLoc())
             << "device kernel '" << kernel.getName()
             << "': host/device closure ABI mismatch: field count differs (host "
             << hostFields.size() << " vs device " << devFields.size()
@@ -202,7 +216,7 @@ void OffloadDetectHostDeviceClosureLayoutMismatchPass::runOnOperation() {
       for (size_t i = 0; i < n; ++i) {
         if (hostFields[i] == devFields[i])
           continue;
-        kernel.emitWarning()
+        mlir::emitWarning(locOf(i))
             << "device kernel '" << kernel.getName() << "': closure field "
             << nameOf(i) << " layout differs: host " << hostFields[i]
             << " vs device " << devFields[i]
