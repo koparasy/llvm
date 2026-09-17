@@ -13,7 +13,7 @@
 // RUN:   -output=%t/combined.cir 2>&1 | FileCheck %s
 // RUN: cir-opt %t/combined.cir --verify-roundtrip -o /dev/null
 
-// CHECK: warning: device kernel '_ZTSZ4mainEUlvE_': closure field 'b' layout differs: host '!cir.double' vs device '!cir.int<s, 32>'; host/device closure ABI mismatch (likely __SYCL_DEVICE_ONLY__ or divergent captures) -- undefined behavior
+// CHECK: warning: SYCL kernel captured-closure layout differs between host and device (captured field 'b'); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior
 
 //--- host.cir
 !s8i = !cir.int<s, 8>

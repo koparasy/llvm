@@ -29,10 +29,14 @@
 //   - compares the two records' ordered field lists.
 // Records are matched by BINDING, never by type-name equality: the host and
 // device closures carry different aliases (`anon.0` vs `__cir_lowered.anon.0`).
-// Any divergence -- a differing field count, or a field whose type differs --
-// emits an MLIR warning naming the kernel, the field index/name, and both
-// types, flagging it as a host/device closure ABI mismatch (undefined
-// behavior).
+// Any divergence -- a differing field count, or a field whose type differs
+// (ignoring a captured pointer's address space, a device-lowering artifact) --
+// emits an MLIR warning anchored at the capture's source line and naming the
+// field, flagging a host/device closure mismatch (undefined behavior). The CIR
+// field types themselves are not printed: at the merge stage there is no Clang
+// AST to recover the C++ spelling, and the lowered CIR types would be more
+// confusing than helpful; the source line and capture name identify the
+// culprit.
 //
 // Analysis + warning ONLY: the pass never mutates the module. It runs at the
 // head of the cir-offload-merge combine pipeline, BEFORE the mem2reg/sccp that
@@ -314,11 +318,10 @@ void OffloadDetectHostDeviceClosureLayoutMismatchPass::runOnOperation() {
 
       if (hostFields.size() != devFields.size()) {
         mlir::emitWarning(kernel.getLoc())
-            << "device kernel '" << kernel.getName()
-            << "': host/device closure ABI mismatch: field count differs (host "
-            << hostFields.size() << " vs device " << devFields.size()
-            << "); likely __SYCL_DEVICE_ONLY__ or divergent captures -- "
-               "undefined behavior";
+            << "SYCL kernel captured-closure layout differs between host and "
+               "device (field count differs); likely a #ifdef "
+               "__SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined "
+               "behavior";
       }
 
       size_t n = std::min(hostFields.size(), devFields.size());
@@ -326,12 +329,11 @@ void OffloadDetectHostDeviceClosureLayoutMismatchPass::runOnOperation() {
         if (sameIgnoringAddrSpace(hostFields[i], devFields[i]))
           continue;
         mlir::emitWarning(locOf(i))
-            << "device kernel '" << kernel.getName() << "': closure field "
-            << nameOf(i) << " layout differs: host " << hostFields[i]
-            << " vs device " << devFields[i]
-            << "; host/device closure ABI mismatch (likely "
-               "__SYCL_DEVICE_ONLY__ or divergent captures) -- undefined "
-               "behavior";
+            << "SYCL kernel captured-closure layout differs between host and "
+               "device (captured field "
+            << nameOf(i)
+            << "); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] "
+               "capture -- undefined behavior";
       }
     }
   }

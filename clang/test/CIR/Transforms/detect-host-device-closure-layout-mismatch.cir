@@ -56,7 +56,7 @@ module attributes {cir.offload.container} {
     // the field's get_member op (its source line).
     cir.func @_ZTSZ4mainEUlvE_(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i) cc(spir_kernel) {
       %clos = cir.alloca "dlam" align(8) : !cir.ptr<!rec_dlam>
-      // expected-warning@+1 {{device kernel '_ZTSZ4mainEUlvE_': closure field 'b' layout differs: host '!cir.double' vs device '!cir.int<s, 32>'; host/device closure ABI mismatch (likely __SYCL_DEVICE_ONLY__ or divergent captures) -- undefined behavior}}
+      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'b'); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior}}
       %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
       cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
       cir.return
@@ -146,7 +146,7 @@ module attributes {cir.offload.container} {
       %clos = cir.alloca "__cir_lowered.anon.0" align(8) : !cir.ptr<!rec_dlam>
       // Field 0: captured pointer, address-space-only difference -> no warning.
       %f0 = cir.get_member %clos[0] {name = "out"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
-      // expected-warning@+1 {{device kernel '_ZTStestkernel': closure field 'b' layout differs: host '!cir.float' vs device '!cir.int<s, 32>'; host/device closure ABI mismatch (likely __SYCL_DEVICE_ONLY__ or divergent captures) -- undefined behavior}}
+      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'b'); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior}}
       %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
       cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
       cir.return
