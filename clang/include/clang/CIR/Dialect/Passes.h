@@ -44,6 +44,7 @@ std::unique_ptr<Pass> createOffloadStampReqdWorkGroupSizePass();
 std::unique_ptr<Pass> createOffloadInferKernelParamNoAliasPass();
 std::unique_ptr<Pass> createOffloadPropagateSYCLKernelArgsPass();
 std::unique_ptr<Pass> createOffloadDetectHostUniformIntDivisorPass();
+std::unique_ptr<Pass> createOffloadDetectHostDeviceClosureLayoutMismatchPass();
 std::unique_ptr<Pass> createGotoSolverPass();
 std::unique_ptr<Pass> createIdiomRecognizerPass();
 std::unique_ptr<Pass> createLibOptPass();

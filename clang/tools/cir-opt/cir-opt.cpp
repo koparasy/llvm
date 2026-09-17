@@ -130,6 +130,10 @@ int main(int argc, char **argv) {
     return mlir::createOffloadDetectHostUniformIntDivisorPass();
   });
 
+  ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+    return mlir::createOffloadDetectHostDeviceClosureLayoutMismatchPass();
+  });
+
   mlir::omp::registerOpenMPPasses();
   mlir::registerTransformsPasses();
 

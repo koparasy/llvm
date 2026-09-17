@@ -8,6 +8,7 @@ add_clang_library(MLIRCIROffloadOpt
   InferKernelParamNoAlias.cpp
   PropagateSYCLKernelArgs.cpp
   DetectHostUniformIntDivisor.cpp
+  DetectHostDeviceClosureLayoutMismatch.cpp
 
   DEPENDS
   MLIRCIROpsIncGen

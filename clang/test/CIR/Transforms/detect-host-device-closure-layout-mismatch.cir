@@ -1,0 +1,110 @@
+// RUN: cir-opt %s -split-input-file -verify-diagnostics \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-detect-host-device-closure-layout-mismatch)"
+
+// A SYCL kernel lambda is compiled twice (host + SPIR-V device). Preprocessor
+// divergence (`#ifdef __SYCL_DEVICE_ONLY__`) or divergent `[=]` implicit
+// captures can make the two closure records disagree in a field's type while
+// keeping the same total size, which the `sizeof(KernelType) == KernelSize`
+// static_assert in queue.hpp does not catch. This pass reaches the host closure
+// record (through the launch site's HostKernelRef closure operand) and the
+// device closure record (the record the kernel prologue reconstructs), matches
+// them by kernel binding -- NOT by type-name equality, since the aliases differ
+// -- and warns on each field whose type diverges. Analysis only. This mirrors
+// detect-host-uniform-int-divisor.cir's container scaffolding, whose lambda
+// kernel name (`_ZTSZ4mainEUlvE_`) makes the binding TU-local.
+
+// -----
+// MISMATCH: closure field 1 is `double` on the host but `s32i` on the device.
+// The pointer field 0 matches, so exactly one warning fires, naming field 'b'.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+// Host closure: {ptr<s32i>, double}.
+!rec_hlam = !cir.struct<"hlam" {data !cir.ptr<!s32i>, data !cir.double}>
+// Device closure (different alias): {ptr<s32i>, s32i}.
+!rec_dlam = !cir.struct<"dlam" {data !cir.ptr<!s32i>, data !s32i}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>)
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "hlam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // The prologue reconstructs the device closure record `dlam` via a
+    // get_member store of the decomposed scalar parameter. Field 1 ("b") is
+    // s32i here but double on the host -> ABI mismatch.
+    // expected-warning@+1 {{device kernel '_ZTSZ4mainEUlvE_': closure field 'b' layout differs: host '!cir.double' vs device '!cir.int<s, 32>'; host/device closure ABI mismatch (likely __SYCL_DEVICE_ONLY__ or divergent captures) -- undefined behavior}}
+    cir.func @_ZTSZ4mainEUlvE_(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i) cc(spir_kernel) {
+      %clos = cir.alloca "dlam" align(8) : !cir.ptr<!rec_dlam>
+      %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
+      cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
+      cir.return
+    }
+  }
+}
+
+// -----
+// MATCHING: host and device closure records have identical field types (only
+// their aliases differ). No warning.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+// Host closure: {ptr<s32i>, s32i}.
+!rec_hlam = !cir.struct<"hlam" {data !cir.ptr<!s32i>, data !s32i}>
+// Device closure (different alias, SAME layout): {ptr<s32i>, s32i}.
+!rec_dlam = !cir.struct<"dlam" {data !cir.ptr<!s32i>, data !s32i}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>)
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "hlam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i) cc(spir_kernel) {
+      %clos = cir.alloca "dlam" align(8) : !cir.ptr<!rec_dlam>
+      %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
+      cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
+      cir.return
+    }
+  }
+}

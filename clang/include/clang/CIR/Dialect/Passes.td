@@ -487,4 +487,39 @@ def OffloadDetectHostUniformIntDivisor
   ];
 }
 
+def OffloadDetectHostDeviceClosureLayoutMismatch
+    : Pass<"cir-offload-detect-host-device-closure-layout-mismatch",
+           "mlir::ModuleOp"> {
+  let summary =
+      "Warn when a SYCL kernel's captured-closure layout diverges host vs device";
+  let description = [{
+    Runs over a `cir.offload.container`. A SYCL kernel lambda is compiled twice
+    -- once for the host and once for the SPIR-V device -- so preprocessor
+    divergence (`#ifdef __SYCL_DEVICE_ONLY__`) or divergent `[=]` implicit
+    captures can make the two closure records disagree in a field's type/layout
+    while keeping the same total size. The `sizeof(KernelType) == KernelSize`
+    static_assert in `sycl/queue.hpp` only checks total size, so an equal-size /
+    different-type divergence compiles clean and produces silent wrong results at
+    runtime. Only the joined host+device container sees both closure layouts, so
+    only a container pass can catch it.
+
+    For each SYCL device `spir_kernel` this pass recovers, through the
+    KernelBindingTable, the host closure record (from the launch site's
+    HostKernelRef closure operand) and the device closure record (the record the
+    kernel prologue reconstructs). Matched by kernel binding -- never by
+    type-name equality, since the two records carry different aliases (`anon.0`
+    vs `__cir_lowered.anon.0`) -- it compares the ordered field lists and emits
+    an MLIR *warning* for each divergence (a differing field count, or a field
+    whose type differs), naming the kernel, the field index/name, and both
+    types. Such a mismatch is a host/device closure ABI mismatch (likely
+    `__SYCL_DEVICE_ONLY__` or divergent captures) and is undefined behavior.
+
+    Analysis only: the pass never mutates the module and is not part of the
+    default cir-offload-merge pipeline, so it must be requested explicitly.
+  }];
+  let constructor =
+      "mlir::createOffloadDetectHostDeviceClosureLayoutMismatchPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+}
+
 #endif // CLANG_CIR_DIALECT_PASSES_TD
