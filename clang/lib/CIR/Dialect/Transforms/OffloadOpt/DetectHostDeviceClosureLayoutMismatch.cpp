@@ -42,12 +42,14 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/IR/Location.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
 #include "clang/CIR/Dialect/Passes.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 namespace mlir {
@@ -59,6 +61,23 @@ using namespace mlir;
 using namespace cir;
 
 namespace {
+
+// Whether two closure-field types are equivalent up to pointer address space.
+// A captured pointer is emitted without an address space on the host but in the
+// device global/generic address space (target_address_space(1)/(4)) on the
+// device -- an expected lowering artifact present on every SYCL kernel, not a
+// layout divergence. Recurse through pointers ignoring their address space so
+// only a genuine type/size difference (e.g. host `float` vs device `int`)
+// counts.
+static bool sameIgnoringAddrSpace(mlir::Type a, mlir::Type b) {
+  if (a == b)
+    return true;
+  auto pa = mlir::dyn_cast<cir::PointerType>(a);
+  auto pb = mlir::dyn_cast<cir::PointerType>(b);
+  if (pa && pb)
+    return sameIgnoringAddrSpace(pa.getPointee(), pb.getPointee());
+  return false;
+}
 
 // Peel the offset-0 reinterprets CIRGen inserts on a closure `this`
 // (address-space / bitcast casts and base_class_addr views) so a closure
@@ -105,6 +124,86 @@ static cir::RecordType hostClosureRecord(mlir::Value closureOperand) {
         return inner;
   // Handler path: the operand is already the closure object pointer.
   return rec;
+}
+
+// Collect "file:line:col" strings for every FileLineColLoc reachable from
+// `loc` (peeling FusedLoc/NameLoc), into `out`. Used to match a device kernel's
+// lambda source location against the host HostKernel<lambda at ...> wrapper.
+static void collectFileLineCols(mlir::Location loc,
+                                llvm::SmallVectorImpl<std::string> &out) {
+  if (auto flc = mlir::dyn_cast<mlir::FileLineColLoc>(loc)) {
+    out.push_back((flc.getFilename().strref() + ":" +
+                   llvm::Twine(flc.getLine()) + ":" +
+                   llvm::Twine(flc.getColumn()))
+                      .str());
+    return;
+  }
+  if (auto fused = mlir::dyn_cast<mlir::FusedLoc>(loc)) {
+    for (mlir::Location sub : fused.getLocations())
+      collectFileLineCols(sub, out);
+    return;
+  }
+  if (auto named = mlir::dyn_cast<mlir::NameLoc>(loc))
+    collectFileLineCols(named.getChildLoc(), out);
+}
+
+// Whether `fn` is a `detail::HostKernel<...>` constructor: the wrapper CIRGen
+// builds around the user closure, whose second argument is a pointer to the
+// closure record (mirrors KernelBindingTable's isHostKernelCtor).
+static bool isHostKernelCtor(cir::FuncOp fn) {
+  llvm::StringRef name = fn.getSymName();
+  return name.contains("6detail10HostKernelI") &&
+         (name.contains("C1") || name.contains("C2"));
+}
+
+// Fallback host-closure recovery for when the launch site's closure operand was
+// not recovered (the handler launch path, where the binding table reports
+// "closure none"). CIRGen wraps the user closure in a
+// `detail::HostKernel<(lambda at FILE:LINE:COL), ...>` whose type name embeds
+// the lambda's source location and whose constructor takes a pointer to the
+// closure record as its second argument. Match that wrapper to `deviceKernel`
+// by the lambda source location (the device kernel and its arguments carry the
+// same loc), then read the closure record off the constructor's second param.
+static cir::RecordType
+hostClosureRecordFromHostKernel(mlir::ModuleOp hostModule,
+                                cir::FuncOp deviceKernel) {
+  // Source locations of the device kernel's lambda (its own loc and each
+  // argument's), any of which the host wrapper name should embed.
+  llvm::SmallVector<std::string, 4> needles;
+  collectFileLineCols(deviceKernel.getLoc(), needles);
+  if (!deviceKernel.getBody().empty())
+    for (mlir::BlockArgument arg :
+         deviceKernel.getBody().front().getArguments())
+      collectFileLineCols(arg.getLoc(), needles);
+  if (needles.empty())
+    return {};
+
+  cir::RecordType found;
+  hostModule.walk([&](cir::FuncOp fn) {
+    if (found || !isHostKernelCtor(fn))
+      return;
+    llvm::ArrayRef<mlir::Type> inputs = fn.getFunctionType().getInputs();
+    if (inputs.size() < 2)
+      return;
+    auto wrapperPtr = mlir::dyn_cast<cir::PointerType>(inputs[0]);
+    if (!wrapperPtr)
+      return;
+    auto wrapperRec = mlir::dyn_cast<cir::RecordType>(wrapperPtr.getPointee());
+    if (!wrapperRec || !wrapperRec.getName())
+      return;
+    llvm::StringRef wrapperName = wrapperRec.getName().getValue();
+    if (llvm::none_of(needles, [&](const std::string &n) {
+          return wrapperName.contains(n);
+        }))
+      return;
+    // The constructor's second argument is a pointer/reference to the closure.
+    auto closurePtr = mlir::dyn_cast<cir::PointerType>(inputs[1]);
+    if (!closurePtr)
+      return;
+    if (auto rec = mlir::dyn_cast<cir::RecordType>(closurePtr.getPointee()))
+      found = rec;
+  });
+  return found;
 }
 
 // The DEVICE closure record a spir_kernel reconstructs in its prologue: the
@@ -157,22 +256,32 @@ void OffloadDetectHostDeviceClosureLayoutMismatchPass::runOnOperation() {
     if (binding.kind != cir::BindingKind::SYCLName)
       continue;
 
-    // Recover the host closure record from any launch site of this binding.
-    cir::RecordType hostRec;
+    // Recover the host closure record from any launch site of this binding
+    // (the direct launch path exposes the HostKernelRef closure operand).
+    cir::RecordType hostRecFromLaunch;
     for (const cir::LaunchSite &site : binding.launchSites) {
-      hostRec = hostClosureRecord(site.getSYCLClosure());
-      if (hostRec)
+      hostRecFromLaunch = hostClosureRecord(site.getSYCLClosure());
+      if (hostRecFromLaunch)
         break;
     }
-    if (!hostRec)
-      continue;
-    llvm::ArrayRef<mlir::Type> hostFields = hostRec.getMembers();
 
     for (cir::FuncOp kernel : binding.deviceKernels) {
       if (kernel.getCallingConv() != cir::CallingConv::SpirKernel)
         continue;
       if (kernel.getBody().empty())
         continue;
+
+      // When the launch site did not expose the closure (the handler launch
+      // path reports "closure none"), fall back to the host-side
+      // HostKernel<lambda at ...> wrapper, matched to this kernel by lambda
+      // source location.
+      cir::RecordType hostRec = hostRecFromLaunch;
+      if (!hostRec)
+        hostRec =
+            hostClosureRecordFromHostKernel(cir::getOffloadContainerHostModule(container), kernel);
+      if (!hostRec)
+        continue;
+      llvm::ArrayRef<mlir::Type> hostFields = hostRec.getMembers();
 
       cir::RecordType devRec = deviceClosureRecord(kernel);
       if (!devRec)
@@ -214,7 +323,7 @@ void OffloadDetectHostDeviceClosureLayoutMismatchPass::runOnOperation() {
 
       size_t n = std::min(hostFields.size(), devFields.size());
       for (size_t i = 0; i < n; ++i) {
-        if (hostFields[i] == devFields[i])
+        if (sameIgnoringAddrSpace(hostFields[i], devFields[i]))
           continue;
         mlir::emitWarning(locOf(i))
             << "device kernel '" << kernel.getName() << "': closure field "
