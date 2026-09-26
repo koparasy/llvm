@@ -1146,7 +1146,8 @@ LValue CIRGenFunction::emitDeclRefLValue(const DeclRefExpr *e) {
       auto getGlob = getGlobVal.getDefiningOp<cir::GetGlobalOp>();
       getGlob.setStaticLocal(var.getStaticLocalGuard().has_value());
       getGlob.setTls(vd->getTLSKind() != VarDecl::TLS_None);
-      addr = Address(cgm.castGlobalToDeclAddrSpace(getGlob, *vd),
+      addr = Address(cgm.castGlobalToDeclAddrSpace(getGlob.getLoc(), getGlob,
+                                                   vd->getType()),
                      convertTypeForMem(vd->getType()),
                      getContext().getDeclAlign(vd));
     } else {
@@ -2901,8 +2902,7 @@ Address CIRGenFunction::maybeCastStackAddressSpace(
     Address alloca, mlir::ptr::MemorySpaceAttrInterface destAddrSpace,
     mlir::Value arraySize) {
   if (!destAddrSpace)
-    destAddrSpace = cir::toCIRAddressSpaceAttr(
-        getMLIRContext(), cgm.getLangTempAllocaAddressSpace());
+    destAddrSpace = cgm.getCIRAddressSpace(cgm.getLangTempAllocaAddressSpace());
 
   mlir::ptr::MemorySpaceAttrInterface srcAddrSpace = getCIRAllocaAddressSpace();
   // Alloca always returns a pointer in alloca address space, which may

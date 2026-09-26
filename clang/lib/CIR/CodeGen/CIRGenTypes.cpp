@@ -916,14 +916,16 @@ CIRGenTypes::getPointerAddressSpace(clang::QualType pointeeTy) const {
     return cir::toCIRAddressSpaceAttr(getMLIRContext(),
                                       pointeeTy.getAddressSpace());
 
-  // Resolve a default-address-space pointee through getTargetAddressSpace, as
-  // classic CodeGen does. This is only non-zero for languages that default to
-  // a non-default address space (e.g. generic for SYCL device data), and uses
-  // the program address space for functions.
-  unsigned targetAS = getTargetAddressSpace(pointeeTy);
-  if (targetAS == 0)
-    return {};
-  return cir::TargetAddressSpaceAttr::get(&getMLIRContext(), targetAS);
+  // Functions live in the program address space.
+  if (pointeeTy->isFunctionType()) {
+    unsigned programAS = cgm.getDataLayout().getProgramAddressSpace();
+    if (programAS == 0)
+      return {};
+    return cir::TargetAddressSpaceAttr::get(&getMLIRContext(), programAS);
+  }
+
+  // Data in the default address space uses the language default.
+  return cgm.getCIRDefaultAddressSpace();
 }
 
 unsigned CIRGenTypes::getTargetAddressSpace(QualType ty) const {

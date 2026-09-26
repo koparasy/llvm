@@ -10,9 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "RecordTypeConverter.h"
 #include "TargetLowering/LowerModule.h"
 #include "TargetLowering/TargetLoweringInfo.h"
 
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -40,13 +42,111 @@ struct TargetLoweringPass
   void runOnOperation() override;
 };
 
+/// Converts LangAddressSpaceAttr → TargetAddressSpaceAttr inside types.
+///
+/// Only the records that (transitively) contain such a pointer are rebuilt, so
+/// that code without language address spaces is left untouched.
+class TargetLoweringTypeConverter : public cir::RecordRewritingTypeConverter {
+public:
+  TargetLoweringTypeConverter(mlir::MLIRContext &ctx,
+                              const cir::TargetLoweringInfo &targetInfo)
+      : RecordRewritingTypeConverter(ctx), targetInfo(targetInfo) {
+    addConversion([this](cir::PointerType type) -> mlir::Type {
+      mlir::Type pointee = convertType(type.getPointee());
+      if (!pointee)
+        return {};
+      auto addrSpace = type.getAddrSpace();
+      if (auto langAS =
+              mlir::dyn_cast_if_present<cir::LangAddressSpaceAttr>(addrSpace))
+        addrSpace = lowerAddrSpace(type.getContext(), langAS);
+      return cir::PointerType::get(type.getContext(), pointee, addrSpace);
+    });
+  }
+
+  mlir::ptr::MemorySpaceAttrInterface
+  lowerAddrSpace(mlir::MLIRContext *ctx,
+                 cir::LangAddressSpaceAttr langAS) const {
+    unsigned targetAS =
+        targetInfo.getTargetAddrSpaceFromCIRAddrSpace(langAS.getValue());
+    if (targetAS == 0)
+      return {};
+    return cir::TargetAddressSpaceAttr::get(ctx, targetAS);
+  }
+
+  /// Convert the types nested in \p attr (e.g. the type of an initializer).
+  mlir::Attribute convertAttr(mlir::Attribute attr) const {
+    return attrReplacer.replace(attr);
+  }
+
+protected:
+  bool shouldConvertRecord(cir::RecordType type) override {
+    auto it = recordNeedsConversion.find(type);
+    if (it != recordNeedsConversion.end())
+      return it->second;
+    // A complete walk that finds nothing is conclusive, so the result can be
+    // cached for the queried record.
+    llvm::SmallPtrSet<mlir::Type, 8> visiting;
+    bool result = containsLangAddrSpace(type, visiting);
+    recordNeedsConversion[type] = result;
+    return result;
+  }
+
+private:
+  /// Whether \p type reaches a pointer in a language address space. Records
+  /// are opaque to the generic sub-element walk, so recurse into their members
+  /// explicitly, guarding against recursive records with \p visiting.
+  bool containsLangAddrSpace(mlir::Type type,
+                             llvm::SmallPtrSetImpl<mlir::Type> &visiting) {
+    if (auto rt = mlir::dyn_cast<cir::RecordType>(type)) {
+      if (rt.getName()) {
+        auto it = recordNeedsConversion.find(type);
+        if (it != recordNeedsConversion.end())
+          return it->second;
+        if (!visiting.insert(type).second)
+          return false;
+      }
+      for (mlir::Type member : rt.getMembers())
+        if (containsLangAddrSpace(member, visiting))
+          return true;
+      if (auto u = mlir::dyn_cast<cir::UnionType>(type))
+        if (mlir::Type pad = u.getPadding())
+          return containsLangAddrSpace(pad, visiting);
+      return false;
+    }
+
+    bool found = false;
+    type.walkImmediateSubElements(
+        [&](mlir::Attribute attr) {
+          found |= mlir::isa<cir::LangAddressSpaceAttr>(attr);
+        },
+        [&](mlir::Type sub) {
+          found = found || containsLangAddrSpace(sub, visiting);
+        });
+    return found;
+  }
+
+  const cir::TargetLoweringInfo &targetInfo;
+  llvm::DenseMap<mlir::Type, bool> recordNeedsConversion;
+  mutable mlir::AttrTypeReplacer attrReplacer = [this] {
+    mlir::AttrTypeReplacer replacer;
+    replacer.addReplacement(
+        [this](mlir::Type type) -> std::optional<mlir::Type> {
+          if (mlir::Type converted = convertType(type))
+            return converted;
+          return std::nullopt;
+        });
+    return replacer;
+  }();
+};
+
 /// A generic target lowering pattern that matches any CIR op whose operand or
 /// result types need address space conversion. Clones the op with converted
 /// types.
 class CIRGenericTargetLoweringPattern : public mlir::ConversionPattern {
 public:
-  CIRGenericTargetLoweringPattern(mlir::MLIRContext *context,
-                                  const mlir::TypeConverter &typeConverter)
+  CIRGenericTargetLoweringPattern(
+      mlir::MLIRContext *context,
+      const TargetLoweringTypeConverter &typeConverter)
       : mlir::ConversionPattern(typeConverter, MatchAnyOpTypeTag(),
                                 /*benefit=*/1, context) {}
 
@@ -69,15 +169,10 @@ public:
     if (operandsAndResultsLegal && regionsLegal)
       return mlir::failure();
 
-    assert(op->getNumRegions() == 0 && "CIRGenericTargetLoweringPattern cannot "
-                                       "deal with operations with regions");
-
     mlir::OperationState loweredOpState(op->getLoc(), op->getName());
     loweredOpState.addOperands(operands);
 
-    // Preserve auxiliary metadata verbatim. Convert only inherent TypeAttrs and
-    // pointer constants so address-space-bearing operation semantics (e.g.
-    // AllocaOp's allocaType) stay in sync with the converted result types.
+    // Preserve auxiliary metadata verbatim.
     loweredOpState.propertiesAttr = op->getPropertiesAsAttribute();
     loweredOpState.addAttributes(op->getDiscardableAttrDictionary().getValue());
 
@@ -98,15 +193,14 @@ public:
     }
 
     mlir::Operation *loweredOp = rewriter.create(loweredOpState);
+    // Convert the types nested in inherent attributes, so that semantics such
+    // as AllocaOp's allocaType or a constant's value stay in sync with the
+    // converted result types.
+    const auto *tlTypeConverter =
+        static_cast<const TargetLoweringTypeConverter *>(typeConverter);
     loweredOp->getName().walkInherentAttrs(
         loweredOp, [&](llvm::StringRef, mlir::Attribute &attr) {
-          if (auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(attr))
-            attr = mlir::TypeAttr::get(
-                typeConverter->convertType(typeAttr.getValue()));
-          else if (auto ptrAttr = mlir::dyn_cast<cir::ConstPtrAttr>(attr))
-            attr = cir::ConstPtrAttr::get(
-                typeConverter->convertType(ptrAttr.getType()),
-                ptrAttr.getValue());
+          attr = tlTypeConverter->convertAttr(attr);
         });
     rewriter.replaceOp(op, loweredOp);
     return mlir::success();
@@ -122,7 +216,7 @@ class CIRGlobalOpTargetLowering
 
 public:
   CIRGlobalOpTargetLowering(mlir::MLIRContext *context,
-                            const mlir::TypeConverter &typeConverter,
+                            const TargetLoweringTypeConverter &typeConverter,
                             const cir::TargetLoweringInfo &targetInfo)
       : mlir::OpConversionPattern<cir::GlobalOp>(typeConverter, context,
                                                  /*benefit=*/1),
@@ -154,6 +248,10 @@ public:
     auto newOp = mlir::cast<cir::GlobalOp>(rewriter.clone(*op.getOperation()));
     newOp.setSymType(loweredSymTy);
     newOp.setAddrSpaceAttr(addrSpace);
+    const auto *tlTypeConverter =
+        static_cast<const TargetLoweringTypeConverter *>(getTypeConverter());
+    if (mlir::Attribute init = newOp.getInitialValueAttr())
+      newOp.setInitialValueAttr(tlTypeConverter->convertAttr(init));
     rewriter.replaceOp(op, newOp);
     return mlir::success();
   }
@@ -220,160 +318,6 @@ static void convertSyncScopeIfPresent(mlir::Operation *op,
   }
 }
 
-/// True if any pointer reachable from \p type carries a LangAddressSpaceAttr
-/// and thus needs its address space lowered. Recursion-safe for identified
-/// (possibly self-recursive) records via \p seen: records only need rewriting
-/// when a lang address space actually flows through them.
-static bool typeNeedsASLowering(mlir::Type type,
-                                llvm::SmallPtrSetImpl<mlir::Type> &seen) {
-  if (auto ptr = mlir::dyn_cast<cir::PointerType>(type)) {
-    if (mlir::isa_and_present<cir::LangAddressSpaceAttr>(ptr.getAddrSpace()))
-      return true;
-    return typeNeedsASLowering(ptr.getPointee(), seen);
-  }
-  if (auto arr = mlir::dyn_cast<cir::ArrayType>(type))
-    return typeNeedsASLowering(arr.getElementType(), seen);
-  if (auto rec = mlir::dyn_cast<cir::RecordType>(type)) {
-    if (!seen.insert(rec).second)
-      return false;
-    return llvm::any_of(rec.getMembers(), [&](mlir::Type m) {
-      return typeNeedsASLowering(m, seen);
-    });
-  }
-  if (auto fn = mlir::dyn_cast<cir::FuncType>(type)) {
-    if (typeNeedsASLowering(fn.getReturnType(), seen))
-      return true;
-    return llvm::any_of(fn.getInputs(), [&](mlir::Type m) {
-      return typeNeedsASLowering(m, seen);
-    });
-  }
-  return false;
-}
-
-/// Prepare the type converter for the target lowering pass.
-/// Converts LangAddressSpaceAttr → TargetAddressSpaceAttr inside pointer types.
-static void
-prepareTargetLoweringTypeConverter(mlir::TypeConverter &converter,
-                                   const cir::TargetLoweringInfo &targetInfo) {
-  converter.addConversion([](mlir::Type type) { return type; });
-
-  converter.addConversion([&converter,
-                           &targetInfo](cir::PointerType type) -> mlir::Type {
-    mlir::Type pointee = converter.convertType(type.getPointee());
-    if (!pointee)
-      return {};
-    auto addrSpace = type.getAddrSpace();
-    if (auto langAS =
-            mlir::dyn_cast_if_present<cir::LangAddressSpaceAttr>(addrSpace)) {
-      unsigned targetAS =
-          targetInfo.getTargetAddrSpaceFromCIRAddrSpace(langAS.getValue());
-      addrSpace =
-          targetAS == 0
-              ? nullptr
-              : cir::TargetAddressSpaceAttr::get(type.getContext(), targetAS);
-    }
-    return cir::PointerType::get(type.getContext(), pointee, addrSpace);
-  });
-
-  converter.addConversion([&converter](cir::ArrayType type) -> mlir::Type {
-    mlir::Type loweredElementType =
-        converter.convertType(type.getElementType());
-    if (!loweredElementType)
-      return {};
-    return cir::ArrayType::get(loweredElementType, type.getSize());
-  });
-
-  converter.addConversion([&converter](cir::FuncType type) -> mlir::Type {
-    llvm::SmallVector<mlir::Type> loweredInputTypes;
-    loweredInputTypes.reserve(type.getNumInputs());
-    if (mlir::failed(
-            converter.convertTypes(type.getInputs(), loweredInputTypes)))
-      return {};
-
-    mlir::Type loweredReturnType = converter.convertType(type.getReturnType());
-    if (!loweredReturnType)
-      return {};
-
-    return cir::FuncType::get(loweredInputTypes, loweredReturnType,
-                              /*isVarArg=*/type.getVarArg());
-  });
-
-  // Records must lower their member pointer address spaces in lockstep with the
-  // outer pointers and get_member results. RecordType is mutable and may be
-  // self-recursive (a member pointing back at the record), so track records
-  // being converted and hand back the renamed shell on re-entry, mirroring
-  // MLIR's LLVMStructType converter.
-  auto recordStack = std::make_shared<llvm::SmallVector<cir::RecordType, 8>>();
-  converter.addConversion([&converter,
-                           recordStack](cir::RecordType type) -> mlir::Type {
-    // Incomplete records have no members to lower.
-    if (type.isIncomplete())
-      return type;
-
-    // Leave records with no address-space-bearing members untouched. This
-    // keeps them legal (identity) and, crucially, avoids renaming a
-    // self-recursive record whose recursive edge would otherwise make its
-    // members compare unequal to themselves.
-    llvm::SmallPtrSet<mlir::Type, 8> seen;
-    if (!typeNeedsASLowering(type, seen))
-      return type;
-
-    mlir::MLIRContext *ctx = type.getContext();
-
-    // Anonymous records are structurally uniqued and cannot be self-recursive,
-    // so rebuild directly.
-    if (!type.getName()) {
-      llvm::SmallVector<mlir::Type> members;
-      if (mlir::failed(converter.convertTypes(type.getMembers(), members)))
-        return {};
-      if (llvm::ArrayRef<mlir::Type>(members) == type.getMembers())
-        return type;
-      if (auto unionTy = mlir::dyn_cast<cir::UnionType>(type))
-        return cir::UnionType::get(ctx, members, unionTy.getPacked(),
-                                   unionTy.getPadding(), type.getMemberKinds());
-      return cir::StructType::get(ctx, members, type.getPacked(),
-                                  type.isClass(), type.getMemberKinds());
-    }
-
-    // Identified record: build a renamed shell first so recursive references
-    // resolve without re-entering. Identified records unique by name only, so
-    // reusing the name would just hand back the original (unconverted) body.
-    auto convertedName = mlir::StringAttr::get(
-        ctx, ("__cir_lowered." + type.getName().getValue()).str());
-    cir::RecordType shell =
-        mlir::isa<cir::UnionType>(type)
-            ? cir::RecordType(cir::UnionType::get(ctx, convertedName))
-            : cir::RecordType(
-                  cir::StructType::get(ctx, convertedName, type.isClass()));
-
-    if (llvm::is_contained(*recordStack, type))
-      return shell;
-    recordStack->push_back(type);
-    llvm::scope_exit pop([&] { recordStack->pop_back(); });
-
-    llvm::SmallVector<mlir::Type> members;
-    if (mlir::failed(converter.convertTypes(type.getMembers(), members)))
-      return {};
-
-    // No member changed: keep the original record and drop the unused shell.
-    if (llvm::ArrayRef<mlir::Type>(members) == type.getMembers())
-      return type;
-
-    if (auto unionShell = mlir::dyn_cast<cir::UnionType>(shell)) {
-      if (unionShell.isIncomplete())
-        unionShell.complete(members,
-                            mlir::cast<cir::UnionType>(type).getPacked(),
-                            mlir::cast<cir::UnionType>(type).getPadding(),
-                            type.getMemberKinds());
-      return unionShell;
-    }
-    auto structShell = mlir::cast<cir::StructType>(shell);
-    if (structShell.isIncomplete())
-      structShell.complete(members, type.getPacked(), type.getMemberKinds());
-    return structShell;
-  });
-}
-
 static void
 populateTargetLoweringConversionTarget(mlir::ConversionTarget &target,
                                        const mlir::TypeConverter &tc) {
@@ -418,8 +362,7 @@ void TargetLoweringPass::runOnOperation() {
   });
 
   // Address space conversion: LangAddressSpaceAttr → TargetAddressSpaceAttr.
-  mlir::TypeConverter typeConverter;
-  prepareTargetLoweringTypeConverter(typeConverter, targetInfo);
+  TargetLoweringTypeConverter typeConverter(*mod.getContext(), targetInfo);
 
   mlir::RewritePatternSet patterns(mod.getContext());
   patterns.add<CIRGlobalOpTargetLowering>(mod.getContext(), typeConverter,
@@ -437,6 +380,19 @@ void TargetLoweringPass::runOnOperation() {
 
   if (failed(mlir::applyPartialConversion(ops, target, std::move(patterns))))
     signalPassFailure();
+
+  typeConverter.restoreRecordTypeNames();
+
+  // Distinct language address spaces can map to the same target address space
+  // (e.g. offload_generic and the default address space on NVPTX), which turns
+  // casts between them into no-ops.
+  mod->walk([](cir::CastOp castOp) {
+    if (castOp.getKind() == cir::CastKind::address_space &&
+        castOp.getSrc().getType() == castOp.getType()) {
+      castOp.replaceAllUsesWith(castOp.getSrc());
+      castOp.erase();
+    }
+  });
 }
 
 std::unique_ptr<Pass> mlir::createTargetLoweringPass() {

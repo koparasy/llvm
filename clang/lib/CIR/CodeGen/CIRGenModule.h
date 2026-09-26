@@ -344,9 +344,10 @@ public:
   getAddrOfGlobalVar(const VarDecl *d, mlir::Type ty = {},
                      ForDefinition_t isForDefinition = NotForDefinition);
 
-  /// Cast \p addr, the address of the global \p vd, to the address space of
-  /// the declared type of \p vd if they differ.
-  mlir::Value castGlobalToDeclAddrSpace(mlir::Value addr, const VarDecl &vd);
+  /// Cast \p addr, the address of a global, to the address space of the
+  /// declared type \p declTy, if they differ.
+  mlir::Value castGlobalToDeclAddrSpace(mlir::Location loc, mlir::Value addr,
+                                        QualType declTy);
 
   /// Get or create a thunk function with the given name and type.
   cir::FuncOp getAddrOfThunk(StringRef name, mlir::Type fnTy, GlobalDecl gd);
@@ -482,6 +483,17 @@ public:
   /// space, which may lead to type mismatches in other parts of the IR.
   LangAS getLangTempAllocaAddressSpace() const;
 
+  /// Return the CIR address space for \p as. LangAS::Default maps to the
+  /// language default address space (see getCIRDefaultAddressSpace()).
+  mlir::ptr::MemorySpaceAttrInterface getCIRAddressSpace(LangAS as);
+
+private:
+  /// Compute the CIR address space of LangAS::Default. On offload devices
+  /// whose default address space is the generic one, this is offload_generic.
+  /// Otherwise it is the target number of LangAS::Default (null when 0).
+  mlir::ptr::MemorySpaceAttrInterface computeCIRDefaultAddressSpace();
+
+public:
   /// Set attributes which are common to any form of a global definition (alias,
   /// Objective-C method, function, global variable).
   ///

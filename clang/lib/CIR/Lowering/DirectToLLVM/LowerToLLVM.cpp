@@ -1870,6 +1870,12 @@ mlir::LogicalResult CIRToLLVMCastOpLowering::matchAndRewrite(
     mlir::Type dstTy = castOp.getType();
     mlir::Value llvmSrcVal = adaptor.getSrc();
     mlir::Type llvmDstTy = getTypeConverter()->convertType(dstTy);
+    // Distinct CIR address spaces can map to the same target address space
+    // (e.g. offload_generic and address space 0 on NVPTX).
+    if (llvmSrcVal.getType() == llvmDstTy) {
+      rewriter.replaceOp(castOp, llvmSrcVal);
+      break;
+    }
     rewriter.replaceOpWithNewOp<mlir::LLVM::AddrSpaceCastOp>(castOp, llvmDstTy,
                                                              llvmSrcVal);
     break;

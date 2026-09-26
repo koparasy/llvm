@@ -393,6 +393,15 @@ public:
   // Fetch the type representing a pointer to unsigned int8 values.
   cir::PointerType getUInt8PtrTy() { return typeCache.uInt8PtrTy; }
 
+  /// void* in \p langAS. LangAS::Default is the language default address
+  /// space, not address space 0.
+  using CIRBaseBuilderTy::getVoidPtrTy;
+  cir::PointerType getVoidPtrTy(clang::LangAS langAS = clang::LangAS::Default) {
+    if (langAS == clang::LangAS::Default)
+      return typeCache.voidPtrTy;
+    return CIRBaseBuilderTy::getVoidPtrTy(langAS);
+  }
+
   /// Get a CIR anonymous struct type.
   cir::StructType
   getAnonRecordTy(llvm::ArrayRef<mlir::Type> members, bool packed,

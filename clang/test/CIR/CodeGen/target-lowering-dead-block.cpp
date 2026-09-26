@@ -22,11 +22,12 @@ __attribute__((device)) int test(int input) {
 
 // CIR-POST-NOT:  builtin.unrealized_conversion_cast
 
-// CIR-PRE:       %[[ACAST:.*]] = cir.cast address_space %[[A]] : !cir.ptr<!s32i, lang_address_space(offload_private)> -> !cir.ptr<!s32i>
+// CIR-PRE:       %[[ACAST:.*]] = cir.cast address_space %[[A]] : !cir.ptr<!s32i, lang_address_space(offload_private)> -> !cir.ptr<!s32i, lang_address_space(offload_generic)>
 // CIR-POST:      %[[ACAST:.*]] = cir.cast address_space %[[A]] : !cir.ptr<!s32i, target_address_space(5)> -> !cir.ptr<!s32i>
 
 // CIR:           cir.trap
-// CIR:           %[[LOAD:.*]] = cir.load align(4) %[[ACAST]] : !cir.ptr<!s32i>, !s32i
+// CIR-PRE:       %[[LOAD:.*]] = cir.load align(4) %[[ACAST]] : !cir.ptr<!s32i, lang_address_space(offload_generic)>, !s32i
+// CIR-POST:      %[[LOAD:.*]] = cir.load align(4) %[[ACAST]] : !cir.ptr<!s32i>, !s32i
 // CIR-PRE-NEXT:  cir.store %[[LOAD]], %[[RETVAL]] : !s32i, !cir.ptr<!s32i, lang_address_space(offload_private)>
 // CIR-PRE-NEXT:  %[[RET:.*]] = cir.load %[[RETVAL]] : !cir.ptr<!s32i, lang_address_space(offload_private)>, !s32i
 // CIR-POST-NEXT: cir.store %[[LOAD]], %[[RETVAL]] : !s32i, !cir.ptr<!s32i, target_address_space(5)>

@@ -486,8 +486,7 @@ void CIRGenFunction::emitFunctionProlog(const FunctionArgList &args,
                    /*insertIntoFnEntryBlock=*/true);
 
     mlir::ptr::MemorySpaceAttrInterface destAddrSpace =
-        cir::toCIRAddressSpaceAttr(getMLIRContext(),
-                                   paramVar->getType().getAddressSpace());
+        cgm.getCIRAddressSpace(paramVar->getType().getAddressSpace());
     Address addr = Address(addrVal, alignment);
     addr = maybeCastStackAddressSpace(addr, destAddrSpace);
 

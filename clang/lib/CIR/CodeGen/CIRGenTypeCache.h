@@ -62,7 +62,7 @@ struct CIRGenTypeCache {
 
   mlir::Type ptrDiffTy;
 
-  /// void* in address space 0
+  /// void* in the language default address space
   cir::PointerType voidPtrTy;
   cir::PointerType uInt8PtrTy;
 
@@ -83,6 +83,10 @@ struct CIRGenTypeCache {
 
   mlir::ptr::MemorySpaceAttrInterface cirAllocaAddressSpace;
 
+  /// The address space of LangAS::Default data: what an unqualified pointer
+  /// means in the source language. Null means target address space 0.
+  mlir::ptr::MemorySpaceAttrInterface cirDefaultAddressSpace;
+
   clang::CharUnits getSizeSize() const {
     return clang::CharUnits::fromQuantity(SizeSizeInBytes);
   }
@@ -96,6 +100,10 @@ struct CIRGenTypeCache {
 
   mlir::ptr::MemorySpaceAttrInterface getCIRAllocaAddressSpace() const {
     return cirAllocaAddressSpace;
+  }
+
+  mlir::ptr::MemorySpaceAttrInterface getCIRDefaultAddressSpace() const {
+    return cirDefaultAddressSpace;
   }
 };
 

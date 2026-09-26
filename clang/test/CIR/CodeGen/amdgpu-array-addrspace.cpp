@@ -26,8 +26,8 @@ int dyn = f();
 
 void takes_ptr(int *p);
 
-// The address of the global is cast to the declared (flat) address space
-// before the array decays.
+// The global lives in address space 1, but its address has the address space
+// of its declared type (flat), as in classic CodeGen.
 
 // CIR-LABEL: cir.func{{.*}} @_Z17pass_global_arrayv()
 // CIR:         %[[ARR:.*]] = cir.get_global @globalArr : !cir.ptr<!cir.array<!s32i x 10>, target_address_space(1)>
@@ -43,8 +43,6 @@ void takes_ptr(int *p);
 void pass_global_array() {
   takes_ptr(globalArr);
 }
-
-// Indexing goes through the flat address, as in classic CodeGen.
 
 // CIR-LABEL: cir.func{{.*}} @_Z18index_global_arrayi
 // CIR:         %[[ARR:.*]] = cir.get_global @globalArr : !cir.ptr<!cir.array<!s32i x 10>, target_address_space(1)>

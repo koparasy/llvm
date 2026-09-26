@@ -94,15 +94,16 @@ CIRGenModule::CIRGenModule(mlir::MLIRContext &mlirContext,
 
   // Initialize cached types
   voidTy = cir::VoidType::get(&getMLIRContext());
-  voidPtrTy = cir::PointerType::get(voidTy);
   sInt8Ty = cir::IntType::get(&getMLIRContext(), 8, /*isSigned=*/true);
   sInt16Ty = cir::IntType::get(&getMLIRContext(), 16, /*isSigned=*/true);
   sInt32Ty = cir::IntType::get(&getMLIRContext(), 32, /*isSigned=*/true);
   sInt64Ty = cir::IntType::get(&getMLIRContext(), 64, /*isSigned=*/true);
   sInt128Ty = cir::IntType::get(&getMLIRContext(), 128, /*isSigned=*/true);
   uInt8Ty = cir::IntType::get(&getMLIRContext(), 8, /*isSigned=*/false);
-  uInt8PtrTy = cir::PointerType::get(uInt8Ty);
   cirAllocaAddressSpace = getTargetCIRGenInfo().getCIRAllocaAddressSpace();
+  cirDefaultAddressSpace = computeCIRDefaultAddressSpace();
+  voidPtrTy = cir::PointerType::get(voidTy, cirDefaultAddressSpace);
+  uInt8PtrTy = cir::PointerType::get(uInt8Ty, cirDefaultAddressSpace);
   uInt16Ty = cir::IntType::get(&getMLIRContext(), 16, /*isSigned=*/false);
   uInt32Ty = cir::IntType::get(&getMLIRContext(), 32, /*isSigned=*/false);
   uInt64Ty = cir::IntType::get(&getMLIRContext(), 64, /*isSigned=*/false);
@@ -1444,26 +1445,30 @@ mlir::Value CIRGenModule::getAddrOfGlobalVar(const VarDecl *d, mlir::Type ty,
 
   bool tlsAccess = d->getTLSKind() != VarDecl::TLS_None;
   cir::GlobalOp g = getOrCreateCIRGlobal(d, ty, isForDefinition);
+  mlir::Location loc = getLoc(d->getSourceRange());
   mlir::Type ptrTy = builder.getPointerTo(g.getSymType(), g.getAddrSpaceAttr());
   mlir::Value addr = cir::GetGlobalOp::create(
-      builder, getLoc(d->getSourceRange()), ptrTy, g.getSymNameAttr(),
-      tlsAccess,
+      builder, loc, ptrTy, g.getSymNameAttr(), tlsAccess,
       /*static_local=*/g.getStaticLocalGuard().has_value());
-  return castGlobalToDeclAddrSpace(addr, *d);
+
+  return castGlobalToDeclAddrSpace(loc, addr, astTy);
 }
 
-mlir::Value CIRGenModule::castGlobalToDeclAddrSpace(mlir::Value addr,
-                                                    const VarDecl &vd) {
-  // A global may live in a different address space than its declared type,
-  // e.g. a CUDA __shared__ variable. Like classic CodeGen, cast once where
-  // the address is formed so every user sees the declared type.
+mlir::Value CIRGenModule::castGlobalToDeclAddrSpace(mlir::Location loc,
+                                                    mlir::Value addr,
+                                                    QualType declTy) {
+  // A global may live in a different address space than its declared type
+  // (e.g. a CUDA __device__ variable is in the global address space, but its
+  // address is a generic pointer). Cast to the address space of the declared
+  // type, as classic CodeGen does.
   auto ptrTy = mlir::cast<cir::PointerType>(addr.getType());
   mlir::ptr::MemorySpaceAttrInterface declAS =
-      getTypes().getPointerAddressSpace(vd.getType());
-  if (ptrTy.getAddrSpace() == declAS)
+      cir::normalizeDefaultAddressSpace(
+          getCIRAddressSpace(declTy.getAddressSpace()));
+  if (cir::normalizeDefaultAddressSpace(ptrTy.getAddrSpace()) == declAS)
     return addr;
   return builder.createAddrSpaceCast(
-      addr, builder.getPointerTo(ptrTy.getPointee(), declAS));
+      loc, addr, builder.getPointerTo(ptrTy.getPointee(), declAS));
 }
 
 cir::GlobalViewAttr CIRGenModule::getAddrOfGlobalVarAttr(const VarDecl *d) {
@@ -2351,6 +2356,34 @@ LangAS CIRGenModule::getLangTempAllocaAddressSpace() const {
     return LangAS::Default;
 
   return LangAS::Default;
+}
+
+mlir::ptr::MemorySpaceAttrInterface
+CIRGenModule::computeCIRDefaultAddressSpace() {
+  unsigned defaultAS = astContext.getTargetAddressSpace(LangAS::Default);
+  // In offload device code (CUDA, HIP, OpenMP target, SYCL) an unqualified
+  // pointer can point to any memory: it is a generic pointer. Say so
+  // explicitly, so that it is distinguishable from address space 0, and leave
+  // the choice of the target address space to target lowering.
+  if (langOpts.CUDAIsDevice || langOpts.OpenMPIsTargetDevice ||
+      langOpts.SYCLIsDevice) {
+    assert(defaultAS ==
+               astContext.getTargetAddressSpace(LangAS::opencl_generic) &&
+           "offload device target does not implement unqualified pointers "
+           "with its generic address space");
+    return cir::LangAddressSpaceAttr::get(
+        &getMLIRContext(), cir::LangAddressSpace::OffloadGeneric);
+  }
+  if (defaultAS == 0)
+    return {};
+  return cir::TargetAddressSpaceAttr::get(&getMLIRContext(), defaultAS);
+}
+
+mlir::ptr::MemorySpaceAttrInterface
+CIRGenModule::getCIRAddressSpace(LangAS as) {
+  if (as == LangAS::Default)
+    return getCIRDefaultAddressSpace();
+  return cir::toCIRAddressSpaceAttr(getMLIRContext(), as);
 }
 
 void CIRGenModule::emitExplicitCastExprType(const ExplicitCastExpr *e,
