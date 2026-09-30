@@ -102,5 +102,5 @@ object out of the image contents and verify that `CUDA_SUCCESS` is returned.
 The test requires CUDA backend and development kit to be available in the
 testing environment.
 
-[ref-link]: ../proposed/sycl_ext_oneapi_free_function_kernels.asciidoc#level-zero-and-opencl-compatibility
+[ref-link]: ../../doc/extensions/deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc#level-zero-and-opencl-compatibility
 [spec-link]: https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/proposed/sycl_ext_oneapi_device_image_backend_content.asciidoc

@@ -89,7 +89,7 @@ link:../experimental/sycl_ext_oneapi_enqueue_functions.asciidoc[
 sycl_ext_oneapi_enqueue_functions] (such as `parallel_for` or `nd_launch`).
 The property is applicable both to kernels expressed as SYCL lambdas/function
 objects and to free function kernels defined by
-link:../experimental/sycl_ext_oneapi_free_function_kernels.asciidoc[
+link:../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc[
 sycl_ext_oneapi_free_function_kernels].
 
 Because `cache_config` is a launch-time property rather than a compile-time

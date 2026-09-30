@@ -55,12 +55,13 @@ This extension also depends on the following other SYCL extensions:
 
 == Status
 
-This is an experimental extension specification, intended to provide early
-access to features and gather community feedback.  Interfaces defined in this
-specification are implemented in {dpcpp}, but they are not finalized and may
-change incompatibly in future versions of {dpcpp} without prior notice.
-*Shipping software products should not rely on APIs defined in this
-specification.*
+This extension has been deprecated.  Although it is still supported in {dpcpp},
+we expect that the interfaces defined in this specification will be removed in
+an upcoming {dpcpp} release.  *Shipping software products should stop using
+APIs defined in this specification and use an alternative instead.*
+
+// __INTEL_PREVIEW_BREAKING_CHANGES: Move this specification to the "removed"
+// folder when the feature is removed at the next breaking changes window.
 
 == Overview
 

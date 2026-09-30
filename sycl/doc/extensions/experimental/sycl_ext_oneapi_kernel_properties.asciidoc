@@ -125,7 +125,7 @@ The APIs defined in this extension are provided by either of the following heade
 
 In addition, the following lightweight header provides a subset of the APIs that
 is suitable for applications that define kernels using the
-link:../experimental/sycl_ext_oneapi_free_function_kernels.asciidoc[
+link:../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc[
 sycl_ext_oneapi_free_function_kernels] extension:
 
 * `<sycl/ext/oneapi/free_function_kernel_properties.hpp>`

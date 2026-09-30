@@ -695,7 +695,7 @@ _Effects_: Equivalent to `return this_work_item::get_root_group()`.
 
 The following example illustrates how to use cross-work-group synchronization in
 a free function kernel using the syntax provided by
-link:../experimental/sycl_ext_oneapi_free_function_kernels.asciidoc[
+link:../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc[
 sycl_ext_oneapi_free_function_kernels].
 
 [source,c++]

@@ -236,4 +236,4 @@ kernels with OpenCL Backend without going through the SYCL host runtime.
 A series of checks should be performed to check compatibility of free function 
 kernels with templateed kernel parameters.
 
-[spec-link]: https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/proposed/sycl_ext_oneapi_free_function_kernels.asciidoc
+[spec-link]: https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc
