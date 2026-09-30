@@ -1046,6 +1046,47 @@ sycl::kernel k_float = kb.ext_oneapi_get_kernel("bartmpl<float>");
 sycl::kernel k_int = kb.ext_oneapi_get_kernel("bartmpl<int>");
 ----
 
+=== Launching a kernel when the language is `sycl`
+
+When the kernel is defined in the language `source_language::sycl`, the
+`kernel` object obtained from the kernel bundle represents a free function
+kernel as defined in
+link:../supported/sycl_ext_oneapi_free_function_kernels.asciidoc[
+sycl_ext_oneapi_free_function_kernels].
+The information descriptor `info::kernel::num_args` may be used to query such
+a `kernel` object.
+The return value tells the number of formal parameters in the function's
+definition.
+
+The application can enqueue the kernel to a device using any of the SYCL
+functions that allow a kernel to be enqueued via a `kernel` object.
+The application must enqueue the free function kernel as an ND-range kernel.
+For example, a free function kernel can be enqueued by calling the
+`handler::parallel_for` overload taking an `nd_range`.
+
+Attempting to enqueue a free function kernel using a mechanism that does not
+take an `nd_range` results in undefined behavior.
+Attempting to enqueue a free function kernel with an `nd_range` whose
+dimensionality does not match the free function kernel definition results in
+undefined behavior.
+
+The application is also responsible for setting the values of any kernel
+arguments when the kernel is enqueued.
+For example, when enqueuing a kernel with `handler::parallel_for`, the kernel
+argument values must be set via `handler::set_arg` or `handler::set_args`.
+The argument index passed to `handler::set_arg` is the position of the
+corresponding formal parameter in the free function kernel, where the first
+parameter has index 0.
+The application must abide by the following rules, otherwise the behavior is
+undefined:
+
+* The application must set a value for each kernel argument.
+* The application must not set a value for a kernel argument that does not
+  exist (e.g. specifying an argument index to `handler::set_arg` that is out of
+  range).
+* The type of the expression used to set the argument's value must match the
+  type of the corresponding formal parameter in the free function kernel.
+
 
 == Examples
 
@@ -1350,6 +1391,53 @@ Some notes about the current behavior:
   value. Even if this occurs, the compilation won't fail. However, a compilation
   using the conflicting hash would proceed without pre-compiled preamble support
   as if this option wasn't enabled.
+
+=== Kernel arguments when the language is `sycl`
+
+==== Decomposed kernel arguments
+
+The {dpcpp} implementation currently "decomposes" certain kernel argument
+types, meaning that some argument types are actually passed as several separate
+arguments when the SYCL runtime invokes the kernel using the underlying
+backend.
+For example, `accessor` consists of several internal member variables.
+On the OpenCL backend, one of these member variables is `cl_mem`, and OpenCL
+restrictions require this variable to be passed directly as an OpenCL kernel
+argument.
+(It cannot be passed as a member embedded within a structure.)
+As a result, {dpcpp} passes each member variable as a separate OpenCL kernel
+argument.
+
+A decomposed argument like this is still represented as a single argument in
+SYCL source code.
+When invoking a kernel, the application sets the value of such an
+argument with a single call to `handler::set_arg`.
+For example, the application sets the value of an `accessor` by calling
+`set_arg(acc)`, where `acc` is a variable of type `accessor`.
+
+It is the responsibility of the implementation to translate these calls to
+`set_arg` into multiple backend argument-setting calls when necessary.
+For example, a call to `set_arg(acc)` may actually result in several OpenCL
+calls to `clSetKernelArg`, one for each of the member variables in `accessor`.
+
+==== Kernel arguments that are optimized away
+
+The {dpcpp} implementation currently has the ability to optimize away unused
+kernel arguments.
+For example, if a kernel is declared to take an argument `foo` which is never
+used by the kernel, the implementation may eliminate the argument entirely and
+avoid calling the backend argument-setting API.
+It is still possible to perform these sorts of optimizations for a free
+function kernel, but the logic inside of `handler::set_arg` needs to know when
+an argument has been optimized away.
+
+Of course, the application is still responsible for calling `set_arg` for all
+kernel arguments, even if the implementation has optimized the argument away.
+(The application has no way of knowing whether the optimization has been
+performed.)
+Therefore, `set_arg` must know whether the argument has been optimized away,
+and it must not call the underlying backend argument-setting API for such an
+argument, effectively turning the call into a no-op.
 
 === Known issues and limitations when the language is `sycl`
 

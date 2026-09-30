@@ -517,49 +517,6 @@ _Returns:_ The same value as
 _Remarks:_ Each information descriptor may specify additional preconditions,
 exceptions that are thrown, etc.
 
-=== Enqueuing a free function kernel and setting parameter values
-
-This extension does not provide a way to obtain a `kernel` object that
-represents a free function kernel.
-However, other extensions may provide such a way.
-For example, the
-link:../experimental/sycl_ext_oneapi_kernel_compiler.asciidoc[
-sycl_ext_oneapi_kernel_compiler] extension creates `kernel` objects for free
-function kernels that are compiled from source code at runtime.
-
-The information descriptor `info::kernel::num_args` may be used to query a
-`kernel` object that represents a free function kernel.
-The return value tells the number of formal parameters in the function's
-definition.
-
-Once the application obtains a `kernel` object for a free function kernel, it
-can enqueue the kernel to a device using any of the SYCL functions that allow
-a kernel to be enqueued via a `kernel` object.
-The application must enqueue the free function kernel as an ND-range kernel.
-For example, a free function kernel can be enqueued by calling the
-`handler::parallel_for` overload taking an `nd_range`.
-
-Attempting to enqueue a free function kernel using a mechanism that does not
-take an `nd_range` results in undefined behavior.
-Attempting to enqueue a free function kernel with an `nd_range` whose
-dimensionality does not match the free function kernel definition results in
-undefined behavior.
-
-The application is also responsible for setting the values of any kernel
-arguments when the kernel is enqueued.
-For example, when enqueuing a kernel with `handler::parallel_for`, the kernel
-argument values must be set via
-`handler::set_arg` or `handler::set_args`.
-The application must abide by the following rules, otherwise the behavior is
-undefined:
-
-* The application must set a value for each kernel argument.
-* The application must not set a value for a kernel argument that does not
-  exist (e.g. specifying an argument index to `handler::set_arg` that is out of
-  range).
-* The type of the expression used to set the argument's value must match the
-  type of the corresponding formal parameter in the free function kernel.
-
 === Obtaining the iteration id for a kernel
 
 In a standard SYCL kernel, the iteration ID is passed as a parameter to the
@@ -965,51 +922,6 @@ However, each helper function has a unique name, so it can be uniquely
 identified from the `sycl` namespace, where it is called to specialize the
 `is_nd_range_kernel` trait.
 
-=== Decomposed kernel arguments
-
-The {dpcpp} implementation currently "decomposes" certain kernel argument
-types, meaning that some argument types are actually passed as several separate
-arguments when the SYCL runtime invokes the kernel using the underlying
-backend.
-For example, `accessor` consists of several internal member variables.
-On the OpenCL backend, one of these member variables is `cl_mem`, and OpenCL
-restrictions require this variable to be passed directly as an OpenCL kernel
-argument.
-(It cannot be passed as a member embedded within a structure.)
-As a result, {dpcpp} passes each member variable as a separate OpenCL kernel
-argument.
-
-A decomposed argument like this is still represented as a single argument in
-SYCL source code.
-When invoking a free function kernel, the application sets the value of such an
-argument with a single call to `handler::set_arg`.
-For example, the application sets the value of an `accessor` by calling
-`set_arg(acc)`, where `acc` is a variable of type `accessor`.
-
-It is the responsibility of the implementation to translate these calls to
-`set_arg` into multiple backend argument-setting calls when necessary.
-For example, a call to `set_arg(acc)` may actually result in several OpenCL
-calls to `clSetKernelArg`, one for each of the member variables in `accessor`.
-
-=== Kernel arguments that are optimized away
-
-The {dpcpp} implementation currently has the ability to optimize away unused
-kernel arguments.
-For example, if a kernel is declared to take an argument `foo` which is never
-used by the kernel, the implementation may eliminate the argument entirely and
-avoid calling the backend argument-setting API.
-It is still possible to perform these sorts of optimizations for a free
-function kernel, but the logic inside of `handler::set_arg` needs to know when
-an argument has been optimized away.
-
-Of course, the application is still responsible for calling `set_arg` for all
-kernel arguments, even if the implementation has optimized the argument away.
-(The application has no way of knowing whether the optimization has been
-performed.)
-Therefore, `set_arg` must know whether the argument has been optimized away,
-and it must not call the underlying backend argument-setting API for such an
-argument, effectively turning the call into a no-op.
-
 
 == Issues
 
@@ -1077,24 +989,6 @@ first parameter is an iteration index.
   {dpcpp} to emit a diagnostic in this case.
   We should decide if it is reasonable to require a diagnostic for all
   implementations of this extensions.
-
-* We currently say it is UB if there is a mismatch between a free function
-  kernel's dimensionality and the call to `parallel_for`.
-  Should we go a step further and require an exception to be thrown in these
-  cases?
-  I'm a little hesitant to require an error check here because this is on the
-  critical path for enqueuing a kernel.
-  However, {dpcpp} is still allowed to throw an exception in this case if the
-  overhead is not too high (I'd suggest `errc::invalid`).
-  I think we should decide during implementation whether the overhead is
-  minimal enough that we can mandate an error in the spec.
-
-* We currently say it is UB if a free function kernel is enqueued without
-  setting a value for each of its arguments.
-  Should we go a step further and require an exception in this case (again
-  probably `errc::invalid`)?
-  Again, I think we should decide during implementation whether the overhead is
-  minimal enough that we can mandate an error in the spec.
 
 
 == Resolved issues
