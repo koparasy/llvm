@@ -175,7 +175,7 @@ kernel bundle that contains the device image.
 The device image's backend content is native ISA for the device, which can be
 passed to `zeModuleCreate` as `ZE_MODULE_FORMAT_NATIVE` format.
 
-:ref1: ../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc#level-zero-and-opencl-compatibility
+:ref1: ../supported/sycl_ext_oneapi_free_function_kernels.asciidoc#level-zero-and-opencl-compatibility
 
 [_Note:_ The interface to kernels in the device image backend content is not
 defined in the general case, which means there is no portable way to invoke

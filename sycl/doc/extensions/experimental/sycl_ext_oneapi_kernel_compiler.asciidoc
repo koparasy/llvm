@@ -46,7 +46,7 @@ This extension also depends on the following other SYCL extensions:
 
 * link:../experimental/sycl_ext_oneapi_properties.asciidoc[
   sycl_ext_oneapi_properties]
-* link:../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc[
+* link:../supported/sycl_ext_oneapi_free_function_kernels.asciidoc[
   sycl_ext_oneapi_free_function_kernels]
 
 
@@ -66,7 +66,7 @@ This extension adds APIs that allow the application to dynamically generate the
 source code for a kernel, which it can then compile and enqueue to a device.
 This extension provides support for kernels written in SYCL according to the
 "free function kernel" syntax defined in
-link:../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc[
+link:../supported/sycl_ext_oneapi_free_function_kernels.asciidoc[
 sycl_ext_oneapi_free_function_kernels].
 However, other extensions could provide support for writing kernels in other
 languages.
@@ -139,7 +139,7 @@ enum class source_language : /*unspecified*/ {
 
 The only enumerator defined by this extension is `sycl`, which indicates that
 the kernel is written in SYCL using the "free function kernel" syntax defined
-in link:../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc[
+in link:../supported/sycl_ext_oneapi_free_function_kernels.asciidoc[
 sycl_ext_oneapi_free_function_kernels].
 Other extensions may provide other enumerators that correspond to other
 languages.

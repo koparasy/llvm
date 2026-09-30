@@ -3,7 +3,7 @@
 SYCL-RTC means using the
 [`kernel_compiler`](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_kernel_compiler.asciidoc)
 extension to wrap a SYCL source string comprised of kernel definitions in the
-[free-function syntax](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc)
+[free-function syntax](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/supported/sycl_ext_oneapi_free_function_kernels.asciidoc)
 into a `kernel_bundle` in the `ext_oneapi_source` state, which is then compiled
 into `exectuable` state by the extension's `build(...)` function. The feature is
 backed by an implementation inside the `sycl-jit` library, which exposes the

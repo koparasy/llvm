@@ -215,7 +215,7 @@ int main() {
 === Usage with a free function kernel
 
 An example using this extension with free function kernels
-(link:../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc[
+(link:../supported/sycl_ext_oneapi_free_function_kernels.asciidoc[
 sycl_ext_oneapi_free_function_kernels]).
 
 [source,c++]

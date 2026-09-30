@@ -2383,7 +2383,7 @@ e.g. directly to a queue without returning an event.
 ==== sycl_ext_oneapi_free_function_kernels
 
 `sycl_ext_oneapi_free_function_kernels`, defined in
-link:../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc[sycl_ext_oneapi_free_function_kernels]
+link:../supported/sycl_ext_oneapi_free_function_kernels.asciidoc[sycl_ext_oneapi_free_function_kernels]
 can be used with SYCL Graphs.
 
 ==== sycl_ext_oneapi_kernel_compiler_spirv
