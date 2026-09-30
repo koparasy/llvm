@@ -63,6 +63,10 @@ The functionality of this extension has been replaced by the supported version
 of sycl_ext_oneapi_free_function_kernels: see
 link:../supported/sycl_ext_oneapi_free_function_kernels.asciidoc[here].
 The kernel bundle APIs defined in this specification have no replacement.
+The single-task kernel APIs defined in this specification also have no direct
+replacement, but the same effect can be achieved by declaring the kernel with
+the `nd_range_kernel<1>` property and launching it with `nd_launch` using an
+ND-range that has one work-item in one work-group.
 
 // __INTEL_PREVIEW_BREAKING_CHANGES: Move this specification to the "removed"
 // folder when the feature is removed at the next breaking changes window.
