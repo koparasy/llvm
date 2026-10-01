@@ -37,14 +37,15 @@ https://github.com/intel/llvm/issues
 
 == Dependencies
 
+:khr-work-item-queries: https://registry.khronos.org/SYCL/specs/sycl-2020/html/sycl-2020.html#sec:khr-work-item-queries
+
 This extension is written against the SYCL 2020 revision 10 specification.
 All references below to the "core SYCL specification" or to section numbers in
 the SYCL specification refer to that revision.
 
 This extension also depends on the following other SYCL extensions:
 
-* link:../supported/sycl_ext_oneapi_free_function_queries.asciidoc[
-  sycl_ext_oneapi_free_function_queries]
+* {khr-work-item-queries}[sycl_khr_work_item_queries]
 * link:../experimental/sycl_ext_oneapi_properties.asciidoc[
   sycl_ext_oneapi_properties]
 * link:../experimental/sycl_ext_oneapi_kernel_properties.asciidoc[
@@ -525,9 +526,11 @@ However, this is not the case for a free function kernel because the function
 parameters are used to pass the kernel arguments instead.
 Therefore, a free function kernel must obtain the iteration ID in some other
 way.
-Typically, a free function kernel uses the functions specified in
-link:../supported/sycl_ext_oneapi_free_function_queries.asciidoc[
-sycl_ext_oneapi_free_function_queries] for this purpose.
+A free function kernel should use the functions specified in the
+{khr-work-item-queries}[sycl_khr_work_item_queries] extension for this purpose.
+For example, `sycl::khr::this_nd_item<Dims>()` returns the `nd_item` for the
+calling work-item, `sycl::khr::this_group<Dims>()` returns its work-group, and
+`sycl::khr::this_sub_group()` returns its sub-group.
 
 === Address space of kernel arguments
 
@@ -662,7 +665,6 @@ enqueue it on a device.
 [source,c++]
 ----
 #include <sycl/sycl.hpp>
-namespace syclext = sycl::ext::oneapi;
 namespace syclexp = sycl::ext::oneapi::experimental;
 
 static constexpr size_t NUM = 1024;
@@ -671,7 +673,7 @@ static constexpr size_t WGSIZE = 16;
 SYCL_EXT_ONEAPI_FUNCTION_PROPERTY((syclexp::nd_range_kernel<1>))
 void iota(float start, float *ptr) {
   // Get the ID of this kernel iteration.
-  size_t id = syclext::this_work_item::get_nd_item<1>().get_global_linear_id();
+  size_t id = sycl::khr::this_nd_item<1>().get_global_linear_id();
 
   ptr[id] = start + static_cast<float>(id);
 }
@@ -935,8 +937,7 @@ void iota(sycl::nd_item<1> nditem, float start, float *ptr) { /*...*/  }
 ```
 
 The advantage is that the user wouldn't need to use the functions in
-link:../supported/sycl_ext_oneapi_free_function_queries.asciidoc[
-sycl_ext_oneapi_free_function_queries] to get the iteration index.
+{khr-work-item-queries}[sycl_khr_work_item_queries] to get the iteration index.
 Doing this raises some new questions, though:
 
 ** When the application sets the value of a kernel parameter via `set_arg`,
