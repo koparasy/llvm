@@ -843,14 +843,6 @@ It is also possible to compile the application in AOT mode via the
 `-fsycl-targets` compiler option and then extract the device image's backend
 content from the executable file.
 
-Both Level Zero and OpenCL identify a kernel via a _name_ string.
-(See `zeKernelCreate` and `clCreateKernel` in their respective specifications.)
-When a kernel is defined according to the restrictions above, the _name_ is
-guaranteed to be the same as the name of the kernel's function in the {cpp}
-source code but with "++__sycl_kernel_++" prefixed.
-For example, if the function name is "foo", the kernel's name in the native
-device code module is "++__sycl_kernel_foo++".
-
 Both Level Zero and OpenCL set kernel argument values using three pieces of
 information:
 
@@ -971,6 +963,11 @@ specialize the `is_nd_range_kernel` trait.
 
 * {dpcpp} does not yet diagnose a direct call to a free function kernel in host
   or device code, as required by this extension.
+
+* The linkage rules for free function kernels need to be decided, in
+  particular whether a free function kernel may have internal linkage (for
+  example, when it is declared `static` or in an unnamed namespace) and, if so,
+  how such kernels defined in different translation units are kept distinct.
 
 
 == Issues
