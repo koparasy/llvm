@@ -232,9 +232,11 @@ void iota(float start, float *ptr) {
 }
 ```
 
-A function decorated with this property can still be called as a
-normal function in either host or device code.
-The property has no effect in such cases.
+A function decorated with this property is a kernel entry point.
+A program that calls a free function kernel directly, in either host or
+device code, is ill-formed.
+Calling a free function kernel through any other means, such as through a
+pointer to the function, results in undefined behavior.
 
 [_Note:_ This extension does not provide a way to define a single-task free
 function kernel.
@@ -959,6 +961,16 @@ specialize the `is_nd_range_kernel` trait.
   link:../experimental/sycl_ext_oneapi_kernel_properties.asciidoc[
   sycl_ext_oneapi_kernel_properties], such as `work_group_size`, and launch
   properties, such as `work_group_scratch_size`), need to be decided.
+
+* The `nd_range_kernel` property is currently shared with the
+  link:../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc[deprecated
+  version] of this extension, which allows a free function kernel to be called
+  directly as an ordinary function.
+  This conflicts with the rule in this extension that such a call is
+  ill-formed, and needs to be resolved.
+
+* {dpcpp} does not yet diagnose a direct call to a free function kernel in host
+  or device code, as required by this extension.
 
 
 == Issues
