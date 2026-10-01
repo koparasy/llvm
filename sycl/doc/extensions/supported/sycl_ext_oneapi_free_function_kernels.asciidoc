@@ -38,6 +38,8 @@ https://github.com/intel/llvm/issues
 == Dependencies
 
 :khr-work-item-queries: https://registry.khronos.org/SYCL/specs/sycl-2020/html/sycl-2020.html#sec:khr-work-item-queries
+:khr-properties: https://github.com/KhronosGroup/SYCL-Docs/pull/980
+:khr-launch: https://github.com/KhronosGroup/SYCL-Docs/pull/922
 
 This extension is written against the SYCL 2020 revision 10 specification.
 All references below to the "core SYCL specification" or to section numbers in
@@ -46,12 +48,12 @@ the SYCL specification refer to that revision.
 This extension also depends on the following other SYCL extensions:
 
 * {khr-work-item-queries}[sycl_khr_work_item_queries]
+* {khr-properties}[sycl_khr_properties]
+* {khr-launch}[sycl_khr_launch]
 * link:../experimental/sycl_ext_oneapi_properties.asciidoc[
   sycl_ext_oneapi_properties]
 * link:../experimental/sycl_ext_oneapi_kernel_properties.asciidoc[
   sycl_ext_oneapi_kernel_properties]
-* link:../experimental/sycl_ext_oneapi_enqueue_functions.asciidoc[
-  sycl_ext_oneapi_enqueue_functions]
 
 
 == Status
@@ -245,8 +247,8 @@ void init(float *ptr) {
    // ...
 }
 
-syclexp::nd_launch(q, sycl::nd_range<1>{1, 1},
-                   syclexp::kernel_function<init>, ptr);
+syclext::launch_grouped(q, sycl::range<1>{1}, sycl::range<1>{1},
+                        syclext::kernel_function<init>, ptr);
 ```
 _{endnote}_]
 
@@ -269,7 +271,7 @@ a|
 a!
 [source]
 ----
-namespace sycl::ext::oneapi::experimental {
+namespace sycl::ext::oneapi {
 
 template<auto *Func, int Dims>
 struct is_nd_range_kernel;
@@ -277,7 +279,7 @@ struct is_nd_range_kernel;
 template<auto *Func, int Dims>
 inline constexpr bool is_nd_range_kernel_v = is_nd_range_kernel<Func, Dims>::value;
 
-} // namespace sycl::ext::oneapi::experimental
+} // namespace sycl::ext::oneapi
 ----
 !====
 
@@ -294,7 +296,7 @@ a|
 a!
 [source]
 ----
-namespace sycl::ext::oneapi::experimental {
+namespace sycl::ext::oneapi {
 
 template<auto *Func>
 struct is_kernel;
@@ -302,7 +304,7 @@ struct is_kernel;
 template<auto *Func>
 inline constexpr bool is_kernel_v = is_kernel<Func>::value;
 
-} // namespace sycl::ext::oneapi::experimental
+} // namespace sycl::ext::oneapi
 ----
 !====
 
@@ -324,7 +326,7 @@ address as a template parameter.
 a@
 [source,c++]
 ----
-namespace sycl::ext::oneapi::experimental {
+namespace sycl::ext::oneapi {
 
 template<auto *Func>
 struct kernel_function_s {};
@@ -332,73 +334,61 @@ struct kernel_function_s {};
 template<auto *Func>
 inline constexpr kernel_function_s<Func> kernel_function;
 
-} // namespace sycl::ext::oneapi::experimental
+} // namespace sycl::ext::oneapi
 ----
 !====
 
 It also adds the following free functions which launch a free function kernel.
+These functions overload the `launch_grouped` functions defined in
+{khr-launch}[sycl_khr_launch], replacing the kernel function object with a
+`kernel_function_s` value that identifies the free function kernel.
 
 [frame=all,grid=none,separator="@"]
 !====
 a@
 [source,c++]
 ----
-namespace sycl::ext::oneapi::experimental {
+namespace sycl::ext::oneapi {
+
+template <auto *Func, int Dimensions, typename PropertyOrList,
+          typename... Args>
+void launch_grouped(const queue& q, range<Dimensions> r,
+                    range<Dimensions> size, kernel_function_s<Func> k,
+                    PropertyOrList props, Args&&... args);              (1)
 
 template <auto *Func, int Dimensions, typename... Args>
-void nd_launch(queue q, nd_range<Dimensions> r,
-               kernel_function_s<Func> k, Args&&... args);
+void launch_grouped(const queue& q, range<Dimensions> r,
+                    range<Dimensions> size, kernel_function_s<Func> k,
+                    Args&&... args);                                    (2)
 
-template <auto *Func, int Dimensions, typename... Args>
-void nd_launch(handler &h, nd_range<Dimensions> r,
-               kernel_function_s<Func> k, Args&&... args);
-
-} // namespace sycl::ext::oneapi::experimental
+} // namespace sycl::ext::oneapi
 ----
 !====
 
-_Constraints_: Available only if `is_nd_range_kernel_v<Func, Dimensions>` is
-`true`.
+_Constraints (1-2)_: Available only if `is_nd_range_kernel_v<Func, Dimensions>`
+is `true`.
 Available only if `+std::is_invocable_v<decltype(Func), Args...>+` is `true`.
 
-_Effects_: Enqueues a kernel object to the `queue` or `handler` as an ND-range
-kernel, using the number of work-items specified by the ND-range `r`.
+_Constraints (1)_: Available only if
+`+khr::is_property_for_v<PropertyOrList, khr::command>+` is `true` or
+`+khr::is_property_list_for_v<PropertyOrList, khr::command>+` is `true`.
+Available only if `props` does not contain `khr::property::use_kernel_bundle`.
+Available only if `props` does not contain `khr::property::use_accessors`.
+
+_Effects (1)_: Enqueues the free function kernel `Func` to the queue `q` as an
+ND-range kernel, using the global range `r` and the work-group size `size`.
+The properties in `props` are applied to the command as specified in
+{khr-launch}[sycl_khr_launch].
 Each value in the `args` pack is passed to the corresponding argument in
 `Func`, converting it to the argument's type if necessary.
 
-'''
+_Effects (2)_: Equivalent to
+`+launch_grouped(q, r, size, k, khr::empty_properties_t{}, args...)+`.
 
-[frame=all,grid=none,separator="@"]
-!====
-a@
-[source,c++]
-----
-namespace sycl::ext::oneapi::experimental {
-
-template <auto *Func, int Dimensions,
-          typename Properties, typename... Args>
-void nd_launch(queue q,
-               launch_config<nd_range<Dimensions>, Properties> c,
-               kernel_function_s<Func> k, Args&& args...);
-
-template <auto *Func, int Dimensions,
-          typename Properties, typename... Args>
-void nd_launch(handler &h,
-               launch_config<nd_range<Dimensions>, Properties> c,
-               kernel_function_s<Func> k, Args&& args...);
-
-} // namespace sycl::ext::oneapi::experimental
-----
-!====
-
-_Constraints_: Available only if `is_nd_range_kernel_v<Func, Dimensions>` is
-`true`.
-Available only if `+std::is_invocable_v<decltype(Func), Args...>+` is `true`.
-
-_Effects_: Enqueues a kernel object to the `queue` or `handler` as an ND-range
-kernel, using the launch configuration specified by `c`.
-Each value in the `args` pack is passed to the corresponding argument in
-`Func`, converting it to the argument's type if necessary.
+[_Note:_ Because `PropertyOrList` must be a property or a property list, a call
+that passes properties selects overload (1), and a call that passes only kernel
+arguments selects overload (2).
+_{endnote}_]
 
 === New free function to check kernel compatibility
 
@@ -410,12 +400,12 @@ free function kernel is compatible with a device.
 a@
 [source,c++]
 ----
-namespace sycl::ext::oneapi::experimental {
+namespace sycl::ext::oneapi {
 
 template <auto *Func>
 bool is_compatible(const device& dev);
 
-} // namespace sycl::ext::oneapi::experimental
+} // namespace sycl::ext::oneapi
 ----
 !====
 
@@ -436,12 +426,12 @@ to query the kernel information descriptors for a free function kernel.
 a@
 [source,c++]
 ----
-namespace sycl::ext::oneapi::experimental {
+namespace sycl::ext::oneapi {
 
 template<auto *Func, typename Param>
 typename Param::return_type get_kernel_info(const context& ctxt);
 
-} // namespace sycl::ext::oneapi::experimental
+} // namespace sycl::ext::oneapi
 ----
 !====
 
@@ -463,13 +453,13 @@ exceptions that are thrown, etc.
 a@
 [source,c++]
 ----
-namespace sycl::ext::oneapi::experimental {
+namespace sycl::ext::oneapi {
 
 template<auto *Func, typename Param>
 typename Param::return_type get_kernel_info(const context& ctxt,
                                             const device& dev);
 
-} // namespace sycl::ext::oneapi::experimental
+} // namespace sycl::ext::oneapi
 ----
 !====
 
@@ -496,12 +486,12 @@ exceptions that are thrown, etc.
 a@
 [source,c++]
 ----
-namespace sycl::ext::oneapi::experimental {
+namespace sycl::ext::oneapi {
 
 template<auto *Func, typename Param>
 typename Param::return_type get_kernel_info(const queue& q);
 
-} // namespace sycl::ext::oneapi::experimental
+} // namespace sycl::ext::oneapi
 ----
 !====
 
@@ -655,6 +645,80 @@ The allowed types are:
 * A type alias to one of the above types.
 
 
+=== Deprecated functionality
+
+The functionality in this section was previously part of an experimental
+version of this extension, but is now deprecated.
+Each function or type behaves as specified in the
+link:../deprecated/sycl_ext_oneapi_free_function_kernels.asciidoc[experimental
+version] of this extension.
+
+[source,c++]
+----
+namespace sycl::ext::oneapi::experimental {
+
+template<auto *Func>
+struct kernel_function_s {};
+
+template<auto *Func>
+inline constexpr kernel_function_s<Func> kernel_function;
+
+template <auto *Func, int Dimensions, typename... Args>
+void nd_launch(queue q, nd_range<Dimensions> r,
+               kernel_function_s<Func> k, Args&&... args);
+
+template <auto *Func, int Dimensions, typename... Args>
+void nd_launch(handler &h, nd_range<Dimensions> r,
+               kernel_function_s<Func> k, Args&&... args);
+
+template <auto *Func, int Dimensions,
+          typename Properties, typename... Args>
+void nd_launch(queue q,
+               launch_config<nd_range<Dimensions>, Properties> c,
+               kernel_function_s<Func> k, Args&&... args);
+
+template <auto *Func, int Dimensions,
+          typename Properties, typename... Args>
+void nd_launch(handler &h,
+               launch_config<nd_range<Dimensions>, Properties> c,
+               kernel_function_s<Func> k, Args&&... args);
+
+template<auto *Func, int Dims>
+struct is_nd_range_kernel;
+
+template<auto *Func, int Dims>
+inline constexpr bool is_nd_range_kernel_v = is_nd_range_kernel<Func, Dims>::value;
+
+template<auto *Func>
+struct is_kernel;
+
+template<auto *Func>
+inline constexpr bool is_kernel_v = is_kernel<Func>::value;
+
+template <auto *Func>
+bool is_compatible(const device& dev);
+
+template<auto *Func, typename Param>
+typename Param::return_type get_kernel_info(const context& ctxt);
+
+template<auto *Func, typename Param>
+typename Param::return_type get_kernel_info(const context& ctxt,
+                                            const device& dev);
+
+template<auto *Func, typename Param>
+typename Param::return_type get_kernel_info(const queue& q);
+
+} // namespace sycl::ext::oneapi::experimental
+----
+
+The `nd_launch` functions are replaced by the `launch_grouped` functions in
+this specification.
+The other functions and types are replaced by the functions and types with the
+same name in the `sycl::ext::oneapi` namespace.
+The experimental version also defines kernel bundle and single-task APIs,
+which are deprecated and have no replacement in this specification.
+
+
 == Examples
 
 === Basic invocation
@@ -665,6 +729,7 @@ enqueue it on a device.
 [source,c++]
 ----
 #include <sycl/sycl.hpp>
+namespace syclext = sycl::ext::oneapi;
 namespace syclexp = sycl::ext::oneapi::experimental;
 
 static constexpr size_t NUM = 1024;
@@ -684,8 +749,8 @@ int main() {
 
   float *ptr = sycl::malloc_shared<float>(NUM, q);
 
-  sycl::nd_range ndr{{NUM}, {WGSIZE}};
-  syclexp::nd_launch(q, ndr, syclexp::kernel_function<iota>, 3.14f, ptr);
+  syclext::launch_grouped(q, sycl::range{NUM}, sycl::range{WGSIZE},
+                          syclext::kernel_function<iota>, 3.14f, ptr);
 
   q.wait();
 }
@@ -701,6 +766,7 @@ cases.
 [source,c++]
 ----
 #include <sycl/sycl.hpp>
+namespace syclext = sycl::ext::oneapi;
 namespace syclexp = sycl::ext::oneapi::experimental;
 
 const size_t NUM = 1024;
@@ -728,61 +794,21 @@ int main() {
 
   float *fptr = sycl::malloc_shared<float>(NUM, q);
   int *iptr = sycl::malloc_shared<int>(NUM, q);
-  sycl::nd_range ndr{{NUM}, {WGSIZE}};
+  sycl::range global{NUM}, local{WGSIZE};
 
   // When the free function kernel is templated, pass the address of a
   // specific instantiation.
-  syclexp::nd_launch(q, ndr, syclexp::kernel_function<iota<float>>, 3.14f, fptr);
-  syclexp::nd_launch(q, ndr, syclexp::kernel_function<iota<int>>, 3, iptr);
+  syclext::launch_grouped(q, global, local, syclext::kernel_function<iota<float>>, 3.14f, fptr);
+  syclext::launch_grouped(q, global, local, syclext::kernel_function<iota<int>>, 3, iptr);
 
   // When there are multiple overloads of a free function kernel, use a cast
   // to disambiguate.
-  syclexp::nd_launch(q, ndr, syclexp::kernel_function<(void(*)(float*))ping>, fptr);
-  syclexp::nd_launch(q, ndr, syclexp::kernel_function<(void(*)(int*))ping>, iptr);
+  syclext::launch_grouped(q, global, local, syclext::kernel_function<(void(*)(float*))ping>, fptr);
+  syclext::launch_grouped(q, global, local, syclext::kernel_function<(void(*)(int*))ping>, iptr);
 
   q.wait();
 }
 ----
-
-=== Using "scratch" work-group local memory
-
-Free function kernels can use work-group local memory via `local_accessor` or
-via other extensions.
-This example demonstrates how to use work-group local memory via the
-link:../experimental/sycl_ext_oneapi_work_group_scratch_memory.asciidoc[
-sycl_ext_oneapi_work_group_scratch_memory] extension because it also illustrates
-how to pass a kernel launch parameter.
-
-[source,c++]
-----
-#include <sycl/sycl.hpp>
-namespace syclexp = sycl::ext::oneapi::experimental;
-
-static constexpr size_t NUM = 1024;
-static constexpr size_t WGSIZE = 16;
-
-SYCL_EXT_ONEAPI_FUNCTION_PROPERTY((syclexp::nd_range_kernel<1>))
-void mykernel() {
-  // Gets a pointer to WGSIZE int's
-  int *ptr = static_cast<int *>(syclexp::get_work_group_scratch_memory());
-}
-
-int main() {
-  sycl::queue q;
-
-  syclexp::launch_config cfg{
-    sycl::nd_range{{NUM}, {WGSIZE}},
-    syclexp::properties{
-      syclexp::work_group_scratch_size{WGSIZE * sizeof(int)}
-    }
-  };
-  syclexp::nd_launch(q, cfg, syclexp::kernel_function<mykernel>);
-
-  q.wait();
-}
-----
-
-
 
 [[level-zero-and-opencl-compatibility]]
 == {dpcpp} guaranteed compatibility with Level Zero and OpenCL backends
@@ -910,7 +936,7 @@ inline namespace {
   static constexpr auto __sycl_shim2() {return (void(*)(int))same_name;}
 }
 
-namespace sycl {
+namespace sycl::ext::oneapi {
   template<> struct is_nd_range_kernel<__sycl_shim1()> : std::true_type {};
   template<> struct is_nd_range_kernel<__sycl_shim2()> : std::true_type {};
 }
@@ -921,8 +947,18 @@ they are defined in the same namespace as the user's kernel function.
 Thus, the {cpp} unqualified name lookup algorithm, finds the correct function
 definition.
 However, each helper function has a unique name, so it can be uniquely
-identified from the `sycl` namespace, where it is called to specialize the
-`is_nd_range_kernel` trait.
+identified from the `sycl::ext::oneapi` namespace, where it is called to
+specialize the `is_nd_range_kernel` trait.
+
+
+== TODO
+
+* The namespace of the `nd_range_kernel` property, and how this extension
+  expresses the properties that cannot yet be expressed with
+  {khr-properties}[sycl_khr_properties] (the kernel properties from
+  link:../experimental/sycl_ext_oneapi_kernel_properties.asciidoc[
+  sycl_ext_oneapi_kernel_properties], such as `work_group_size`, and launch
+  properties, such as `work_group_scratch_size`), need to be decided.
 
 
 == Issues
