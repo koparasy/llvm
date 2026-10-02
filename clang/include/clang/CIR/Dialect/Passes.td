@@ -453,28 +453,37 @@ def OffloadPropagateSYCLKernelArgs
 def OffloadDetectHostUniformIntDivisor
     : Pass<"cir-offload-detect-host-uniform-int-divisor",
            "mlir::ModuleOp"> {
-  let summary = "Remark on device int div/rem by a launch-uniform scalar capture";
+  let summary = "Remark on device compute driven by a launch-uniform capture";
   let description = [{
     Runs over a `cir.offload.container`. For each SYCL device kernel, walks the
-    kernel body for integer division / remainder (`cir.div` / `cir.rem`) and
-    tests whether the divisor is *kernel-scope-uniform*: invariant across the
-    launch because it is derived only from captured scalar closure fields
-    (classified with the same param->field mapping the scalar-capture
-    propagation pass uses) and `cir.const`, propagated through pure integer
-    arithmetic. A divisor whose chain reaches a work-item/index builtin, a
-    non-captured memory load, or a parameter not backed by a captured scalar is
-    NOT uniform and is skipped, as is a divisor that is already a compile-time
-    constant (the backend already strength-reduces those).
+    kernel body for expensive computations whose operands are
+    *kernel-scope-uniform*: invariant across the launch because they are derived
+    only from captured scalar closure fields (classified with the same
+    param->field mapping the scalar-capture propagation pass uses) and
+    `cir.const`, propagated through pure arithmetic and pure (`const`) library
+    calls. A chain that reaches a work-item/index builtin (`__spirv_BuiltIn*`),
+    a non-captured memory load, or a parameter not backed by a captured scalar
+    is NOT uniform.
 
-    For each launch-uniform divisor it emits an MLIR *remark* naming the kernel
-    and the capture field, suggesting the value's reciprocal be host-precomputed
-    as a magic-multiply (the strength reduction the front end cannot see -- it
-    lacks the whole-launch view -- and the back end cannot see -- the divisor is
-    a runtime value on the device side). Every SYCL device kernel is a
-    candidate, TU-local or not: a remark is sound cross-TU (unlike the
-    in-place-edit opts), and the motivating case is a named functor. Diagnostic
-    only: the pass never mutates the module and is not part of the default merge
-    pipeline, so it must be requested explicitly (CMPLRLLVM-76652).
+    Two remark kinds, both diagnostic (the strength reduction / hoist the front
+    end cannot see -- it lacks the whole-launch view -- and the back end cannot
+    see -- the value is a runtime kernel argument on the device side):
+
+    - integer/floating-point division or remainder whose DIVISOR is uniform (the
+      classic `lid / C_`): suggest host-precomputing a reciprocal magic-multiply
+      whose constants are a function of the divisor. Skips a constant divisor --
+      the backend already strength-reduces those.
+    - an expensive fully-uniform computation (a transcendental math call such as
+      `cos`/`sin`/`exp`/`pow`/`sqrt`, or a division with both operands uniform):
+      the whole result is a launch constant, so suggest host-precomputing it and
+      passing the scalar. Reported once, at the outermost expensive op of a
+      uniform expression, and only when a runtime capture is actually involved.
+
+    Every SYCL device kernel is a candidate, TU-local or not: a remark is sound
+    cross-TU (unlike the in-place-edit opts), and the motivating case is a named
+    functor. Diagnostic only: the pass never mutates the module and is not part
+    of the default merge pipeline, so it must be requested explicitly
+    (CMPLRLLVM-76652).
   }];
   let constructor = "mlir::createOffloadDetectHostUniformIntDivisorPass()";
   let dependentDialects = ["cir::CIRDialect"];
@@ -508,14 +517,16 @@ def OffloadDetectHostDeviceClosureLayoutMismatch
     HostKernelRef closure operand) and the device closure record (the record the
     kernel prologue reconstructs). Matched by kernel binding -- never by
     type-name equality, since the two records carry different aliases (`anon.0`
-    vs `__cir_lowered.anon.0`) -- it compares the ordered field lists and emits
-    an MLIR *warning* for each divergence (a differing field count, or a field
-    whose type differs), naming the kernel, the field index/name, and both
-    types. Such a mismatch is a host/device closure ABI mismatch (likely
+    vs `__cir_lowered.anon.0`) -- it compares the ordered field lists (ignoring
+    a captured pointer's address space, a device-lowering artifact) and emits an
+    MLIR *warning* for each divergence (a differing field count, or a field whose
+    type differs), anchored at the capture's source line and naming the field.
+    Such a mismatch is a host/device closure mismatch (likely
     `__SYCL_DEVICE_ONLY__` or divergent captures) and is undefined behavior.
 
-    Analysis only: the pass never mutates the module and is not part of the
-    default cir-offload-merge pipeline, so it must be requested explicitly.
+    Analysis only: the pass never mutates the module. It runs at the head of the
+    cir-offload-merge combine pipeline, before the mem2reg that would promote the
+    device closure alloca the device-record recovery reads.
   }];
   let constructor =
       "mlir::createOffloadDetectHostDeviceClosureLayoutMismatchPass()";
