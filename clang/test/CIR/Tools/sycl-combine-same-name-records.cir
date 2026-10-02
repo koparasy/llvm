@@ -1,0 +1,31 @@
+// Host and SYCL device modules define the same-named identified record with
+// different member types (device pointers carry a target address space). The
+// combine namespaces the device records so they do not collide in the shared
+// context.
+
+// RUN: rm -rf %t && split-file %s %t
+// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   -output=%t/combined.cir
+// RUN: FileCheck %s --input-file=%t/combined.cir
+
+// CHECK: !cir.struct<"S" {data !cir.ptr<!cir.float>}>
+// CHECK: !cir.struct<"__cir_lowered.S" {data !cir.ptr<!cir.float, target_address_space(4)>}>
+
+//--- host.cir
+!rec_S = !cir.struct<"S" {data !cir.ptr<!cir.float>}>
+module attributes {cir.triple = "x86_64-unknown-linux-gnu"} {
+  cir.func @h(%arg0: !cir.ptr<!rec_S>) {
+    %0 = cir.get_member %arg0[0] {name = "p"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!cir.float>>
+    cir.return
+  }
+}
+
+//--- device.cir
+!rec_S = !cir.struct<"S" {data !cir.ptr<!cir.float, target_address_space(4)>}>
+module attributes {cir.triple = "spir64-unknown-unknown"} {
+  cir.func @d(%arg0: !cir.ptr<!rec_S>) {
+    %0 = cir.get_member %arg0[0] {name = "p"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!cir.float, target_address_space(4)>>
+    cir.return
+  }
+}

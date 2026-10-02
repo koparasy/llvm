@@ -35,6 +35,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "clang/Basic/TargetID.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
+#include "clang/CIR/Dialect/IR/CIRInlinerInterface.h"
 #include "clang/CIR/Dialect/OpenMP/RegisterOpenMPExtensions.h"
 #include "clang/CIR/Dialect/Passes.h"
 #include "clang/Driver/OffloadBundler.h"
@@ -47,6 +48,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -268,14 +270,57 @@ void registerDialects(mlir::DialectRegistry &registry) {
   // uses MLIR's generic inliner for SYCL launch-geometry recovery; its
   // InlinerInterface collection requires every loaded dialect that promised a
   // DialectInlinerInterface to have registered one. LLVM and Func promise it.
-  mlir::LLVM::registerInlinerInterface(registry);
-  mlir::func::registerInlinerExtension(registry);
+  cir::registerInlinerInterface(registry);
+}
+
+// Prefix every identified record name in `text` with `__cir_lowered.`, unless
+// it already carries it. Identified records are uniqued by name in the shared
+// MLIRContext, so a SYCL device record (whose pointer members carry target
+// address spaces) would otherwise collide with the same-named host record and
+// silently take its body.
+static std::string namespaceDeviceRecords(llvm::StringRef text) {
+  static constexpr llvm::StringLiteral prefix = "__cir_lowered.";
+  std::string out;
+  out.reserve(text.size());
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t hit = llvm::StringRef::npos;
+    size_t open = 0;
+    for (llvm::StringRef kw :
+         {"!cir.struct<\"", "!cir.struct<class \"", "!cir.union<\""}) {
+      size_t at = text.find(kw, pos);
+      if (at < hit) {
+        hit = at;
+        open = kw.size();
+      }
+    }
+    if (hit == llvm::StringRef::npos) {
+      out.append(text.substr(pos));
+      break;
+    }
+    out.append(text.substr(pos, hit - pos + open));
+    pos = hit + open;
+    if (!text.substr(pos).starts_with(prefix))
+      out.append(prefix);
+  }
+  return out;
 }
 
 mlir::OwningOpRef<mlir::ModuleOp> parseCIRInput(llvm::StringRef inputFileName,
-                                                mlir::MLIRContext &context) {
+                                                mlir::MLIRContext &context,
+                                                bool isSYCLDevice) {
   mlir::ParserConfig parserConfig(&context);
-  return mlir::parseSourceFile<mlir::ModuleOp>(inputFileName, parserConfig);
+  if (!isSYCLDevice)
+    return mlir::parseSourceFile<mlir::ModuleOp>(inputFileName, parserConfig);
+  auto bufferOrErr = llvm::MemoryBuffer::getFileOrSTDIN(inputFileName);
+  if (std::error_code ec = bufferOrErr.getError()) {
+    llvm::errs() << "error: cannot open '" << inputFileName
+                 << "': " << ec.message() << "\n";
+    return {};
+  }
+  std::string text = namespaceDeviceRecords((*bufferOrErr)->getBuffer());
+  return mlir::parseSourceString<mlir::ModuleOp>(text, parserConfig,
+                                                 inputFileName);
 }
 
 void setOffloadAttrs(mlir::ModuleOp cirModule, llvm::StringRef name,
@@ -298,8 +343,11 @@ combineInputs(llvm::ArrayRef<InputTarget> inputTargets,
   llvm::StringMap<unsigned> deviceNames;
 
   for (const InputTarget &inputTarget : inputTargets) {
+    bool isSYCLDevice =
+        !inputTarget.IsHost &&
+        llvm::StringRef(inputTarget.Target).starts_with("sycl-");
     mlir::OwningOpRef<mlir::ModuleOp> cirModule =
-        parseCIRInput(inputTarget.Input, context);
+        parseCIRInput(inputTarget.Input, context, isSYCLDevice);
     if (!cirModule)
       return {};
 
@@ -440,7 +488,7 @@ int splitInput(llvm::StringRef inputFileName,
                llvm::MutableArrayRef<TargetOutput> targetOutputs,
                mlir::MLIRContext &context) {
   mlir::OwningOpRef<mlir::ModuleOp> cirModule =
-      parseCIRInput(inputFileName, context);
+      parseCIRInput(inputFileName, context, /*isSYCLDevice=*/false);
   if (!cirModule)
     return reportError("failed to parse input file");
 
