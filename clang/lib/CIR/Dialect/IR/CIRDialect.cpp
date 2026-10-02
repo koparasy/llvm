@@ -94,74 +94,6 @@ struct CIROpAsmDialectInterface : public OpAsmDialectInterface {
   }
 };
 
-/// Inlining legality/terminator hooks for the CIR dialect.
-///
-/// CIR has no inlining algorithm of its own -- it reuses MLIR's generic
-/// inliner (mlir::inlineCall / InlinerInterface). This interface supplies the
-/// two things the generic inliner needs from a dialect: legality answers and
-/// terminator fixup.
-///
-/// Legality is intentionally unconditional (force-inline). The `no_inline`
-/// #cir.inline_kind marker on a cir.func / cir.call is a *codegen* hint and is
-/// deliberately NOT consulted here: analysis-only clients (e.g. the SYCL
-/// launch-geometry recovery in the offload combine) clone a throwaway module
-/// and force-inline a targeted launch-shim chain regardless of the hint. The
-/// caller is responsible for deciding *which* calls to inline; this hook only
-/// says whether it is structurally legal.
-struct CIRInlinerInterface : public mlir::DialectInlinerInterface {
-  using mlir::DialectInlinerInterface::DialectInlinerInterface;
-
-  //===--------------------------------------------------------------------===//
-  // Analysis Hooks
-  //===--------------------------------------------------------------------===//
-
-  // A call of a cir.func into another region is always legal to inline; the
-  // no_inline hint is ignored on purpose (see class comment).
-  bool isLegalToInline(mlir::Operation *call, mlir::Operation *callable,
-                       bool wouldBeCloned) const final {
-    return true;
-  }
-
-  // Any operation is legal to inline into any CIR region.
-  bool isLegalToInline(mlir::Operation *, mlir::Region *, bool,
-                       mlir::IRMapping &) const final {
-    return true;
-  }
-
-  // Any cir.func body is legal to inline.
-  bool isLegalToInline(mlir::Region *, mlir::Region *, bool,
-                       mlir::IRMapping &) const final {
-    return true;
-  }
-
-  //===--------------------------------------------------------------------===//
-  // Transformation Hooks
-  //===--------------------------------------------------------------------===//
-
-  // Multi-block callee case: a cir.return in an inlined block is rewritten to
-  // a cir.br into the post-call continuation block, forwarding the returned
-  // values as branch operands (mirrors the func dialect's ReturnOp handling).
-  // FlattenCFG must have run on the callee first so that cir.return is a
-  // top-level block terminator rather than nested in a cir.scope/cleanup.scope.
-  void handleTerminator(mlir::Operation *op, mlir::Block *newDest) const final {
-    auto returnOp = mlir::dyn_cast<cir::ReturnOp>(op);
-    if (!returnOp)
-      return;
-    mlir::OpBuilder builder(op);
-    cir::BrOp::create(builder, op->getLoc(), returnOp.getOperands(), newDest);
-    op->erase();
-  }
-
-  // Single-block callee case: the cir.return operands directly replace the
-  // call results.
-  void handleTerminator(mlir::Operation *op,
-                        mlir::ValueRange valuesToRepl) const final {
-    auto returnOp = mlir::cast<cir::ReturnOp>(op);
-    assert(returnOp.getNumOperands() == valuesToRepl.size());
-    for (const auto &it : llvm::enumerate(returnOp.getOperands()))
-      valuesToRepl[it.index()].replaceAllUsesWith(it.value());
-  }
-};
 } // namespace
 
 void cir::CIRDialect::initialize() {
@@ -171,7 +103,7 @@ void cir::CIRDialect::initialize() {
 #define GET_OP_LIST
 #include "clang/CIR/Dialect/IR/CIROps.cpp.inc"
       >();
-  addInterfaces<CIROpAsmDialectInterface, CIRInlinerInterface>();
+  addInterfaces<CIROpAsmDialectInterface>();
 }
 
 Operation *cir::CIRDialect::materializeConstant(mlir::OpBuilder &builder,

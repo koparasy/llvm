@@ -195,13 +195,13 @@ module attributes {cir.offload.container} {
       %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
       %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
       %g0 = cir.get_member %ndr[0] {name = "globalSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
-      %ga = cir.base_class_addr %g0 : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %ga = cir.base_class_addr nonnull %g0 [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
       %gc = cir.get_member %ga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
       %gp = cir.cast array_to_ptrdecay %gc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
       %mg = cir.get_member %view[0] {name = "MGlobalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
       cir.store %gp, %mg : !cir.ptr<!u64i>, !cir.ptr<!cir.ptr<!u64i>>
       %l0 = cir.get_member %ndr[1] {name = "localSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
-      %la = cir.base_class_addr %l0 : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %la = cir.base_class_addr nonnull %l0 [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
       %lc = cir.get_member %la[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
       %lp = cir.cast array_to_ptrdecay %lc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
       %ml = cir.get_member %view[1] {name = "MLocalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
@@ -221,11 +221,11 @@ module attributes {cir.offload.container} {
       %rl = cir.alloca "rl" align(8) : !cir.ptr<!rec_range>
       %c1024 = cir.const #cir.int<1024> : !u64i
       %c256 = cir.const #cir.int<256> : !u64i
-      %rga = cir.base_class_addr %rg : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %rga = cir.base_class_addr nonnull %rg [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
       %rgc = cir.get_member %rga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
       %rgp = cir.cast array_to_ptrdecay %rgc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
       cir.store %c1024, %rgp : !u64i, !cir.ptr<!u64i>
-      %rla = cir.base_class_addr %rl : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %rla = cir.base_class_addr nonnull %rl [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
       %rlc = cir.get_member %rla[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
       %rlp = cir.cast array_to_ptrdecay %rlc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
       cir.store %c256, %rlp : !u64i, !cir.ptr<!u64i>
@@ -277,7 +277,7 @@ module attributes {cir.offload.container} {
     cir.func internal @_ZN4sycl3_V16detail20submit_kernel_directE(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %rng: !cir.ptr<!rec_range>, %clos: !cir.ptr<!s8i>) {
       %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
       %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
-      %ga = cir.base_class_addr %rng : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %ga = cir.base_class_addr nonnull %rng [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
       %gc = cir.get_member %ga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
       %gp = cir.cast array_to_ptrdecay %gc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
       %mg = cir.get_member %view[0] {name = "MGlobalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
@@ -297,7 +297,7 @@ module attributes {cir.offload.container} {
     cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %clos: !cir.ptr<!s8i>) {
       %rg = cir.alloca "rg" align(8) : !cir.ptr<!rec_range>
       %c2048 = cir.const #cir.int<2048> : !u64i
-      %rga = cir.base_class_addr %rg : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %rga = cir.base_class_addr nonnull %rg [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
       %rgc = cir.get_member %rga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
       %rgp = cir.cast array_to_ptrdecay %rgc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
       cir.store %c2048, %rgp : !u64i, !cir.ptr<!u64i>
@@ -344,7 +344,7 @@ module attributes {cir.offload.container} {
     cir.func internal @_ZN4sycl3_V16detail20submit_kernel_directE(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %rng: !cir.ptr<!rec_range>, %clos: !cir.ptr<!s8i>) {
       %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
       %slot = cir.alloca "dki" align(8) : !cir.ptr<!cir.ptr<!s8i>>
-      %ga = cir.base_class_addr %rng : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %ga = cir.base_class_addr nonnull %rng [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
       %gc = cir.get_member %ga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
       %gp = cir.cast array_to_ptrdecay %gc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
       %mg = cir.get_member %view[0] {name = "MGlobalSize"} : !cir.ptr<!rec_view> -> !cir.ptr<!cir.ptr<!u64i>>
@@ -360,7 +360,7 @@ module attributes {cir.offload.container} {
     }
     cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %clos: !cir.ptr<!s8i>, %n: !u64i) {
       %rg = cir.alloca "rg" align(8) : !cir.ptr<!rec_range>
-      %rga = cir.base_class_addr %rg : !cir.ptr<!rec_range> nonnull [0] -> !cir.ptr<!rec_arr>
+      %rga = cir.base_class_addr nonnull %rg [0] : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
       %rgc = cir.get_member %rga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
       %rgp = cir.cast array_to_ptrdecay %rgc : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
       cir.store %n, %rgp : !u64i, !cir.ptr<!u64i>
