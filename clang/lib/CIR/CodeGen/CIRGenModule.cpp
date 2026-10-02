@@ -1975,6 +1975,21 @@ cir::GlobalOp CIRGenModule::createOrReplaceCXXRuntimeVariable(
   return gv;
 }
 
+/// Whether \p ty is a record (or a specialization of a record template)
+/// marked [[__sycl_detail__::device_global]] (mirrors
+/// SemaSYCL::isTypeDecoratedWithDeclAttribute<SYCLDeviceGlobalAttr>).
+static bool isTypeDecoratedWithSYCLDeviceGlobal(QualType ty) {
+  const CXXRecordDecl *recTy = ty->getAsCXXRecordDecl();
+  if (!recTy)
+    return false;
+  if (recTy->hasAttr<SYCLDeviceGlobalAttr>())
+    return true;
+  if (const auto *ctsd = dyn_cast<ClassTemplateSpecializationDecl>(recTy))
+    if (CXXRecordDecl *rd = ctsd->getSpecializedTemplate()->getTemplatedDecl())
+      return rd->hasAttr<SYCLDeviceGlobalAttr>();
+  return false;
+}
+
 cir::GlobalLinkageKind
 CIRGenModule::getCIRLinkageForDeclarator(const DeclaratorDecl *dd,
                                          GVALinkage linkage) {
@@ -1992,6 +2007,19 @@ CIRGenModule::getCIRLinkageForDeclarator(const DeclaratorDecl *dd,
   // so we can use available_externally linkage.
   if (linkage == GVA_AvailableExternally)
     return cir::GlobalLinkageKind::AvailableExternallyLinkage;
+
+  // SYCL: Device code is not generally limited to one translation unit, but
+  // anything accessed from another translation unit is required to be annotated
+  // with the SYCL_EXTERNAL macro. For any function or variable that does not
+  // have this, linkonce_odr suffices. If -fno-sycl-rdc is passed, we know there
+  // is only one translation unit and can so mark them internal (mirrors
+  // classic CodeGen's getLLVMLinkageForDeclarator).
+  if (astContext.getLangOpts().SYCLIsDevice && !dd->hasAttr<SYCLKernelAttr>() &&
+      !dd->hasAttr<SYCLDeviceAttr>() && !dd->hasAttr<SYCLExternalAttr>() &&
+      !isTypeDecoratedWithSYCLDeviceGlobal(dd->getType()))
+    return astContext.getLangOpts().GPURelocatableDeviceCode
+               ? cir::GlobalLinkageKind::LinkOnceODRLinkage
+               : cir::GlobalLinkageKind::InternalLinkage;
 
   // Note that Apple's kernel linker doesn't support symbol
   // coalescing, so we need to avoid linkonce and weak linkages there.
