@@ -29,6 +29,6 @@ int f(void) {
 // OBJ: .data
 // OBJ-SAME: x
 
-// NO-AST: cannot apply AST actions to CIR file
+// NO-AST: cannot apply AST actions to ClangIR file
 
 // INVALID: failed to parse CIR input
