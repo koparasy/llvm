@@ -248,7 +248,9 @@ def CallConvLowering : Pass<"cir-call-conv-lowering", "mlir::ModuleOp"> {
              clEnumValN(cir::CallConvTarget::X86_64, "x86_64",
                         "x86_64 System V"),
              clEnumValN(cir::CallConvTarget::AMDGPU, "amdgpu",
-                        "AMDGPU")
+                        "AMDGPU"),
+             clEnumValN(cir::CallConvTarget::SPIRV, "spirv",
+                        "SPIR / SPIR-V")
            )}]>,
     Option<"classificationAttr", "classification-attr", "std::string",
            /*default=*/"\"\"",

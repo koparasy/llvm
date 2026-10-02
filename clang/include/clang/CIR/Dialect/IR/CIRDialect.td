@@ -117,6 +117,10 @@ def CIR_Dialect : Dialect {
     static llvm::StringRef getCatchCopyThunkAttrName() { return "cir.eh.catch_copy_thunk"; }
 
     static llvm::StringRef getSYCLRegisteredKernelsAttrName() { return "cir.sycl_registered_kernels"; }
+    // Target address space of an aggregate return's sret pointer, when it is
+    // not the alloca address space (SPIR offload with
+    // -fno-offload-use-alloca-addrspace-for-srets). Read by CallConvLowering.
+    static llvm::StringRef getSRetAddressSpaceAttrName() { return "cir.sret_address_space"; }
     static llvm::StringRef getAMDGPUCodeObjectVersionAttrName() { return "cir.amdhsa_code_object_version"; }
     static llvm::StringRef getAMDGPUPrintfKindAttrName() { return "cir.amdgpu_printf_kind"; }
     static llvm::StringRef getAMDGPUXnackAttrName() { return "cir.amdgpu_xnack"; }

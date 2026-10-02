@@ -166,7 +166,8 @@ static bool hasIncompleteRecordByValue(mlir::Type ty) {
 /// of a supported element type.  Also a `_Complex`, or a fixed-width vector,
 /// of a supported element type.  Everything else is reported NYI at the
 /// reject() choke point in classifyX86_64Function.
-static bool isSupportedType(mlir::Type ty, const DataLayout &dl) {
+static bool isSupportedType(mlir::Type ty, const DataLayout &dl,
+                            bool anyWidthVectors = false) {
   // A pointer is only handled in the default address space (null) or an
   // already-lowered target address space.  A LangAddressSpaceAttr must be
   // lowered before this pass, so reject it rather than silently dropping it.
@@ -199,7 +200,7 @@ static bool isSupportedType(mlir::Type ty, const DataLayout &dl) {
     return intTy.getWidth() <= 64 || intTy.getWidth() == 128;
   }
   if (auto complexTy = dyn_cast<cir::ComplexType>(ty))
-    return isSupportedType(complexTy.getElementType(), dl);
+    return isSupportedType(complexTy.getElementType(), dl, anyWidthVectors);
   if (auto vecTy = dyn_cast<cir::VectorType>(ty)) {
     // A scalable vector has no size the SysV eightbyte rules can read, and
     // x86_64 has no calling convention for one.
@@ -223,21 +224,24 @@ static bool isSupportedType(mlir::Type ty, const DataLayout &dl) {
     // Clang also rounds the vector's own width up to a power of two, and the
     // classifier branches on the exact width, so a three-char vector would be
     // classified at 24 bits where clang uses 32.
-    if (!llvm::isPowerOf2_64(dl.getTypeSizeInBits(ty).getFixedValue()))
+    // On SPIR a vector is passed directly in its own type, so the width the
+    // classifier sees does not drive any coercion and any width is fine.
+    if (!anyWidthVectors &&
+        !llvm::isPowerOf2_64(dl.getTypeSizeInBits(ty).getFixedValue()))
       return false;
-    return isSupportedType(elemTy, dl);
+    return isSupportedType(elemTy, dl, anyWidthVectors);
   }
   if (auto arrTy = dyn_cast<cir::ArrayType>(ty))
-    return isSupportedType(arrTy.getElementType(), dl);
+    return isSupportedType(arrTy.getElementType(), dl, anyWidthVectors);
   // A bit-field is classified from the type it was declared with and the bits
   // it holds, and is loaded through its access unit, so both types have to be
   // ones the bridge handles.  A zero-width bit-field has no unit of its own.
   if (auto bfTy = dyn_cast<cir::BitFieldType>(ty)) {
     if (mlir::Type storageTy = bfTy.getStorageType())
-      if (!isSupportedType(storageTy, dl))
+      if (!isSupportedType(storageTy, dl, anyWidthVectors))
         return false;
     return llvm::all_of(bfTy.getFields(), [&](cir::BitFieldDeclAttr decl) {
-      return isSupportedType(decl.getDeclaredType(), dl);
+      return isSupportedType(decl.getDeclaredType(), dl, anyWidthVectors);
     });
   }
   if (auto recTy = dyn_cast<cir::RecordType>(ty)) {
@@ -246,8 +250,9 @@ static bool isSupportedType(mlir::Type ty, const DataLayout &dl) {
       return false;
     // The members are checked first so that everything below reasons only
     // about types the bridge handles.
-    if (!llvm::all_of(recTy.getMembers(),
-                      [&](mlir::Type m) { return isSupportedType(m, dl); }))
+    if (!llvm::all_of(recTy.getMembers(), [&](mlir::Type m) {
+          return isSupportedType(m, dl, anyWidthVectors);
+        }))
       return false;
     if (recTy.isUnion()) {
       llvm::ArrayRef<mlir::Type> members = recTy.getMembers();
@@ -630,7 +635,8 @@ convertABIArgInfo(const llvm::abi::ArgInfo &info, MLIRContext *ctx,
   }
   if (info.isIndirect())
     return ArgClassification::getIndirect(info.getIndirectAlign(),
-                                          info.getIndirectByVal());
+                                          info.getIndirectByVal(),
+                                          info.getIndirectAddrSpace());
   assert(info.isIgnore() && "Unexpected classification");
   return ArgClassification::getIgnore();
 }
@@ -651,6 +657,10 @@ static llvm::abi::RequiredArgs requiredArgs(cir::FuncType fnTy) {
 static llvm::CallingConv::ID abiCallingConv(cir::CallingConv cc) {
   if (cc == cir::CallingConv::AMDGPUKernel)
     return llvm::CallingConv::AMDGPU_KERNEL;
+  if (cc == cir::CallingConv::SpirKernel)
+    return llvm::CallingConv::SPIR_KERNEL;
+  if (cc == cir::CallingConv::SpirFunction)
+    return llvm::CallingConv::SPIR_FUNC;
   return llvm::CallingConv::C;
 }
 
@@ -676,8 +686,12 @@ classifyAbiSignature(mlir::Type retCIR, mlir::TypeRange inputs,
          "declared parameters cannot outnumber the classified arguments");
   bool voidRet = isa<cir::VoidType>(retCIR);
 
+  bool anyWidthVectors = false;
+  if (auto tripleAttr = modOp->getAttrOfType<mlir::StringAttr>(
+          cir::CIRDialect::getTripleAttrName()))
+    anyWidthVectors = llvm::Triple(tripleAttr.getValue()).isSPIROrSPIRV();
   auto reject = [&](mlir::Type t) -> bool {
-    if (isSupportedType(t, dl))
+    if (isSupportedType(t, dl, anyWidthVectors))
       return false;
     emitError() << "calling-convention lowering not yet implemented for type "
                 << t;
@@ -969,17 +983,34 @@ void CallConvLoweringPass::runOnOperation() {
       static_cast<unsigned>(llvm::abi::X86AVXABILevel::Last) + 1;
   bool isX86 = target == cir::CallConvTarget::X86_64;
   bool isAMDGPU = target == cir::CallConvTarget::AMDGPU;
-  // The x86_64 and AMDGPU drivers classify with the LLVM ABI library and share
-  // the type mapper; the test and classification-attr drivers do neither.
-  bool useAbiClassifier = isX86 || isAMDGPU;
+  bool isSPIRV = target == cir::CallConvTarget::SPIRV;
+  // The x86_64, AMDGPU and SPIR-V drivers classify with the LLVM ABI library
+  // and share the type mapper; the test and classification-attr drivers do
+  // neither.
+  bool useAbiClassifier = isX86 || isAMDGPU || isSPIRV;
   std::optional<mlir::abi::ABITypeMapper> abiTypeMapper;
   std::array<std::unique_ptr<llvm::abi::TargetInfo>, numAvxLevels> x86Targets;
   std::unique_ptr<llvm::abi::TargetInfo> amdgpuTarget;
+  std::unique_ptr<llvm::abi::TargetInfo> spirvTarget;
   if (useAbiClassifier)
     abiTypeMapper.emplace(dl);
   if (isAMDGPU)
     amdgpuTarget =
         llvm::abi::createAMDGPUTargetInfo(abiTypeMapper->getTypeBuilder());
+  // SPIR/SPIR-V code is device code, whose kernels take aggregate arguments
+  // by value (classic CodeGen: CommonSPIRABIInfo under SYCLIsDevice, and the
+  // default rules for OpenCL).
+  if (isSPIRV) {
+    // CIRGen records the sret pointer's address space when it is not the
+    // alloca one (the default, 0).
+    unsigned sretAS = 0;
+    if (auto attr = moduleOp->getAttrOfType<mlir::IntegerAttr>(
+            cir::CIRDialect::getSRetAddressSpaceAttrName()))
+      sretAS = attr.getInt();
+    spirvTarget = llvm::abi::createSPIRVTargetInfo(
+        abiTypeMapper->getTypeBuilder(), llvm::abi::ABICompatInfo(),
+        /*KernelPassAggregatesIndirect=*/true, /*SRetAddrSpace=*/sretAS);
+  }
   auto x86TargetFor =
       [&](llvm::abi::X86AVXABILevel level) -> const llvm::abi::TargetInfo & {
     assert(static_cast<unsigned>(level) < numAvxLevels &&
@@ -1003,6 +1034,8 @@ void CallConvLoweringPass::runOnOperation() {
   auto targetInfoFor = [&](cir::FuncOp func) -> const llvm::abi::TargetInfo & {
     if (isAMDGPU)
       return *amdgpuTarget;
+    if (isSPIRV)
+      return *spirvTarget;
     return x86TargetFor(avxLevelFor(func));
   };
 

@@ -28,6 +28,12 @@ static CallConvTarget getCallConvTarget(const llvm::Triple &triple) {
     return CallConvTarget::X86_64;
   if (triple.isAMDGPU())
     return CallConvTarget::AMDGPU;
+  // AMDGCN-flavored SPIR-V follows AMDGPU rules in classic CodeGen; it is not
+  // handled here yet.
+  // Vulkan (HLSL) shaders are not device kernels and are not handled yet.
+  if (triple.isSPIROrSPIRV() && triple.getVendor() != llvm::Triple::AMD &&
+      triple.getOS() != llvm::Triple::Vulkan)
+    return CallConvTarget::SPIRV;
   return CallConvTarget::None;
 }
 

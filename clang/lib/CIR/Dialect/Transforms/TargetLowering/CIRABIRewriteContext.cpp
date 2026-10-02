@@ -1049,6 +1049,17 @@ void insertArgCoercion(
 /// `cir.return (cir.load <alloca>)` shape is an invariant guaranteed by
 /// CIRGen, so it is asserted via `cast<>` rather than guarded with a
 /// fallback.
+/// The pointer type an sret return travels through: the return type in the
+/// classification's indirect address space (e.g. generic on SPIR for SYCL).
+cir::PointerType getSRetPointerType(mlir::Type origRetTy,
+                                    const ArgClassification &retInfo) {
+  if (!retInfo.indirectAddrSpace)
+    return cir::PointerType::get(origRetTy);
+  return cir::PointerType::get(
+      origRetTy, cir::TargetAddressSpaceAttr::get(origRetTy.getContext(),
+                                                  retInfo.indirectAddrSpace));
+}
+
 void insertSRetStores(mlir::FunctionOpInterface funcOp, mlir::Type origRetTy,
                       mlir::OpBuilder &builder) {
   mlir::Value sretPtr = funcOp.getArguments()[0];
@@ -1071,7 +1082,19 @@ void insertSRetStores(mlir::FunctionOpInterface funcOp, mlir::Type origRetTy,
     // feeding the other cir.return ops) to read from sretPtr instead, so
     // all returns are covered by this single rewiring.  Only then is the
     // now-unused alloca safe to erase.
-    if (!retAlloca) {
+    // When the sret pointer is in another address space than the body's
+    // `__retval` slot (e.g. a generic sret on SPIR), the slot cannot be
+    // rewired: its users are typed for its own address space. Keep it and
+    // store the returned value through the sret pointer instead.
+    if (retLoad.getAddr().getType() != sretPtr.getType()) {
+      builder.setInsertionPoint(retOp);
+      cir::StoreOp::create(builder, retOp.getLoc(), retLoad.getResult(),
+                           sretPtr, /*isVolatile=*/mlir::UnitAttr(),
+                           /*is_nontemporal=*/mlir::UnitAttr(),
+                           /*alignment=*/mlir::IntegerAttr(),
+                           /*sync_scope=*/cir::SyncScopeKindAttr(),
+                           /*mem_order=*/cir::MemOrderAttr());
+    } else if (!retAlloca) {
       retAlloca = mlir::cast<cir::AllocaOp>(retLoad.getAddr().getDefiningOp());
       retAlloca.getResult().replaceAllUsesWith(sretPtr);
       retAlloca->erase();
@@ -1211,7 +1234,10 @@ void rewriteIndirectReturnCall(cir::CallOp call,
                                mlir::OpBuilder &builder,
                                const mlir::DataLayout &dl) {
   mlir::MLIRContext *ctx = call->getContext();
+  // The caller's slot is a plain local; the callee may expect the sret
+  // pointer in another address space (generic on SPIR), reached by a cast.
   auto ptrTy = cir::PointerType::get(origRetTy);
+  cir::PointerType sretTy = getSRetPointerType(origRetTy, fc.returnInfo);
   builder.setInsertionPoint(call);
   uint64_t sretAlign = fc.returnInfo.indirectAlign.value();
 
@@ -1246,8 +1272,12 @@ void rewriteIndirectReturnCall(cir::CallOp call,
     sretSlot = alloca;
   }
 
+  mlir::Value sretArg = sretSlot;
+  if (sretTy != ptrTy)
+    sretArg = cir::CastOp::create(builder, call.getLoc(), sretTy,
+                                  cir::CastKind::address_space, sretSlot);
   SmallVector<mlir::Value> sretArgs;
-  sretArgs.push_back(sretSlot);
+  sretArgs.push_back(sretArg);
   sretArgs.append(newArgs.begin(), newArgs.end());
 
   // numEllipsisArgs counts from the end, so the sret slot prepended here stays
@@ -1521,7 +1551,8 @@ mlir::LogicalResult CIRABIRewriteContext::rewriteFunctionDefinition(
   bool hasSRet =
       fc.returnInfo.kind == ArgKind::Indirect && !oldResultTypes.empty();
   if (hasSRet)
-    newArgTypes.insert(newArgTypes.begin(), cir::PointerType::get(origRetTy));
+    newArgTypes.insert(newArgTypes.begin(),
+                       getSRetPointerType(origRetTy, fc.returnInfo));
 
   if (funcOp.isDefinition()) {
     mlir::Region &body = funcOp->getRegion(0);
@@ -1530,8 +1561,8 @@ mlir::LogicalResult CIRABIRewriteContext::rewriteFunctionDefinition(
       // through it before any index-based argument handling below (which
       // then accounts for the +1 offset).
       if (hasSRet) {
-        body.front().insertArgument(0u, cir::PointerType::get(origRetTy),
-                                    funcOp.getLoc());
+        body.front().insertArgument(
+            0u, getSRetPointerType(origRetTy, fc.returnInfo), funcOp.getLoc());
         insertSRetStores(funcOp, origRetTy, builder);
       }
 

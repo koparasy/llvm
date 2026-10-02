@@ -25,7 +25,24 @@ private:
   // compilations, matching classic CodeGen's isTargetDevice() gate.
   bool KernelPassAggregatesIndirect;
 
+  // Address space of the pointer an aggregate is returned through (sret). It
+  // follows the language's default address space: generic for SYCL, private
+  // for OpenCL C, matching classic CodeGen.
+  unsigned SRetAddrSpace;
+
+  ArgInfo classifyReturnType(const Type *RetTy) const {
+    if (!RetTy->isVoid() && isAggregateTypeForABI(RetTy))
+      return getNaturalAlignIndirect(RetTy, SRetAddrSpace);
+    return DefaultTargetInfo::classifyReturnType(RetTy);
+  }
+
   ArgInfo classifyKernelArgumentType(const Type *ArgTy) const {
+    // A bool is not a legal SPIR-V kernel argument; pass it in the host's
+    // in-memory representation (i8), as classic CodeGen does for SYCL.
+    if (KernelPassAggregatesIndirect)
+      if (const auto *IT = dyn_cast<IntegerType>(ArgTy); IT && IT->isBool())
+        return ArgInfo::getDirect(
+            TB.getIntegerType(8, Align(1), /*Signed=*/false));
     // TODO: Clang also coerces default address space pointer arguments to
     // CrossWorkGroup pointers, which needs the target's language address space
     // mapping.
@@ -42,9 +59,10 @@ private:
 
 public:
   SPIRVTargetInfo(TypeBuilder &Builder, const ABICompatInfo &Info,
-                  bool KernelPassAggregatesIndirect)
+                  bool KernelPassAggregatesIndirect, unsigned SRetAddrSpace)
       : DefaultTargetInfo(Builder), CompatInfo(Info),
-        KernelPassAggregatesIndirect(KernelPassAggregatesIndirect) {}
+        KernelPassAggregatesIndirect(KernelPassAggregatesIndirect),
+        SRetAddrSpace(SRetAddrSpace) {}
 
   const ABICompatInfo &getABICompatInfo() const override { return CompatInfo; }
 
@@ -63,9 +81,10 @@ public:
 
 std::unique_ptr<TargetInfo>
 createSPIRVTargetInfo(TypeBuilder &TB, const ABICompatInfo &Compat,
-                      bool KernelPassAggregatesIndirect) {
-  return std::make_unique<SPIRVTargetInfo>(TB, Compat,
-                                           KernelPassAggregatesIndirect);
+                      bool KernelPassAggregatesIndirect,
+                      unsigned SRetAddrSpace) {
+  return std::make_unique<SPIRVTargetInfo>(
+      TB, Compat, KernelPassAggregatesIndirect, SRetAddrSpace);
 }
 
 } // namespace llvm::abi

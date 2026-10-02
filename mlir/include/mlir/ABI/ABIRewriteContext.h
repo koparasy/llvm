@@ -67,6 +67,10 @@ struct ArgClassification {
   /// For Indirect: alignment of the pointed-to object.
   llvm::Align indirectAlign = llvm::Align(1);
 
+  /// For Indirect: target address space of the pointer the object is passed
+  /// or returned through (0 = the default address space).
+  unsigned indirectAddrSpace = 0;
+
   /// For Extend: whether to sign-extend (true) or zero-extend (false).
   bool signExtend = false;
 
@@ -99,6 +103,7 @@ struct ArgClassification {
   bool operator==(const ArgClassification &other) const {
     return kind == other.kind && coercedType == other.coercedType &&
            indirectAlign == other.indirectAlign &&
+           indirectAddrSpace == other.indirectAddrSpace &&
            signExtend == other.signExtend && canFlatten == other.canFlatten &&
            byVal == other.byVal && directOffset == other.directOffset &&
            neededIntRegs == other.neededIntRegs &&
@@ -127,11 +132,13 @@ struct ArgClassification {
     return c;
   }
 
-  static ArgClassification getIndirect(llvm::Align align, bool byVal = true) {
+  static ArgClassification getIndirect(llvm::Align align, bool byVal = true,
+                                       unsigned addrSpace = 0) {
     ArgClassification c;
     c.kind = ArgKind::Indirect;
     c.indirectAlign = align;
     c.byVal = byVal;
+    c.indirectAddrSpace = addrSpace;
     return c;
   }
 

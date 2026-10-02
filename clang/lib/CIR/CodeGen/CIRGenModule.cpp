@@ -3906,6 +3906,14 @@ CIRGenModule::getMLIRVisibilityFromCIRLinkage(cir::GlobalLinkageKind glk) {
 }
 
 void CIRGenModule::release() {
+  // Classic CodeGen types an sret pointer in the alloca address space unless
+  // UseAllocaASForSrets is off, in which case it takes the return type's
+  // (unqualified, so the language default) target address space -- generic
+  // for SYCL. Record that for the AST-free call-convention lowering.
+  if (getTriple().isSPIROrSPIRV() && !codeGenOpts.UseAllocaASForSrets)
+    if (unsigned sretAS = genTypes.getTargetAddressSpace(astContext.IntTy))
+      theModule->setAttr(cir::CIRDialect::getSRetAddressSpaceAttrName(),
+                         builder.getI32IntegerAttr(sretAS));
   emitDeferred();
   emitVTablesOpportunistically();
   applyReplacements();

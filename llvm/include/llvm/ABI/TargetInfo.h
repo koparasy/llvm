@@ -152,9 +152,12 @@ createAMDGPUTargetInfo(TypeBuilder &TB,
 /// Create the SPIR-V target ABI info. \p KernelPassAggregatesIndirect requests
 /// that SPIR_KERNEL aggregate arguments be passed indirectly by value; callers
 /// (e.g. Clang) set it for device compilations (LangOptions::isTargetDevice()).
+/// \p SRetAddrSpace is the address space of an aggregate return's sret
+/// pointer, i.e. the target address space of the language's default one.
 LLVM_ABI std::unique_ptr<TargetInfo>
 createSPIRVTargetInfo(TypeBuilder &TB, const ABICompatInfo &Compat,
-                      bool KernelPassAggregatesIndirect);
+                      bool KernelPassAggregatesIndirect,
+                      unsigned SRetAddrSpace = 0);
 
 /// The AVX ABI level for X86 targets.
 enum class X86AVXABILevel {
