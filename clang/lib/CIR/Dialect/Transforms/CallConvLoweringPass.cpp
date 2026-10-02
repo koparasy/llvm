@@ -1064,6 +1064,16 @@ void CallConvLoweringPass::runOnOperation() {
       anyFailed = true;
       return;
     }
+    // A bool is not a legal SPIR-V kernel argument: classic CodeGen passes it
+    // in the host's in-memory representation (i8). The bridge maps CIR's bool
+    // to its 8-bit storage, so the target cannot tell it from a char; apply
+    // the rule here.
+    if (isSPIRV && f.getCallingConv() == cir::CallingConv::SpirKernel)
+      for (auto [argTy, argInfo] : llvm::zip(fnTy.getInputs(), fc->argInfos))
+        if (isa<cir::BoolType>(argTy))
+          argInfo = ArgClassification::getDirect(
+              cir::IntType::get(&getContext(), 8, /*isSigned=*/false),
+              /*offset=*/0);
     classifications.insert({f, std::move(*fc)});
   });
   if (anyFailed) {

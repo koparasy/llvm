@@ -1,0 +1,35 @@
+// RUN: cir-opt %s -cir-call-conv-lowering=target=spirv | FileCheck %s
+
+// SPIR kernels follow classic SPIR CodeGen: an aggregate argument is passed
+// byval and a bool is passed in its in-memory representation (i8).
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!u8i = !cir.int<u, 8>
+!rec_range = !cir.struct<"range" {data !cir.array<!u64i x 1>}>
+
+module attributes {
+  cir.triple = "spir64-unknown-unknown",
+  dlti.dl_spec = #dlti.dl_spec<
+    #dlti.dl_entry<i1, dense<8>: vector<2xi64>>,
+    #dlti.dl_entry<i8, dense<8>: vector<2xi64>>,
+    #dlti.dl_entry<i32, dense<32>: vector<2xi64>>,
+    #dlti.dl_entry<i64, dense<64>: vector<2xi64>>>
+} {
+  // CHECK-LABEL: cir.func @k(
+  // CHECK-SAME: !cir.ptr<!s32i, target_address_space(1)>
+  // CHECK-SAME: !cir.ptr<!rec_range> {llvm.align = 8 : i64, llvm.byval = !rec_range, llvm.noundef}
+  // CHECK-SAME: !u8i
+  // CHECK-SAME: cc(spir_kernel)
+  cir.func @k(%arg0: !cir.ptr<!s32i, target_address_space(1)>, %arg1: !rec_range, %arg2: !cir.bool) cc(spir_kernel) {
+    cir.return
+  }
+
+  // A non-kernel function keeps a bool as is (zero-extended).
+  // CHECK-LABEL: cir.func @f(
+  // CHECK-SAME: !cir.bool {llvm.zeroext}
+  // CHECK-SAME: cc(spir_function)
+  cir.func @f(%arg0: !cir.bool) cc(spir_function) {
+    cir.return
+  }
+}
