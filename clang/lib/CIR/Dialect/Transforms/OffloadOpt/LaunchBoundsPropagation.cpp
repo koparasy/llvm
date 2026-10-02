@@ -102,6 +102,10 @@ void OffloadLaunchBoundsPropagationPass::runOnOperation() {
 
   for (const auto &entry : table) {
     const cir::KernelBinding &binding = entry.second;
+    // SYCL bindings have no host stub; their launches are handled by the
+    // SYCL-specific passes.
+    if (binding.kind != cir::BindingKind::CUDAStub)
+      continue;
     llvm::ArrayRef<cir::LaunchSite> sites = binding.launchSites;
 
     // A kernel launched nowhere in this TU says nothing about its geometry.

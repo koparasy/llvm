@@ -368,7 +368,9 @@ bool cir::hasUseOutsideSelf(cir::FuncOp fn, mlir::Operation *scope) {
 bool KernelBindingTable::allLaunchSitesVisible(
     llvm::StringRef kernelName) const {
   const KernelBinding *binding = lookup(kernelName);
-  if (!binding)
+  // Only a CUDA/HIP binding has a host stub whose uses describe the launches;
+  // a SYCL binding is launched by name and reports its own visibility.
+  if (!binding || !binding->hostStub)
     return false;
   cir::FuncOp stub = binding->hostStub;
   if (!cir::isLocalLinkage(stub.getLinkage()))
