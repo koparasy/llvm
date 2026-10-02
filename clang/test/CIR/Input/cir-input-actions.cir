@@ -1,0 +1,28 @@
+// A .cir input is routed to the ClangIR frontend action instead of being
+// parsed as C, and every CIR action consumes it.
+
+// RUN: rm -rf %t && split-file %s %t
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fclangir -emit-cir %t/f.c -o %t/f.cir
+
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fclangir -emit-llvm -x cir %t/f.cir -o - \
+// RUN:   | FileCheck %s --check-prefix=LLVM
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fclangir -emit-obj -x cir %t/f.cir -o /dev/null
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fclangir -S -x cir %t/f.cir -o - \
+// RUN:   | FileCheck %s --check-prefix=ASM
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fclangir -emit-llvm-bc -x cir %t/f.cir -o /dev/null
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fclangir -emit-cir -x cir %t/f.cir -o - \
+// RUN:   | FileCheck %s --check-prefix=CIR
+
+// ClangIR input implies -fclangir.
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -emit-llvm -x cir %t/f.cir -o - \
+// RUN:   | FileCheck %s --check-prefix=LLVM
+
+// The .cir extension selects ClangIR input without -x.
+// RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -emit-obj %t/f.cir -o /dev/null
+
+// LLVM: define {{.*}}i32 @f(i32
+// ASM: f:
+// CIR: cir.func {{.*}}@f(
+
+//--- f.c
+int f(int x) { return x; }
