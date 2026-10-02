@@ -1222,10 +1222,10 @@ void CallConvLoweringPass::runOnOperation() {
         isX86 && c.getNumArgOperands() > funcTy.getNumInputs();
     std::optional<FunctionClassification> fc =
         classifyCallSite
-            ? classifyX86_64VariadicCall(
-                  c, funcTy, dl, *x86TypeMapper,
-                  x86TargetFor(avxLevelFor(c->getParentOfType<cir::FuncOp>())),
-                  moduleOp)
+            ? classifyAbiVariadicCall(
+                  c, funcTy, dl, *abiTypeMapper,
+                  targetInfoFor(c->getParentOfType<cir::FuncOp>()),
+                  llvm::CallingConv::C, moduleOp)
             : classifySignature(funcTy.getInputs());
     if (!fc) {
       signalPassFailure();

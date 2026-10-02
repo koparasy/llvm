@@ -148,9 +148,11 @@ LLVM_ABI std::unique_ptr<TargetInfo> createBPFTargetInfo(TypeBuilder &TB);
 LLVM_ABI std::unique_ptr<TargetInfo>
 createAMDGPUTargetInfo(TypeBuilder &TB,
                        bool CoerceGenericPtrArgToGlobal = false);
+
 /// Create the SPIR-V target ABI info. \p KernelPassAggregatesIndirect requests
 /// that SPIR_KERNEL aggregate arguments be passed indirectly by value; callers
 /// (e.g. Clang) set it for device compilations (LangOptions::isTargetDevice()).
+LLVM_ABI std::unique_ptr<TargetInfo>
 createSPIRVTargetInfo(TypeBuilder &TB, const ABICompatInfo &Compat,
                       bool KernelPassAggregatesIndirect);
 
