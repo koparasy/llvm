@@ -2953,7 +2953,8 @@ class CIR_FPBinaryOp<string mnemonic, list<Trait> traits = []>
       OptionalAttr<CIR_FenvAttr>:$fenv,
       OptionalAttr<CIR_FastMathFlagsAttr>:$fastmath_flags));
   let assemblyFormat = [{
-    $lhs `,` $rhs `:` type($lhs) (`fenv` `` $fenv^)? attr-dict
+    $lhs `,` $rhs `:` type($lhs) (`fenv` `` $fenv^)?
+    (`fastmath` `` $fastmath_flags^)? attr-dict
   }];
 
   let constrainedLLVMIntrinsic = mnemonic;
