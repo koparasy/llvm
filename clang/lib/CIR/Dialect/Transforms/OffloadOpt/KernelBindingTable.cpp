@@ -327,8 +327,7 @@ static bool isLambdaClosureKernel(cir::FuncOp kernel,
 // any module's `cir.sycl_registered_kernels` attribute -- an array of
 // [user-name, mangled-name] string pairs. Such a kernel is reachable by name
 // across TUs, so it can never be treated as TU-local.
-static bool isRegisteredKernel(mlir::ModuleOp container,
-                               llvm::StringRef name) {
+static bool isRegisteredKernel(mlir::ModuleOp container, llvm::StringRef name) {
   auto inModule = [&](mlir::ModuleOp mod) {
     auto arr = mod->getAttrOfType<mlir::ArrayAttr>(
         cir::CIRDialect::getSYCLRegisteredKernelsAttrName());
@@ -345,7 +344,8 @@ static bool isRegisteredKernel(mlir::ModuleOp container,
   };
   if (inModule(cir::getOffloadContainerHostModule(container)))
     return true;
-  for (mlir::ModuleOp deviceMod : cir::getOffloadContainerDeviceModules(container))
+  for (mlir::ModuleOp deviceMod :
+       cir::getOffloadContainerDeviceModules(container))
     if (inModule(deviceMod))
       return true;
   return false;
@@ -419,7 +419,8 @@ KernelBindingTable::KernelBindingTable(mlir::ModuleOp container) {
     it->second.launchSites.push_back(site);
   });
 
-  for (mlir::ModuleOp deviceMod : cir::getOffloadContainerDeviceModules(container)) {
+  for (mlir::ModuleOp deviceMod :
+       cir::getOffloadContainerDeviceModules(container)) {
     for (auto &binding : bindings) {
       if (cir::FuncOp kernel = llvm::dyn_cast_if_present<cir::FuncOp>(
               deviceMod.lookupSymbol(binding.first))) {
@@ -1613,8 +1614,7 @@ static void foldClosureNoAlias(mlir::Value closureOperand, bool &seenAnySite,
 // names and traces the launch it feeds. Keyed by the kernel's _ZTS mangled name
 // so the results map straight onto the SYCL bindings, which are keyed the same.
 static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
-    mlir::ModuleOp container,
-    llvm::StringMap<llvm::StringSet<>> &noAliasFields,
+    mlir::ModuleOp container, llvm::StringMap<llvm::StringSet<>> &noAliasFields,
     llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> &constArgs) {
   llvm::StringMap<SyclGeometry> result;
   // Per-kernel running noalias eligibility, ANDed across the kernel's sites.
@@ -1715,7 +1715,8 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
       nameStrings.try_emplace(value, global);
   });
 
-  for (mlir::ModuleOp deviceMod : cir::getOffloadContainerDeviceModules(container)) {
+  for (mlir::ModuleOp deviceMod :
+       cir::getOffloadContainerDeviceModules(container)) {
     deviceMod.walk([&](cir::FuncOp kernel) {
       if (kernel.getCallingConv() != cir::CallingConv::SpirKernel)
         return;
@@ -1752,8 +1753,7 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
 // Records one launch site per host `getDeviceKernelInfo<Kernel>()` marker,
 // resolving the kernel it names through the CompileTimeKernelInfo chain and the
 // runtime launch call it feeds. Bindings already carry their name-strings.
-void KernelBindingTable::recordSYCLLaunchSites(
-    mlir::ModuleOp container) {
+void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
   mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
 
   // Index SYCL bindings by their name-string global, so a marker's resolved

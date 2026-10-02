@@ -10938,9 +10938,9 @@ void OffloadWrapper::ConstructJob(Compilation &C, const JobAction &JA,
 }
 
 namespace {
-// Build the comma-separated "-targets=kind-triple[-arch],..." argument shared by
-// the CIR offload merge and split tools, from the per-dependence tool chains,
-// bound architectures, and offload kinds.
+// Build the comma-separated "-targets=kind-triple[-arch],..." argument shared
+// by the CIR offload merge and split tools, from the per-dependence tool
+// chains, bound architectures, and offload kinds.
 void addOffloadTargetsArg(
     const llvm::opt::ArgList &TCArgs, ArgStringList &CmdArgs,
     ArrayRef<JobActionWithDependentInfo::DependentActionInfo> DepInfo) {
@@ -10953,9 +10953,8 @@ void addOffloadTargetsArg(
     const auto &Dep = DepInfo[I];
     Triples += Action::GetOffloadKindName(Dep.DependentOffloadKind);
     Triples += '-';
-    Triples += llvm::Triple(Dep.DependentToolChain
-                                ->ComputeEffectiveClangTriple(
-                                    TCArgs, Dep.DependentBoundArch))
+    Triples += llvm::Triple(Dep.DependentToolChain->ComputeEffectiveClangTriple(
+                                TCArgs, Dep.DependentBoundArch))
                    .normalize(llvm::Triple::CanonicalForm::FOUR_IDENT);
     if ((Dep.DependentOffloadKind == Action::OFK_HIP ||
          Dep.DependentOffloadKind == Action::OFK_Cuda) &&

@@ -108,8 +108,9 @@ void Action::propagateDeviceOffloadInfo(OffloadKind OKind, BoundArch OArch,
   // Merge/split mix host and device inputs; stamp the node itself but do not
   // recurse, so device info never bleeds into the host CIR compile.
   if (Kind == CIRSplitJobClass || Kind == CIRMergeJobClass) {
-    assert((OffloadingDeviceKind == OKind || OffloadingDeviceKind == OFK_None) &&
-           "Setting device kind to a different device??");
+    assert(
+        (OffloadingDeviceKind == OKind || OffloadingDeviceKind == OFK_None) &&
+        "Setting device kind to a different device??");
     OffloadingDeviceKind = OKind;
     OffloadingArch = OArch;
     OffloadingToolChain = OToolChain;

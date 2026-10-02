@@ -281,8 +281,8 @@ void OffloadDetectHostDeviceClosureLayoutMismatchPass::runOnOperation() {
       // source location.
       cir::RecordType hostRec = hostRecFromLaunch;
       if (!hostRec)
-        hostRec =
-            hostClosureRecordFromHostKernel(cir::getOffloadContainerHostModule(container), kernel);
+        hostRec = hostClosureRecordFromHostKernel(
+            cir::getOffloadContainerHostModule(container), kernel);
       if (!hostRec)
         continue;
       llvm::ArrayRef<mlir::Type> hostFields = hostRec.getMembers();

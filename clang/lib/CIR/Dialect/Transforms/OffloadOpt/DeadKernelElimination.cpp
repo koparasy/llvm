@@ -85,8 +85,7 @@ void OffloadDeadKernelEliminationPass::runOnOperation() {
       continue;
     cir::FuncOp stub = binding.second.hostStub;
     bool localLinkage = cir::isLocalLinkage(stub.getLinkage());
-    bool stubDead =
-        localLinkage && !cir::hasUseOutsideSelf(stub, hostModule);
+    bool stubDead = localLinkage && !cir::hasUseOutsideSelf(stub, hostModule);
     if (stubDead) {
       LDBG() << "stub for '" << binding.first << "': dead, erasing";
       remarkErased(stub, binding.first, "removed dead host stub",
@@ -95,8 +94,7 @@ void OffloadDeadKernelEliminationPass::runOnOperation() {
       ++numStubsErased;
     } else {
       if (!localLinkage) {
-        LDBG() << "stub for '" << binding.first
-               << "': kept, external linkage";
+        LDBG() << "stub for '" << binding.first << "': kept, external linkage";
         remarkKept(stub, binding.first,
                    "external linkage: another TU may launch through this stub");
       }

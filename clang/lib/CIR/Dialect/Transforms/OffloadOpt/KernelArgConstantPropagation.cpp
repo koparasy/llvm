@@ -31,8 +31,8 @@ static constexpr llvm::StringLiteral kRemarkCategory = "cir-offload-const-prop";
 static void remarkSkipped(cir::FuncOp stub, llvm::StringRef kernelName,
                           const char *reason, size_t numLaunchSites) {
   remark::missed(stub.getLoc(), remark::RemarkOpts::name(kRemarkName)
-                                   .category(kRemarkCategory)
-                                   .function(kernelName))
+                                    .category(kRemarkCategory)
+                                    .function(kernelName))
       << remark::add("kernel arguments not propagated")
       << remark::reason(reason)
       << remark::metric("launchSites", numLaunchSites);
@@ -41,8 +41,8 @@ static void remarkSkipped(cir::FuncOp stub, llvm::StringRef kernelName,
 // The constant every site passes for argument `argIdx`, or null if they
 // disagree or any of them passes a non-constant. Agreement is a property of the
 // set of sites, so it lives here rather than on a single site.
-static mlir::TypedAttr
-commonConstantArg(llvm::ArrayRef<cir::LaunchSite> sites, unsigned argIdx) {
+static mlir::TypedAttr commonConstantArg(llvm::ArrayRef<cir::LaunchSite> sites,
+                                         unsigned argIdx) {
   mlir::TypedAttr common;
   for (const cir::LaunchSite &site : sites) {
     mlir::TypedAttr value = site.getConstArg(argIdx);
@@ -91,8 +91,8 @@ void OffloadKernelArgConstantPropagationPass::runOnOperation() {
     // A kernel launched nowhere in this TU says nothing about its arguments.
     if (sites.empty()) {
       LDBG() << "  skipped: no launch site in this TU";
-      remarkSkipped(stub, entry.first, "no launch site in this translation unit",
-                    sites.size());
+      remarkSkipped(stub, entry.first,
+                    "no launch site in this translation unit", sites.size());
       ++numKernelsSkipped;
       continue;
     }

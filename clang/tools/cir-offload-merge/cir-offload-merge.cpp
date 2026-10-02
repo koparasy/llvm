@@ -322,8 +322,9 @@ combineInputs(llvm::ArrayRef<InputTarget> inputTargets,
   // `cir.offload.container` unit attribute and holds the host and device
   // modules directly, host first, matching the container verifier.
   mlir::OwningOpRef<mlir::ModuleOp> combinedModule(mlir::ModuleOp::create(loc));
-  (*combinedModule)->setAttr(cir::CIRDialect::getOffloadContainerAttrName(),
-                             mlir::UnitAttr::get(&context));
+  (*combinedModule)
+      ->setAttr(cir::CIRDialect::getOffloadContainerAttrName(),
+                mlir::UnitAttr::get(&context));
 
   // Preserve the container invariant expected by the verifier: the host module
   // is the first nested op, followed by device modules in input order.
@@ -351,8 +352,7 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   // the as-emitted container: the mem2reg below promotes the device closure
   // alloca whose get_member stores this check recovers the device closure
   // record from, so it must observe the IR before that. Diagnostic only.
-  pm.addPass(
-      mlir::createOffloadDetectHostDeviceClosureLayoutMismatchPass());
+  pm.addPass(mlir::createOffloadDetectHostDeviceClosureLayoutMismatchPass());
 
   // Promote stack slots and propagate constants so that a kernel argument known
   // at compile time reaches the device stub call site as a cir.const. Runs on

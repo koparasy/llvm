@@ -48,8 +48,8 @@ struct KernelClone {
 // The sites must be launch sites of the binding, but passing a subset is
 // allowed and is the point of the routine.
 std::optional<KernelClone>
-cloneKernelForSites(mlir::ModuleOp container,
-                    const cir::KernelBinding &binding, llvm::StringRef suffix,
+cloneKernelForSites(mlir::ModuleOp container, const cir::KernelBinding &binding,
+                    llvm::StringRef suffix,
                     llvm::ArrayRef<cir::LaunchSite> sites);
 
 // Representation of the target for a kernel specialization. The target is

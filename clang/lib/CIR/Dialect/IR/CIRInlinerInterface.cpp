@@ -7,12 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/CIR/Dialect/IR/CIRInlinerInterface.h"
-#include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Transforms/InliningUtils.h"
+#include "clang/CIR/Dialect/IR/CIRDialect.h"
 
 using namespace mlir;
 using namespace cir;
@@ -53,11 +53,13 @@ struct CIRInlinerInterface : public mlir::DialectInlinerInterface {
     return !nestedReturn;
   }
 
-  bool isLegalToInline(mlir::Region *dest, mlir::Region *src, bool wouldBeCloned,
+  bool isLegalToInline(mlir::Region *dest, mlir::Region *src,
+                       bool wouldBeCloned,
                        mlir::IRMapping &valueMapping) const final {
     return true;
   }
-  bool isLegalToInline(mlir::Operation *op, mlir::Region *dest, bool wouldBeCloned,
+  bool isLegalToInline(mlir::Operation *op, mlir::Region *dest,
+                       bool wouldBeCloned,
                        mlir::IRMapping &valueMapping) const final {
     return true;
   }
@@ -102,8 +104,7 @@ void cir::registerInlinerInterface(mlir::DialectRegistry &registry) {
   // interface as soon as a module mentions those dialects' callables.
   mlir::LLVM::registerInlinerInterface(registry);
   mlir::func::registerInlinerExtension(registry);
-  registry.addExtension(
-      +[](mlir::MLIRContext *ctx, cir::CIRDialect *dialect) {
-        dialect->addInterfaces<CIRInlinerInterface>();
-      });
+  registry.addExtension(+[](mlir::MLIRContext *ctx, cir::CIRDialect *dialect) {
+    dialect->addInterfaces<CIRInlinerInterface>();
+  });
 }
