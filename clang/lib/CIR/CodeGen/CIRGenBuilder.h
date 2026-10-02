@@ -482,7 +482,8 @@ public:
     if (destType == addr.getElementType())
       return addr;
 
-    auto ptrTy = getPointerTo(destType);
+    // Preserve the source pointer's address space (OG parity).
+    auto ptrTy = getPointerTo(destType, addr.getAddressSpace());
     auto baseAddr =
         cir::BaseClassAddrOp::create(*this, loc, ptrTy, addr.getPointer(),
                                      mlir::APInt(64, offset), assumeNotNull);
@@ -495,7 +496,8 @@ public:
     if (destType == addr.getElementType())
       return addr;
 
-    cir::PointerType ptrTy = getPointerTo(destType);
+    // Preserve the source pointer's address space (OG parity).
+    cir::PointerType ptrTy = getPointerTo(destType, addr.getAddressSpace());
     auto derivedAddr =
         cir::DerivedClassAddrOp::create(*this, loc, ptrTy, addr.getPointer(),
                                         mlir::APInt(64, offset), assumeNotNull);
@@ -539,7 +541,8 @@ public:
     if (destType == addr.getElementType())
       return addr;
 
-    auto ptrTy = getPointerTo(destType);
+    // Preserve the source pointer's address space (OG parity).
+    auto ptrTy = getPointerTo(destType, addr.getAddressSpace());
     return Address(createBitcast(loc, addr.getPointer(), ptrTy), destType,
                    addr.getAlignment());
   }
@@ -592,7 +595,9 @@ public:
     auto srcPtrTy = mlir::cast<cir::PointerType>(value.getType());
     auto srcComplexTy = mlir::cast<cir::ComplexType>(srcPtrTy.getPointee());
     return cir::ComplexRealPtrOp::create(
-        *this, loc, getPointerTo(srcComplexTy.getElementType()), value);
+        *this, loc,
+        getPointerTo(srcComplexTy.getElementType(), srcPtrTy.getAddrSpace()),
+        value);
   }
 
   Address createComplexRealPtr(mlir::Location loc, Address addr) {
@@ -607,7 +612,9 @@ public:
     auto srcPtrTy = mlir::cast<cir::PointerType>(value.getType());
     auto srcComplexTy = mlir::cast<cir::ComplexType>(srcPtrTy.getPointee());
     return cir::ComplexImagPtrOp::create(
-        *this, loc, getPointerTo(srcComplexTy.getElementType()), value);
+        *this, loc,
+        getPointerTo(srcComplexTy.getElementType(), srcPtrTy.getAddrSpace()),
+        value);
   }
 
   Address createComplexImagPtr(mlir::Location loc, Address addr) {
