@@ -2289,6 +2289,7 @@ static mlir::LogicalResult rewriteCallOrInvoke(
     return mlir::failure();
 
   mlir::LLVM::LLVMFunctionType llvmFnTy;
+  std::optional<mlir::LLVM::CConv> cconv;
 
   // Temporary to handle the case where we need to prepend an operand if the
   // callee is an alias.
@@ -2301,6 +2302,13 @@ static mlir::LogicalResult rewriteCallOrInvoke(
       llvmFnTy = converter->convertType<mlir::LLVM::LLVMFunctionType>(
           fn.getFunctionType());
       assert(llvmFnTy && "Failed to convert function type");
+      // A direct call uses the callee's calling convention, as classic CodeGen
+      // does. A mismatch (e.g. a C call to a SPIR `spir_func` definition) is
+      // undefined behavior that the optimizer folds to `unreachable`.
+      if (auto cirFn = mlir::dyn_cast<cir::FuncOp>(callee))
+        cconv = convertCallingConv(cirFn.getCallingConv());
+      else if (auto llvmFn = mlir::dyn_cast<mlir::LLVM::LLVMFuncOp>(callee))
+        cconv = llvmFn.getCConv();
     } else if (auto alias = mlir::cast<mlir::LLVM::AliasOp>(callee)) {
       // If the callee was an alias. In that case,
       // we need to prepend the address of the alias to the operands. The
@@ -2347,10 +2355,14 @@ static mlir::LogicalResult rewriteCallOrInvoke(
         op, llvmFnTy, calleeAttr, callOperands, continueBlock,
         mlir::ValueRange{}, landingPadBlock, mlir::ValueRange{});
     setLoweredCallAttributes(newOp, attributes);
+    if (cconv)
+      newOp.setCConv(*cconv);
   } else {
     auto newOp = rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
         op, llvmFnTy, calleeAttr, callOperands);
     setLoweredCallAttributes(newOp, attributes);
+    if (cconv)
+      newOp.setCConv(*cconv);
     if (memoryEffects)
       newOp.setMemoryEffectsAttr(memoryEffects);
     newOp.setNoUnwind(noUnwind);

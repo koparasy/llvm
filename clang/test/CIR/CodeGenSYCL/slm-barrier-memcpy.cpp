@@ -39,5 +39,5 @@ void slm_reduce(__attribute__((opencl_local)) int *slm,
 // LLVM: define {{.*}} void @_Z10slm_reduce
 // LLVM:   call void @llvm.memcpy.p4.p4.i64(
 // LLVM:   store i32 {{.*}}, ptr addrspace(3)
-// LLVM:   call void @_Z22__spirv_ControlBarrieriii(i32 noundef 2, i32 noundef 2, i32 noundef 272)
+// LLVM:   call spir_func void @_Z22__spirv_ControlBarrieriii(i32 noundef 2, i32 noundef 2, i32 noundef 272)
 // LLVM:   load i32, ptr addrspace(3)
