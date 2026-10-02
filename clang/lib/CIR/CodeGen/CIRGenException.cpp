@@ -171,6 +171,13 @@ void CIRGenFunction::emitStartEHSpec(const Decl *d) {
   if (!cgm.getLangOpts().CXXExceptions)
     return;
 
+  // CUDA and SYCL device code doesn't have exceptions, so an exception
+  // specification needs no terminate scope there (mirrors classic CodeGen,
+  // which never forms a landing pad for device code).
+  const LangOptions &lo = cgm.getLangOpts();
+  if ((lo.CUDA && lo.CUDAIsDevice) || lo.SYCLIsDevice)
+    return;
+
   const FunctionDecl *fd = dyn_cast_or_null<FunctionDecl>(d);
   if (!fd) {
     // This can't currently happen in CIR, but if we do get here, we need to
