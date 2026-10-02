@@ -7401,6 +7401,7 @@ static void extractPCH(bool UseNewOffloadingDriver,
         C.MakeAction<OffloadPackagerExtractJobAction>(AL, A->getType(), TC);
     AL.push_back(PackagerAction);
   }
+}
 
 // True when the ClangIR host/device offload-merge pipeline is requested for a
 // CUDA/HIP compilation.
