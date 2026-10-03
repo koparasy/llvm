@@ -2328,16 +2328,9 @@ CIRGenModule::getAddrOfConstantStringFromLiteral(const StringLiteral *s,
 }
 
 LangAS CIRGenModule::getGlobalConstantAddressSpace() const {
-  LangAS as =
-      CodeGenUtils::getGlobalConstantAddressSpace(langOpts, getTarget());
-  // CIR cannot represent SYCL address spaces yet.
-  /// TODO: Remove this wrapper once CIR supports the global constant address
-  /// space for SYCL.
-  if (as == LangAS::sycl_global) {
-    errorNYI("SYCL global constant address space");
-    return LangAS::Default;
-  }
-  return as;
+  // SYCL address spaces map to CIR's offload language address spaces, so
+  // sycl_global needs no special casing here.
+  return CodeGenUtils::getGlobalConstantAddressSpace(langOpts, getTarget());
 }
 
 // TODO(cir): this could be a common AST helper for both CIR and LLVM codegen.
