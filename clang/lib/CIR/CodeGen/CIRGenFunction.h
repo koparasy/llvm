@@ -2730,6 +2730,22 @@ public:
   mlir::Value performAddrSpaceCast(mlir::Value v, mlir::Type destTy) const {
     if (cir::GlobalOp globalOp = v.getDefiningOp<cir::GlobalOp>())
       cgm.errorNYI("Global op addrspace cast");
+    // Two AST address spaces can map to the same target one (e.g. OpenCL's
+    // and SYCL's global), and the pointee may change along with the address
+    // space (a SPIR-V builtin returning `void __global *`). cir.cast
+    // address_space changes only the address space, so split the conversion
+    // into an address-space cast and a pointee bitcast as needed.
+    auto srcPtrTy = mlir::dyn_cast<cir::PointerType>(v.getType());
+    auto dstPtrTy = mlir::dyn_cast<cir::PointerType>(destTy);
+    if (srcPtrTy && dstPtrTy) {
+      if (srcPtrTy.getAddrSpace() != dstPtrTy.getAddrSpace())
+        v = builder.createAddrSpaceCast(
+            v, cir::PointerType::get(srcPtrTy.getPointee(),
+                                     dstPtrTy.getAddrSpace()));
+      if (v.getType() != destTy)
+        v = builder.createBitcast(v, destTy);
+      return v;
+    }
     return builder.createAddrSpaceCast(v, destTy);
   }
 

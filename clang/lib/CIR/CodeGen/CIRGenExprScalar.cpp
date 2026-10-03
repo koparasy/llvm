@@ -2600,7 +2600,17 @@ mlir::Value ScalarExprEmitter::VisitCastExpr(CastExpr *ce) {
     mlir::Value src = Visit(const_cast<Expr *>(subExpr));
     mlir::Type dstTy = cgf.convertType(destTy);
 
-    assert(!cir::MissingFeatures::addressSpace());
+    // A pointer bitcast between address spaces (e.g. reinterpret_cast of the
+    // address of a private SYCL local to a generic pointer type) first moves
+    // the pointer to the destination address space, as classic CodeGen does.
+    auto srcPtrTy = mlir::dyn_cast<cir::PointerType>(src.getType());
+    auto dstPtrTy = mlir::dyn_cast<cir::PointerType>(dstTy);
+    if (srcPtrTy && dstPtrTy &&
+        srcPtrTy.getAddrSpace() != dstPtrTy.getAddrSpace())
+      src = cgf.getBuilder().createAddrSpaceCast(
+          cgf.getLoc(subExpr->getSourceRange()), src,
+          cir::PointerType::get(srcPtrTy.getPointee(),
+                                dstPtrTy.getAddrSpace()));
 
     if (cgf.sanOpts.has(SanitizerKind::CFIUnrelatedCast))
       cgf.getCIRGenModule().errorNYI(subExpr->getSourceRange(),
