@@ -5335,9 +5335,9 @@ def CIR_CopyOp : CIR_Op<"copy",[
 // MemCpyOp && MemMoveOp
 //===----------------------------------------------------------------------===//
 
-class CIR_MemOp<string mnemonic> : CIR_Op<mnemonic, [
-  AllTypesMatch<["dst", "src"]>
-]> {
+// `dst` and `src` may be in different address spaces (e.g. a private local
+// copied from a generic pointer in device code), as for llvm.memcpy.
+class CIR_MemOp<string mnemonic> : CIR_Op<mnemonic> {
   dag commonArgs = (ins
     Arg<CIR_VoidPtrType, "", [MemWrite]>:$dst,
     Arg<CIR_VoidPtrType, "", [MemRead]>:$src
@@ -5407,7 +5407,7 @@ def CIR_MemMoveOp : CIR_MemOp<"libc.memmove"> {
 
   let assemblyFormat = [{
     $len `bytes` `from` $src `to` $dst attr-dict
-    `:` qualified(type($dst)) `,` type($len)
+    `:` qualified(type($dst)) `,` qualified(type($src)) `,` type($len)
   }];
 
   let extraClassDeclaration = [{

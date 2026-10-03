@@ -16,7 +16,7 @@ void foo(void) {
   // CIR: %[[V6:.*]] = cir.const #cir.int<4> : !u64i
   // CIR: %[[V7:.*]] = cir.const #cir.int<4> : !u64i
   // CIR: %[[V8:.*]] = cir.mul %[[V6]], %[[V7]] : !u64i
-  // CIR: cir.libc.memmove %[[V8]] bytes from %[[V3]] to %[[V5]] : !cir.ptr<!void>, !u64i
+  // CIR: cir.libc.memmove %[[V8]] bytes from %[[V3]] to %[[V5]] : !cir.ptr<!void>, !cir.ptr<!void>, !u64i
   // CIR: cir.return
 
   // LLVM-LABEL: define dso_local void @_Z3foov()
@@ -44,10 +44,10 @@ void test_conditional_bcopy(void) {
   // CIR-LABEL: cir.func {{.*}} @_Z22test_conditional_bcopyv()
   // CIR: cir.ternary
   // CIR: cir.ternary
-  // CIR: cir.libc.memmove {{.*}} bytes from {{.*}} to {{.*}} : !cir.ptr<!void>, !u64i
+  // CIR: cir.libc.memmove {{.*}} bytes from {{.*}} to {{.*}} : !cir.ptr<!void>, !cir.ptr<!void>, !u64i
   // CIR: false
   // CIR: false
-  // CIR: cir.libc.memmove {{.*}} bytes from {{.*}} to {{.*}} : !cir.ptr<!void>, !u64i
+  // CIR: cir.libc.memmove {{.*}} bytes from {{.*}} to {{.*}} : !cir.ptr<!void>, !cir.ptr<!void>, !u64i
 
   // LLVM-LABEL: define{{.*}} void @_Z22test_conditional_bcopyv
   // LLVM: br
@@ -73,9 +73,9 @@ void test_conditional_bcopy(void) {
 void another_conditional_bcopy(char *dst, char *src, int sz, int len) {
   // CIR-LABEL: cir.func no_inline dso_local @_Z25another_conditional_bcopyPcS_ii
   // CIR: cir.if
-  // CIR: cir.libc.memmove {{.*}} bytes from {{.*}} to {{.*}} : !cir.ptr<!void>, !u64i
+  // CIR: cir.libc.memmove {{.*}} bytes from {{.*}} to {{.*}} : !cir.ptr<!void>, !cir.ptr<!void>, !u64i
   // cir: else
-  // CIR: cir.libc.memmove {{.*}} bytes from {{.*}} to {{.*}} : !cir.ptr<!void>, !u64i
+  // CIR: cir.libc.memmove {{.*}} bytes from {{.*}} to {{.*}} : !cir.ptr<!void>, !cir.ptr<!void>, !u64i
 
   // LLVM-LABEL: define{{.*}} void @_Z25another_conditional_bcopyPcS_ii
   // LLVM: br
@@ -101,7 +101,7 @@ void another_conditional_bcopy(char *dst, char *src, int sz, int len) {
 
 extern "C" void bcopy(const void *__src, void *__dest, size_t __n);
 // CIR: @_Z9testbcopyPKvPvm(
-// CIR:     cir.libc.memmove {{.*}} bytes from {{.*}} to {{.*}} : !cir.ptr<!void>, !u64i
+// CIR:     cir.libc.memmove {{.*}} bytes from {{.*}} to {{.*}} : !cir.ptr<!void>, !cir.ptr<!void>, !u64i
 // CIR:     cir.return 
 
 // LLVM: @_Z9testbcopyPKvPvm(

@@ -1,0 +1,21 @@
+// RUN: cir-opt %s | FileCheck %s
+// RUN: cir-opt %s -cir-to-llvm | FileCheck %s --check-prefix=LLVM
+
+// cir.libc.memcpy / memmove accept source and destination pointers in
+// different address spaces (e.g. sycl::bit_cast copying from a generic
+// pointer into a private local), as llvm.memcpy does.
+
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+module {
+  // CHECK-LABEL: cir.func @copy
+  // CHECK: cir.libc.memcpy %{{.*}} bytes from %{{.*}} to %{{.*}} : !u64i, !cir.ptr<!void, target_address_space(4)> -> !cir.ptr<!void>
+  // CHECK: cir.libc.memmove %{{.*}} bytes from %{{.*}} to %{{.*}} : !cir.ptr<!void>, !cir.ptr<!void, target_address_space(4)>, !u64i
+  // LLVM: "llvm.intr.memcpy"(%{{.*}}, %{{.*}}, %{{.*}}) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr<4>, i64) -> ()
+  // LLVM: "llvm.intr.memmove"(%{{.*}}, %{{.*}}, %{{.*}}) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr<4>, i64) -> ()
+  cir.func @copy(%dst: !cir.ptr<!void>, %src: !cir.ptr<!void, target_address_space(4)>, %n: !u64i) {
+    cir.libc.memcpy %n bytes from %src to %dst : !u64i, !cir.ptr<!void, target_address_space(4)> -> !cir.ptr<!void>
+    cir.libc.memmove %n bytes from %src to %dst : !cir.ptr<!void>, !cir.ptr<!void, target_address_space(4)>, !u64i
+    cir.return
+  }
+}
