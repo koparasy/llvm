@@ -70,6 +70,7 @@ add_clang_library(clangCIR
   clangBasic
   clangCodeGenUtils
   clangLex
+  clangSema
   CIRRegisterAllDialects
   CIROpenACCSupport
   CIROpenMPSupport

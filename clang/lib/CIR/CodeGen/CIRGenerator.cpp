@@ -24,6 +24,7 @@
 #include "clang/CIR/CIRGenerator.h"
 #include "clang/CIR/InitAllDialects.h"
 #include "clang/CIR/MissingFeatures.h"
+#include "clang/Sema/SemaSYCL.h"
 #include "llvm/IR/DataLayout.h"
 
 using namespace cir;
@@ -210,6 +211,14 @@ void CIRGenerator::CompleteTentativeDefinition(VarDecl *d) {
 
 void CIRGenerator::HandleVTable(CXXRecordDecl *rd) {
   if (diags.hasErrorOccurred())
+    return;
+
+  // The only vtables meaningful in SYCL device code are those of classes with
+  // 'indirectly_callable' virtual functions; emitting any other would pull
+  // host-only virtual functions (and their RTTI) into the device image, as in
+  // classic CodeGen's HandleVTable.
+  if (astContext->getLangOpts().SYCLIsDevice &&
+      !SemaSYCL::hasSYCLIndirectlyCallableVirtualMethod(rd))
     return;
 
   cgm->emitVTable(rd);
