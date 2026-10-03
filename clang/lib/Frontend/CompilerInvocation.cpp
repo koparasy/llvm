@@ -621,8 +621,10 @@ static bool FixupInvocation(CompilerInvocation &Invocation,
     Diags.Report(diag::err_opt_not_valid_without_opt)
         << "-fsycl-enable-int-header-diags"
         << "-fsycl-is-host";
-  // SYCL requires C++; reject C inputs on both device and host.
-  if ((LangOpts.SYCLIsDevice || LangOpts.SYCLIsHost) && !LangOpts.CPlusPlus)
+  // SYCL requires C++; reject C inputs on both device and host. A ClangIR
+  // input was already compiled from C++ and carries no source language.
+  if ((LangOpts.SYCLIsDevice || LangOpts.SYCLIsHost) && !LangOpts.CPlusPlus &&
+      IK.getLanguage() != Language::CIR)
     Diags.Report(diag::err_drv_argument_not_allowed_with)
         << GetInputKindName(IK) << "-fsycl";
 
@@ -3794,6 +3796,18 @@ void CompilerInvocationBase::GenerateLangArgs(const LangOptions &Opts,
     if (!Opts.OptRecordFile.empty())
       GenerateArg(Consumer, OPT_opt_record_file, Opts.OptRecordFile);
 
+    if (IK.getLanguage() == Language::CIR) {
+      if (Opts.SYCLIsDevice)
+        GenerateArg(Consumer, OPT_fsycl_is_device);
+      if (Opts.SYCLIsHost)
+        GenerateArg(Consumer, OPT_fsycl_is_host);
+      if (!Opts.SYCLUniquePrefix.empty())
+        GenerateArg(Consumer, OPT_fsycl_unique_prefix_EQ,
+                    Opts.SYCLUniquePrefix);
+      if (!Opts.SYCLESIMDForceStatelessMem)
+        GenerateArg(Consumer, OPT_fno_sycl_esimd_force_stateless_mem);
+    }
+
     return;
   }
 
@@ -4206,6 +4220,19 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
     if (Args.hasArg(OPT_opt_record_file))
       Opts.OptRecordFile =
           std::string(Args.getLastArgValue(OPT_opt_record_file));
+
+    // A ClangIR input (e.g. a device module split out of the offload combine)
+    // still goes through the SYCL device/host backend passes in
+    // BackendUtil.cpp, which key on these options.
+    if (IK.getLanguage() == Language::CIR) {
+      Opts.SYCLIsDevice = Args.hasArg(OPT_fsycl_is_device);
+      Opts.SYCLIsHost = Args.hasArg(OPT_fsycl_is_host);
+      Opts.SYCLUniquePrefix =
+          std::string(Args.getLastArgValue(OPT_fsycl_unique_prefix_EQ));
+      Opts.SYCLESIMDForceStatelessMem =
+          Args.hasFlag(OPT_fsycl_esimd_force_stateless_mem,
+                       OPT_fno_sycl_esimd_force_stateless_mem, true);
+    }
 
     return Diags.getNumErrors() == NumErrorsBefore;
   }
