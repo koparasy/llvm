@@ -796,7 +796,12 @@ static mlir::Value buildDynamicCastToVoidAfterNullCheck(
   // Access vtable to get the offset from the given object to its containing
   // complete object.
   // TODO: Add a specialized operation to get the object offset?
-  auto vptrPtr = cir::VTableGetVPtrOp::create(builder, loc, op.getSrc());
+  auto vptrPtr = cir::VTableGetVPtrOp::create(
+      builder, loc,
+      cir::PointerType::get(
+          cir::VPtrType::get(builder.getContext()),
+          mlir::cast<cir::PointerType>(op.getSrc().getType()).getAddrSpace()),
+      op.getSrc());
   mlir::Value vptr = cir::LoadOp::create(
       builder, loc, vptrPtr,
       /*isDeref=*/false,

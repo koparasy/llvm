@@ -400,6 +400,10 @@ def CIR_PtrToVPtr : CIR_PtrToType<CIR_AnyVPtrType>,
       BuildableType<"$_builder.getType<" # cppType # ">("
         "$_builder.getType<::cir::VPtrType>())">;
 
+// A pointer to a vptr in any address space: the vptr field lives in the same
+// address space as its object, so the type follows the operand (not buildable).
+def CIR_PtrToVPtrAnyAS : CIR_PtrToType<CIR_AnyVPtrType>;
+
 //===----------------------------------------------------------------------===//
 // Scalar Type predicates
 //===----------------------------------------------------------------------===//

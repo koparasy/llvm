@@ -3660,7 +3660,7 @@ def CIR_VTableGetVPtrOp : CIR_Op<"vtable.get_vptr", [Pure]> {
     CIR_PointerType:$src
   );
 
-  let results = (outs CIR_PtrToVPtr:$result);
+  let results = (outs CIR_PtrToVPtrAnyAS:$result);
 
   let assemblyFormat = [{
       $src `:` qualified(type($src)) `->` qualified(type($result)) attr-dict

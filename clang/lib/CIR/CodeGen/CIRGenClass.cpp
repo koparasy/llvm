@@ -455,9 +455,13 @@ void CIRGenFunction::initializeVTablePointer(mlir::Location loc,
   //
   // vtable field is derived from `this` pointer, therefore they should be in
   // the same addr space.
-  assert(!cir::MissingFeatures::addressSpace());
-  auto vtablePtr =
-      cir::VTableGetVPtrOp::create(builder, loc, classAddr.getPointer());
+  auto vtablePtr = cir::VTableGetVPtrOp::create(
+      builder, loc,
+      cir::PointerType::get(
+          cir::VPtrType::get(builder.getContext()),
+          mlir::cast<cir::PointerType>(classAddr.getPointer().getType())
+              .getAddrSpace()),
+      classAddr.getPointer());
   Address vtableField = Address(vtablePtr, classAddr.getAlignment());
   builder.createStore(loc, vtableAddressPoint, vtableField);
   assert(!cir::MissingFeatures::opTBAA());
@@ -1333,8 +1337,14 @@ bool CIRGenFunction::shouldEmitVTableTypeCheckedLoad(const CXXRecordDecl *rd) {
 
 mlir::Value CIRGenFunction::getVTablePtr(mlir::Location loc, Address thisAddr,
                                          const CXXRecordDecl *rd) {
-  auto vtablePtr =
-      cir::VTableGetVPtrOp::create(builder, loc, thisAddr.getPointer());
+  // The vptr field lives in the same address space as the object.
+  auto vtablePtr = cir::VTableGetVPtrOp::create(
+      builder, loc,
+      cir::PointerType::get(
+          cir::VPtrType::get(builder.getContext()),
+          mlir::cast<cir::PointerType>(thisAddr.getPointer().getType())
+              .getAddrSpace()),
+      thisAddr.getPointer());
   Address vtablePtrAddr = Address(vtablePtr, thisAddr.getAlignment());
 
   auto vtable = builder.createLoad(loc, vtablePtrAddr);
