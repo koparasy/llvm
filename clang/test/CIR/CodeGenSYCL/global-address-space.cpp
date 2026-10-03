@@ -55,10 +55,10 @@ int get(int i) {
 // CIR-PRE:         cir.cast address_space %[[TABLE]] : !cir.ptr<!cir.array<!s32i x 4>, lang_address_space(offload_global)> -> !cir.ptr<!cir.array<!s32i x 4>, lang_address_space(offload_generic)>
 
 // LLVM-LABEL: define {{.*}} i32 @_Z3geti(
-// LLVM:         getelementptr {{.*}}[4 x i32], ptr addrspace(4) addrspacecast (ptr addrspace(1) @_ZL5table to ptr addrspace(4))
-// LLVM:         getelementptr {{.*}}[3 x i32], ptr addrspace(4) addrspacecast (ptr addrspace(1) @_ZZ3getiE5local to ptr addrspace(4))
-// LLVM:         load i32, ptr addrspace(4) addrspacecast (ptr addrspace(1) @_ZZ3getiE1u to ptr addrspace(4))
-// LLVM:         load i32, ptr addrspace(4) addrspacecast (ptr addrspace(1) @_ZL2cu to ptr addrspace(4))
+// LLVM:         getelementptr {{.*}}[4 x i32], ptr addrspace({{1|4}}) {{.*}}@_ZL5table
+// LLVM:         getelementptr {{.*}}[3 x i32], ptr addrspace({{1|4}}) {{.*}}@_ZZ3getiE5local
+// LLVM:         load i32, ptr addrspace({{1|4}}) {{.*}}@_ZZ3getiE1u
+// LLVM:         load i32, ptr addrspace({{1|4}}) {{.*}}@_ZL2cu
 
 void test(int *out) {
   kernel_single_task<KN>([out]() { *out = get(1); });

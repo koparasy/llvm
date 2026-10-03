@@ -29,8 +29,9 @@ int [[clang::opencl_global]] *load_member(S *s) { return s->p; }
 
 // After target lowering the member pointer address space is lowered in lockstep
 // with the get_member result, so both are target_address_space(1) and the
-// record member type matches the get_member result pointee.
+// record member type matches the get_member result pointee. The record is
+// lowered in place, keeping its name.
 
-// POST: !rec_[[REC:.*]] = !cir.struct<"__cir_lowered.S" {data !cir.ptr<!s32i, target_address_space(1)>}>
+// POST: !rec_[[REC:.*]] = !cir.struct<"S" {data !cir.ptr<!s32i, target_address_space(1)>}>
 // POST: cir.func {{.*}}@_Z11load_memberP1S
 // POST:   cir.get_member {{.*}} !cir.ptr<!rec_[[REC]]> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(1)>>

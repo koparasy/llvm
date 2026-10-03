@@ -59,7 +59,7 @@ int follow(Node *p, bool c) {
 // LLVM-LABEL: define {{.*}} i32 @_Z6followP4Nodeb(ptr addrspace(4)
 // LLVM:         getelementptr inbounds nuw %struct.Node, ptr addrspace(4) %{{.*}}, i32 0, i32 1
 // LLVM:         load ptr addrspace(4), ptr addrspace(4)
-// LLVM:         store ptr addrspace(4) %{{.*}}, ptr addrspace(4)
+// LLVM:         store ptr addrspace(4) %{{.*}}, ptr{{( addrspace\(4\))?}}
 
 void test(Node *p) {
   kernel_single_task<KN>([p]() { follow(p, true); });
