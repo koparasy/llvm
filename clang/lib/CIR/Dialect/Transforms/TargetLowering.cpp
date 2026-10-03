@@ -257,6 +257,20 @@ public:
   }
 };
 
+/// Whether an inherent attribute of \p op (e.g. a cir.func's func_info, which
+/// names the constructed or destroyed record, or a byval/sret argument
+/// attribute) still refers to a type the converter rewrites.
+static bool hasUnconvertedInherentAttr(mlir::Operation *op,
+                                       const TargetLoweringTypeConverter &tc) {
+  bool unconverted = false;
+  op->getName().walkInherentAttrs(op,
+                                  [&](llvm::StringRef, mlir::Attribute &attr) {
+                                    if (attr && tc.convertAttr(attr) != attr)
+                                      unconverted = true;
+                                  });
+  return unconverted;
+}
+
 /// Pattern to lower FuncOp types that contain address spaces.
 class CIRFuncOpTargetLowering : public mlir::OpConversionPattern<cir::FuncOp> {
 public:
@@ -285,12 +299,22 @@ public:
         signatureConversion.getConvertedTypes(), loweredReturnType,
         /*isVarArg=*/opFuncType.getVarArg());
 
+    const auto &tlTypeConverter =
+        static_cast<const TargetLoweringTypeConverter &>(*getTypeConverter());
     // Nothing changed, skip.
-    if (loweredFuncType == opFuncType)
+    if (loweredFuncType == opFuncType &&
+        !hasUnconvertedInherentAttr(op, tlTypeConverter))
       return mlir::failure();
 
     cir::FuncOp loweredFuncOp = rewriter.cloneWithoutRegions(op);
     loweredFuncOp.setFunctionType(loweredFuncType);
+    // Keep types named by the function's attributes (func_info's record,
+    // byval/sret argument types) in sync with the converted records.
+    loweredFuncOp->getName().walkInherentAttrs(
+        loweredFuncOp, [&](llvm::StringRef, mlir::Attribute &attr) {
+          if (attr)
+            attr = tlTypeConverter.convertAttr(attr);
+        });
     rewriter.inlineRegionBefore(op.getBody(), loweredFuncOp.getBody(),
                                 loweredFuncOp.end());
     if (mlir::failed(rewriter.convertRegionTypes(&loweredFuncOp.getBody(),
@@ -332,8 +356,11 @@ populateTargetLoweringConversionTarget(mlir::ConversionTarget &target,
             [&tc](mlir::Region &region) { return tc.isLegal(&region); });
       });
 
-  target.addDynamicallyLegalOp<cir::FuncOp>(
-      [&tc](cir::FuncOp op) { return tc.isLegal(op.getFunctionType()); });
+  target.addDynamicallyLegalOp<cir::FuncOp>([&tc](cir::FuncOp op) {
+    return tc.isLegal(op.getFunctionType()) &&
+           !hasUnconvertedInherentAttr(
+               op, static_cast<const TargetLoweringTypeConverter &>(tc));
+  });
 
   target.addDynamicallyLegalOp<cir::GlobalOp>([&tc](cir::GlobalOp op) {
     if (!tc.isLegal(op.getSymType()))
