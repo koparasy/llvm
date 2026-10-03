@@ -729,7 +729,9 @@ void CIRGenFunction::emitCXXAggrConstructorCall(
   mlir::Type elementType = arrayBase.getElementType();
   while (auto maybeArrayTy = mlir::dyn_cast<cir::ArrayType>(elementType))
     elementType = maybeArrayTy.getElementType();
-  cir::PointerType ptrToElmType = builder.getPointerTo(elementType);
+  // Elements live in the same address space as the array.
+  cir::PointerType ptrToElmType =
+      builder.getPointerTo(elementType, arrayBase.getAddressSpace());
 
   bool useDynamicArrayCtor = true;
   uint64_t constElementCount = 0;

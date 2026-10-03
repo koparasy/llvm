@@ -1126,7 +1126,9 @@ struct IrregularPartialArrayDestroy final : EHScopeStack::Cleanup {
     QualType baseElementType = cgf.getContext().getBaseElementType(elementType);
 
     mlir::Type cirElementType = cgf.convertTypeForMem(baseElementType);
-    cir::PointerType ptrToElmType = builder.getPointerTo(cirElementType);
+    cir::PointerType ptrToElmType = builder.getPointerTo(
+        cirElementType,
+        mlir::cast<cir::PointerType>(arrayBegin.getType()).getAddrSpace());
 
     mlir::Value begin = arrayBegin;
     if (baseElementType != elementType) {
@@ -1279,7 +1281,10 @@ void CIRGenFunction::emitArrayDestroy(mlir::Value begin,
   // Differently from LLVM traditional codegen, use a higher level
   // representation instead of lowering directly to a loop.
   mlir::Type cirElementType = convertTypeForMem(elementType);
-  cir::PointerType ptrToElmType = builder.getPointerTo(cirElementType);
+  // Elements live in the same address space as the array.
+  cir::PointerType ptrToElmType = builder.getPointerTo(
+      cirElementType,
+      mlir::cast<cir::PointerType>(begin.getType()).getAddrSpace());
 
   auto regionBuilder = [&](mlir::OpBuilder &b, mlir::Location loc) {
     mlir::BlockArgument arg =
