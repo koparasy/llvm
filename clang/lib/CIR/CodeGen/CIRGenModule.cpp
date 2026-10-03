@@ -1666,6 +1666,32 @@ void CIRGenModule::emitGlobalVarDefinition(const clang::VarDecl *vd,
   if (vd->hasAttr<AnnotateAttr>())
     addGlobalAnnotations(vd, gv);
 
+  // SYCL device globals carry string IR attributes the device runtime uses
+  // to find them (mirrors classic CodeGen's AddGlobalSYCLIRAttributes and
+  // addSYCLUniqueID): the type's add_ir_attributes_global_variable pairs
+  // (e.g. "sycl-device-global-size"), and "sycl-unique-id" for device_global
+  // and host_pipe types.
+  if (langOpts.SYCLIsDevice)
+    if (const RecordDecl *rd = vd->getType()->getAsRecordDecl()) {
+      SmallVector<mlir::NamedAttribute> irAttrs;
+      if (const auto *a = rd->getAttr<SYCLAddIRAttributesGlobalVariableAttr>())
+        for (const auto &[name, value] :
+             a->getFilteredAttributeNameValuePairs(astContext))
+          irAttrs.push_back(
+              builder.getNamedAttr(name, builder.getStringAttr(value)));
+      bool isHostPipe = false;
+      if (const auto *ta = rd->getAttr<SYCLTypeAttr>())
+        isHostPipe = ta->getType() == SYCLTypeAttr::SYCLType::host_pipe;
+      if (rd->hasAttr<SYCLDeviceGlobalAttr>() || isHostPipe)
+        irAttrs.push_back(builder.getNamedAttr(
+            "sycl-unique-id",
+            builder.getStringAttr(
+                SYCLUniqueStableIdExpr::ComputeName(astContext, vd))));
+      if (!irAttrs.empty())
+        gv->setAttr(cir::CIRDialect::getSYCLIRAttributesAttrName(),
+                    builder.getDictionaryAttr(irAttrs));
+    }
+
   // Set CIR's linkage type as appropriate.
   cir::GlobalLinkageKind linkage = getCIRLinkageVarDefinition(vd);
 

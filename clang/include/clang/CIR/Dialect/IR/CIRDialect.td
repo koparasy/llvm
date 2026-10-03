@@ -121,6 +121,9 @@ def CIR_Dialect : Dialect {
     // not the alloca address space (SPIR offload with
     // -fno-offload-use-alloca-addrspace-for-srets). Read by CallConvLowering.
     static llvm::StringRef getSRetAddressSpaceAttrName() { return "cir.sret_address_space"; }
+    // String attributes a SYCL device global carries into LLVM IR (e.g. the
+    // device_global's "sycl-unique-id" and "sycl-device-global-size").
+    static llvm::StringRef getSYCLIRAttributesAttrName() { return "cir.sycl_ir_attributes"; }
     static llvm::StringRef getAMDGPUCodeObjectVersionAttrName() { return "cir.amdhsa_code_object_version"; }
     static llvm::StringRef getAMDGPUPrintfKindAttrName() { return "cir.amdgpu_printf_kind"; }
     static llvm::StringRef getAMDGPUXnackAttrName() { return "cir.amdgpu_xnack"; }

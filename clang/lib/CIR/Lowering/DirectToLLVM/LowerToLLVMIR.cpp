@@ -61,6 +61,16 @@ public:
     } else if (auto mod = dyn_cast<mlir::ModuleOp>(op)) {
       if (mlir::failed(amendModule(mod, attribute, moduleTranslation)))
         return mlir::failure();
+    } else if (attribute.getName() ==
+               cir::CIRDialect::getSYCLIRAttributesAttrName()) {
+      // SYCL device global: copy the name/value pairs onto the IR global.
+      auto *gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(
+          moduleTranslation.lookupGlobal(op));
+      auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attribute.getValue());
+      if (gv && dict)
+        for (mlir::NamedAttribute entry : dict)
+          if (auto value = mlir::dyn_cast<mlir::StringAttr>(entry.getValue()))
+            gv->addAttribute(entry.getName().strref(), value.getValue());
     } else if (attribute.getName() == "cir.riscv_nontemporal_domain") {
       if (mlir::failed(amendRISCVNontemporalDomain(op, instructions, attribute,
                                                    moduleTranslation)))

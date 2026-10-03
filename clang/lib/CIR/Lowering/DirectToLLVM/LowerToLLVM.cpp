@@ -3014,6 +3014,13 @@ CIRToLLVMGlobalOpLowering::lowerGlobalAttributes(
     attributes.push_back(rewriter.getNamedAttr("externally_initialized",
                                                rewriter.getUnitAttr()));
 
+  // Forwarded to LLVM IR global-variable attributes by the CIR translation
+  // interface.
+  if (mlir::Attribute syclAttrs =
+          op->getAttr(CIRDialect::getSYCLIRAttributesAttrName()))
+    attributes.push_back(rewriter.getNamedAttr(
+        CIRDialect::getSYCLIRAttributesAttrName(), syclAttrs));
+
   return attributes;
 }
 
