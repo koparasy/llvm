@@ -61,6 +61,8 @@ def CIR_Dialect : Dialect {
     static llvm::StringRef getSYCLModuleIdAttrName() { return "sycl-module-id"; }
     static llvm::StringRef getSYCLKernelArgAccessorPtrAttrName() { return "cir.sycl_kernel_arg_accessor_ptr"; }
     static llvm::StringRef getSYCLSimdKernelArgAccessorPtrAttrName() { return "cir.kernel_arg_accessor_ptr"; }
+    static llvm::StringRef getSYCLKernelParamAttrName() { return "cir.sycl_kernel_param"; }
+    static llvm::StringRef getSYCLKernelObjectAttrName() { return "cir.sycl_kernel_object"; }
     static llvm::StringRef getDontCallErrorAttrName() { return "dontcall-error"; }
     static llvm::StringRef getDontCallWarnAttrName() { return "dontcall-warn"; }
     static llvm::StringRef getSrcLocAttrName() { return "cir.srcloc"; }

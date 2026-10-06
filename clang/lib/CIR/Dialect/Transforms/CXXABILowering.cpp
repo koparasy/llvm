@@ -355,6 +355,7 @@ mlir::LogicalResult CIRAllocaOpABILowering::matchAndRewrite(
   loweredOp.setInit(op.getInit());
   loweredOp.setConstant(op.getConstant());
   loweredOp.setAnnotationsAttr(op.getAnnotationsAttr());
+  loweredOp->setDiscardableAttrs(op->getDiscardableAttrDictionary());
 
   rewriter.replaceOp(op, loweredOp);
   return mlir::success();

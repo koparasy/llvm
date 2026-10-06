@@ -49,12 +49,12 @@ module attributes {cir.offload.container} {
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
     // CHECK: cir.func @_ZTSZ4mainEUlvE_(
-    // CHECK-SAME: %arg0: !cir.ptr<!s32i, target_address_space(1)> {llvm.noalias}
-    // CHECK-SAME: %arg1: !cir.ptr<!s32i, target_address_space(1)> {llvm.noalias}
+    // CHECK-SAME: %arg0: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "a"{{[^}]*}}}, llvm.noalias}
+    // CHECK-SAME: %arg1: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "b"{{[^}]*}}}, llvm.noalias}
     // CHECK-SAME: %arg2: !cir.ptr<!s32i, target_address_space(3)>)
     // CHECK-NOT: %arg2: {{.*}}llvm.noalias
-    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!s32i, target_address_space(1)>, %arg1: !cir.ptr<!s32i, target_address_space(1)>, %arg2: !cir.ptr<!s32i, target_address_space(3)>) cc(spir_kernel) {
-      %0 = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam>
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "a", kind = "pointer", path = ["a"]}}, %arg1: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "b", kind = "pointer", path = ["b"]}}, %arg2: !cir.ptr<!s32i, target_address_space(3)>) cc(spir_kernel) {
+      %0 = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
       %fa = cir.get_member %0[0] {name = "a"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
       %ca = cir.cast address_space %arg0 : !cir.ptr<!s32i, target_address_space(1)> -> !cir.ptr<!s32i, target_address_space(4)>
       cir.store %ca, %fa : !cir.ptr<!s32i, target_address_space(4)>, !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
@@ -111,8 +111,8 @@ module attributes {cir.offload.container} {
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
     // CHECK-NOT: llvm.noalias
-    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!s32i, target_address_space(1)>, %arg1: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
-      %0 = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam>
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "a", kind = "pointer", path = ["a"]}}, %arg1: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "b", kind = "pointer", path = ["b"]}}) cc(spir_kernel) {
+      %0 = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
       %fa = cir.get_member %0[0] {name = "a"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
       %ca = cir.cast address_space %arg0 : !cir.ptr<!s32i, target_address_space(1)> -> !cir.ptr<!s32i, target_address_space(4)>
       cir.store %ca, %fa : !cir.ptr<!s32i, target_address_space(4)>, !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
@@ -186,11 +186,11 @@ module attributes {cir.offload.container} {
     // The specialized clone carries llvm.noalias on both distinct-USM
     // parameters and the combine-private provenance marker.
     // CHECK: cir.func @_Z9addKernelv.spec.noalias.0(
-    // CHECK-SAME: %arg0: !cir.ptr<!s32i, target_address_space(1)> {llvm.noalias}
-    // CHECK-SAME: %arg1: !cir.ptr<!s32i, target_address_space(1)> {llvm.noalias}
+    // CHECK-SAME: %arg0: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "a"{{[^}]*}}}, llvm.noalias}
+    // CHECK-SAME: %arg1: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "b"{{[^}]*}}}, llvm.noalias}
     // CHECK-SAME: attributes {cir.specialization_private}
-    cir.func @_Z9addKernelv(%arg0: !cir.ptr<!s32i, target_address_space(1)>, %arg1: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
-      %0 = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam>
+    cir.func @_Z9addKernelv(%arg0: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "a", kind = "pointer", path = ["a"]}}, %arg1: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "b", kind = "pointer", path = ["b"]}}) cc(spir_kernel) {
+      %0 = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
       %fa = cir.get_member %0[0] {name = "a"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
       %ca = cir.cast address_space %arg0 : !cir.ptr<!s32i, target_address_space(1)> -> !cir.ptr<!s32i, target_address_space(4)>
       cir.store %ca, %fa : !cir.ptr<!s32i, target_address_space(4)>, !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>

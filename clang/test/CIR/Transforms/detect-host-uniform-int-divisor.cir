@@ -48,8 +48,8 @@ module attributes {cir.offload.container} {
     // "C" (the prologue the scalar-capture mapper recognizes), so it is a
     // captured scalar -- uniform. %lid comes from a work-item builtin call --
     // not uniform.
-    cir.func @_ZTSZ4mainEUlvE_(%argC: !s32i, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
-      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+    cir.func @_ZTSZ4mainEUlvE_(%argC: !s32i {cir.sycl_kernel_param = {field = "C", kind = "scalar", path = ["C"]}}, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam> {cir.sycl_kernel_object}
       %sc = cir.alloca "C.addr" align(4) : !cir.ptr<!s32i>
       cir.store %argC, %sc : !s32i, !cir.ptr<!s32i>
       %vc = cir.load %sc : !cir.ptr<!s32i>, !s32i
@@ -119,8 +119,8 @@ module attributes {cir.offload.container} {
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
     cir.func private @get_local_id(!s32i) -> !s32i
-    cir.func @_ZTSZ4mainEUlvE_(%argC: !s32i, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
-      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+    cir.func @_ZTSZ4mainEUlvE_(%argC: !s32i {cir.sycl_kernel_param = {field = "C", kind = "scalar", path = ["C"]}}, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam> {cir.sycl_kernel_object}
       %fc = cir.get_member %clos[0] {name = "C"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
       cir.store %argC, %fc : !s32i, !cir.ptr<!s32i>
 
@@ -182,8 +182,8 @@ module attributes {cir.offload.container} {
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
     cir.func private @get_local_id(!s32i) -> !s32i
-    cir.func @_ZTSZ4mainEUlvE_(%argC: !s32i, %in: !cir.ptr<!s32i, target_address_space(1)>, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
-      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+    cir.func @_ZTSZ4mainEUlvE_(%argC: !s32i {cir.sycl_kernel_param = {field = "C", kind = "scalar", path = ["C"]}}, %in: !cir.ptr<!s32i, target_address_space(1)>, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam> {cir.sycl_kernel_object}
       %fc = cir.get_member %clos[0] {name = "C"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
       cir.store %argC, %fc : !s32i, !cir.ptr<!s32i>
 
@@ -254,8 +254,8 @@ module attributes {cir.offload.container} {
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
     cir.func private @get_local_id(!s32i) -> !u64i
-    cir.func @_ZTS9MyFunctor(%argC: !u32i, %argOut: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
-      %clos = cir.alloca "MyFunctor" align(8) : !cir.ptr<!rec_fun>
+    cir.func @_ZTS9MyFunctor(%argC: !u32i {cir.sycl_kernel_param = {field = "C_", kind = "scalar", path = ["C_"]}}, %argOut: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "MyFunctor" align(8) : !cir.ptr<!rec_fun> {cir.sycl_kernel_object}
       %fc = cir.get_member %clos[0] {name = "C_"} : !cir.ptr<!rec_fun> -> !cir.ptr<!u32i>
       cir.store %argC, %fc : !u32i, !cir.ptr<!u32i>
 
@@ -322,8 +322,8 @@ module attributes {cir.offload.container} {
     cir.func private @_Z32__spirv_BuiltInLocalInvocationIdi(!s32i) -> !u64i attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
     cir.func private @_Z15__spirv_ocl_cosf(!cir.float) -> !cir.float attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
     cir.func private @_Z16__spirv_ocl_sqrtf(!cir.float) -> !cir.float attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
-    cir.func @_ZTSZ4mainEUlvE_(%argT: !cir.float, %argP: !cir.float, %fout: !cir.ptr<!cir.float, target_address_space(1)>) cc(spir_kernel) {
-      %clos = cir.alloca "gf" align(8) : !cir.ptr<!rec_gf>
+    cir.func @_ZTSZ4mainEUlvE_(%argT: !cir.float {cir.sycl_kernel_param = {field = "theta", kind = "scalar", path = ["theta"]}}, %argP: !cir.float {cir.sycl_kernel_param = {field = "phi", kind = "scalar", path = ["phi"]}}, %fout: !cir.ptr<!cir.float, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "gf" align(8) : !cir.ptr<!rec_gf> {cir.sycl_kernel_object}
       %fth = cir.get_member %clos[0] {name = "theta"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
       cir.store %argT, %fth : !cir.float, !cir.ptr<!cir.float>
       %fph = cir.get_member %clos[1] {name = "phi"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
@@ -413,8 +413,8 @@ module attributes {cir.offload.container} {
     cir.func private @_Z32__spirv_BuiltInLocalInvocationIdi(!s32i) -> !u64i attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
     cir.func private @_Z15__spirv_ocl_cosf(!cir.float) -> !cir.float attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
     cir.func private @_Z16__spirv_ocl_sqrtf(!cir.float) -> !cir.float attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
-    cir.func @_ZTSZ4mainEUlvE_(%argT: !cir.float, %argP: !cir.float, %fout: !cir.ptr<!cir.float, target_address_space(1)>) cc(spir_kernel) {
-      %clos = cir.alloca "gf" align(8) : !cir.ptr<!rec_gf>
+    cir.func @_ZTSZ4mainEUlvE_(%argT: !cir.float {cir.sycl_kernel_param = {field = "theta", kind = "scalar", path = ["theta"]}}, %argP: !cir.float {cir.sycl_kernel_param = {field = "phi", kind = "scalar", path = ["phi"]}}, %fout: !cir.ptr<!cir.float, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "gf" align(8) : !cir.ptr<!rec_gf> {cir.sycl_kernel_object}
       %fth = cir.get_member %clos[0] {name = "theta"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>
       cir.store %argT, %fth : !cir.float, !cir.ptr<!cir.float>
       %fph = cir.get_member %clos[1] {name = "phi"} : !cir.ptr<!rec_gf> -> !cir.ptr<!cir.float>

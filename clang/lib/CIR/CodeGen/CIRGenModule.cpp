@@ -3610,6 +3610,241 @@ void CIRGenModule::emitOpenCLKernelArgMetadata(cir::FuncOp func,
                 metadata);
 }
 
+namespace {
+/// Recovers, from the kernel body SemaSYCL synthesizes, which closure member
+/// each kernel parameter initializes. The body declares a local clone of the
+/// kernel object with an InitListExpr whose leaves read parameters (pointers,
+/// scalars and standard-layout copies), then calls `__init` on each member of
+/// a special SYCL type (accessors, streams, ...) with the parameters that
+/// type was decomposed into.
+class SYCLKernelParamMapper {
+public:
+  struct Entry {
+    llvm::StringRef kind;
+    llvm::SmallVector<std::string> path;
+    std::optional<unsigned> initArg;
+    llvm::StringRef accessorPart;
+    unsigned uses = 0;
+  };
+
+  SYCLKernelParamMapper(CIRGenModule &cgm, const FunctionDecl *fd)
+      : cgm(cgm), fd(fd) {}
+
+  const VarDecl *getClosure() const { return closure; }
+
+  llvm::DenseMap<const ParmVarDecl *, Entry> run() {
+    const auto *body = dyn_cast_or_null<CompoundStmt>(fd->getBody());
+    if (!body)
+      return {};
+    for (const Stmt *s : body->body()) {
+      if (const auto *ds = dyn_cast<DeclStmt>(s)) {
+        if (!ds->isSingleDecl())
+          continue;
+        // The kernel object clone is the first local of record type that is
+        // aggregate-initialized; it is named after the kernel class, or
+        // `__SYCLKernel` for a lambda.
+        const auto *vd = dyn_cast<VarDecl>(ds->getSingleDecl());
+        if (!vd || closure || !vd->getType()->isRecordType() ||
+            !vd->getInit() ||
+            !isa<InitListExpr>(vd->getInit()->IgnoreImplicit()))
+          continue;
+        closure = vd;
+        llvm::SmallVector<std::string> path;
+        visitInit(vd->getInit(), vd->getType(), path);
+        continue;
+      }
+      if (const auto *call = dyn_cast<CXXMemberCallExpr>(s))
+        visitInitCall(call);
+    }
+    // A parameter that feeds more than one place has no single field.
+    llvm::DenseMap<const ParmVarDecl *, Entry> result;
+    for (auto &[pvd, entry] : entries)
+      if (entry.uses == 1)
+        result.try_emplace(pvd, std::move(entry));
+    return result;
+  }
+
+private:
+  CIRGenModule &cgm;
+  const FunctionDecl *fd;
+  const VarDecl *closure = nullptr;
+  llvm::DenseMap<const ParmVarDecl *, Entry> entries;
+
+  std::string fieldName(const FieldDecl *field) const {
+    auto it = cgm.lambdaFieldToName.find(field);
+    if (it != cgm.lambdaFieldToName.end())
+      return it->second.str();
+    return field->getName().str();
+  }
+
+  /// The single parameter of this kernel referenced from `e`, if any.
+  const ParmVarDecl *singleParam(const Expr *e) const {
+    const ParmVarDecl *found = nullptr;
+    bool ambiguous = false;
+    llvm::SmallVector<const Stmt *, 8> worklist{e};
+    while (!worklist.empty()) {
+      const Stmt *s = worklist.pop_back_val();
+      if (!s)
+        continue;
+      if (const auto *dre = dyn_cast<DeclRefExpr>(s)) {
+        if (const auto *pvd = dyn_cast<ParmVarDecl>(dre->getDecl());
+            pvd && pvd->getDeclContext() == fd) {
+          ambiguous |= found && found != pvd;
+          found = pvd;
+        }
+      }
+      for (const Stmt *child : s->children())
+        worklist.push_back(child);
+    }
+    return ambiguous ? nullptr : found;
+  }
+
+  void record(const ParmVarDecl *pvd, Entry entry) {
+    Entry &slot = entries[pvd];
+    unsigned uses = slot.uses + 1;
+    slot = std::move(entry);
+    slot.uses = uses;
+  }
+
+  void visitInit(const Expr *init, QualType type,
+                 llvm::SmallVectorImpl<std::string> &path) {
+    if (const auto *ile = dyn_cast<InitListExpr>(init->IgnoreImplicit())) {
+      if (const auto *at = cgm.getASTContext().getAsArrayType(type)) {
+        for (auto [i, elt] : llvm::enumerate(ile->inits())) {
+          path.push_back("[" + std::to_string(i) + "]");
+          visitInit(elt, at->getElementType(), path);
+          path.pop_back();
+        }
+        return;
+      }
+      const auto *rd = type->getAsCXXRecordDecl();
+      if (!rd || rd->isUnion())
+        return;
+      // Bases come first in the initializer list, then the fields.
+      llvm::SmallVector<std::pair<std::string, QualType>> members;
+      for (const CXXBaseSpecifier &base : rd->bases())
+        members.emplace_back(
+            "^" + base.getType()->getAsCXXRecordDecl()->getName().str(),
+            base.getType());
+      for (const FieldDecl *field : rd->fields())
+        if (!field->isUnnamedBitField())
+          members.emplace_back(fieldName(field), field->getType());
+      if (members.size() != ile->getNumInits())
+        return;
+      for (auto [member, elt] : llvm::zip(members, ile->inits())) {
+        path.push_back(member.first);
+        visitInit(elt, member.second, path);
+        path.pop_back();
+      }
+      return;
+    }
+    if (path.empty())
+      return;
+    const ParmVarDecl *pvd = singleParam(init);
+    if (!pvd)
+      return;
+    Entry entry;
+    if (type->isPointerType())
+      entry.kind = "pointer";
+    else if (type->isScalarType())
+      entry.kind = "scalar";
+    else
+      entry.kind = "std_layout";
+    entry.path.assign(path.begin(), path.end());
+    record(pvd, std::move(entry));
+  }
+
+  /// The member path from the closure to the object an `__init` call is made
+  /// on, or false if it is not rooted at the closure.
+  bool memberPath(const Expr *e, llvm::SmallVectorImpl<std::string> &path) {
+    e = e->IgnoreImplicit();
+    if (const auto *dre = dyn_cast<DeclRefExpr>(e))
+      return dre->getDecl() == closure;
+    if (const auto *me = dyn_cast<MemberExpr>(e)) {
+      const auto *field = dyn_cast<FieldDecl>(me->getMemberDecl());
+      if (!field || me->isArrow() || !memberPath(me->getBase(), path))
+        return false;
+      path.push_back(fieldName(field));
+      return true;
+    }
+    if (const auto *ase = dyn_cast<ArraySubscriptExpr>(e)) {
+      std::optional<llvm::APSInt> idx =
+          ase->getIdx()->getIntegerConstantExpr(cgm.getASTContext());
+      if (!idx || !memberPath(ase->getBase(), path))
+        return false;
+      path.push_back("[" + std::to_string(idx->getZExtValue()) + "]");
+      return true;
+    }
+    return false;
+  }
+
+  void visitInitCall(const CXXMemberCallExpr *call) {
+    const CXXMethodDecl *method = call->getMethodDecl();
+    if (!method || !method->getName().starts_with("__init"))
+      return;
+    llvm::SmallVector<std::string> path;
+    if (!memberPath(call->getImplicitObjectArgument(), path) || path.empty())
+      return;
+    // The kind is that of the object initialized, which may inherit __init
+    // (local_accessor from accessor).
+    const CXXRecordDecl *rd =
+        call->getImplicitObjectArgument()->getType()->getAsCXXRecordDecl();
+    llvm::StringRef kind = "special";
+    if (const auto *typeAttr = rd ? rd->getAttr<SYCLTypeAttr>() : nullptr)
+      kind = SYCLTypeAttr::ConvertSYCLTypeToStr(typeAttr->getType());
+    bool isAccessor = kind == "accessor" || kind == "local_accessor";
+    for (auto [i, arg] : llvm::enumerate(call->arguments())) {
+      const ParmVarDecl *pvd = singleParam(arg);
+      if (!pvd)
+        continue;
+      Entry entry;
+      entry.kind = kind;
+      entry.path = path;
+      entry.initArg = i;
+      // accessor::__init(Ptr, AccessRange, MemRange, Offset).
+      if (pvd->hasAttr<SYCLAccessorPtrAttr>())
+        entry.accessorPart = "ptr";
+      else if (isAccessor && call->getNumArgs() == 4)
+        entry.accessorPart = i == 1   ? "access_range"
+                             : i == 2 ? "mem_range"
+                             : i == 3 ? "offset"
+                                      : "";
+      record(pvd, std::move(entry));
+    }
+  }
+};
+} // namespace
+
+const VarDecl *
+CIRGenModule::emitSYCLKernelParamMap(cir::FuncOp func,
+                                     const clang::FunctionDecl *fd) {
+  SYCLKernelParamMapper mapper(*this, fd);
+  llvm::DenseMap<const ParmVarDecl *, SYCLKernelParamMapper::Entry> map =
+      mapper.run();
+  mlir::MLIRContext *ctx = &getMLIRContext();
+  for (const ParmVarDecl *param : fd->parameters()) {
+    auto it = map.find(param);
+    if (it == map.end())
+      continue;
+    const SYCLKernelParamMapper::Entry &entry = it->second;
+    llvm::SmallVector<mlir::Attribute> path;
+    for (const std::string &member : entry.path)
+      path.push_back(builder.getStringAttr(member));
+    mlir::NamedAttrList attrs;
+    attrs.set("kind", builder.getStringAttr(entry.kind));
+    attrs.set("field", builder.getStringAttr(entry.path.front()));
+    attrs.set("path", builder.getArrayAttr(path));
+    if (entry.initArg)
+      attrs.set("init_arg", builder.getI32IntegerAttr(*entry.initArg));
+    if (!entry.accessorPart.empty())
+      attrs.set("accessor_part", builder.getStringAttr(entry.accessorPart));
+    func.setArgAttr(param->getFunctionScopeIndex(),
+                    cir::CIRDialect::getSYCLKernelParamAttrName(),
+                    attrs.getDictionary(ctx));
+  }
+  return mapper.getClosure();
+}
+
 void CIRGenModule::emitSYCLKernelArgAccessorMetadata(
     cir::FuncOp func, const clang::FunctionDecl *fd) {
   // One entry per kernel parameter, true for the base pointer of an accessor.

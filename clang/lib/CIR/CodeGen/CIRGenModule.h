@@ -691,6 +691,12 @@ public:
   void emitSYCLKernelArgAccessorMetadata(cir::FuncOp func,
                                          const clang::FunctionDecl *fd);
 
+  /// Attach `cir.sycl_kernel_param` to each SYCL kernel parameter, recording
+  /// the closure member it initializes and how (see SYCLKernelParamMapper).
+  /// Returns the kernel's local closure object, if found.
+  const clang::VarDecl *emitSYCLKernelParamMap(cir::FuncOp func,
+                                               const clang::FunctionDecl *fd);
+
   void emitGlobalDefinition(clang::GlobalDecl gd,
                             mlir::Operation *op = nullptr);
   void emitGlobalFunctionDefinition(clang::GlobalDecl gd, mlir::Operation *op);

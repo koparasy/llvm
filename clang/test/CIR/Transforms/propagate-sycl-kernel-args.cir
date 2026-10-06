@@ -66,8 +66,8 @@ module attributes {cir.offload.container} {
     // CHECK: cir.cast int_to_bool %[[FLAG]]
     // CHECK: cir.if
     // CHECK: cir.store %[[COEFF]], %arg3
-    cir.func @_ZTSZ4mainEUlvE_(%arg0: !s32i, %arg1: !s32i, %arg2: !s32i, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
-      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !s32i {cir.sycl_kernel_param = {field = "flag", kind = "scalar", path = ["flag"]}}, %arg1: !s32i {cir.sycl_kernel_param = {field = "coeff", kind = "scalar", path = ["coeff"]}}, %arg2: !s32i {cir.sycl_kernel_param = {field = "n", kind = "scalar", path = ["n"]}}, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam> {cir.sycl_kernel_object}
       %sflag = cir.alloca "flag.addr" align(4) : !cir.ptr<!s32i>
       %scoeff = cir.alloca "coeff.addr" align(4) : !cir.ptr<!s32i>
       %sn = cir.alloca "n.addr" align(4) : !cir.ptr<!s32i>
@@ -220,8 +220,8 @@ module attributes {cir.offload.container} {
     // CHECK: %[[COEFF:.*]] = cir.const #cir.int<7> : !s32i
     // CHECK: cir.store %arg0, %{{.*}}
     // CHECK: cir.store %[[COEFF]], %{{.*}}
-    cir.func @_ZTSZ4mainEUlvE_(%arg0: !s32i, %arg1: !s32i) cc(spir_kernel) {
-      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !s32i {cir.sycl_kernel_param = {field = "flag", kind = "scalar", path = ["flag"]}}, %arg1: !s32i {cir.sycl_kernel_param = {field = "coeff", kind = "scalar", path = ["coeff"]}}) cc(spir_kernel) {
+      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam> {cir.sycl_kernel_object}
       %sflag = cir.alloca "flag.addr" align(4) : !cir.ptr<!s32i>
       %scoeff = cir.alloca "coeff.addr" align(4) : !cir.ptr<!s32i>
       cir.store %arg0, %sflag : !s32i, !cir.ptr<!s32i>
@@ -302,8 +302,8 @@ module attributes {cir.offload.container} {
     // CHECK-SAME: attributes {cir.specialization_private}
     // CHECK-DAG: cir.const #cir.int<1> : !s32i
     // CHECK-DAG: cir.const #cir.int<7> : !s32i
-    cir.func @_ZTS9MyFunctor(%arg0: !s32i, %arg1: !s32i, %arg2: !s32i, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
-      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+    cir.func @_ZTS9MyFunctor(%arg0: !s32i {cir.sycl_kernel_param = {field = "flag", kind = "scalar", path = ["flag"]}}, %arg1: !s32i {cir.sycl_kernel_param = {field = "coeff", kind = "scalar", path = ["coeff"]}}, %arg2: !s32i {cir.sycl_kernel_param = {field = "n", kind = "scalar", path = ["n"]}}, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
+      %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam> {cir.sycl_kernel_object}
       %sflag = cir.alloca "flag.addr" align(4) : !cir.ptr<!s32i>
       %scoeff = cir.alloca "coeff.addr" align(4) : !cir.ptr<!s32i>
       %sn = cir.alloca "n.addr" align(4) : !cir.ptr<!s32i>

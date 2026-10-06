@@ -9,9 +9,9 @@
 // Propagates a SYCL captured SCALAR that is a compile-time constant at every
 // visible launch into the device kernel body.
 //
-// A spir_kernel scalar parameter is bound to a closure capture field (the
-// prologue spills the by-value argument to a stack slot, reloads it, and stores
-// it into a cir.get_member of the closure record). KernelBindingTable already
+// A spir_kernel scalar parameter is bound to the closure capture field CIRGen
+// recorded for it in `cir.sycl_kernel_param` (see SYCLKernelParams.h).
+// KernelBindingTable already
 // resolved, on the host side, which scalar capture fields hold the SAME
 // compile-time constant at every launch site -- see KernelBinding::
 // syclConstArgs. This pass maps each device scalar parameter to its field and,
@@ -39,8 +39,7 @@
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/Passes.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
-#include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/SmallVector.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_OFFLOADPROPAGATESYCLKERNELARGS
@@ -51,46 +50,6 @@ using namespace mlir;
 using namespace cir;
 
 namespace {
-
-// The single closure capture field a spir_kernel parameter is stored into, or
-// empty if it reaches no field or more than one. The prologue routes the
-// by-value scalar argument through a spill slot (before mem2reg) and, for a
-// bool, a bitcast/integral reinterpret, into a cir.get_member store; walk that
-// forward. Shares the shape with InferKernelParamNoAlias.cpp's mapper, minus
-// the address-space cast that only pointer captures carry.
-static llvm::StringRef closureFieldForArg(mlir::Value arg) {
-  llvm::StringRef field;
-  llvm::SmallVector<mlir::Value, 4> worklist{arg};
-  llvm::SmallPtrSet<mlir::Value, 8> seen{arg};
-  while (!worklist.empty()) {
-    mlir::Value v = worklist.pop_back_val();
-    for (mlir::Operation *user : v.getUsers()) {
-      if (auto st = mlir::dyn_cast<cir::StoreOp>(user)) {
-        if (st.getValue() != v)
-          continue;
-        if (auto gm = st.getAddr().getDefiningOp<cir::GetMemberOp>()) {
-          if (!field.empty() && field != gm.getName())
-            return {}; // Two distinct fields: ambiguous, give up.
-          field = gm.getName();
-          continue;
-        }
-        // A spill into a stack slot: follow the reloads of that slot.
-        for (mlir::Operation *slotUser : st.getAddr().getUsers())
-          if (auto load = mlir::dyn_cast<cir::LoadOp>(slotUser))
-            if (seen.insert(load.getResult()).second)
-              worklist.push_back(load.getResult());
-        continue;
-      }
-      if (auto cast = mlir::dyn_cast<cir::CastOp>(user)) {
-        if ((cast.getKind() == cir::CastKind::integral ||
-             cast.getKind() == cir::CastKind::bitcast) &&
-            seen.insert(cast.getResult()).second)
-          worklist.push_back(cast.getResult());
-      }
-    }
-  }
-  return field;
-}
 
 struct OffloadPropagateSYCLKernelArgsPass
     : public impl::OffloadPropagateSYCLKernelArgsBase<
@@ -123,7 +82,8 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
           continue;
         if (arg.use_empty())
           continue;
-        llvm::StringRef field = closureFieldForArg(arg);
+        llvm::StringRef field = cir::getSYCLCapturedField(
+            kernel, arg.getArgNumber(), /*wantPointer=*/false);
         if (field.empty())
           continue;
         mlir::TypedAttr value = consts.lookup(field);

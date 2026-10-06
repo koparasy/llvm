@@ -34,9 +34,9 @@
 // argument). Only the joined host+device container sees both.
 //
 // The uniformity oracle mirrors the scalar-capture classification of
-// PropagateSYCLKernelArgs.cpp: a spir_kernel scalar parameter that the prologue
-// stores into a closure capture field (arg -> [spill slot ->] cir.get_member
-// store) is a captured scalar, and hence uniform. From there a value is uniform
+// PropagateSYCLKernelArgs.cpp: a spir_kernel scalar parameter that CIRGen
+// records as copied into a closure capture field (`cir.sycl_kernel_param`) is
+// a captured scalar, and hence uniform. From there a value is uniform
 // iff every step back is such a captured field, a cir.const, a pure
 // (memory-effect-free) op over uniform operands, or a `const` (readnone) call
 // whose callee is NOT a work-item/index builtin (`__spirv_BuiltIn*`) and whose
@@ -60,6 +60,7 @@
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/Passes.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -96,50 +97,26 @@ static mlir::Value peelPtrCasts(mlir::Value v) {
   return v;
 }
 
-// The single closure capture field a spir_kernel SCALAR parameter is stored
-// into, together with the closure record it is a member of, or an empty field
-// if the parameter reaches no field or more than one. Shares the forward-walk
-// shape with PropagateSYCLKernelArgs.cpp's mapper (arg -> [spill slot ->]
-// cir.get_member store), and additionally reports the get_member base so a
-// later divisor load can be matched to the very closure the parameter feeds.
+// The closure capture field a spir_kernel SCALAR parameter is copied into, as
+// recorded by CIRGen in `cir.sycl_kernel_param`, together with the kernel's
+// closure object (`cir.sycl_kernel_object`) so a later divisor load can be
+// matched to the very closure the parameter feeds. Empty for a parameter with
+// no captured-scalar field, and for any block argument that is not a kernel
+// parameter.
 struct CapturedField {
   llvm::StringRef name;
-  mlir::Value closure; // the record the field lives in (casts peeled)
+  mlir::Value closure; // the kernel's closure object alloca
 };
 
-static CapturedField closureFieldForArg(mlir::Value arg) {
-  CapturedField result;
-  llvm::SmallVector<mlir::Value, 4> worklist{arg};
-  llvm::SmallPtrSet<mlir::Value, 8> seen{arg};
-  while (!worklist.empty()) {
-    mlir::Value v = worklist.pop_back_val();
-    for (mlir::Operation *user : v.getUsers()) {
-      if (auto st = mlir::dyn_cast<cir::StoreOp>(user)) {
-        if (st.getValue() != v)
-          continue;
-        if (auto gm = st.getAddr().getDefiningOp<cir::GetMemberOp>()) {
-          if (!result.name.empty() && result.name != gm.getName())
-            return {}; // Two distinct fields: ambiguous, give up.
-          result.name = gm.getName();
-          result.closure = peelPtrCasts(gm.getAddr());
-          continue;
-        }
-        // A spill into a stack slot: follow the reloads of that slot.
-        for (mlir::Operation *slotUser : st.getAddr().getUsers())
-          if (auto load = mlir::dyn_cast<cir::LoadOp>(slotUser))
-            if (seen.insert(load.getResult()).second)
-              worklist.push_back(load.getResult());
-        continue;
-      }
-      if (auto cast = mlir::dyn_cast<cir::CastOp>(user)) {
-        if ((cast.getKind() == cir::CastKind::integral ||
-             cast.getKind() == cir::CastKind::bitcast) &&
-            seen.insert(cast.getResult()).second)
-          worklist.push_back(cast.getResult());
-      }
-    }
-  }
-  return result;
+static CapturedField capturedScalarField(mlir::BlockArgument arg) {
+  auto kernel = mlir::dyn_cast<cir::FuncOp>(arg.getOwner()->getParentOp());
+  if (!kernel || arg.getOwner() != &kernel.getBody().front())
+    return {};
+  llvm::StringRef name = cir::getSYCLCapturedField(kernel, arg.getArgNumber(),
+                                                   /*wantPointer=*/false);
+  if (name.empty())
+    return {};
+  return {name, cir::getSYCLKernelObject(kernel)};
 }
 
 // Uniformity oracle over the def-use chain of a divisor. `fields` maps each
@@ -160,8 +137,8 @@ static bool isUniform(mlir::Value v, const llvm::StringMap<mlir::Value> &fields,
   // A kernel parameter is uniform iff it is a captured scalar (it maps to a
   // closure field). Any other block argument -- a non-captured parameter, or a
   // loop/region-carried value -- is conservatively non-uniform.
-  if (mlir::isa<mlir::BlockArgument>(v)) {
-    CapturedField cf = closureFieldForArg(v);
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+    CapturedField cf = capturedScalarField(arg);
     if (cf.name.empty() || !fields.count(cf.name))
       return false;
     if (outField.empty())
@@ -321,7 +298,7 @@ void OffloadDetectHostUniformIntDivisorPass::runOnOperation() {
       if (!mlir::isa<cir::IntType, cir::FPTypeInterface, cir::BoolType>(
               arg.getType()))
         continue;
-      CapturedField cf = closureFieldForArg(arg);
+      CapturedField cf = capturedScalarField(arg);
       if (!cf.name.empty() && cf.closure)
         fields.try_emplace(cf.name, cf.closure);
     }

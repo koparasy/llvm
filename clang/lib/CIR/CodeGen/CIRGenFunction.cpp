@@ -830,11 +830,27 @@ cir::FuncOp CIRGenFunction::generateCode(clang::GlobalDecl gd, cir::FuncOp fn,
 
   if (getLangOpts().OpenCL && funcDecl->hasAttr<DeviceKernelAttr>())
     cgm.emitOpenCLKernelArgMetadata(fn, funcDecl);
-  if (getLangOpts().SYCLIsDevice && funcDecl->hasAttr<DeviceKernelAttr>())
+  if (getLangOpts().SYCLIsDevice && funcDecl->hasAttr<DeviceKernelAttr>()) {
     cgm.emitSYCLKernelArgAccessorMetadata(fn, funcDecl);
+    if (funcDecl->hasAttr<SYCLKernelAttr>())
+      if (const VarDecl *kernelObj = cgm.emitSYCLKernelParamMap(fn, funcDecl))
+        markSYCLKernelObject(kernelObj);
+  }
 
   eraseEmptyAndUnusedBlocks(fn);
   return fn;
+}
+
+void CIRGenFunction::markSYCLKernelObject(const VarDecl *kernelObj) {
+  auto it = localDeclMap.find(kernelObj);
+  if (it == localDeclMap.end())
+    return;
+  mlir::Value ptr = it->second.getPointer();
+  while (auto cast = ptr.getDefiningOp<cir::CastOp>())
+    ptr = cast.getSrc();
+  if (auto alloca = ptr.getDefiningOp<cir::AllocaOp>())
+    alloca->setAttr(cir::CIRDialect::getSYCLKernelObjectAttrName(),
+                    mlir::UnitAttr::get(&getMLIRContext()));
 }
 
 void CIRGenFunction::emitConstructorBody(FunctionArgList &args) {

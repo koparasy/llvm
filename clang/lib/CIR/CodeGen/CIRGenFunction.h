@@ -738,6 +738,10 @@ public:
 
   void finishFunction(SourceLocation endLoc);
 
+  /// Tag the alloca of a SYCL kernel's local closure object with
+  /// `cir.sycl_kernel_object`.
+  void markSYCLKernelObject(const clang::VarDecl *kernelObj);
+
   /// Determine whether the given initializer is trivial in the sense
   /// that it requires no code to be generated.
   bool isTrivialInitializer(const Expr *init);
