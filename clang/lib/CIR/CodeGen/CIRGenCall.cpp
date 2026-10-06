@@ -681,6 +681,19 @@ void CIRGenModule::constructFunctionReturnAttributes(
   }
 }
 
+/// Whether a SYCL kernel parameter carries the "sycl-unaliased" compile-time
+/// property through add_ir_attributes_kernel_parameter.
+static bool hasSYCLRestrictPropertyIRAttr(const ParmVarDecl *pvd,
+                                          const ASTContext &context) {
+  const auto *irAttr = pvd->getAttr<SYCLAddIRAttributesKernelParameterAttr>();
+  if (!irAttr)
+    return false;
+  return llvm::any_of(irAttr->getAttributeNameValuePairs(context),
+                      [](const std::pair<std::string, std::string> &pair) {
+                        return pair.first == "sycl-unaliased";
+                      });
+}
+
 void CIRGenModule::constructFunctionArgumentAttributes(
     const CIRGenFunctionInfo &info, const Decl *targetDecl, bool isThunk,
     bool attrOnCallSite, llvm::MutableArrayRef<mlir::NamedAttrList> argAttrs) {
@@ -809,6 +822,23 @@ void CIRGenModule::constructFunctionArgumentAttributes(
         pvd->getType().isRestrictQualified() && !fd->getBuiltinID())
       argAttrList.set(mlir::LLVM::LLVMDialect::getNoAliasAttrName(),
                       mlir::UnitAttr::get(&getMLIRContext()));
+
+    // SYCL kernel parameters synthesized by SemaSYCL, on definitions only.
+    // Mirrors EmitFunctionProlog in classic codegen: accessor pointers of
+    // read-only accessors are readonly, and pointer parameters are noalias
+    // under [[intel::kernel_args_restrict]], under the sycl-unaliased
+    // compile-time property, or with __restrict__ on the parameter.
+    if (!attrOnCallSite && pvd && getLangOpts().SYCLIsDevice) {
+      if (pvd->hasAttr<SYCLAccessorReadonlyAttr>())
+        argAttrList.set(mlir::LLVM::LLVMDialect::getReadonlyAttrName(),
+                        mlir::UnitAttr::get(&getMLIRContext()));
+      if (pvd->getType()->isPointerType() &&
+          (fd->hasAttr<SYCLIntelKernelArgsRestrictAttr>() ||
+           hasSYCLRestrictPropertyIRAttr(pvd, getASTContext()) ||
+           pvd->hasAttr<RestrictAttr>()))
+        argAttrList.set(mlir::LLVM::LLVMDialect::getNoAliasAttrName(),
+                        mlir::UnitAttr::get(&getMLIRContext()));
+    }
 
     // __attribute__((nonnull)) on pointer parameters.  Checks both
     // per-parameter and function-level nonnull attributes.

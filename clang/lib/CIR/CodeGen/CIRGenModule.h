@@ -686,6 +686,11 @@ public:
   void emitOpenCLKernelArgMetadata(cir::FuncOp func,
                                    const clang::FunctionDecl *fd);
 
+  /// Record which SYCL kernel parameters are accessor base pointers, for the
+  /// kernel_arg_runtime_aligned/kernel_arg_exclusive_ptr metadata.
+  void emitSYCLKernelArgAccessorMetadata(cir::FuncOp func,
+                                         const clang::FunctionDecl *fd);
+
   void emitGlobalDefinition(clang::GlobalDecl gd,
                             mlir::Operation *op = nullptr);
   void emitGlobalFunctionDefinition(clang::GlobalDecl gd, mlir::Operation *op);

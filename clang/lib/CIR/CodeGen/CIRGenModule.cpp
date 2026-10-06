@@ -3610,6 +3610,25 @@ void CIRGenModule::emitOpenCLKernelArgMetadata(cir::FuncOp func,
                 metadata);
 }
 
+void CIRGenModule::emitSYCLKernelArgAccessorMetadata(
+    cir::FuncOp func, const clang::FunctionDecl *fd) {
+  // One entry per kernel parameter, true for the base pointer of an accessor.
+  // Classic codegen emits this as kernel_arg_accessor_ptr for ESIMD kernels,
+  // and otherwise as kernel_arg_runtime_aligned and kernel_arg_exclusive_ptr
+  // only when at least one parameter is an accessor pointer.
+  SmallVector<bool> accessorPtrs;
+  for (const ParmVarDecl *param : fd->parameters())
+    accessorPtrs.push_back(param->hasAttr<SYCLAccessorPtrAttr>());
+
+  bool isSimd = fd->hasAttr<SYCLSimdAttr>();
+  if (!isSimd && !llvm::is_contained(accessorPtrs, true))
+    return;
+  func->setAttr(isSimd
+                    ? cir::CIRDialect::getSYCLSimdKernelArgAccessorPtrAttrName()
+                    : cir::CIRDialect::getSYCLKernelArgAccessorPtrAttrName(),
+                mlir::DenseBoolArrayAttr::get(&getMLIRContext(), accessorPtrs));
+}
+
 cir::FuncOp CIRGenModule::getOrCreateCIRFunction(
     StringRef mangledName, mlir::Type funcType, GlobalDecl gd, bool forVTable,
     bool dontDefer, bool isThunk, ForDefinition_t isForDefinition,

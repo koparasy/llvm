@@ -199,6 +199,33 @@ private:
       return amendReqdWorkGroupSize(func, llvmFunc, attribute,
                                     moduleTranslation);
 
+    // Per-parameter SYCL accessor base pointer flags, emitted as the boolean
+    // kernel argument metadata classic clang attaches in
+    // CodeGenModule::GenKernelArgMetadata.
+    if (attrName == cir::CIRDialect::getSYCLKernelArgAccessorPtrAttrName() ||
+        attrName ==
+            cir::CIRDialect::getSYCLSimdKernelArgAccessorPtrAttrName()) {
+      auto flags =
+          mlir::dyn_cast<mlir::DenseBoolArrayAttr>(attribute.getValue());
+      if (!flags)
+        return func.emitError()
+               << "expected " << attrName << " to be a boolean array";
+      llvm::LLVMContext &llvmContext = moduleTranslation.getLLVMContext();
+      llvm::SmallVector<llvm::Metadata *> md;
+      for (bool flag : flags.asArrayRef())
+        md.push_back(llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::getBool(llvmContext, flag)));
+      llvm::MDNode *node = llvm::MDNode::get(llvmContext, md);
+      if (attrName ==
+          cir::CIRDialect::getSYCLSimdKernelArgAccessorPtrAttrName()) {
+        llvmFunc->setMetadata("kernel_arg_accessor_ptr", node);
+      } else {
+        llvmFunc->setMetadata("kernel_arg_runtime_aligned", node);
+        llvmFunc->setMetadata("kernel_arg_exclusive_ptr", node);
+      }
+      return mlir::success();
+    }
+
     // Strip the "cir." prefix to get the LLVM attribute name.
     llvm::StringRef llvmAttrName = attrName.substr(strlen("cir."));
     if (auto strAttr = mlir::dyn_cast<mlir::StringAttr>(attribute.getValue()))

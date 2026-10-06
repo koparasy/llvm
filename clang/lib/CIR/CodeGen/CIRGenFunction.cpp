@@ -830,6 +830,8 @@ cir::FuncOp CIRGenFunction::generateCode(clang::GlobalDecl gd, cir::FuncOp fn,
 
   if (getLangOpts().OpenCL && funcDecl->hasAttr<DeviceKernelAttr>())
     cgm.emitOpenCLKernelArgMetadata(fn, funcDecl);
+  if (getLangOpts().SYCLIsDevice && funcDecl->hasAttr<DeviceKernelAttr>())
+    cgm.emitSYCLKernelArgAccessorMetadata(fn, funcDecl);
 
   eraseEmptyAndUnusedBlocks(fn);
   return fn;
