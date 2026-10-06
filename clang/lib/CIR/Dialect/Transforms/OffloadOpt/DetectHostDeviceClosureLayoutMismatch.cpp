@@ -25,8 +25,10 @@
 //   - recovers the HOST closure record from a launch site's HostKernelRef
 //     closure operand (the HostKernelRef wraps a pointer to the user closure);
 //   - recovers the DEVICE closure record from each device spir_kernel's
-//     prologue (the record the kernel reconstructs via cir.get_member stores);
-//   - compares the two records' ordered field lists.
+//     closure object, the alloca CIRGen tags `cir.sycl_kernel_object`;
+//   - compares the two records' ordered field lists. A field holding a SYCL
+//     special type (accessor, stream, ...) is reported as not checked: its
+//     host and device representations differ by design.
 // Records are matched by BINDING, never by type-name equality: the host and
 // device closures carry different aliases (`anon.0` vs `__cir_lowered.anon.0`).
 // Any divergence -- a differing field count, or a field whose type differs
@@ -40,8 +42,7 @@
 //
 // Analysis + warning ONLY: the pass never mutates the module. It runs at the
 // head of the cir-offload-merge combine pipeline, BEFORE the mem2reg/sccp that
-// would promote the device closure alloca away (the alloca + get_member stores
-// are how the device closure record is recovered), so the check sees the
+// would promote the device closure alloca away, so the check sees the
 // as-emitted closures.
 //
 //===----------------------------------------------------------------------===//
@@ -52,9 +53,11 @@
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
 #include "clang/CIR/Dialect/Passes.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_OFFLOADDETECTHOSTDEVICECLOSURELAYOUTMISMATCH
@@ -168,9 +171,13 @@ static bool isHostKernelCtor(cir::FuncOp fn) {
 // closure record as its second argument. Match that wrapper to `deviceKernel`
 // by the lambda source location (the device kernel and its arguments carry the
 // same loc), then read the closure record off the constructor's second param.
+// The location also appears in wrappers around the lambda, e.g.
+// HostKernel<RoundedRangeKernel<(lambda at ...)>>, so prefer the wrapper whose
+// closure record is named like the device one, else the innermost wrapper.
 static cir::RecordType
 hostClosureRecordFromHostKernel(mlir::ModuleOp hostModule,
-                                cir::FuncOp deviceKernel) {
+                                cir::FuncOp deviceKernel,
+                                cir::RecordType deviceRec) {
   // Source locations of the device kernel's lambda (its own loc and each
   // argument's), any of which the host wrapper name should embed.
   llvm::SmallVector<std::string, 4> needles;
@@ -182,9 +189,16 @@ hostClosureRecordFromHostKernel(mlir::ModuleOp hostModule,
   if (needles.empty())
     return {};
 
+  llvm::StringRef deviceName;
+  if (deviceRec && deviceRec.getName())
+    deviceName = deviceRec.getName().getValue();
+  deviceName.consume_front("__cir_lowered.");
+
   cir::RecordType found;
+  size_t foundWrapperLen = 0;
+  bool exact = false;
   hostModule.walk([&](cir::FuncOp fn) {
-    if (found || !isHostKernelCtor(fn))
+    if (exact || !isHostKernelCtor(fn))
       return;
     llvm::ArrayRef<mlir::Type> inputs = fn.getFunctionType().getInputs();
     if (inputs.size() < 2)
@@ -204,39 +218,49 @@ hostClosureRecordFromHostKernel(mlir::ModuleOp hostModule,
     auto closurePtr = mlir::dyn_cast<cir::PointerType>(inputs[1]);
     if (!closurePtr)
       return;
-    if (auto rec = mlir::dyn_cast<cir::RecordType>(closurePtr.getPointee()))
+    auto rec = mlir::dyn_cast<cir::RecordType>(closurePtr.getPointee());
+    if (!rec)
+      return;
+    if (rec.getName() && !deviceName.empty() &&
+        rec.getName().getValue() == deviceName) {
       found = rec;
+      exact = true;
+      return;
+    }
+    if (!found || wrapperName.size() < foundWrapperLen) {
+      found = rec;
+      foundWrapperLen = wrapperName.size();
+    }
   });
   return found;
 }
 
-// The DEVICE closure record a spir_kernel reconstructs in its prologue: the
-// sole named record `cir.alloca` whose address feeds a `cir.get_member` (the
-// per-field store the decomposed kernel arguments populate). A scalar spill
-// slot (`C.addr`) is not a record, so it is skipped.
+// The DEVICE closure record of a spir_kernel: the type of the closure object
+// CIRGen tags with `cir.sycl_kernel_object`.
 static cir::RecordType deviceClosureRecord(cir::FuncOp kernel) {
-  cir::RecordType found;
-  kernel.walk([&](cir::AllocaOp alloca) {
-    if (found)
-      return;
-    auto rec = mlir::dyn_cast<cir::RecordType>(alloca.getAllocaType());
-    if (!rec || !rec.getName())
-      return;
-    for (mlir::Operation *user : alloca.getResult().getUsers()) {
-      if (mlir::isa<cir::GetMemberOp>(user)) {
-        found = rec;
-        return;
-      }
-      // A closure `this` is address-space cast before member access.
-      if (auto cast = mlir::dyn_cast<cir::CastOp>(user))
-        for (mlir::Operation *cu : cast.getResult().getUsers())
-          if (mlir::isa<cir::GetMemberOp>(cu)) {
-            found = rec;
-            return;
-          }
-    }
-  });
-  return found;
+  mlir::Value obj = cir::getSYCLKernelObject(kernel);
+  if (!obj)
+    return {};
+  auto alloca = obj.getDefiningOp<cir::AllocaOp>();
+  return alloca ? mlir::dyn_cast<cir::RecordType>(alloca.getAllocaType())
+                : cir::RecordType();
+}
+
+// Closure fields holding (or containing) a SYCL special type such as an
+// accessor or stream, read off the kernel parameters CIRGen decomposed them
+// into. Their host and device representations differ by design (a host
+// accessor holds its runtime implementation, the device one its pointer and
+// ranges), so a type comparison would flag every accessor kernel.
+static llvm::StringSet<> specialTypeFields(cir::FuncOp kernel) {
+  llvm::StringSet<> fields;
+  for (unsigned i = 0, e = kernel.getNumArguments(); i != e; ++i) {
+    std::optional<cir::SYCLKernelParam> param =
+        cir::getSYCLKernelParam(kernel, i);
+    if (param && param->kind != "pointer" && param->kind != "scalar" &&
+        param->kind != "std_layout")
+      fields.insert(param->field);
+  }
+  return fields;
 }
 
 struct OffloadDetectHostDeviceClosureLayoutMismatchPass
@@ -279,17 +303,17 @@ void OffloadDetectHostDeviceClosureLayoutMismatchPass::runOnOperation() {
       // path reports "closure none"), fall back to the host-side
       // HostKernel<lambda at ...> wrapper, matched to this kernel by lambda
       // source location.
-      cir::RecordType hostRec = hostRecFromLaunch;
-      if (!hostRec)
-        hostRec = hostClosureRecordFromHostKernel(
-            cir::getOffloadContainerHostModule(container), kernel);
-      if (!hostRec)
-        continue;
-      llvm::ArrayRef<mlir::Type> hostFields = hostRec.getMembers();
-
       cir::RecordType devRec = deviceClosureRecord(kernel);
       if (!devRec)
         continue;
+
+      cir::RecordType hostRec = hostRecFromLaunch;
+      if (!hostRec)
+        hostRec = hostClosureRecordFromHostKernel(
+            cir::getOffloadContainerHostModule(container), kernel, devRec);
+      if (!hostRec)
+        continue;
+      llvm::ArrayRef<mlir::Type> hostFields = hostRec.getMembers();
       llvm::ArrayRef<mlir::Type> devFields = devRec.getMembers();
 
       // Per-field get_member ops of the device closure: their names label the
@@ -324,10 +348,22 @@ void OffloadDetectHostDeviceClosureLayoutMismatchPass::runOnOperation() {
                "behavior";
       }
 
+      // TODO: compare a host special-type field against the device parameters
+      // it was decomposed into instead of skipping it.
+      llvm::StringSet<> special = specialTypeFields(kernel);
       size_t n = std::min(hostFields.size(), devFields.size());
       for (size_t i = 0; i < n; ++i) {
         if (sameIgnoringAddrSpace(hostFields[i], devFields[i]))
           continue;
+        auto it = fieldOps.find(i);
+        if (it != fieldOps.end() && special.contains(it->second.getName())) {
+          mlir::emitRemark(locOf(i))
+              << "SYCL kernel captured field " << nameOf(i)
+              << " not checked for a host/device layout difference: it holds "
+                 "a SYCL special type whose host and device representations "
+                 "differ";
+          continue;
+        }
         mlir::emitWarning(locOf(i))
             << "SYCL kernel captured-closure layout differs between host and "
                "device (captured field "

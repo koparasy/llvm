@@ -49,8 +49,8 @@ module {
 !s32i = !cir.int<s, 32>
 !rec_dlam = !cir.struct<"dlam" {data !cir.ptr<!s32i>, data !s32i}>
 module {
-  cir.func @_ZTSZ4mainEUlvE_(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i) cc(spir_kernel) {
-    %clos = cir.alloca "dlam" align(8) : !cir.ptr<!rec_dlam>
+  cir.func @_ZTSZ4mainEUlvE_(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i {cir.sycl_kernel_param = {field = "b", kind = "scalar", path = ["b"]}}) cc(spir_kernel) {
+    %clos = cir.alloca "dlam" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
     %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
     cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
     cir.return
