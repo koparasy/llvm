@@ -47,6 +47,9 @@ class raw_ostream;
 
 namespace cir::pointsto {
 
+class FunctionGraph;
+class PointsToModelRegistry;
+
 /// Whether values of \p type are pointers to the analysis (!cir.ptr and
 /// !cir.vptr).
 bool isPointerValueType(mlir::Type type);
@@ -109,12 +112,56 @@ struct MemTransferRecord {
 void closeMemTransfers(Graph &graph,
                        llvm::ArrayRef<MemTransferRecord> transfers);
 
-/// A call recorded by the local phase. The local phase gives calls no
-/// semantics: it only remembers the cells involved, for the library models
-/// (T06) and the interprocedural phases (T08/T10) to act on.
+/// Record a memory-to-memory copy of \p length bytes (std::nullopt: unknown)
+/// from \p src to \p dst made by \p op: Ref on src, Mod on dst, the sizes
+/// grown by a constant length, and a MemTransferRecord for the closure. A
+/// constant length of zero or less copies nothing. Used by cir.libc.memcpy,
+/// cir.libc.memmove and the memcpy-family library models.
+void recordMemTransfer(FunctionGraph &fg, mlir::Operation *op, Cell dst,
+                       Cell src, std::optional<int64_t> length);
+
+/// How the local phase treated a call.
+enum class CallKind : uint8_t {
+  /// A direct call to a function with a body: recorded only, the
+  /// interprocedural phase (T08) connects it.
+  Defined,
+  /// A library model gave the call its effect (CallSiteRecord::modelled).
+  Modelled,
+  /// A direct call to a declaration without a model (or to a missing
+  /// symbol): the unknown-call rule.
+  UnknownDecl,
+  /// An indirect call whose callee pointer points only to functions known by
+  /// symbol: the targets that are declarations give their effect (model or
+  /// unknown-call rule) now; the interprocedural phase connects the defined
+  /// ones.
+  IndirectResolved,
+  /// An indirect call whose targets are not known: the unknown-call rule.
+  IndirectUnknown,
+};
+
+llvm::StringRef getCallKindName(CallKind kind);
+
+/// A call recorded by the local phase, with the cells involved. Calls to
+/// declarations get their effect here, from a library model or from the
+/// unknown-call rule; calls to defined functions are only recorded, for the
+/// interprocedural phases (T08/T10) to act on.
 struct CallSiteRecord {
-  /// The cir.call or cir.try_call.
+  /// The cir.call or cir.try_call; for a synthetic site, the op that implies
+  /// the call (cir.delete_array).
   mlir::Operation *call = nullptr;
+  /// The callee of a direct call or of a synthetic site.
+  mlir::FlatSymbolRefAttr callee;
+  /// Set for a call the IR does not spell as a call op: the element
+  /// destructor and the operator delete of a cir.delete_array. `args` then
+  /// holds the cells passed (the first is `this` or the freed pointer).
+  bool synthetic = false;
+  CallKind kind = CallKind::Defined;
+  /// The name of the model that gave the call its effect, or empty.
+  llvm::StringRef modelled;
+  /// Set by the unknown-call rule: the callee may read or write any
+  /// non-constant global with non-internal linkage. The globals graph (T08)
+  /// applies this; the local phase only records it.
+  bool clobbersGlobals = false;
   /// The cell of the callee pointer of an indirect call; std::nullopt for a
   /// direct call (or an indirect call through a null pointer).
   std::optional<Cell> calleePtr;
@@ -128,6 +175,22 @@ struct CallSiteRecord {
   llvm::SmallVector<std::pair<unsigned, AggregateSlots>, 0> aggregateArgs;
   /// Fresh slot nodes for an aggregate result that holds pointers.
   std::optional<AggregateSlots> resultSlots;
+};
+
+/// An effect on what a pointer reaches that the local phase applies after
+/// the walk (and after closeMemTransfers), once every link of the function
+/// is known: flow-insensitively, what is stored into a node after a call is
+/// also visible to the callee.
+struct DeferredEffect {
+  enum class Kind : uint8_t {
+    /// Set `flags` on the node of `cell` and on every node reachable from it
+    /// (Graph::markReachable).
+    Reachable,
+  };
+  Kind kind;
+  Cell cell;
+  NodeFlags flags;
+  const Reason *why;
 };
 
 /// The points-to graph of one function: the memory graph and the roots that
@@ -164,10 +227,13 @@ public:
   /// \code
   ///   formal #<i> -> <cell>
   ///   return -> <cell>
-  ///   call <op> [callee=<cell>] args={<i>: <cell>, ...} result=<cell>
+  ///   call <op> [@<callee>] [synthetic] [callee=<cell>]
+  ///       args={<i>: <cell>, ...} result=<cell>
   ///       [slots={<i>: <slots>, ...}] [result.slots=<slots>]
+  ///       kind=<CallKind>[ model=<name>][ clobbers-globals]
   /// \endcode
-  /// Only pointer formals and arguments are listed; a missing cell prints as
+  /// (the call on one line). Only pointer formals and arguments are listed
+  /// (every argument of a synthetic site); a missing cell prints as
   /// `null`. Aggregate formals and returns print `formal #<i> -> <slots>` and
   /// `return -> <slots>`, where <slots> is `{<offset>: <cell>, ...}`.
   void print(llvm::raw_ostream &os) const;
@@ -219,9 +285,13 @@ private:
 class LocalBuilder {
 public:
   /// \p symbols, if given, caches symbol lookups across builders.
+  /// \p models, if given, gives calls to the functions it models their
+  /// effect; a call to a declaration it does not model (or any declaration,
+  /// without a registry) gets the unknown-call rule.
   explicit LocalBuilder(cir::FuncOp func,
                         mlir::SymbolTableCollection *symbols = nullptr,
-                        ReasonTable *reasons = nullptr);
+                        ReasonTable *reasons = nullptr,
+                        const PointsToModelRegistry *models = nullptr);
   ~LocalBuilder();
 
   /// Walk the body and return the finished graph. Call once. Under
@@ -305,6 +375,27 @@ private:
   void visitMemTransfer(mlir::Operation *op, mlir::Value dst, mlir::Value src,
                         mlir::Value length);
   void visitMemChr(cir::MemChrOp op);
+  void visitStdFind(cir::StdFindOp op);
+  /// cir.array.ctor / cir.array.dtor: the element pointer of each region is
+  /// the array's cell, on a node made an array of the element size.
+  void visitArrayInit(mlir::Operation *op, mlir::Value addr,
+                      mlir::Value numElements);
+  void visitDeleteArray(cir::DeleteArrayOp op);
+  /// Give the call site \p index of fg->callSites its effect: a model, the
+  /// unknown-call rule, or nothing (a defined callee). \p call is null for a
+  /// synthetic site.
+  void dispatchCall(size_t index, cir::CIRCallOpInterface call);
+  /// The unknown-call rule: every node reachable from a pointer argument
+  /// becomes External (with Mod and Ref), the result points to an unknown
+  /// object, and the site clobbers the globals.
+  void applyUnknownCall(CallSiteRecord &site, const Reason *why);
+  /// Decide the indirect calls once the walk is over: resolved if the callee
+  /// pointer points only to functions, the unknown-call rule otherwise.
+  void resolveIndirectCalls();
+  /// Give a resolved indirect call the effect of each target that is a
+  /// declaration (its model, or the unknown-call rule).
+  void applyResolvedTargets(CallSiteRecord &site);
+  void applyDeferredEffects();
   /// Collapse the nodes of \p dst and \p src and unify their single links:
   /// a copy whose extent or layout is unknown.
   void copyFieldInsensitive(Cell dst, Cell src, mlir::Operation *op,
@@ -342,6 +433,12 @@ private:
   llvm::StringMap<unsigned> pessimisticOps;
   llvm::StringMap<unsigned> unhandledOps;
   llvm::StringMap<unsigned> unclassifiedOps;
+  const PointsToModelRegistry *models;
+  /// Effects on reachable nodes, applied after the walk.
+  llvm::SmallVector<DeferredEffect, 0> deferredEffects;
+  /// The indices in fg->callSites of the indirect calls, decided after the
+  /// walk.
+  llvm::SmallVector<size_t, 0> indirectCalls;
   bool verifyErrors = false;
 };
 

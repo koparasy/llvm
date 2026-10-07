@@ -1,0 +1,117 @@
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// A declaration (or call) carrying #cir.memory_effects gets a summary from
+// it instead of the unknown-call rule. The promise limits memory accesses,
+// not what a pointer result may be, so with a pointer result:
+//  - none: the argument objects may be returned, so they become External
+//    (but not what they point to: nothing is read);
+//  - readOnly: Ref on everything reachable from the arguments, and External
+//    too, since the result may be any pointer read from there;
+//  - argMemOnly (writes): the callee may store one argument's object into
+//    another's memory, so everything reachable becomes External, Mod and
+//    Ref; only the globals are spared (no clobbers-globals);
+//  - other memory written: the unknown-call rule.
+// Without a pointer result, none and readOnly leave the objects alone apart
+// from Ref.
+// The callee's and the call's attributes are combined class by class.
+
+!s32i = !cir.int<s, 32>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @pure(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i> attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+cir.func private @reader(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i> attributes {memory_effects = #cir.memory_effects<other = read, arg_mem = read, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+cir.func private @argwriter(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i> attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = readwrite, inaccessible_mem = readwrite, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+cir.func private @writer(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i> attributes {memory_effects = #cir.memory_effects<other = write, arg_mem = readwrite, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+cir.func private @plain(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+cir.func private @pure_int(!cir.ptr<!cir.ptr<!s32i>>) -> !s32i attributes {memory_effects = #cir.memory_effects<other = none, arg_mem = none, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+cir.func private @reader_int(!cir.ptr<!cir.ptr<!s32i>>) -> !s32i attributes {memory_effects = #cir.memory_effects<other = read, arg_mem = read, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>}
+
+// none: a may be returned, b (only reachable through memory) may not.
+
+// CHECK-LABEL: === @none
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[A:n[0-9]+]] [Stack|External|Mod] size=8 origins={stack(cir.alloca 'a' {{.*}})} links={0->[[B]]+0} reasons={External: EscapedTo(cir.call {{.*}}, "may be returned by a memory_effects(none) call")}
+// CHECK-DAG: [[R:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={}
+// CHECK-DAG: call cir.call @pure args={0: [[A]]+0} result=[[R]]+0 kind=modelled model=memory-effects{{$}}
+cir.func @none() {
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %a = cir.alloca "a" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %a : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.call @pure(%a) : (!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// readOnly: a and b (reachable) get Ref and, as possible results, External.
+
+// CHECK-LABEL: === @read_only
+// CHECK-DAG: [[B:n[0-9]+]] [Stack|External|Ref] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[A:n[0-9]+]] [Stack|External|Mod|Ref] size=8 origins={stack(cir.alloca 'a' {{.*}})} links={0->[[B]]+0}
+// CHECK-DAG: [[R:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: EscapedTo(cir.call {{.*}}, "may be returned by a read-only call")
+// CHECK-DAG: call cir.call @reader args={0: [[A]]+0} result=[[R]]+0 kind=modelled model=memory-effects{{$}}
+cir.func @read_only() {
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %a = cir.alloca "a" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %a : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.call @reader(%a) : (!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// argMemOnly: everything a reaches is External, Mod and Ref; nothing
+// collapses, and the globals are not clobbered.
+
+// CHECK-LABEL: === @arg_mem_only
+// CHECK-DAG: [[B:n[0-9]+]] [Stack|External|Mod|Ref] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={} reasons={External: EscapedTo(cir.call {{.*}}, "reachable from an escaped pointer") <- EscapedTo(cir.call {{.*}}, "written by an argmem-only callee")
+// CHECK-DAG: [[A:n[0-9]+]] [Stack|External|Mod|Ref] size=8 origins={stack(cir.alloca 'a' {{.*}})} links={0->[[B]]+0}
+// CHECK-DAG: [[R:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={}
+// CHECK-DAG: call cir.call @argwriter args={0: [[A]]+0} result=[[R]]+0 kind=modelled model=memory-effects{{$}}
+// CHECK-NOT: Collapsed
+cir.func @arg_mem_only() {
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %a = cir.alloca "a" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %a : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.call @argwriter(%a) : (!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// other = write: no usable promise, the unknown-call rule.
+
+// CHECK-LABEL: === @writes_other
+// CHECK-DAG: [[A:n[0-9]+]] [Stack|External|Mod|Ref] size=8 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: call cir.call @writer args={0: [[A]]+0} result={{n[0-9]+}}+0 kind=unknown-decl clobbers-globals
+cir.func @writes_other() {
+  %a = cir.alloca "a" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.call @writer(%a) : (!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// Without a pointer result nothing can be handed back: none leaves the
+// arguments untouched and readOnly only adds Ref.
+
+// CHECK-LABEL: === @int_result
+// CHECK-DAG: [[B:n[0-9]+]] [Stack|Ref] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[A:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'a' {{.*}})} links={0->[[B]]+0}
+// CHECK-NOT: External
+cir.func @int_result() {
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %a = cir.alloca "a" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %a : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %x = cir.call @pure_int(%a) : (!cir.ptr<!cir.ptr<!s32i>>) -> !s32i
+  %y = cir.call @reader_int(%a) : (!cir.ptr<!cir.ptr<!s32i>>) -> !s32i
+  cir.return
+}
+
+// The attribute on the call alone is enough; on both, they are met class by
+// class: @writer's other = write meets the call's other = read to read, so
+// the call is read-only.
+
+// CHECK-LABEL: === @call_site_attr
+// CHECK-DAG: [[A:n[0-9]+]] [Stack|External|Ref] size=8 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: call cir.call @plain args={0: [[A]]+0} result={{n[0-9]+}}+0 kind=modelled model=memory-effects{{$}}
+// CHECK-DAG: call cir.call @writer args={0: [[A]]+0} result={{n[0-9]+}}+0 kind=modelled model=memory-effects{{$}}
+cir.func @call_site_attr() {
+  %a = cir.alloca "a" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.call @plain(%a) {memory_effects = #cir.memory_effects<other = read, arg_mem = read, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>} : (!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  %r2 = cir.call @writer(%a) {memory_effects = #cir.memory_effects<other = read, arg_mem = read, inaccessible_mem = none, errno_mem = none, target_mem0 = none, target_mem1 = none>} : (!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  cir.return
+}
+}

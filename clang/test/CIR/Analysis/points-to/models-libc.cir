@@ -1,0 +1,171 @@
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Calls to the C string and memory functions, the printf family and the C++
+// ABI runtime get their effect from the generic models instead of the
+// unknown-call rule.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_S = !cir.struct<"S" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @memcpy(!cir.ptr<!void>, !cir.ptr<!void>, !u64i) -> !cir.ptr<!void>
+cir.func private @memset(!cir.ptr<!void>, !s32i, !u64i) -> !cir.ptr<!void>
+cir.func private @strcpy(!cir.ptr<!s8i>, !cir.ptr<!s8i>) -> !cir.ptr<!s8i>
+cir.func private @strlen(!cir.ptr<!s8i>) -> !u64i
+cir.func private @strchr(!cir.ptr<!s8i>, !s32i) -> !cir.ptr<!s8i>
+cir.func private @printf(!cir.ptr<!s8i>, ...) -> !s32i
+cir.func private @puts(!cir.ptr<!s8i>) -> !s32i
+cir.func private @__cxa_atexit(!cir.ptr<!cir.func<(!cir.ptr<!void>)>>, !cir.ptr<!void>, !cir.ptr<!void>) -> !s32i
+cir.func private @__cxa_guard_acquire(!cir.ptr<!u64i>) -> !s32i
+cir.func private @_ZSt20__throw_length_errorPKc(!cir.ptr<!s8i>)
+cir.func private @abort()
+cir.func private @dtor(!cir.ptr<!void>)
+cir.func private @_ZSt4findIPiiET_S1_S1_RKT0_(!cir.ptr<!s32i>, !cir.ptr<!s32i>, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+cir.global "private" internal @dso = #cir.int<0> : !s8i
+
+// memcpy by call: like cir.libc.memcpy, both slots of the struct are copied
+// (a byte-range record closed after the walk), and the result is `dst`.
+
+// CHECK-LABEL: === @memcpy_call
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0, 8->[[B]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=16 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0, 8->[[B]]+0}
+// CHECK-DAG: call cir.call @memcpy args={0: [[DST]]+0, 1: [[SRC]]+0} result=[[DST]]+0 kind=modelled model=memcpy
+// CHECK-DAG: ret -> [[DST]]+0
+cir.func @memcpy_call() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_S>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
+  %f0 = cir.get_member %src[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %s = cir.cast bitcast %src : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %d = cir.cast bitcast %dst : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %len = cir.const #cir.int<16> : !u64i
+  %r = cir.call @memcpy(%d, %s, %len) {test.ptr = "ret"} : (!cir.ptr<!void>, !cir.ptr<!void>, !u64i) -> !cir.ptr<!void>
+  %f1 = cir.get_member %src[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %f1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+// memset: Mod, sized; strcpy: an unknown-length copy; strlen: Ref.
+
+// CHECK-LABEL: === @string_ops
+// CHECK-DAG: [[BUF:n[0-9]+]] [Stack|Mod] size=32 origins={stack(cir.alloca 'buf' {{.*}})} links={}
+// CHECK-DAG: [[STR:n[0-9]+]] [Stack|Ref] size=8 origins={stack(cir.alloca 'str' {{.*}})} links={}
+// CHECK-DAG: call cir.call @memset args={0: [[BUF]]+0} result=[[BUF]]+0 kind=modelled model=memset
+// CHECK-DAG: call cir.call @strcpy args={0: [[BUF]]+0, 1: [[STR]]+0} result=[[BUF]]+0 kind=modelled model=strcpy
+// CHECK-DAG: call cir.call @strlen args={0: [[STR]]+0} result=null kind=modelled model=string-read
+cir.func @string_ops() {
+  %buf = cir.alloca "buf" align(1) : !cir.ptr<!cir.array<!s8i x 32>>
+  %str = cir.alloca "str" align(1) : !cir.ptr<!cir.array<!s8i x 8>>
+  %bp = cir.cast array_to_ptrdecay %buf : !cir.ptr<!cir.array<!s8i x 32>> -> !cir.ptr<!s8i>
+  %sp = cir.cast array_to_ptrdecay %str : !cir.ptr<!cir.array<!s8i x 8>> -> !cir.ptr<!s8i>
+  %bv = cir.cast bitcast %bp : !cir.ptr<!s8i> -> !cir.ptr<!void>
+  %zero = cir.const #cir.int<0> : !s32i
+  %c32 = cir.const #cir.int<32> : !u64i
+  %m = cir.call @memset(%bv, %zero, %c32) : (!cir.ptr<!void>, !s32i, !u64i) -> !cir.ptr<!void>
+  %c = cir.call @strcpy(%bp, %sp) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>) -> !cir.ptr<!s8i>
+  %l = cir.call @strlen(%sp) : (!cir.ptr<!s8i>) -> !u64i
+  cir.return
+}
+
+// strchr returns a pointer into its first argument, at an unknown offset:
+// the argument's node collapses and the result is its cell.
+
+// CHECK-LABEL: === @search
+// CHECK-DAG: [[STR:n[0-9]+]] [Stack|Collapsed|Ref] size=8 origins={stack(cir.alloca 'str' {{.*}})} links={} reasons={Collapsed: CollapsedAt(cir.call {{.*}}, "pointer into the searched range")}
+// CHECK-DAG: call cir.call @strchr args={0: [[STR]]+0} result=[[STR]]+0 kind=modelled model=string-search
+// CHECK-DAG: found -> [[STR]]+0
+cir.func @search() {
+  %str = cir.alloca "str" align(1) : !cir.ptr<!cir.array<!s8i x 8>>
+  %sp = cir.cast array_to_ptrdecay %str : !cir.ptr<!cir.array<!s8i x 8>> -> !cir.ptr<!s8i>
+  %ch = cir.const #cir.int<47> : !s32i
+  %r = cir.call @strchr(%sp, %ch) {test.ptr = "found"} : (!cir.ptr<!s8i>, !s32i) -> !cir.ptr<!s8i>
+  cir.return
+}
+
+// printf: Mod and Ref on everything reachable from its pointer arguments
+// (%s reads, %n writes), but nothing escapes and the globals are not
+// clobbered. puts: the same.
+
+// CHECK-LABEL: === @print
+// CHECK-DAG: [[X:n[0-9]+]] [Stack|Mod|Ref] size=4 origins={stack(cir.alloca 'x' {{.*}})} links={}
+// CHECK-DAG: [[P:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'p' {{.*}})} links={0->[[X]]+0}
+// CHECK-DAG: [[FMT:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'fmt' {{.*}})} links={}
+// CHECK-DAG: call cir.call @printf args={0: [[FMT]]+0, 1: [[P]]+0} result=null kind=modelled model=printf{{$}}
+// CHECK-DAG: call cir.call @puts args={0: [[FMT]]+0} result=null kind=modelled model=printf{{$}}
+// CHECK-NOT: External
+cir.func @print() {
+  %fmt = cir.alloca "fmt" align(1) : !cir.ptr<!cir.array<!s8i x 8>>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %p = cir.alloca "p" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %f = cir.cast array_to_ptrdecay %fmt : !cir.ptr<!cir.array<!s8i x 8>> -> !cir.ptr<!s8i>
+  %r = cir.call @printf(%f, %p) : (!cir.ptr<!s8i>, !cir.ptr<!cir.ptr<!s32i>>) -> !s32i
+  %r2 = cir.call @puts(%f) : (!cir.ptr<!s8i>) -> !s32i
+  cir.return
+}
+
+// __cxa_atexit keeps the function and the object to call at exit: both
+// escape (External), and so does what the object points to. The DSO handle
+// escapes too.
+
+// CHECK-LABEL: === @atexit
+// CHECK-DAG: [[DTOR:n[0-9]+]] [Function|External|Mod|Ref] size=0 origins={func(@dtor)} links={} reasons={External: EscapedTo(cir.call {{.*}}, "kept by cxa-atexit")
+// CHECK-DAG: [[Y:n[0-9]+]] [Stack|External|Mod|Ref] size=4 origins={stack(cir.alloca 'y' {{.*}})} links={} reasons={External: EscapedTo(cir.call {{.*}}, "reachable from an escaped pointer") <- EscapedTo(cir.call {{.*}}, "kept by cxa-atexit")
+// CHECK-DAG: [[OBJ:n[0-9]+]] [Stack|External|Mod|Ref] size=8 origins={stack(cir.alloca 'obj' {{.*}})} links={0->[[Y]]+0}
+// CHECK-DAG: call cir.call @__cxa_atexit args={0: [[DTOR]]+0, 1: [[OBJ]]+0, 2: {{n[0-9]+}}+0} result=null kind=modelled model=cxa-atexit{{$}}
+cir.func @atexit() {
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %obj = cir.alloca "obj" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %obj : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %fn = cir.get_global @dtor : !cir.ptr<!cir.func<(!cir.ptr<!void>)>>
+  %o = cir.cast bitcast %obj : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!void>
+  %h = cir.get_global @dso : !cir.ptr<!s8i>
+  %hv = cir.cast bitcast %h : !cir.ptr<!s8i> -> !cir.ptr<!void>
+  %r = cir.call @__cxa_atexit(%fn, %o, %hv) : (!cir.ptr<!cir.func<(!cir.ptr<!void>)>>, !cir.ptr<!void>, !cir.ptr<!void>) -> !s32i
+  cir.return
+}
+
+// No pointer effect: the static-init guard (Mod and Ref on the guard),
+// std::__throw_length_error (Ref on the message), abort.
+
+// CHECK-LABEL: === @no_effect
+// CHECK-DAG: [[G:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'guard' {{.*}})} links={}
+// CHECK-DAG: [[M:n[0-9]+]] [Stack|Ref] size=8 origins={stack(cir.alloca 'msg' {{.*}})} links={}
+// CHECK-DAG: call cir.call @__cxa_guard_acquire args={0: [[G]]+0} result=null kind=modelled model=cxa-guard{{$}}
+// CHECK-DAG: call cir.call @_ZSt20__throw_length_errorPKc args={0: [[M]]+0} result=null kind=modelled model=std-throw{{$}}
+// CHECK-DAG: call cir.call @abort args={} result=null kind=modelled model=terminate{{$}}
+cir.func @no_effect() {
+  %guard = cir.alloca "guard" align(8) : !cir.ptr<!u64i>
+  %msg = cir.alloca "msg" align(1) : !cir.ptr<!cir.array<!s8i x 8>>
+  %g = cir.call @__cxa_guard_acquire(%guard) : (!cir.ptr<!u64i>) -> !s32i
+  %mp = cir.cast array_to_ptrdecay %msg : !cir.ptr<!cir.array<!s8i x 8>> -> !cir.ptr<!s8i>
+  cir.call @_ZSt20__throw_length_errorPKc(%mp) : (!cir.ptr<!s8i>) -> ()
+  cir.call @abort() : () -> ()
+  cir.return
+}
+
+// cir.std.find: the result points into the range, at an unknown offset: the
+// node of `first`, collapsed, which `last` points into too. The value
+// searched for is read.
+
+// CHECK-LABEL: === @find
+// CHECK-DAG: [[ARR:n[0-9]+]] [Stack|Collapsed|Ref] size=16 origins={stack(cir.alloca 'arr' {{.*}})} links={} reasons={Collapsed: CollapsedAt(cir.std.find {{.*}}, "iterator into the searched range")}
+// CHECK-DAG: [[V:n[0-9]+]] [Stack|Ref] size=4 origins={stack(cir.alloca 'v' {{.*}})} links={}
+// CHECK-DAG: it -> [[ARR]]+0
+cir.func @find() {
+  %arr = cir.alloca "arr" align(4) : !cir.ptr<!cir.array<!s32i x 4>>
+  %v = cir.alloca "v" align(4) : !cir.ptr<!s32i>
+  %first = cir.cast array_to_ptrdecay %arr : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!s32i>
+  %c4 = cir.const #cir.int<4> : !s32i
+  %last = cir.ptr_stride %first, %c4 : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+  %it = cir.std.find(%first : !cir.ptr<!s32i>, %last : !cir.ptr<!s32i>, %v : !cir.ptr<!s32i>, @_ZSt4findIPiiET_S1_S1_RKT0_) -> !cir.ptr<!s32i> {test.ptr = "it"}
+  cir.return
+}
+}

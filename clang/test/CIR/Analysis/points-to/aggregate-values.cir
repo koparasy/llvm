@@ -15,7 +15,8 @@ cir.func private @take(!rec_S)
 
 // CHECK-LABEL: === @call_result
 // CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=24 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[T0:n[0-9]+]]+0, 16->[[T1:n[0-9]+]]+0}
-// CHECK-DAG: call cir.call @make args={} result=null result.slots={0: [[T0]]+0, 16: [[T1]]+0}
+// CHECK-DAG: call cir.call @make args={} result=null result.slots={0: [[T0]]+0, 16: [[T1]]+0} kind=unknown-decl clobbers-globals
+// CHECK-DAG: [[T0]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: EscapedTo(cir.call {{.*}}, "@make")
 // CHECK-DAG: v -> {0: [[T0]]+0, 16: [[T1]]+0}
 cir.func @call_result() {
   %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
@@ -26,10 +27,12 @@ cir.func @call_result() {
 }
 
 // insert_member replaces the member's slot; extract_member reads a slot.
-// The record starts as #cir.zero: null slots that link nothing.
+// The record starts as #cir.zero: null slots that link nothing. @take is a
+// declaration without a model, so `a`, which a slot of its aggregate argument
+// points to, escapes.
 
 // CHECK-LABEL: === @insert_extract
-// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[A:n[0-9]+]] [Stack|External|Mod|Ref] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
 // CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=24 origins={stack(cir.alloca 'dst' {{.*}})} links={16->[[A]]+0}
 // CHECK-DAG: zero -> {0: null, 16: null}
 // CHECK-DAG: ins -> {0: null, 16: [[A]]+0}

@@ -48,8 +48,26 @@
 //    cir.return (into the single return cell): unification, slot by slot
 //    for aggregates.
 //  - Atomics: a load of the old value plus a store of the new one.
-//  - Calls: recorded only. A pointer result gets a fresh node, an aggregate
-//    result fresh slot nodes.
+//  - Calls: recorded, with a fresh node for a pointer result and fresh slot
+//    nodes for an aggregate result. Then, for a direct call: a library model
+//    (PointsToModels.h) if the registry has one; nothing more for a callee
+//    with a body (the interprocedural phase connects it); the unknown-call
+//    rule for any other declaration. Indirect calls are decided after the
+//    walk: resolved (recorded only) if the callee pointer points only to
+//    functions, the unknown-call rule otherwise.
+//  - The unknown-call rule: every node reachable from a pointer argument
+//    (or a pointer slot of an aggregate argument) becomes External, with Mod
+//    and Ref and Reason{EscapedTo, @callee}; the result and the result slots
+//    point to UnknownObj nodes, External and Incomplete; the site is marked
+//    clobbersGlobals. Effects on reachable nodes are applied after the walk,
+//    so that links added after the call in walk order are covered too.
+//  - cir.array.ctor / cir.array.dtor: the array's node becomes an array of
+//    the element size and the element pointer of each region is its cell,
+//    so the constructor or destructor call in the region is recorded with
+//    `this` = the array. cir.delete_array: synthetic call sites for the
+//    element destructor and for operator delete, with the array's cell.
+//  - cir.std.find: the result points into the node of `first`, collapsed
+//    (the same for each pointer slot of an iterator record).
 //  - cir.get_global: one Global (or Function) node per symbol, its
 //    initializer linked (GlobalNodes).
 //  - cir.const: a null pointer has no cell; #cir.global_view and
@@ -73,6 +91,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "clang/CIR/Dialect/Analysis/CIRPointerDecomposition.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/OpClassification.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
@@ -122,6 +141,22 @@ static Cell shift(Cell cell, int64_t delta) {
 // FunctionGraph
 //===----------------------------------------------------------------------===//
 
+StringRef cir::pointsto::getCallKindName(CallKind kind) {
+  switch (kind) {
+  case CallKind::Defined:
+    return "defined";
+  case CallKind::Modelled:
+    return "modelled";
+  case CallKind::UnknownDecl:
+    return "unknown-decl";
+  case CallKind::IndirectResolved:
+    return "indirect-resolved";
+  case CallKind::IndirectUnknown:
+    return "indirect-unknown";
+  }
+  llvm_unreachable("unknown call kind");
+}
+
 static void printOptCell(raw_ostream &os, std::optional<Cell> cell) {
   Graph::printCell(os, cell ? *cell : Cell());
 }
@@ -163,17 +198,20 @@ void FunctionGraph::print(raw_ostream &os) const {
   }
   for (const CallSiteRecord &site : callSites) {
     os << "call " << site.call->getName();
-    if (auto callee = site.call->getAttrOfType<FlatSymbolRefAttr>("callee"))
-      os << " " << callee;
+    if (site.callee)
+      os << " " << site.callee;
+    if (site.synthetic)
+      os << " synthetic";
     if (site.calleePtr) {
       os << " callee=";
       Graph::printCell(os, *site.calleePtr);
     }
     os << " args={";
     bool first = true;
+    auto callOp = dyn_cast<CIRCallOpInterface>(site.call);
     for (auto [i, arg] : llvm::enumerate(site.args)) {
-      if (!isPointerType(
-              cast<CIRCallOpInterface>(site.call).getArgOperand(i).getType()))
+      if (!site.synthetic && callOp &&
+          !isPointerType(callOp.getArgOperand(i).getType()))
         continue;
       os << (first ? "" : ", ") << i << ": ";
       printOptCell(os, arg);
@@ -193,6 +231,11 @@ void FunctionGraph::print(raw_ostream &os) const {
       os << " result.slots=";
       printSlots(os, *site.resultSlots);
     }
+    os << " kind=" << getCallKindName(site.kind);
+    if (!site.modelled.empty())
+      os << " model=" << site.modelled;
+    if (site.clobbersGlobals)
+      os << " clobbers-globals";
     os << "\n";
   }
 }
@@ -206,8 +249,10 @@ mlir::DataLayout LocalBuilder::getDataLayoutFor(cir::FuncOp func) {
 }
 
 LocalBuilder::LocalBuilder(cir::FuncOp func, SymbolTableCollection *symbols,
-                           ReasonTable *reasons)
-    : func(func), dataLayout(getDataLayoutFor(func)), symbols(symbols) {
+                           ReasonTable *reasons,
+                           const PointsToModelRegistry *models)
+    : func(func), dataLayout(getDataLayoutFor(func)), symbols(symbols),
+      models(models) {
   if (!symbols) {
     ownedSymbols = std::make_unique<SymbolTableCollection>();
     this->symbols = ownedSymbols.get();
@@ -456,6 +501,8 @@ std::unique_ptr<FunctionGraph> LocalBuilder::build() {
   });
   defineBlockArguments();
   closeMemTransfers(graph, fg->memTransfers);
+  applyDeferredEffects();
+  resolveIndirectCalls();
 
   if (isPointsToVerifyEnabled())
     verifyErrors = failed(verifyFunctionGraph(*fg));
@@ -527,6 +574,8 @@ void LocalBuilder::visit(Operation *op) {
       for (BlockArgument arg : region.front().getArguments()) {
         if (!hasPointers(arg.getType()))
           continue;
+        if (isa<cir::ArrayCtor, cir::ArrayDtor>(op))
+          continue; // The element pointer: visitArrayInit.
         if (!why)
           why = fg->getGraph().makeReason(Reason::Kind::UnhandledOp, op,
                                           "region argument");
@@ -614,6 +663,14 @@ void LocalBuilder::visit(Operation *op) {
           visitMemTransfer(op, op.getDst(), op.getSrc(), op.getLen());
         })
         .Case<cir::MemChrOp>([&](auto op) { visitMemChr(op); })
+        .Case<cir::StdFindOp>([&](auto op) { visitStdFind(op); })
+        .Case<cir::ArrayCtor>([&](cir::ArrayCtor op) {
+          visitArrayInit(op, op.getAddr(), op.getNumElements());
+        })
+        .Case<cir::ArrayDtor>([&](cir::ArrayDtor op) {
+          visitArrayInit(op, op.getAddr(), op.getNumElements());
+        })
+        .Case<cir::DeleteArrayOp>([&](auto op) { visitDeleteArray(op); })
         .Case<cir::StrLenOp>([&](cir::StrLenOp op) {
           visitModRef(op.getString(), {}, /*mod=*/false, /*ref=*/true);
         })
@@ -1123,6 +1180,8 @@ void LocalBuilder::visitCall(CIRCallOpInterface op) {
   site.call = op;
   if (op.isIndirect())
     site.calleePtr = cellFor(op.getIndirectCall());
+  else
+    site.callee = op->getAttrOfType<FlatSymbolRefAttr>("callee");
   for (unsigned i = 0, e = op.getNumArgOperands(); i != e; ++i) {
     Value arg = op.getArgOperand(i);
     site.args.push_back(cellFor(arg));
@@ -1131,7 +1190,6 @@ void LocalBuilder::visitCall(CIRCallOpInterface op) {
   }
   Graph &graph = fg->getGraph();
   for (Value result : op->getResults()) {
-    // TODO(T06/T08): the callee's effects and return value.
     if (isPointerType(result.getType())) {
       Cell cell(graph.makeNode());
       define(result, cell);
@@ -1148,6 +1206,140 @@ void LocalBuilder::visitCall(CIRCallOpInterface op) {
     site.resultSlots = std::move(slots);
   }
   fg->callSites.push_back(std::move(site));
+  size_t index = fg->callSites.size() - 1;
+  if (op.isIndirect()) {
+    indirectCalls.push_back(index);
+    return;
+  }
+  dispatchCall(index, op);
+}
+
+void LocalBuilder::dispatchCall(size_t index, CIRCallOpInterface call) {
+  CallSiteRecord &site = fg->callSites[index];
+  Graph &graph = fg->getGraph();
+  cir::FuncOp callee;
+  if (site.callee)
+    callee =
+        symbols->lookupNearestSymbolFrom<cir::FuncOp>(site.call, site.callee);
+  StringRef name = site.callee ? site.callee.getValue() : StringRef();
+  if (models)
+    if (const PointsToModel *model = models->lookup(call, callee, name)) {
+      ModelContext ctx(*fg, dataLayout, deferredEffects);
+      model->apply(*fg, site, ctx);
+      site.kind = CallKind::Modelled;
+      site.modelled = model->name();
+      return;
+    }
+  if (callee && !callee.isDeclaration()) {
+    site.kind = CallKind::Defined; // T08 connects the body.
+    return;
+  }
+  site.kind = CallKind::UnknownDecl;
+  applyUnknownCall(site, graph.makeReason(Reason::Kind::EscapedTo, site.call,
+                                          ("@" + name).str()));
+}
+
+void LocalBuilder::applyUnknownCall(CallSiteRecord &site, const Reason *why) {
+  // SOUNDNESS: code we don't see may read, write, keep or publish anything
+  // reachable from what it is given, and return any pointer.
+  ModelContext::forEachPointerArg(site, [&](Cell cell) {
+    deferredEffects.push_back(
+        {DeferredEffect::Kind::Reachable, cell,
+         NodeFlags::External | NodeFlags::Mod | NodeFlags::Ref, why});
+  });
+  ModelContext ctx(*fg, dataLayout, deferredEffects);
+  ctx.setResultUnknown(site, NodeFlags::External | NodeFlags::Incomplete, why);
+  // And it may read or write any global another TU can name; the globals
+  // graph (T08) applies this.
+  site.clobbersGlobals = true;
+}
+
+/// Whether the callee pointer of an indirect call points only to functions
+/// known by symbol, so that the interprocedural phase can bind the targets.
+static bool isResolvedCallee(std::optional<Cell> calleePtr) {
+  if (!calleePtr)
+    return false;
+  const Node *node = calleePtr->getNode();
+  if (!node || node->getOrigins().empty())
+    return false;
+  if (hasAny(node->getFlags(), NodeFlags::UnknownObj | NodeFlags::Incomplete |
+                                   NodeFlags::External))
+    return false;
+  return llvm::all_of(node->getOrigins(), [](const Origin &origin) {
+    return origin.kind == Origin::Kind::FuncSym;
+  });
+}
+
+void LocalBuilder::resolveIndirectCalls() {
+  // An unresolved call makes what its arguments reach External, which may
+  // in turn make another callee pointer External: iterate until no call
+  // changes. Flags only grow, so this ends. A resolved call gets, now, the
+  // effect of each target that is a declaration (its model or the
+  // unknown-call rule); its defined targets are left to the interprocedural
+  // phase.
+  SmallVector<size_t, 0> pending = std::move(indirectCalls);
+  indirectCalls.clear();
+  llvm::DenseSet<size_t> applied;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    llvm::erase_if(pending, [&](size_t index) {
+      CallSiteRecord &site = fg->callSites[index];
+      if (isResolvedCallee(site.calleePtr)) {
+        if (applied.insert(index).second) {
+          applyResolvedTargets(site);
+          changed = true;
+        }
+        return false;
+      }
+      site.kind = CallKind::IndirectUnknown;
+      applyUnknownCall(
+          site, fg->getGraph().makeReason(Reason::Kind::IndirectUnresolved,
+                                          site.call, "callee not known"));
+      changed = true;
+      return true;
+    });
+    applyDeferredEffects();
+  }
+  for (size_t index : pending)
+    fg->callSites[index].kind = CallKind::IndirectResolved;
+}
+
+void LocalBuilder::applyResolvedTargets(CallSiteRecord &site) {
+  auto call = cast<CIRCallOpInterface>(site.call);
+  SmallVector<FlatSymbolRefAttr, 2> targets;
+  for (const Origin &origin : site.calleePtr->getNode()->getOrigins())
+    if (auto sym = dyn_cast_if_present<FlatSymbolRefAttr>(origin.sym))
+      targets.push_back(sym);
+  for (FlatSymbolRefAttr target : targets) {
+    auto callee = symbols->lookupNearestSymbolFrom<cir::FuncOp>(func, target);
+    if (models)
+      if (const PointsToModel *model =
+              models->lookup(call, callee, target.getValue())) {
+        ModelContext ctx(*fg, dataLayout, deferredEffects);
+        model->apply(*fg, site, ctx);
+        site.modelled = model->name();
+        continue;
+      }
+    if (callee && !callee.isDeclaration())
+      continue; // T08 binds the body.
+    applyUnknownCall(
+        site, fg->getGraph().makeReason(Reason::Kind::EscapedTo, site.call,
+                                        ("@" + target.getValue()).str()));
+  }
+}
+
+void LocalBuilder::applyDeferredEffects() {
+  Graph &graph = fg->getGraph();
+  SmallVector<DeferredEffect, 0> effects = std::move(deferredEffects);
+  deferredEffects.clear();
+  for (const DeferredEffect &effect : effects) {
+    switch (effect.kind) {
+    case DeferredEffect::Kind::Reachable:
+      graph.markReachable(effect.cell, effect.flags, effect.why);
+      break;
+    }
+  }
 }
 
 void LocalBuilder::visitGetGlobal(cir::GetGlobalOp op) {
@@ -1213,29 +1405,34 @@ void LocalBuilder::visitCopy(cir::CopyOp op) {
   fg->memTransfers.push_back({op, *dst, *src, length});
 }
 
+void cir::pointsto::recordMemTransfer(FunctionGraph &fg, Operation *op,
+                                      Cell dst, Cell src,
+                                      std::optional<int64_t> length) {
+  Graph &graph = fg.getGraph();
+  graph.addFlags(dst, NodeFlags::Mod);
+  graph.addFlags(src, NodeFlags::Ref);
+  // Like cir.copy over the bytes [0, length), without a type: done by the
+  // closure after the walk, once every link of the function is known. An
+  // unknown length is a range without an end: the closure relates every
+  // offset at or after the two cells, which over-approximates any length.
+  if (length && *length <= 0)
+    return;
+  if (length) {
+    graph.growSize(dst.getNode(), dst.getOffset() + *length);
+    graph.growSize(src.getNode(), src.getOffset() + *length);
+  }
+  fg.memTransfers.push_back(
+      {op, dst, src,
+       length ? static_cast<uint64_t>(*length) : MemTransferRecord::kUnknown});
+}
+
 void LocalBuilder::visitMemTransfer(Operation *op, Value dstValue,
                                     Value srcValue, Value lengthValue) {
   std::optional<Cell> dst = cellFor(dstValue);
   std::optional<Cell> src = cellFor(srcValue);
   if (!dst || !src)
     return; // Copying from or to null is UB.
-  Graph &graph = fg->getGraph();
-  graph.addFlags(*dst, NodeFlags::Mod);
-  graph.addFlags(*src, NodeFlags::Ref);
-  // Like cir.copy over the bytes [0, length), without a type: done by the
-  // closure after the walk, once every link of the function is known. An
-  // unknown length is a range without an end: the closure relates every
-  // offset at or after the two cells, which over-approximates any length.
-  std::optional<int64_t> length = getConstantIndex(lengthValue);
-  if (length && *length <= 0)
-    return;
-  if (length) {
-    graph.growSize(dst->getNode(), dst->getOffset() + *length);
-    graph.growSize(src->getNode(), src->getOffset() + *length);
-  }
-  fg->memTransfers.push_back(
-      {op, *dst, *src,
-       length ? static_cast<uint64_t>(*length) : MemTransferRecord::kUnknown});
+  recordMemTransfer(*fg, op, *dst, *src, getConstantIndex(lengthValue));
 }
 
 void LocalBuilder::visitMemChr(cir::MemChrOp op) {
@@ -1251,6 +1448,128 @@ void LocalBuilder::visitMemChr(cir::MemChrOp op) {
                  graph.makeReason(Reason::Kind::CollapsedAt, op,
                                   "pointer into the searched range"));
   define(op.getResult(), *src);
+}
+
+void LocalBuilder::visitStdFind(cir::StdFindOp op) {
+  // C++20 [alg.find]: the result is the first iterator in [first, last) that
+  // matches, or last. Either way it points into the range, at an offset we
+  // don't know: the node of `first`, collapsed, which `last` points into too.
+  Graph &graph = fg->getGraph();
+  const Reason *why = graph.makeReason(Reason::Kind::CollapsedAt, op,
+                                       "iterator into the searched range");
+  if (isPointerType(op.getPattern().getType()))
+    if (std::optional<Cell> pattern = cellFor(op.getPattern()))
+      graph.addFlags(*pattern, NodeFlags::Ref);
+  auto relate = [&](Cell first, Cell last, Cell result) {
+    graph.addFlags(first, NodeFlags::Ref);
+    graph.collapse(first.getNode(), why);
+    if (last)
+      graph.unify(first, last, why);
+    graph.unify(first, result, why);
+  };
+  Value result = op.getResult();
+  if (isPointerType(result.getType())) {
+    std::optional<Cell> first = cellFor(op.getFirst());
+    std::optional<Cell> last = cellFor(op.getLast());
+    if (!first) {
+      // An empty range starting at null: the result is `last`.
+      defineCopy(result, op.getLast());
+      return;
+    }
+    Cell cell(graph.makeNode());
+    relate(*first, last ? *last : Cell(), cell);
+    define(result, cell);
+    return;
+  }
+  std::optional<AggregateSlots> first = slotsFor(op.getFirst());
+  std::optional<AggregateSlots> last = slotsFor(op.getLast());
+  if (!first || !last)
+    return; // No pointers in the iterator.
+  AggregateSlots slots;
+  for (auto [f, l] : llvm::zip(*first, *last)) {
+    Cell cell(graph.makeNode());
+    if (f.second)
+      relate(f.second, l.second, cell);
+    else if (l.second)
+      graph.unify(l.second, cell, why);
+    slots.emplace_back(f.first, cell);
+  }
+  defineSlots(result, slots);
+}
+
+void LocalBuilder::visitArrayInit(Operation *op, Value addr,
+                                  Value numElements) {
+  Graph &graph = fg->getGraph();
+  std::optional<Cell> cell = cellFor(addr);
+  Region &body = op->getRegion(0);
+  Type elemPtrType = body.empty() || body.front().getNumArguments() == 0
+                         ? Type()
+                         : body.front().getArgument(0).getType();
+  if (cell) {
+    graph.addFlags(*cell, NodeFlags::Mod | NodeFlags::Ref);
+    // The constructor (destructor) runs on each element: the elements share
+    // one abstract element, as after a dynamic index. A single element needs
+    // no array.
+    auto arrayTy = dyn_cast<cir::ArrayType>(
+        cast<cir::PointerType>(addr.getType()).getPointee());
+    bool single = !numElements && arrayTy && arrayTy.getSize() == 1;
+    std::optional<int64_t> elemSize;
+    if (auto elemPtrTy = dyn_cast_if_present<cir::PointerType>(elemPtrType))
+      elemSize = getTypeSizeInBytes(elemPtrTy.getPointee(), dataLayout);
+    if (arrayTy)
+      if (std::optional<int64_t> total =
+              getTypeSizeInBytes(arrayTy, dataLayout))
+        graph.growSize(cell->getNode(), cell->getOffset() + *total);
+    const Reason *why = graph.makeReason(Reason::Kind::CollapsedAt, op,
+                                         "constructed element by element");
+    if (!single) {
+      if (elemSize && *elemSize > 0)
+        graph.markArray(cell->getNode(), *elemSize, why);
+      else
+        graph.collapse(cell->getNode(), why);
+    }
+  }
+  // The element pointer of each region is the array's cell, so the call in
+  // the region is recorded with `this` = the array.
+  for (Region &region : op->getRegions()) {
+    if (region.empty())
+      continue;
+    for (BlockArgument arg : region.front().getArguments()) {
+      if (!isPointerType(arg.getType()))
+        continue;
+      define(arg, cell ? *cell : Cell(graph.makeNode()));
+    }
+  }
+}
+
+void LocalBuilder::visitDeleteArray(cir::DeleteArrayOp op) {
+  Graph &graph = fg->getGraph();
+  std::optional<Cell> cell = cellFor(op.getAddress());
+  if (!cell)
+    return; // delete[] of null does nothing.
+  auto addSite = [&](FlatSymbolRefAttr callee) {
+    CallSiteRecord site;
+    site.call = op;
+    site.callee = callee;
+    site.synthetic = true;
+    site.args.push_back(*cell);
+    fg->callSites.push_back(std::move(site));
+    dispatchCall(fg->callSites.size() - 1, CIRCallOpInterface());
+  };
+  if (FlatSymbolRefAttr dtor = op.getElementDtorAttr()) {
+    // The destructor runs on each element (C++20 [expr.delete]p6).
+    Type elemType =
+        cast<cir::PointerType>(op.getAddress().getType()).getPointee();
+    std::optional<int64_t> elemSize = getTypeSizeInBytes(elemType, dataLayout);
+    const Reason *why = graph.makeReason(Reason::Kind::CollapsedAt, op,
+                                         "destroyed element by element");
+    if (elemSize && *elemSize > 0)
+      graph.markArray(cell->getNode(), *elemSize, why);
+    else
+      graph.collapse(cell->getNode(), why);
+    addSite(dtor);
+  }
+  addSite(op.getDeleteFnAttr());
 }
 
 //===----------------------------------------------------------------------===//

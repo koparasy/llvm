@@ -20,12 +20,17 @@
 // self-check); a violation is an error on the offending op and fails the
 // pass.
 //
+// Calls get the generic library models (PointsToModels.h) unless models=0.
+//
 // With print-stats, a summary of the whole input follows: functions, live
-// nodes, collapsed nodes, build time and the ops that went pessimistic.
+// nodes, collapsed and External nodes, build time, the ops that went
+// pessimistic, the call sites by kind and by model, and the declarations
+// that got the unknown-call rule most often.
 //
 //===----------------------------------------------------------------------===//
 
 #include "clang/CIR/Dialect/Analysis/PointsTo/LocalBuilder.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/Support/Timer.h"
@@ -54,6 +59,9 @@ struct TestCIRPointsToPass
   Option<bool> printStats{*this, "print-stats",
                           llvm::cl::desc("Print totals for the whole input"),
                           llvm::cl::init(false)};
+  Option<bool> useModels{*this, "models",
+                         llvm::cl::desc("Apply the generic library models"),
+                         llvm::cl::init(true)};
 
   void runOnOperation() override;
 };
@@ -78,8 +86,12 @@ void TestCIRPointsToPass::runOnOperation() {
   raw_ostream &os = llvm::outs();
   SymbolTableCollection symbols;
   llvm::StringMap<unsigned> pessimisticOps, unhandledOps, unclassifiedOps,
-      collapseReasons;
-  size_t numFuncs = 0, numNodes = 0, numCollapsed = 0, numOps = 0;
+      collapseReasons, callKinds, callModels, unknownDecls;
+  size_t numFuncs = 0, numNodes = 0, numCollapsed = 0, numOps = 0,
+         numExternal = 0, numCalls = 0;
+  PointsToModelRegistry registry;
+  if (useModels)
+    registerGenericModels(registry);
   llvm::TimeRecord buildTime;
   bool anyFailed = false;
 
@@ -87,7 +99,7 @@ void TestCIRPointsToPass::runOnOperation() {
     if (func.isDeclaration())
       return;
     llvm::TimeRecord start = llvm::TimeRecord::getCurrentTime(true);
-    LocalBuilder builder(func, &symbols);
+    LocalBuilder builder(func, &symbols, /*reasons=*/nullptr, &registry);
     std::unique_ptr<FunctionGraph> fg = builder.build();
     llvm::TimeRecord end = llvm::TimeRecord::getCurrentTime(false);
     end -= start;
@@ -100,8 +112,18 @@ void TestCIRPointsToPass::runOnOperation() {
 
     ++numFuncs;
     func.walk([&](Operation *) { ++numOps; });
+    for (const CallSiteRecord &site : fg->callSites) {
+      ++numCalls;
+      ++callKinds[getCallKindName(site.kind)];
+      if (!site.modelled.empty())
+        ++callModels[site.modelled];
+      if (site.kind == CallKind::UnknownDecl)
+        ++unknownDecls[site.callee ? site.callee.getValue() : "<missing>"];
+    }
     for (const Node *node : fg->getGraph().nodes()) {
       ++numNodes;
+      if (node->hasFlags(NodeFlags::External))
+        ++numExternal;
       if (!node->isCollapsed())
         continue;
       ++numCollapsed;
@@ -156,7 +178,7 @@ void TestCIRPointsToPass::runOnOperation() {
 
   if (printStats) {
     auto printTop = [&](StringRef title, const llvm::StringMap<unsigned> &map,
-                        StringRef unit = "op names") {
+                        StringRef unit = "op names", size_t limit = ~0u) {
       SmallVector<std::pair<unsigned, StringRef>> sorted;
       for (const auto &entry : map)
         sorted.emplace_back(entry.getValue(), entry.getKey());
@@ -164,7 +186,7 @@ void TestCIRPointsToPass::runOnOperation() {
         return a.first != b.first ? a.first > b.first : a.second < b.second;
       });
       os << title << ": " << sorted.size() << " " << unit << "\n";
-      for (auto [count, name] : sorted)
+      for (auto [count, name] : llvm::ArrayRef(sorted).take_front(limit))
         os << "  " << name << " " << count << "\n";
     };
     os << "--- stats\n"
@@ -172,11 +194,17 @@ void TestCIRPointsToPass::runOnOperation() {
        << "ops: " << numOps << "\n"
        << "live nodes: " << numNodes << "\n"
        << "collapsed nodes: " << numCollapsed << "\n"
+       << "external nodes: " << numExternal << "\n"
        << "build time (wall, s): " << buildTime.getWallTime() << "\n";
     printTop("collapsed nodes by reason", collapseReasons, "reasons");
     printTop("pessimistic ops (touching pointers or memory)", pessimisticOps);
     printTop("ops sent to the pessimistic default", unhandledOps);
     printTop("unclassified ops", unclassifiedOps);
+    os << "call sites: " << numCalls << "\n";
+    printTop("call sites by kind", callKinds, "kinds");
+    printTop("modelled call sites by model", callModels, "models");
+    printTop("unknown declarations by call count", unknownDecls,
+             "declarations", ~0u);
   }
 
   if (anyFailed)

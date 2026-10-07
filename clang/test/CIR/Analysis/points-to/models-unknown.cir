@@ -1,0 +1,96 @@
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// The unknown-call rule, for a declaration without a model and for an
+// indirect call whose targets are not known: every node reachable from a
+// pointer argument becomes External (with Mod and Ref), the argument's node
+// with Reason{EscapedTo, @callee} and the nodes reached from it with a reason
+// that chains to it; the result points to an unknown object
+// (UnknownObj|External|Incomplete); the site clobbers the globals.
+
+!s32i = !cir.int<s, 32>
+!rec_P = !cir.struct<"P" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @opaque(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+cir.func private @make_pair() -> !rec_P
+cir.func private @untouched(!s32i)
+
+// a holds &b; opaque(&a): a and b are External, the result is unknown.
+
+// CHECK-LABEL: === @escape_chain
+// CHECK-DAG: [[B:n[0-9]+]] [Stack|External|Mod|Ref] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={} reasons={External: EscapedTo(cir.call {{.*}}, "reachable from an escaped pointer") <- EscapedTo(cir.call {{.*}}, "@opaque")
+// CHECK-DAG: [[A:n[0-9]+]] [Stack|External|Mod|Ref] size=8 origins={stack(cir.alloca 'a' {{.*}})} links={0->[[B]]+0} reasons={External: EscapedTo(cir.call {{.*}}, "@opaque")
+// CHECK-DAG: [[R:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: EscapedTo(cir.call {{.*}}, "@opaque"), External: EscapedTo(cir.call {{.*}}, "@opaque")}
+// CHECK-DAG: [[C:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'c' {{.*}})} links={}
+// CHECK-DAG: call cir.call @opaque args={0: [[A]]+0} result=[[R]]+0 kind=unknown-decl clobbers-globals
+// CHECK-DAG: res -> [[R]]+0
+cir.func @escape_chain() {
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %c = cir.alloca "c" align(4) : !cir.ptr<!s32i>
+  %a = cir.alloca "a" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %a : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.call @opaque(%a) {test.ptr = "res"} : (!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// Flow-insensitively, what is stored into an escaped node after the call is
+// also visible to the callee: d, stored into a after the call, is External.
+
+// CHECK-LABEL: === @store_after_call
+// CHECK-DAG: [[D:n[0-9]+]] [Stack|External|Mod|Ref] size=4 origins={stack(cir.alloca 'd' {{.*}})} links={}
+// CHECK-DAG: [[A:n[0-9]+]] [Stack|External|Mod|Ref] size=8 origins={stack(cir.alloca 'a' {{.*}})} links={0->[[D]]+0}
+cir.func @store_after_call() {
+  %d = cir.alloca "d" align(4) : !cir.ptr<!s32i>
+  %a = cir.alloca "a" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.call @opaque(%a) : (!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  cir.store %d, %a : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+// An aggregate result: each pointer slot points to an unknown object. A call
+// without pointer arguments still clobbers the globals.
+
+// CHECK-LABEL: === @aggregate_result
+// CHECK-DAG: [[S0:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: EscapedTo(cir.call {{.*}}, "@make_pair")
+// CHECK-DAG: [[S1:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: EscapedTo(cir.call {{.*}}, "@make_pair")
+// CHECK-DAG: call cir.call @make_pair args={} result=null result.slots={0: [[S0]]+0, 8: [[S1]]+0} kind=unknown-decl clobbers-globals
+// CHECK-DAG: call cir.call @untouched args={} result=null kind=unknown-decl clobbers-globals
+cir.func @aggregate_result() {
+  %v = cir.call @make_pair() : () -> !rec_P
+  %n = cir.const #cir.int<1> : !s32i
+  cir.call @untouched(%n) : (!s32i) -> ()
+  cir.return
+}
+
+// An indirect call through a function pointer passed in: the callee is not
+// known, so the call gets the unknown-call rule, with an IndirectUnresolved
+// reason.
+
+// CHECK-LABEL: === @indirect_unknown
+// CHECK-DAG: [[E:n[0-9]+]] [Stack|External|Mod|Ref] size=8 origins={stack(cir.alloca 'e' {{.*}})} links={} reasons={External: IndirectUnresolved(cir.call {{.*}}, "callee not known")
+// CHECK-DAG: call cir.call callee={{n[0-9]+}}+0 args={0: [[E]]+0} result={{n[0-9]+}}+0 kind=indirect-unknown clobbers-globals
+cir.func @indirect_unknown(%fp: !cir.ptr<!cir.func<(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>>>) {
+  %e = cir.alloca "e" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.call %fp(%e) : (!cir.ptr<!cir.func<(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>>>, !cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// An indirect call whose callee pointer was stored into a slot the first
+// call let escape: unknown code may have replaced it, so the second call is
+// unresolved too, although the slot only ever got @opaque here.
+
+// CHECK-LABEL: === @indirect_through_escaped_slot
+// CHECK: call cir.call @opaque {{.*}} kind=unknown-decl clobbers-globals
+// CHECK: call cir.call callee={{n[0-9]+}}+0 {{.*}} kind=indirect-unknown clobbers-globals
+cir.func @indirect_through_escaped_slot() {
+  %e = cir.alloca "e" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>>>>
+  %f = cir.get_global @opaque : !cir.ptr<!cir.func<(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>>>
+  cir.store %f, %slot : !cir.ptr<!cir.func<(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>>>, !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>>>>
+  %sv = cir.cast bitcast %slot : !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>>>> -> !cir.ptr<!cir.ptr<!s32i>>
+  %r0 = cir.call @opaque(%sv) : (!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  %fp = cir.load %slot : !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>>>>, !cir.ptr<!cir.func<(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>>>
+  %r = cir.call %fp(%e) : (!cir.ptr<!cir.func<(!cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>>>, !cir.ptr<!cir.ptr<!s32i>>) -> !cir.ptr<!s32i>
+  cir.return
+}
+}

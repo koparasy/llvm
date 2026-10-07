@@ -32,6 +32,8 @@ static const OpClassEntry kOpClassificationTable[] = {
     // Handled: LocalBuilder has a rule.
     //===------------------------------------------------------------------===//
     {"cir.alloca", kHandled},              // Stack node.
+    {"cir.array.ctor", kHandled},          // Array node; element ptr = it.
+    {"cir.array.dtor", kHandled},          // Array node; element ptr = it.
     {"cir.atomic.clear", kHandled},        // Mod|Ref on an integer.
     {"cir.atomic.cmpxchg", kHandled},      // Load + store.
     {"cir.atomic.fetch", kHandled},        // Load + store.
@@ -57,6 +59,7 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.coroutine", kHandled},          // RegionBranchOpInterface.
     {"cir.derived_class_addr", kHandled}, // Constant offset.
     {"cir.do", kHandled},                 // RegionBranchOpInterface.
+    {"cir.delete_array", kHandled},       // Synthetic dtor + delete calls.
     {"cir.dyn_cast", kHandled},           // Collapse.
     {"cir.extract_member", kHandled},     // Aggregate slot.
     {"cir.for", kHandled},                // RegionBranchOpInterface.
@@ -85,6 +88,7 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.scope", kHandled},           // RegionBranchOpInterface.
     {"cir.select", kHandled},          // Unify.
     {"cir.set_bitfield", kHandled},    // Mod on an integer.
+    {"cir.std.find", kHandled},        // Into `first`, collapsed.
     {"cir.std.strlen", kHandled},      // Ref.
     {"cir.store", kHandled},           // Link / aggregate slots.
     {"cir.switch", kHandled},          // RegionBranchOpInterface.
@@ -248,46 +252,42 @@ static const OpClassEntry kOpClassificationTable[] = {
     //===------------------------------------------------------------------===//
     {"cir.address_of_return_address", kPessimistic}, // Frame internals.
     {"cir.alloc.exception", kPessimistic},           // TODO: exception objects.
-    {"cir.array.ctor", kPessimistic},            // TODO(T06): per-element ctor.
-    {"cir.array.dtor", kPessimistic},            // TODO(T06): per-element dtor.
-    {"cir.asm", kPessimistic},                   // Opaque.
-    {"cir.begin_catch", kPessimistic},           // TODO: exception objects.
-    {"cir.block_address", kPessimistic},         // Label address.
-    {"cir.catch_param", kPessimistic},           // TODO: exception objects.
-    {"cir.construct_catch_param", kPessimistic}, // TODO: exception objects.
-    {"cir.coro.intrinsic.alloc", kPessimistic},  // Coroutines.
-    {"cir.coro.intrinsic.begin", kPessimistic},  // Coroutines.
-    {"cir.coro.intrinsic.destroy", kPessimistic}, // Coroutines.
-    {"cir.coro.intrinsic.done", kPessimistic},    // Coroutines.
-    {"cir.coro.intrinsic.end", kPessimistic},     // Coroutines.
-    {"cir.coro.intrinsic.free", kPessimistic},    // Coroutines.
-    {"cir.coro.intrinsic.id", kPessimistic},      // Coroutines.
-    {"cir.coro.intrinsic.promise", kPessimistic}, // Coroutines.
-    {"cir.coro.intrinsic.resume", kPessimistic},  // Coroutines.
-    {"cir.coro.intrinsic.size", kPessimistic},    // Coroutines.
-    {"cir.cpuid", kPessimistic},                  // Rare; writes an int array.
-    {"cir.delete_array", kPessimistic},           // TODO(T06): dtor + delete.
-    {"cir.eh.inflight_exception", kPessimistic},  // TODO: exception objects.
-    {"cir.eh.longjmp", kPessimistic},             // jmp_buf.
-    {"cir.eh.setjmp", kPessimistic},              // jmp_buf.
-    {"cir.end_cleanup", kPessimistic},            // TODO: exception objects.
-    {"cir.frame_address", kPessimistic},          // Frame internals.
-    {"cir.get_method", kPessimistic},             // TODO(T09): method pointers.
-    {"cir.indirect_goto", kPessimistic},          // Label address.
-    {"cir.init_catch_param", kPessimistic},       // TODO: exception objects.
-    {"cir.resume.flat", kPessimistic},            // TODO: exception objects.
-    {"cir.return_address", kPessimistic},         // Frame internals.
-    {"cir.stackrestore", kPessimistic},           // Frame internals.
-    {"cir.stacksave", kPessimistic},              // Frame internals.
-    {"cir.std.find", kPessimistic},               // TODO(T06): library model.
-    {"cir.throw", kPessimistic},                  // TODO: exception objects.
-    {"cir.try_throw", kPessimistic},              // TODO: exception objects.
-    {"cir.va_arg", kPessimistic},                 // Varargs are not modelled.
-    {"cir.va_copy", kPessimistic},                // Varargs are not modelled.
-    {"cir.va_end", kPessimistic},                 // Varargs are not modelled.
-    {"cir.va_start", kPessimistic},               // Varargs are not modelled.
-    {"cir.vtable.address_point", kPessimistic},   // TODO(T09): vtables.
-    {"cir.vtable.get_type_info", kPessimistic},   // TODO(T09): vtables.
+    {"cir.asm", kPessimistic},                       // Opaque.
+    {"cir.begin_catch", kPessimistic},               // TODO: exception objects.
+    {"cir.block_address", kPessimistic},             // Label address.
+    {"cir.catch_param", kPessimistic},               // TODO: exception objects.
+    {"cir.construct_catch_param", kPessimistic},     // TODO: exception objects.
+    {"cir.coro.intrinsic.alloc", kPessimistic},      // Coroutines.
+    {"cir.coro.intrinsic.begin", kPessimistic},      // Coroutines.
+    {"cir.coro.intrinsic.destroy", kPessimistic},    // Coroutines.
+    {"cir.coro.intrinsic.done", kPessimistic},       // Coroutines.
+    {"cir.coro.intrinsic.end", kPessimistic},        // Coroutines.
+    {"cir.coro.intrinsic.free", kPessimistic},       // Coroutines.
+    {"cir.coro.intrinsic.id", kPessimistic},         // Coroutines.
+    {"cir.coro.intrinsic.promise", kPessimistic},    // Coroutines.
+    {"cir.coro.intrinsic.resume", kPessimistic},     // Coroutines.
+    {"cir.coro.intrinsic.size", kPessimistic},       // Coroutines.
+    {"cir.cpuid", kPessimistic},                 // Rare; writes an int array.
+    {"cir.eh.inflight_exception", kPessimistic}, // TODO: exception objects.
+    {"cir.eh.longjmp", kPessimistic},            // jmp_buf.
+    {"cir.eh.setjmp", kPessimistic},             // jmp_buf.
+    {"cir.end_cleanup", kPessimistic},           // TODO: exception objects.
+    {"cir.frame_address", kPessimistic},         // Frame internals.
+    {"cir.get_method", kPessimistic},            // TODO(T09): method pointers.
+    {"cir.indirect_goto", kPessimistic},         // Label address.
+    {"cir.init_catch_param", kPessimistic},      // TODO: exception objects.
+    {"cir.resume.flat", kPessimistic},           // TODO: exception objects.
+    {"cir.return_address", kPessimistic},        // Frame internals.
+    {"cir.stackrestore", kPessimistic},          // Frame internals.
+    {"cir.stacksave", kPessimistic},             // Frame internals.
+    {"cir.throw", kPessimistic},                 // TODO: exception objects.
+    {"cir.try_throw", kPessimistic},             // TODO: exception objects.
+    {"cir.va_arg", kPessimistic},                // Varargs are not modelled.
+    {"cir.va_copy", kPessimistic},               // Varargs are not modelled.
+    {"cir.va_end", kPessimistic},                // Varargs are not modelled.
+    {"cir.va_start", kPessimistic},              // Varargs are not modelled.
+    {"cir.vtable.address_point", kPessimistic},  // TODO(T09): vtables.
+    {"cir.vtable.get_type_info", kPessimistic},  // TODO(T09): vtables.
     {"cir.vtable.get_virtual_fn_addr", kPessimistic}, // TODO(T09): vtables.
     {"cir.vtt.address_point", kPessimistic},          // TODO(T09): vtables.
 };

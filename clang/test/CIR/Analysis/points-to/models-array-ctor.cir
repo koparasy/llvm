@@ -1,0 +1,71 @@
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// cir.array.ctor / cir.array.dtor run a constructor or destructor on each
+// element: the array's node becomes an array of the element size, and the
+// element pointer of the region is the array's cell, so the call in the
+// region is recorded with `this` = the array (a defined callee is left to
+// the interprocedural phase, a declaration gets the unknown-call rule).
+// cir.delete_array gets synthetic call sites for the element destructor and
+// for operator delete.
+
+!u8i = !cir.int<u, 8>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_S = !cir.struct<"S" {data !cir.ptr<!u8i>, data !u64i}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func @_ZN1SC1Ev(%this: !cir.ptr<!rec_S>) {
+  cir.return
+}
+cir.func private @_ZN1SD1Ev(!cir.ptr<!rec_S>)
+cir.func private @_ZdaPv(!cir.ptr<!void>)
+
+// A fixed-size array: 4 elements of 16 bytes.
+
+// CHECK-LABEL: === @fixed
+// CHECK-DAG: [[ARR:n[0-9]+]] [Stack|Mod|Ref] size=64 arr=16 origins={stack(cir.alloca 's' {{.*}})} links={}
+// CHECK-DAG: call cir.call @_ZN1SC1Ev args={0: [[ARR]]+0} result=null kind=defined{{$}}
+cir.func @fixed() {
+  %0 = cir.alloca "s" align(16) init : !cir.ptr<!cir.array<!rec_S x 4>>
+  cir.array.ctor %0 : !cir.ptr<!cir.array<!rec_S x 4>> {
+  ^bb0(%arg0: !cir.ptr<!rec_S>):
+    cir.call @_ZN1SC1Ev(%arg0) : (!cir.ptr<!rec_S>) -> ()
+  }
+  cir.return
+}
+
+// A dynamic count, constructor and destructor: the destructor is a
+// declaration, so the array escapes.
+
+// CHECK-LABEL: === @dynamic
+// CHECK-DAG: [[P:n[0-9]+]] [Incomplete|External|Mod|Ref] size=0 arr=16 origins={} links={}
+// CHECK-DAG: call cir.call @_ZN1SC1Ev args={0: [[P]]+0} result=null kind=defined{{$}}
+// CHECK-DAG: call cir.call @_ZN1SD1Ev args={0: [[P]]+0} result=null kind=unknown-decl clobbers-globals
+cir.func @dynamic(%p: !cir.ptr<!rec_S>, %n: !u64i) {
+  cir.array.ctor %p, %n : !cir.ptr<!rec_S>, !u64i {
+  ^bb0(%e: !cir.ptr<!rec_S>):
+    cir.call @_ZN1SC1Ev(%e) : (!cir.ptr<!rec_S>) -> ()
+  }
+  cir.array.dtor %p, %n : !cir.ptr<!rec_S>, !u64i {
+  ^bb0(%e: !cir.ptr<!rec_S>):
+    cir.call @_ZN1SD1Ev(%e) : (!cir.ptr<!rec_S>) -> ()
+  }
+  cir.return
+}
+
+// delete[] with an element destructor: two synthetic sites on the array's
+// cell, the destructor (an unknown declaration) and operator delete[] (the
+// deallocation model).
+
+// CHECK-LABEL: === @delete_array
+// CHECK-DAG: [[H:n[0-9]+]] [Heap|External|Mod|Ref] size=0 arr=16 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: call cir.delete_array @_ZN1SD1Ev synthetic args={0: [[H]]+0} result=null kind=unknown-decl clobbers-globals
+// CHECK-DAG: call cir.delete_array @_ZdaPv synthetic args={0: [[H]]+0} result=null kind=modelled model=operator-delete{{$}}
+cir.func private @_Znam(!u64i) -> !cir.ptr<!void>
+cir.func @delete_array(%n: !u64i) {
+  %v = cir.call @_Znam(%n) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %v : !cir.ptr<!void> -> !cir.ptr<!rec_S>
+  cir.delete_array %p : !cir.ptr<!rec_S> delete_fn(@_ZdaPv) element_dtor(@_ZN1SD1Ev) element_align(8)
+  cir.return
+}
+}

@@ -1,0 +1,140 @@
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Allocation functions return storage disjoint from every other object, so
+// each call site gets its own Heap node (origin HeapCall), sized from a
+// constant size argument. Fresh storage holds no pointer: the node has no
+// links. realloc unifies the result with the old object; posix_memalign
+// writes the result through its first argument. A user-defined operator new
+// (a definition) is not modelled: a replacement may keep the pointer.
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func private @malloc(!u64i) -> !cir.ptr<!void>
+cir.func private @calloc(!u64i, !u64i) -> !cir.ptr<!void>
+cir.func private @realloc(!cir.ptr<!void>, !u64i) -> !cir.ptr<!void>
+cir.func private @posix_memalign(!cir.ptr<!cir.ptr<!void>>, !u64i, !u64i) -> !s32i
+cir.func private @strdup(!cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+cir.func private @free(!cir.ptr<!void>)
+cir.func private @_ZdlPv(!cir.ptr<!void>)
+cir.func private @__cxa_allocate_exception(!u64i) -> !cir.ptr<!void>
+
+// Two operator new calls: two distinct Heap nodes, without links.
+
+// CHECK-LABEL: === @two_news
+// CHECK-DAG: [[N1:n[0-9]+]] [Heap] size=16 origins={heap(cir.call {{.*}}models-alloc.cir:{{[0-9]+}}:{{[0-9]+}})} links={}
+// CHECK-DAG: [[N2:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: call cir.call @_Znwm args={} result=[[N1]]+0 kind=modelled model=operator-new
+// CHECK-DAG: call cir.call @_Znwm args={} result=[[N2]]+0 kind=modelled model=operator-new
+// CHECK-DAG: p1 -> [[N1]]+0
+// CHECK-DAG: p2 -> [[N2]]+0
+// CHECK-NOT: clobbers-globals
+cir.func @two_news() {
+  %c16 = cir.const #cir.int<16> : !u64i
+  %c4 = cir.const #cir.int<4> : !u64i
+  %p1 = cir.call @_Znwm(%c16) {test.ptr = "p1"} : (!u64i) -> !cir.ptr<!void>
+  %p2 = cir.call @_Znwm(%c4) {test.ptr = "p2"} : (!u64i) -> !cir.ptr<!void>
+  cir.return
+}
+
+// malloc of a dynamic size (size 0 = unknown) and calloc of a constant count
+// and size (3 * 8 bytes); free and operator delete have no pointer effect,
+// just Mod on the freed node.
+
+// CHECK-LABEL: === @malloc_calloc
+// CHECK-DAG: [[M:n[0-9]+]] [Heap|Mod] size=0 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: [[C:n[0-9]+]] [Heap|Mod] size=24 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: call cir.call @malloc args={} result=[[M]]+0 kind=modelled model=malloc
+// CHECK-DAG: call cir.call @calloc args={} result=[[C]]+0 kind=modelled model=calloc
+// CHECK-DAG: call cir.call @free args={0: [[M]]+0} result=null kind=modelled model=free
+// CHECK-DAG: call cir.call @_ZdlPv args={0: [[C]]+0} result=null kind=modelled model=operator-delete
+cir.func @malloc_calloc(%n: !u64i) {
+  %c3 = cir.const #cir.int<3> : !u64i
+  %c8 = cir.const #cir.int<8> : !u64i
+  %m = cir.call @malloc(%n) : (!u64i) -> !cir.ptr<!void>
+  %c = cir.call @calloc(%c3, %c8) : (!u64i, !u64i) -> !cir.ptr<!void>
+  cir.call @free(%m) : (!cir.ptr<!void>) -> ()
+  cir.call @_ZdlPv(%c) : (!cir.ptr<!void>) -> ()
+  cir.return
+}
+
+// realloc: the result and the old object are one node (two origins); the
+// pointer the old object held is still there.
+
+// CHECK-LABEL: === @do_realloc
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[H:n[0-9]+]] [Heap|Mod|Ref] size=32 origins={heap(cir.call {{.*}}), heap(cir.call {{.*}})} links={0->[[A]]+0}
+// CHECK-DAG: old -> [[H]]+0
+// CHECK-DAG: new -> [[H]]+0
+cir.func @do_realloc() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %c8 = cir.const #cir.int<8> : !u64i
+  %c32 = cir.const #cir.int<32> : !u64i
+  %old = cir.call @malloc(%c8) {test.ptr = "old"} : (!u64i) -> !cir.ptr<!void>
+  %slot = cir.cast bitcast %old : !cir.ptr<!void> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %new = cir.call @realloc(%old, %c32) {test.ptr = "new"} : (!cir.ptr<!void>, !u64i) -> !cir.ptr<!void>
+  cir.return
+}
+
+// posix_memalign writes the new object's address into *out.
+
+// CHECK-LABEL: === @do_posix_memalign
+// CHECK-DAG: [[H:n[0-9]+]] [Heap] size=64 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: [[OUT:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'out' {{.*}})} links={0->[[H]]+0}
+// CHECK-DAG: loaded -> [[H]]+0
+// CHECK-DAG: call cir.call @posix_memalign args={0: [[OUT]]+0} result=null kind=modelled model=posix_memalign
+cir.func @do_posix_memalign() {
+  %out = cir.alloca "out" align(8) : !cir.ptr<!cir.ptr<!void>>
+  %c16 = cir.const #cir.int<16> : !u64i
+  %c64 = cir.const #cir.int<64> : !u64i
+  %r = cir.call @posix_memalign(%out, %c16, %c64) : (!cir.ptr<!cir.ptr<!void>>, !u64i, !u64i) -> !s32i
+  %p = cir.load %out : !cir.ptr<!cir.ptr<!void>>, !cir.ptr<!void> {test.ptr = "loaded"}
+  cir.return
+}
+
+// strdup: a fresh Heap node; the source string is only read.
+// __cxa_allocate_exception: a fresh Heap node too.
+
+// CHECK-LABEL: === @strdup_exception
+// CHECK-DAG: [[S:n[0-9]+]] [Stack|Ref] size=4 origins={stack(cir.alloca 's' {{.*}})} links={}
+// CHECK-DAG: [[D:n[0-9]+]] [Heap] size=0 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: [[E:n[0-9]+]] [Heap] size=24 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: call cir.call @strdup args={0: [[S]]+0} result=[[D]]+0 kind=modelled model=strdup
+// CHECK-DAG: call cir.call @__cxa_allocate_exception args={} result=[[E]]+0 kind=modelled model=cxa-allocate-exception
+cir.func @strdup_exception() {
+  %s = cir.alloca "s" align(4) : !cir.ptr<!s32i>
+  %d = cir.call @strdup(%s) : (!cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  %c24 = cir.const #cir.int<24> : !u64i
+  %e = cir.call @__cxa_allocate_exception(%c24) : (!u64i) -> !cir.ptr<!void>
+  cir.return
+}
+
+// A user-defined (replacement) operator new[] is a definition: the call is
+// recorded for the interprocedural phase, not modelled.
+
+cir.global "private" internal @pool = #cir.zero : !cir.array<!s32i x 64>
+cir.func @_Znam(%n: !u64i) -> !cir.ptr<!void> {
+  %g = cir.get_global @pool : !cir.ptr<!cir.array<!s32i x 64>>
+  %v = cir.cast bitcast %g : !cir.ptr<!cir.array<!s32i x 64>> -> !cir.ptr<!void>
+  cir.return %v : !cir.ptr<!void>
+}
+
+// CHECK-LABEL: === @replaced_new
+// CHECK: call cir.call @_Znam args={} result={{n[0-9]+}}+0 kind=defined{{$}}
+cir.func @replaced_new() {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %p = cir.call @_Znam(%c4) : (!u64i) -> !cir.ptr<!void>
+  cir.return
+}
+}
+
+// Without the models, operator new is an unknown declaration.
+
+// RUN: cir-opt %s -test-cir-points-to='models=0' -o /dev/null | FileCheck %s --check-prefix=NOMODELS
+// NOMODELS-LABEL: === @two_news
+// NOMODELS: [UnknownObj|Incomplete|External]
+// NOMODELS: call cir.call @_Znwm args={} result={{n[0-9]+}}+0 kind=unknown-decl clobbers-globals

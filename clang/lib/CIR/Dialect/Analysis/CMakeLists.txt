@@ -6,6 +6,7 @@ add_clang_library(MLIRCIRAnalysis
   PointsTo/LocalBuilder.cpp
   PointsTo/OpClassification.cpp
   PointsTo/PointsToGraph.cpp
+  PointsTo/PointsToModels.cpp
   PointsTo/PointsToVerifier.cpp
 
   LINK_LIBS PUBLIC

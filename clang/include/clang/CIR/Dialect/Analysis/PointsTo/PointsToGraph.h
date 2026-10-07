@@ -351,6 +351,16 @@ public:
   /// Set \p flags on the node of \p cell. For each status bit that has no
   /// reason yet, record \p why (if non-null).
   void addFlags(Cell cell, NodeFlags flags, const Reason *why = nullptr);
+  /// Set the status bits \p flags on the node of \p from and on every node
+  /// reachable from it through links (all of a node's links, whatever the
+  /// offset of \p from). The node of \p from records \p why; the nodes
+  /// reached from it record one derived reason, "reachable from an escaped
+  /// pointer", whose cause is \p why. The walk is iterative with a visited
+  /// set, so cycles and long chains are fine. \p flags must not contain
+  /// Collapsed (collapsing would rewrite the links being walked). Returns the
+  /// number of nodes visited.
+  size_t markReachable(Cell from, NodeFlags flags, const Reason *why = nullptr);
+
   /// Add \p origin to the node of \p cell unless it is already there.
   void addOrigin(Cell cell, const Origin &origin);
   /// Raise the known extent of \p node (resolved first) to at least \p size

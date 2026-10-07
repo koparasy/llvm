@@ -542,6 +542,46 @@ TEST(PointsToGraphTest, CloneReachableWithCycles) {
 }
 
 //===----------------------------------------------------------------------===//
+// markReachable
+//===----------------------------------------------------------------------===//
+
+TEST(PointsToGraphTest, MarkReachableFollowsLinksAndCycles) {
+  Graph g;
+  Node *root = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Node *mid = g.makeNode(NodeFlags::Heap);
+  Node *leaf = g.makeNode(NodeFlags::Heap);
+  Node *other = g.makeNode(NodeFlags::Heap);
+  // root+8 -> mid, mid -> leaf, leaf -> root (a cycle); other is unreachable
+  // but points into the cycle.
+  g.setLink(Cell(root, 8), Cell(mid));
+  g.setLink(Cell(mid, 0), Cell(leaf));
+  g.setLink(Cell(leaf, 0), Cell(root));
+  g.setLink(Cell(other, 0), Cell(mid));
+
+  const Reason *why = g.makeReason(Reason::Kind::EscapedTo, nullptr, "@f");
+  // From an interior cell: the whole node's links count.
+  EXPECT_EQ(g.markReachable(Cell(root, 16), NodeFlags::External, why), 3u);
+  EXPECT_VERIFIED(g);
+  for (Node *n : {root, mid, leaf})
+    EXPECT_TRUE(n->hasFlags(NodeFlags::External));
+  EXPECT_FALSE(other->hasFlags(NodeFlags::External));
+
+  EXPECT_EQ(root->getReason(NodeFlags::External), why);
+  const Reason *derived = mid->getReason(NodeFlags::External);
+  ASSERT_NE(derived, nullptr);
+  EXPECT_EQ(derived->kind, Reason::Kind::EscapedTo);
+  EXPECT_EQ(derived->cause, why);
+  EXPECT_EQ(leaf->getReason(NodeFlags::External), derived);
+
+  // Marking again keeps the first reasons.
+  const Reason *later = g.makeReason(Reason::Kind::EscapedTo, nullptr, "@g");
+  g.markReachable(Cell(leaf), NodeFlags::External | NodeFlags::Mod, later);
+  EXPECT_EQ(root->getReason(NodeFlags::External), why);
+  EXPECT_TRUE(root->hasFlags(NodeFlags::Mod));
+  EXPECT_EQ(g.markReachable(Cell(), NodeFlags::External, why), 0u);
+}
+
+//===----------------------------------------------------------------------===//
 // 9. Printing.
 //===----------------------------------------------------------------------===//
 

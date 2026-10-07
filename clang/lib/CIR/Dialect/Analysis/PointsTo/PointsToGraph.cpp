@@ -31,6 +31,7 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToGraph.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/Operation.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Debug.h"
@@ -281,6 +282,35 @@ void Graph::addFlags(Cell cell, NodeFlags flags, const Reason *why) {
     if (hasAny(flags & NodeFlags::StatusMask, bit))
       recordReason(node, bit, why);
   }
+}
+
+size_t Graph::markReachable(Cell from, NodeFlags flags, const Reason *why) {
+  assert(!hasAny(flags, NodeFlags::Collapsed) &&
+         "markReachable must not collapse nodes");
+  Node *root = from.getNode();
+  if (!root)
+    return 0;
+  const Reason *derived = nullptr;
+  llvm::SmallPtrSet<Node *, 16> visited;
+  llvm::SmallVector<Node *, 16> worklist{root};
+  visited.insert(root);
+  while (!worklist.empty()) {
+    Node *node = worklist.pop_back_val();
+    const Reason *r = why;
+    if (node != root && why) {
+      if (!derived)
+        derived = makeReason(why->kind, why->op,
+                             "reachable from an escaped pointer", why);
+      r = derived;
+    }
+    addFlags(Cell(node), flags, r);
+    for (const auto &link : node->links) {
+      Node *target = link.second.getNode();
+      if (target && visited.insert(target).second)
+        worklist.push_back(target);
+    }
+  }
+  return visited.size();
 }
 
 void Graph::addOrigin(Cell cell, const Origin &origin) {
