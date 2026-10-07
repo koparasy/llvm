@@ -13,10 +13,12 @@
 //                  with in == out: unknown target (open)
 //   TWIN_OPEN      closed-tu off, and an external caller calls f() on a Local
 //                  with in == out
-// TWIN_ESCAPE and TWIN_INDIRECT are wrong under closed-tu (NoAlias, and the run
-// aborts): the call turns unresolved, but Local::f keeps complete formals.
-// That is the closed-tu gap N13, for T18; see the XFAIL tests
-// t11-devirt-closed-escape.cpp and t11-devirt-closed-indirect.cpp.
+// TWIN_ESCAPE and TWIN_INDIRECT also run under closed-tu (closed-tu gap N13):
+// the call turns unresolved, and Local::f, which code we don't see may then
+// call, gets incomplete formals ("address escapes to unknown code"). In
+// ESCAPE its node is External (l escaped with its vptr); in INDIRECT the
+// callee is an unknown object, which may point to any function reachable from
+// a global another TU can name, here the vtable of Local.
 //
 // RUN: %pt_run %s %t.pos %pt_opts closed-tu=1 2>&1 | FileCheck %s --check-prefix=EXEC
 // RUN: FileCheck %s --check-prefix=POS --input-file=%t.pos.table
@@ -26,8 +28,12 @@
 // RUN: FileCheck %s --check-prefix=TWIN --input-file=%t.reassign.table
 // RUN: env CXXFLAGS=-DTWIN_ESCAPE %pt_run %s %t.escape %pt_opts 2>&1 | FileCheck %s --check-prefix=EXEC
 // RUN: FileCheck %s --check-prefix=TWIN --input-file=%t.escape.table
+// RUN: env CXXFLAGS=-DTWIN_ESCAPE %pt_run %s %t.escape-closed %pt_opts closed-tu=1 2>&1 | FileCheck %s --check-prefix=EXEC
+// RUN: FileCheck %s --check-prefix=TWIN --input-file=%t.escape-closed.table
 // RUN: env CXXFLAGS=-DTWIN_INDIRECT %pt_run %s %t.indirect %pt_opts 2>&1 | FileCheck %s --check-prefix=EXEC
 // RUN: FileCheck %s --check-prefix=TWIN --input-file=%t.indirect.table
+// RUN: env CXXFLAGS=-DTWIN_INDIRECT %pt_run %s %t.indirect-closed %pt_opts closed-tu=1 2>&1 | FileCheck %s --check-prefix=EXEC
+// RUN: FileCheck %s --check-prefix=TWIN --input-file=%t.indirect-closed.table
 // RUN: env CXXFLAGS=-DTWIN_OPEN %pt_run %s %t.open %pt_opts 2>&1 | FileCheck %s --check-prefix=EXEC
 // RUN: FileCheck %s --check-prefix=TWIN --input-file=%t.open.table
 //

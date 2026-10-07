@@ -71,6 +71,12 @@
 // analysis walks. PointsToAnalysisOptions::assumeClosedTU treats every
 // function that way. The return cell of a function that may have unknown
 // callers is Incomplete too: what it returns reaches code we don't see.
+// Complete formals are revised in the fixpoint of step 5: a function whose
+// Function node turns External (its address escaped to code we don't see),
+// or that is a target of an unresolved indirect call, may be called by code
+// we don't see with anything, so its formals and return cell become
+// Incomplete, Reason{UnknownCaller, func, "address escapes to unknown code"}
+// chained to the cause, and TUFunction::formalsComplete becomes false.
 //
 //===----------------------------------------------------------------------===//
 
@@ -149,7 +155,9 @@ struct TUCallSite {
 /// The roots of one function in the TU graph.
 struct TUFunction {
   cir::FuncOp func;
-  /// Whether every caller is visible, so that the formals start complete.
+  /// Whether every caller is visible, so that the formals are complete. Set
+  /// before propagation, cleared if the function escapes (see the file
+  /// comment).
   bool formalsComplete = false;
   /// One entry per entry-block argument: the cell of a pointer formal.
   llvm::SmallVector<std::optional<Cell>, 4> formals;
@@ -254,6 +262,9 @@ struct PointsToAnalysisStats {
   size_t numClobberingCalls = 0;
   /// Functions whose formals start complete.
   size_t numCompleteFunctions = 0;
+  /// Of those, the functions whose formals became Incomplete because code we
+  /// don't see may call them (markEscapedFunctions).
+  size_t numEscapedFunctions = 0;
   /// Functions in a recursive call-graph SCC (direct calls and bound
   /// indirect targets), and nodes marked Summary.
   size_t numRecursiveFunctions = 0;
@@ -393,6 +404,11 @@ private:
   void applyUnknownCall(TUCallSite &call, const Reason *why);
   void propagateStatus();
   bool clobberGlobals();
+  /// Make Incomplete the formals and the return cell of every function with
+  /// complete formals that code we don't see may call: its Function node is
+  /// External, or it is a target of an unresolved indirect call. Returns
+  /// whether it marked a function.
+  bool markEscapedFunctions();
   /// Find the recursive functions: the call-graph SCCs with a cycle, over
   /// the direct calls and the bound indirect targets.
   void computeRecursion();

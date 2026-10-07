@@ -196,6 +196,18 @@ void PointsToAnalysis::run() {
         options.assumeClosedTU || visibleCallers.contains(func.getOperation());
     buildLocal(func, complete);
   }
+  // A global another TU can name may hand the functions in its initializer
+  // to code we don't see even if no function here names it: give it a node,
+  // so that markEscapedFunctions sees those functions.
+  for (auto global : module.getOps<cir::GlobalOp>()) {
+    std::optional<Attribute> init = global.getInitialValue();
+    if (!init || cir::isLocalLinkage(global.getLinkage()))
+      continue;
+    bool namesSymbol = false;
+    init->walk([&](FlatSymbolRefAttr) { namesSymbol = true; });
+    if (namesSymbol)
+      globals->getNode(FlatSymbolRefAttr::get(global.getSymNameAttr()));
+  }
   llvm::TimeRecord localTime = llvm::TimeRecord::getCurrentTime(false);
   localTime -= localStart;
   stats.localSeconds = localTime.getWallTime();
@@ -218,7 +230,10 @@ void PointsToAnalysis::run() {
   //    callee node more targets, and adds links the copy closure must relate
   //    (N8);
   //  - any of them can make a callee node External or Incomplete, which turns
-  //    a call resolved earlier into an unresolved one.
+  //    a call resolved earlier into an unresolved one;
+  //  - a function whose node turned External, or that is a target of an
+  //    unresolved call, gets Incomplete formals (markEscapedFunctions, N13),
+  //    which propagation then spreads.
   // The loop stops only after a round in which no rule changed anything, so
   // the result satisfies every rule. It terminates: every rule only adds
   // flags or merges nodes, both monotone, and the graph has finitely many
@@ -235,6 +250,7 @@ void PointsToAnalysis::run() {
     propagateStatus();
     bool bound = false;
     changed |= resolveIndirectCalls(/*finalize=*/false, bound);
+    changed |= markEscapedFunctions();
     if (!changed)
       changed = resolveIndirectCalls(/*finalize=*/true, bound);
     if (bound)
@@ -697,6 +713,123 @@ void PointsToAnalysis::applyUnknownCall(TUCallSite &call, const Reason *why) {
       if (cell)
         unknown(cell);
   site.clobbersGlobals = true;
+}
+
+bool PointsToAnalysis::markEscapedFunctions() {
+  // SOUNDNESS (N13): complete formals (visible callers, or assumeClosedTU)
+  // claim that every caller is bound to the function. Code we don't see can
+  // call it all the same once its address reaches that code: its Function
+  // node is External; or once a call through a pointer to it is unresolved:
+  // the unknown-call rule binds no target. Such a caller may pass anything,
+  // so the formals and the return cell become Incomplete. Only flags are
+  // added, so the fixpoint in run() stays monotone.
+  //
+  // The targets of an unresolved call are not all known: its callee node may
+  // hold a pointer unknown code made (External, Incomplete, UnknownObj, or a
+  // non-function origin). Unknown code can only have the address of a
+  // function of this TU if it reached that code: through an External node
+  // (covered by the first rule) or through a global another TU can name,
+  // such as the vtable of a class whose key function is here, which an
+  // object built by unknown code points to. So such a call may call every
+  // function reachable from a nameable global. (Unknown code naming one of
+  // our functions directly is a caller we don't see, which assumeClosedTU
+  // rules out.)
+  llvm::DenseMap<Operation *, const Reason *> causes;
+  auto consider = [&](FlatSymbolRefAttr sym, const Reason *cause) {
+    auto func = symbols.lookupNearestSymbolFrom<cir::FuncOp>(module, sym);
+    if (!func)
+      return;
+    TUFunction *fn = functionMap.lookup(func.getOperation());
+    if (fn && fn->formalsComplete)
+      causes.try_emplace(func.getOperation(), cause);
+  };
+  // The first cause found is kept: External nodes, then unresolved calls.
+  for (auto [sym, raw] : globals->getSymbolNodes()) {
+    const Node *node = Cell(raw).getNode();
+    if (node->hasFlags(NodeFlags::External))
+      consider(sym, node->getReason(NodeFlags::External));
+  }
+  const Reason *unknownTargetWhy = nullptr;
+  for (std::unique_ptr<TUFunction> &fn : functions)
+    for (TUCallSite &call : fn->callSites) {
+      if (call.resolution != CallResolution::IndirectUnresolved)
+        continue;
+      for (FlatSymbolRefAttr target : call.targets)
+        consider(target, call.unresolvedWhy);
+      if (!call.site.calleePtr)
+        continue;
+      const Node *callee = call.site.calleePtr->getNode();
+      bool unknownTarget = hasAny(callee->getFlags(),
+                                  NodeFlags::External | NodeFlags::Incomplete |
+                                      NodeFlags::UnknownObj);
+      for (const Origin &origin : callee->getOrigins()) {
+        auto sym = dyn_cast_if_present<FlatSymbolRefAttr>(origin.sym);
+        if (origin.kind == Origin::Kind::FuncSym && sym)
+          consider(sym, call.unresolvedWhy);
+        else
+          unknownTarget = true;
+      }
+      if (unknownTarget && !unknownTargetWhy)
+        unknownTargetWhy = call.unresolvedWhy;
+    }
+  if (unknownTargetWhy) {
+    // Every node reachable from a global another TU can name.
+    llvm::DenseSet<const Node *> visited;
+    SmallVector<const Node *, 0> worklist;
+    for (auto [sym, raw] : globals->getSymbolNodes()) {
+      Operation *target = symbols.lookupNearestSymbolFrom(module, sym);
+      auto global = dyn_cast_if_present<cir::GlobalOp>(target);
+      bool nameable = global ? global.isDeclaration() ||
+                                   !cir::isLocalLinkage(global.getLinkage())
+                             : !isa_and_present<cir::FuncOp>(target);
+      const Node *node = Cell(raw).getNode();
+      if (nameable && visited.insert(node).second)
+        worklist.push_back(node);
+    }
+    while (!worklist.empty()) {
+      const Node *node = worklist.pop_back_val();
+      for (const Origin &origin : node->getOrigins())
+        if (origin.kind == Origin::Kind::FuncSym)
+          if (auto sym = dyn_cast_if_present<FlatSymbolRefAttr>(origin.sym))
+            consider(sym, unknownTargetWhy);
+      for (auto [off, cell] : node->getLinks()) {
+        const Node *next = cell.getNode();
+        if (visited.insert(next).second)
+          worklist.push_back(next);
+      }
+    }
+  }
+  if (causes.empty())
+    return false;
+
+  // In processing order, for deterministic reasons.
+  for (std::unique_ptr<TUFunction> &fn : functions) {
+    auto it = causes.find(fn->func.getOperation());
+    if (it == causes.end())
+      continue;
+    fn->formalsComplete = false;
+    ++stats.numEscapedFunctions;
+    const Reason *why =
+        graph->makeReason(Reason::Kind::UnknownCaller, fn->func,
+                          "address escapes to unknown code", it->second);
+    auto mark = [&](Cell cell) {
+      if (cell)
+        graph->addFlags(cell, NodeFlags::Incomplete, why);
+    };
+    for (const std::optional<Cell> &formal : fn->formals)
+      if (formal)
+        mark(*formal);
+    for (const std::optional<AggregateSlots> &slots : fn->formalSlots)
+      if (slots)
+        for (auto [off, cell] : *slots)
+          mark(cell);
+    if (fn->returnCell)
+      mark(*fn->returnCell);
+    if (fn->returnSlots)
+      for (auto [off, cell] : *fn->returnSlots)
+        mark(cell);
+  }
+  return true;
 }
 
 void PointsToAnalysis::propagateStatus() {

@@ -345,6 +345,8 @@ void TestCIRPointsToPass::runCI() {
        << "functions: " << stats.numFunctions << "\n"
        << "functions with complete formals: " << stats.numCompleteFunctions
        << "\n"
+       << "functions whose address escapes: " << stats.numEscapedFunctions
+       << "\n"
        << "local nodes: " << stats.numLocalNodes << "\n"
        << "TU live nodes: " << numNodes << "\n"
        << "collapsed nodes: " << numCollapsed << "\n"

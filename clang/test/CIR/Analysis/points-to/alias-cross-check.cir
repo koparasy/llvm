@@ -17,6 +17,8 @@
 // RUN: cir-opt %S/alias-ipo.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/array-cap.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/array-cap.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/closed-tu-escape.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/closed-tu-escape.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/copy.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/copy.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/escape-call.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null

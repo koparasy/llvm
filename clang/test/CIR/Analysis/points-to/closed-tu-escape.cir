@@ -1,0 +1,96 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1 print-stats=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Closed-tu (N13): every function starts with complete formals, but one that
+// code we don't see may call gets Incomplete formals once the fixpoint shows
+// it, Reason{UnknownCaller, "address escapes to unknown code"} chained to the
+// cause:
+//  - @stored: its address is in @gfp, a global another TU can name (no
+//    function here names @gfp; its node is made for its initializer);
+//  - @passed: its address is passed to the declaration @sink;
+//  - @tabled: its address is in @tbl, a constant another TU can name, so it
+//    is not External; but @call_unknown calls through a pointer from unknown
+//    code, which may be any function reachable from a nameable global;
+//  - @resolved: only called through a resolved indirect call, stays complete;
+//  - @direct: internal, only called directly, stays complete.
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[A1:n[0-9]+]] [Stack|Incomplete] size=4 origins={stack(cir.alloca 'a1' {{.*}})} links={} reasons={Incomplete: UnknownCaller(cir.func {{.*}}, "address escapes to unknown code") <- EscapedTo(cir.global {{.*}}, "reachable from an escaped pointer") <- EscapedTo(cir.global {{.*}}, "global visible to other TUs")}
+// CHECK-DAG: [[A2:n[0-9]+]] [Stack|Incomplete] size=4 origins={stack(cir.alloca 'a2' {{.*}})} links={} reasons={Incomplete: UnknownCaller(cir.func {{.*}}, "address escapes to unknown code") <- EscapedTo(cir.call {{.*}}, "@sink")}
+// CHECK-DAG: [[A3:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a3' {{.*}})} links={}{{$}}
+// CHECK-DAG: [[A4:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a4' {{.*}})} links={}{{$}}
+// CHECK-DAG: [[A5:n[0-9]+]] [Stack|Incomplete] size=4 origins={stack(cir.alloca 'a5' {{.*}})} links={} reasons={Incomplete: UnknownCaller(cir.func {{.*}}, "address escapes to unknown code") <- IndirectUnresolved(cir.call {{.*}}, "callee may be an unknown object")}
+// CHECK-DAG: {{n[0-9]+}} [Global] size=8 origins={global(@tbl)} links={0->{{n[0-9]+}}+0}
+// CHECK-LABEL: === @stored formals=incomplete
+// CHECK-NEXT: @stored formal #0 -> [[A1]]+0
+// CHECK-LABEL: === @passed formals=incomplete
+// CHECK-NEXT: @passed formal #0 -> [[A2]]+0
+// CHECK-LABEL: === @resolved formals=complete
+// CHECK-NEXT: @resolved formal #0 -> [[A3]]+0
+// CHECK-LABEL: === @direct formals=complete
+// CHECK-NEXT: @direct formal #0 -> [[A4]]+0
+// CHECK-LABEL: === @tabled formals=incomplete
+// CHECK-NEXT: @tabled formal #0 -> [[A5]]+0
+// CHECK-LABEL: === calls
+// CHECK: @main cir.call -> indirect -> {@resolved}
+// CHECK: @call_unknown cir.call -> indirect-unresolved (IndirectUnresolved, "callee may be an unknown object")
+// CHECK-LABEL: --- ci stats
+// CHECK: functions with complete formals: 7
+// CHECK-NEXT: functions whose address escapes: 3
+
+!s32i = !cir.int<s, 32>
+!vty = !cir.func<(!cir.ptr<!s32i>)>
+!uty = !cir.func<() -> !cir.ptr<!vty>>
+
+module {
+cir.func private @sink(!cir.ptr<!vty>)
+cir.func private @unknown_fp() -> !cir.ptr<!vty>
+
+cir.func internal @stored(%p: !cir.ptr<!s32i>) {
+  cir.return
+}
+cir.global external @gfp = #cir.global_view<@stored> : !cir.ptr<!vty>
+
+cir.func internal @passed(%p: !cir.ptr<!s32i>) {
+  cir.return
+}
+cir.func internal @resolved(%p: !cir.ptr<!s32i>) {
+  cir.return
+}
+cir.func internal @direct(%p: !cir.ptr<!s32i>) {
+  cir.return
+}
+cir.func internal @tabled(%p: !cir.ptr<!s32i>) {
+  cir.return
+}
+cir.global constant external @tbl = #cir.const_array<[#cir.global_view<@tabled> : !cir.ptr<!vty>]> : !cir.array<!cir.ptr<!vty> x 1>
+
+cir.func @main() {
+  %a1 = cir.alloca "a1" align(4) : !cir.ptr<!s32i>
+  %a2 = cir.alloca "a2" align(4) : !cir.ptr<!s32i>
+  %a3 = cir.alloca "a3" align(4) : !cir.ptr<!s32i>
+  %a4 = cir.alloca "a4" align(4) : !cir.ptr<!s32i>
+  %a5 = cir.alloca "a5" align(4) : !cir.ptr<!s32i>
+  %a1_tag = cir.cast bitcast %a1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a1"}
+  %a3_tag = cir.cast bitcast %a3 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a3"}
+  %a5_tag = cir.cast bitcast %a5 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a5"}
+  cir.call @stored(%a1) : (!cir.ptr<!s32i>) -> ()
+  cir.call @passed(%a2) : (!cir.ptr<!s32i>) -> ()
+  cir.call @direct(%a4) : (!cir.ptr<!s32i>) -> ()
+  cir.call @tabled(%a5) : (!cir.ptr<!s32i>) -> ()
+  %f = cir.get_global @passed : !cir.ptr<!vty>
+  cir.call @sink(%f) : (!cir.ptr<!vty>) -> ()
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!vty>>
+  %r = cir.get_global @resolved : !cir.ptr<!vty>
+  cir.store %r, %slot : !cir.ptr<!vty>, !cir.ptr<!cir.ptr<!vty>>
+  %fp = cir.load %slot : !cir.ptr<!cir.ptr<!vty>>, !cir.ptr<!vty>
+  cir.call %fp(%a3) : (!cir.ptr<!vty>, !cir.ptr<!s32i>) -> ()
+  cir.return
+}
+
+cir.func @call_unknown() {
+  %a6 = cir.alloca "a6" align(4) : !cir.ptr<!s32i>
+  %g = cir.call @unknown_fp() : () -> !cir.ptr<!vty>
+  cir.call %g(%a6) : (!cir.ptr<!vty>, !cir.ptr<!s32i>) -> ()
+  cir.return
+}
+}
