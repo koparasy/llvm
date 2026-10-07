@@ -29,6 +29,16 @@
 //    collapses both nodes and unifies their single links.
 //  - cir.libc.memchr: the source's node at an unknown offset (collapse).
 //  - cir.vtable.get_vptr: the object's cell (the vptr is at offset 0).
+//  - cir.vtable.address_point: the cell of the vtable global's node at the
+//    address point's byte offset (GEP [0, index, offset] on the vtable's
+//    record type); cir.vtt.address_point: entry `offset` of the VTT global
+//    or of the sub-VTT operand. Loads of their slots read the links of the
+//    #cir.vtable / VTT initializer (GlobalNodes).
+//  - cir.vtable.get_virtual_fn_addr: the vptr's cell plus index pointers;
+//    cir.vtable.get_type_info: the vptr's cell minus one pointer.
+//  - cir.get_method of a constant #cir.method<@f>: the callee is @f's
+//    Function node and the adjusted `this` the object's cell. Any other
+//    method pointer is pessimistic.
 //  - A load, store or copy through a type with arrays too long to scan for
 //    pointer slots smashes the node (an array of the element size, or a
 //    collapse) so that the scanned slots stand for the missing ones.
@@ -54,7 +64,8 @@
 //    with a body (the interprocedural phase connects it); the unknown-call
 //    rule for any other declaration. Indirect calls are decided after the
 //    walk: resolved (recorded only) if the callee pointer points only to
-//    functions, the unknown-call rule otherwise.
+//    functions, the unknown-call rule otherwise; or, under
+//    setDeferIndirectCalls, left to the interprocedural phase.
 //  - The unknown-call rule: every node reachable from a pointer argument
 //    (or a pointer slot of an aggregate argument) becomes External, with Mod
 //    and Ref and Reason{EscapedTo, @callee}; the result and the result slots
@@ -153,6 +164,8 @@ StringRef cir::pointsto::getCallKindName(CallKind kind) {
     return "indirect-resolved";
   case CallKind::IndirectUnknown:
     return "indirect-unknown";
+  case CallKind::IndirectDeferred:
+    return "indirect-deferred";
   }
   llvm_unreachable("unknown call kind");
 }
@@ -506,7 +519,13 @@ std::unique_ptr<FunctionGraph> LocalBuilder::build() {
   defineBlockArguments();
   closeMemTransfers(graph, fg->memTransfers);
   applyDeferredEffects();
-  resolveIndirectCalls();
+  if (deferIndirectCalls) {
+    for (size_t index : indirectCalls)
+      fg->callSites[index].kind = CallKind::IndirectDeferred;
+    indirectCalls.clear();
+  } else {
+    resolveIndirectCalls();
+  }
   for (auto [sym, node] : globals->getSymbolNodes())
     fg->symbolCells.emplace_back(sym, Cell(node));
 
@@ -684,6 +703,23 @@ void LocalBuilder::visit(Operation *op) {
           // The vptr is at offset 0 of the object: like a bitcast.
           defineCopy(op.getResult(), op.getSrc());
         })
+        .Case<cir::VTableAddrPointOp>(
+            [&](cir::VTableAddrPointOp op) { visitVTableAddrPoint(op); })
+        .Case<cir::VTTAddrPointOp>(
+            [&](cir::VTTAddrPointOp op) { visitVTTAddrPoint(op); })
+        .Case<cir::VTableGetVirtualFnAddrOp>(
+            [&](cir::VTableGetVirtualFnAddrOp op) {
+              visitVPtrStep(op, op.getVptr(),
+                            static_cast<int64_t>(op.getIndex()) *
+                                fg->getGraph().getPointerSize());
+            })
+        .Case<cir::VTableGetTypeInfoOp>([&](cir::VTableGetTypeInfoOp op) {
+          // Itanium C++ ABI 2.5.2: the RTTI pointer is the slot just before
+          // the address point (lowered as a ptr_stride of -1 pointer).
+          visitVPtrStep(op, op.getVptr(),
+                        -static_cast<int64_t>(fg->getGraph().getPointerSize()));
+        })
+        .Case<cir::GetMethodOp>([&](auto op) { visitGetMethod(op); })
         .Case<cir::LocalInitOp>([](cir::LocalInitOp) {
           // The walk visits the ctor and dtor regions as part of the
           // function; the op itself moves no pointer.
@@ -1112,6 +1148,116 @@ void LocalBuilder::visitAddressStep(Operation *op) {
   define(result, *base);
 }
 
+/// The byte offset of the address point \p point inside a vtable (group) of
+/// type \p type, following the lowering: a GEP [0, index, offset] on the
+/// vtable's record type. std::nullopt if the type is not such a record.
+static std::optional<int64_t>
+getAddressPointOffset(Type type, cir::AddressPointAttr point,
+                      const DataLayout &dataLayout) {
+  auto recordTy = dyn_cast_if_present<cir::RecordType>(type);
+  if (!recordTy || recordTy.isIncomplete() || point.getIndex() < 0 ||
+      static_cast<size_t>(point.getIndex()) >= recordTy.getNumElements())
+    return std::nullopt;
+  unsigned index = point.getIndex();
+  auto arrayTy = dyn_cast<cir::ArrayType>(recordTy.getElementType(index));
+  if (!arrayTy || point.getOffset() < 0 ||
+      static_cast<uint64_t>(point.getOffset()) > arrayTy.getSize())
+    return std::nullopt;
+  std::optional<int64_t> elemSize =
+      getTypeSizeInBytes(arrayTy.getElementType(), dataLayout);
+  if (!elemSize)
+    return std::nullopt;
+  return static_cast<int64_t>(recordTy.getElementOffset(dataLayout, index)) +
+         point.getOffset() * *elemSize;
+}
+
+void LocalBuilder::visitVTableAddrPoint(cir::VTableAddrPointOp op) {
+  // The address point is a cell of the vtable global's node, whose slots
+  // GlobalNodes linked to the Function nodes of the #cir.vtable initializer.
+  Cell vtable(globals->getNode(op.getNameAttr()));
+  std::optional<int64_t> offset =
+      getAddressPointOffset(globals->getSymbolType(op.getNameAttr()),
+                            op.getAddressPoint(), dataLayout);
+  if (!offset) {
+    Graph &graph = fg->getGraph();
+    graph.collapse(vtable.getNode(),
+                   graph.makeReason(Reason::Kind::CollapsedAt, op,
+                                    "vtable address point not understood"));
+    define(op.getAddr(), vtable);
+    return;
+  }
+  define(op.getAddr(), shift(vtable, *offset));
+}
+
+void LocalBuilder::visitVTTAddrPoint(cir::VTTAddrPointOp op) {
+  // The VTT is an array of vtable address points: entry `offset` of the VTT
+  // global, or of the sub-VTT the operand points to.
+  Graph &graph = fg->getGraph();
+  int64_t step = static_cast<int64_t>(op.getOffset()) * graph.getPointerSize();
+  if (Value addr = op.getSymAddr()) {
+    if (!isPointerType(addr.getType())) {
+      visitUnhandled(op, "VTT address that is not a pointer");
+      return;
+    }
+    std::optional<Cell> base = cellFor(addr);
+    define(op.getAddr(), base ? shift(*base, step) : Cell(graph.makeNode()));
+    return;
+  }
+  FlatSymbolRefAttr name = op.getNameAttr();
+  if (!name) {
+    visitUnhandled(op, "VTT address point without a VTT");
+    return;
+  }
+  Cell vtt(globals->getNode(name));
+  // The lowering is a GEP [0, offset] on the VTT's type: an array of
+  // pointers. Any other type: step by its element size if it is an array,
+  // else smash the node.
+  std::optional<int64_t> elemSize;
+  if (auto arrayTy =
+          dyn_cast_if_present<cir::ArrayType>(globals->getSymbolType(name)))
+    elemSize = getTypeSizeInBytes(arrayTy.getElementType(), dataLayout);
+  if (!elemSize) {
+    graph.collapse(vtt.getNode(),
+                   graph.makeReason(Reason::Kind::CollapsedAt, op,
+                                    "VTT of an unexpected type"));
+    define(op.getAddr(), vtt);
+    return;
+  }
+  define(op.getAddr(), shift(vtt, op.getOffset() * *elemSize));
+}
+
+void LocalBuilder::visitVPtrStep(Operation *op, Value vptr, int64_t offset) {
+  // A vptr points to an address point inside a vtable; a slot of it is a
+  // constant number of pointers away. A load from the result reads the
+  // slot's link: the Function node of the virtual function, or the RTTI.
+  std::optional<Cell> base = cellFor(vptr);
+  if (!base) {
+    // A null vptr points to nothing (using it is UB).
+    define(op->getResult(0), Cell(fg->getGraph().makeNode()));
+    return;
+  }
+  define(op->getResult(0), shift(*base, offset));
+}
+
+void LocalBuilder::visitGetMethod(cir::GetMethodOp op) {
+  // Itanium C++ ABI 2.3: a pointer to a non-virtual member function holds
+  // the function's address and a this-adjustment, which is zero for a
+  // constant naming a member of the class itself (conversions are separate
+  // cir.base_method / cir.derived_method ops). Anything else (a virtual
+  // member, a method pointer read from memory or converted) stays
+  // pessimistic.
+  auto constant = op.getMethod().getDefiningOp<cir::ConstantOp>();
+  auto method =
+      constant ? dyn_cast<cir::MethodAttr>(constant.getValue()) : nullptr;
+  if (!method || !method.getSymbol()) {
+    visitUnhandled(op, "method pointer not a constant non-virtual member");
+    return;
+  }
+  define(op.getCallee(), Cell(globals->getNode(*method.getSymbol())));
+  if (std::optional<Cell> object = cellFor(op.getObject()))
+    define(op.getAdjustedThis(), *object);
+}
+
 void LocalBuilder::visitCast(cir::CastOp op) {
   Graph &graph = fg->getGraph();
   switch (op.getKind()) {
@@ -1231,7 +1377,7 @@ void LocalBuilder::dispatchCall(size_t index, CIRCallOpInterface call) {
   if (models)
     if (const PointsToModel *model = models->lookup(call, callee, name)) {
       ModelContext ctx(*fg, dataLayout, deferredEffects);
-      model->apply(*fg, site, ctx);
+      model->apply(site, ctx);
       site.kind = CallKind::Modelled;
       site.modelled = model->name();
       return;
@@ -1322,8 +1468,13 @@ void LocalBuilder::applyResolvedTargets(CallSiteRecord &site) {
     if (models)
       if (const PointsToModel *model =
               models->lookup(call, callee, target.getValue())) {
+        // The model reads the callee from the site: give it the target. The
+        // cells are shared, so the copy's effects are the site's.
+        CallSiteRecord targetSite = site;
+        targetSite.callee = target;
         ModelContext ctx(*fg, dataLayout, deferredEffects);
-        model->apply(*fg, site, ctx);
+        model->apply(targetSite, ctx);
+        site.clobbersGlobals |= targetSite.clobbersGlobals;
         site.modelled = model->name();
         continue;
       }
@@ -1414,7 +1565,12 @@ void LocalBuilder::visitCopy(cir::CopyOp op) {
 void cir::pointsto::recordMemTransfer(FunctionGraph &fg, Operation *op,
                                       Cell dst, Cell src,
                                       std::optional<int64_t> length) {
-  Graph &graph = fg.getGraph();
+  recordMemTransfer(fg.getGraph(), fg.memTransfers, op, dst, src, length);
+}
+
+void cir::pointsto::recordMemTransfer(
+    Graph &graph, SmallVectorImpl<MemTransferRecord> &transfers, Operation *op,
+    Cell dst, Cell src, std::optional<int64_t> length) {
   graph.addFlags(dst, NodeFlags::Mod);
   graph.addFlags(src, NodeFlags::Ref);
   // Like cir.copy over the bytes [0, length), without a type: done by the
@@ -1427,7 +1583,7 @@ void cir::pointsto::recordMemTransfer(FunctionGraph &fg, Operation *op,
     graph.growSize(dst.getNode(), dst.getOffset() + *length);
     graph.growSize(src.getNode(), src.getOffset() + *length);
   }
-  fg.memTransfers.push_back(
+  transfers.push_back(
       {op, dst, src,
        length ? static_cast<uint64_t>(*length) : MemTransferRecord::kUnknown});
 }

@@ -1,0 +1,59 @@
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// The address arithmetic of the vtable ops in the local graph:
+// cir.vtt.address_point is entry `offset` of the VTT global (or of the
+// sub-VTT its operand points to), and loading it reads the VTT
+// initializer's link to the vtable's address point. cir.get_method of a
+// constant #cir.method<@f> gives @f's Function node and the object as
+// `this`; any other method pointer is pessimistic.
+
+!s32i = !cir.int<s, 32>
+!u8i = !cir.int<u, 8>
+!void = !cir.void
+!rec_Foo = !cir.struct<"Foo" {data !s32i}>
+!rec_vt = !cir.struct<{data !cir.array<!cir.ptr<!u8i> x 4>}>
+!mty = !cir.method<!cir.func<(!cir.ptr<!rec_Foo>, !s32i)> in !rec_Foo>
+
+module {
+cir.global "private" constant internal @_ZTV1D = #cir.vtable<{#cir.const_array<[#cir.ptr<null> : !cir.ptr<!u8i>, #cir.ptr<null> : !cir.ptr<!u8i>, #cir.ptr<null> : !cir.ptr<!u8i>, #cir.ptr<null> : !cir.ptr<!u8i>]> : !cir.array<!cir.ptr<!u8i> x 4>}> : !rec_vt
+cir.global "private" constant internal @_ZTT1D = #cir.const_array<[#cir.global_view<@_ZTV1D, [0 : i32, 3 : i32]> : !cir.ptr<!u8i>, #cir.global_view<@_ZTV1D, [0 : i32, 2 : i32]> : !cir.ptr<!u8i>]> : !cir.array<!cir.ptr<!u8i> x 2>
+
+// CHECK-LABEL: === @vtt
+// CHECK-DAG: [[VTT:n[0-9]+]] [Global|Ref] size=16 origins={global(@_ZTT1D)} links={0->[[VT:n[0-9]+]]+24, 8->[[VT]]+16}
+// CHECK-DAG: e1 -> [[VTT]]+8
+// CHECK-DAG: sub -> [[VTT]]+8
+// CHECK-DAG: vp -> [[VT]]+16
+cir.func @vtt() {
+  %e1 = cir.vtt.address_point @_ZTT1D, offset = 1 -> !cir.ptr<!cir.ptr<!void>> {test.ptr = "e1"}
+  %e0 = cir.vtt.address_point @_ZTT1D, offset = 0 -> !cir.ptr<!cir.ptr<!void>>
+  %sub = cir.vtt.address_point %e0 : !cir.ptr<!cir.ptr<!void>>, offset = 1 -> !cir.ptr<!cir.ptr<!void>> {test.ptr = "sub"}
+  %vp = cir.load %sub : !cir.ptr<!cir.ptr<!void>>, !cir.ptr<!void>
+  %vp_tag = cir.cast bitcast %vp : !cir.ptr<!void> -> !cir.ptr<!void> {test.ptr = "vp"}
+  cir.return
+}
+
+cir.func private @_ZN3Foo2m1Ei(!cir.ptr<!void>, !s32i)
+
+// CHECK-LABEL: === @method_const
+// CHECK-DAG: [[F:n[0-9]+]] [Function] size=0 origins={func(@_ZN3Foo2m1Ei)} links={}
+// CHECK-DAG: [[OBJ:n[0-9]+]] [Stack|External|Mod|Ref] size=4 origins={stack(cir.alloca 'obj' {{.*}})} links={}
+// CHECK-DAG: call cir.call callee=[[F]]+0 args={0: [[OBJ]]+0} {{.*}}kind=indirect-resolved
+cir.func @method_const(%n: !s32i) {
+  %obj = cir.alloca "obj" align(4) : !cir.ptr<!rec_Foo>
+  %m = cir.const #cir.method<@_ZN3Foo2m1Ei> : !mty
+  %callee, %this = cir.get_method %m, %obj : (!mty, !cir.ptr<!rec_Foo>) -> (!cir.ptr<!cir.func<(!cir.ptr<!void>, !s32i)>>, !cir.ptr<!void>)
+  cir.call %callee(%this, %n) : (!cir.ptr<!cir.func<(!cir.ptr<!void>, !s32i)>>, !cir.ptr<!void>, !s32i) -> ()
+  cir.return
+}
+
+// CHECK-LABEL: === @method_loaded
+// CHECK-DAG: {{n[0-9]+}} [Stack|External|Collapsed] size=4 origins={stack(cir.alloca 'obj' {{.*}})} {{.*}}UnhandledOp(cir.get_method {{.*}}, "method pointer not a constant non-virtual member")
+// CHECK-DAG: kind=indirect-unknown
+cir.func @method_loaded(%pm: !cir.ptr<!mty>, %n: !s32i) {
+  %obj = cir.alloca "obj" align(4) : !cir.ptr<!rec_Foo>
+  %m = cir.load %pm : !cir.ptr<!mty>, !mty
+  %callee, %this = cir.get_method %m, %obj : (!mty, !cir.ptr<!rec_Foo>) -> (!cir.ptr<!cir.func<(!cir.ptr<!void>, !s32i)>>, !cir.ptr<!void>)
+  cir.call %callee(%this, %n) : (!cir.ptr<!cir.func<(!cir.ptr<!void>, !s32i)>>, !cir.ptr<!void>, !s32i) -> ()
+  cir.return
+}
+}

@@ -39,10 +39,15 @@
 //   @func <name> -> <cell or slots>   for each tagged value, as above
 //   === calls
 //   @caller <op> [@callee] -> direct @f | model <name> | unknown
-//                             | indirect-unresolved
+//                             | indirect -> {@f, @g}
+//                             | indirect-unresolved (<Kind>, "<detail>")
+//                               [bound={@f, ...}]
 //
-// closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU. print-graphs=0
-// leaves out everything but the statistics.
+// closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU and
+// max-indirect-rounds=<n> PointsToAnalysisOptions::maxIndirectRounds.
+// print-graphs=0 leaves out everything but the statistics, which end with one
+// line per unresolved indirect call: its location, its reason, and the first
+// reason the callee node got External or Incomplete.
 //
 //===----------------------------------------------------------------------===//
 
@@ -51,6 +56,7 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -89,6 +95,11 @@ struct TestCIRPointsToPass
                         llvm::cl::desc("In ci mode, assume every caller of "
                                        "every function is in the module"),
                         llvm::cl::init(false)};
+  Option<unsigned> maxIndirectRounds{
+      *this, "max-indirect-rounds",
+      llvm::cl::desc("In ci mode, the rounds of indirect-call resolution "
+                     "that may bind new targets"),
+      llvm::cl::init(PointsToAnalysisOptions().maxIndirectRounds)};
 
   void runOnOperation() override;
   void runLocal();
@@ -109,6 +120,46 @@ void printSlots(raw_ostream &os, StringRef name,
     Graph::printCell(os, slot.second);
   }
   os << "}\n";
+}
+
+std::string formatTargets(const TUCallSite &call) {
+  std::string out = "{";
+  for (auto [i, target] : llvm::enumerate(call.targets))
+    out += (i ? ", @" : "@") + target.getValue().str();
+  return out + "}";
+}
+
+std::string formatReason(const Reason *why) {
+  std::string out = getReasonKindName(why->kind).str();
+  if (!why->detail.empty())
+    out += ", \"" + why->detail.str() + "\"";
+  return out;
+}
+
+/// The op of \p why and the first op of its causes, as "name file:line".
+std::string formatReasonSite(const Reason *why) {
+  for (; why; why = why->cause) {
+    if (!why->op)
+      continue;
+    std::string out = why->op->getName().getStringRef().str();
+    if (auto loc = dyn_cast<FileLineColLoc>(why->op->getLoc()))
+      out += " " + llvm::sys::path::filename(loc.getFilename().getValue())
+                       .str() +
+             ":" + std::to_string(loc.getLine());
+    if (auto func = why->op->getParentOfType<cir::FuncOp>())
+      out += " in @" + func.getSymName().str();
+    else if (auto func = dyn_cast<cir::FuncOp>(why->op))
+      out += " @" + func.getSymName().str();
+    return out;
+  }
+  return "-";
+}
+
+/// The root of the chain of \p why: the last cause.
+const Reason *rootReason(const Reason *why) {
+  while (why && why->cause)
+    why = why->cause;
+  return why;
 }
 
 void TestCIRPointsToPass::runOnOperation() {
@@ -155,6 +206,7 @@ void TestCIRPointsToPass::runCI() {
     registerGenericModels(registry);
   PointsToAnalysisOptions options;
   options.assumeClosedTU = closedTU;
+  options.maxIndirectRounds = maxIndirectRounds;
   bool anyFailed = false;
 
   SmallVector<ModuleOp> modules;
@@ -213,6 +265,14 @@ void TestCIRPointsToPass::runCI() {
             os << " @" << cir::FuncOp(call.callee).getSymName();
           else if (call.resolution == CallResolution::Model)
             os << " " << call.site.modelled;
+          else if (call.resolution == CallResolution::Indirect)
+            os << " -> " << formatTargets(call);
+          else if (call.resolution == CallResolution::IndirectUnresolved) {
+            if (call.unresolvedWhy)
+              os << " (" << formatReason(call.unresolvedWhy) << ")";
+            if (!call.targets.empty())
+              os << " bound=" << formatTargets(call);
+          }
           os << "\n";
         }
       }
@@ -256,7 +316,12 @@ void TestCIRPointsToPass::runCI() {
        << "incomplete nodes: " << numIncomplete << "\n"
        << "direct calls: " << stats.numDirectCalls << "\n"
        << "bindings unified: " << stats.numBindings << "\n"
-       << "indirect calls unresolved here: " << stats.numIndirectUnresolved
+       << "indirect calls resolved: " << stats.numIndirectResolved << "\n"
+       << "indirect calls unresolved: " << stats.numIndirectUnresolved << "\n"
+       << "indirect targets bound: " << stats.numIndirectTargetsBound << "\n"
+       << "indirect rounds that bound a target: " << stats.numIndirectRounds
+       << "\n"
+       << "indirect calls over the round budget: " << stats.numIndirectBudget
        << "\n"
        << "clobbering calls: " << stats.numClobberingCalls << "\n"
        << "copy closure settled: " << (stats.transfersSettled ? "yes" : "no")
@@ -276,6 +341,35 @@ void TestCIRPointsToPass::runCI() {
     };
     printMap("call sites by resolution", resolutions);
     printMap("collapsed nodes by reason", collapseReasons);
+    llvm::StringMap<unsigned> unresolvedReasons;
+    for (const auto &fn : analysis.getFunctions())
+      for (const TUCallSite &call : fn->callSites)
+        if (call.resolution == CallResolution::IndirectUnresolved &&
+            call.unresolvedWhy)
+          ++unresolvedReasons[formatReason(call.unresolvedWhy)];
+    printMap("unresolved indirect calls by reason", unresolvedReasons);
+    os << "unresolved indirect calls:\n";
+    for (const auto &fn : analysis.getFunctions())
+      for (const TUCallSite &call : fn->callSites) {
+        if (call.resolution != CallResolution::IndirectUnresolved)
+          continue;
+        os << "  " << formatReasonSite(call.unresolvedWhy) << ": "
+           << (call.unresolvedWhy ? formatReason(call.unresolvedWhy) : "-");
+        if (!call.targets.empty())
+          os << " bound=" << formatTargets(call);
+        if (call.site.calleePtr) {
+          const Node *callee = call.site.calleePtr->getNode();
+          for (NodeFlags flag : {NodeFlags::External, NodeFlags::Incomplete})
+            if (const Reason *why = callee->getReason(flag)) {
+              const Reason *root = rootReason(why);
+              os << "; " << getFlagName(flag) << " from "
+                 << formatReason(root) << " at " << formatReasonSite(root);
+            }
+          os << "; callee n" << callee->getId() << " origins="
+             << callee->getOrigins().size();
+        }
+        os << "\n";
+      }
   }
   if (anyFailed)
     signalPassFailure();

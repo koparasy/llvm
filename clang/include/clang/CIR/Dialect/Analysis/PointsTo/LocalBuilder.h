@@ -120,6 +120,11 @@ bool closeMemTransfers(Graph &graph,
 /// cir.libc.memmove and the memcpy-family library models.
 void recordMemTransfer(FunctionGraph &fg, mlir::Operation *op, Cell dst,
                        Cell src, std::optional<int64_t> length);
+/// The same on \p graph, appending the record to \p transfers.
+void recordMemTransfer(Graph &graph,
+                       llvm::SmallVectorImpl<MemTransferRecord> &transfers,
+                       mlir::Operation *op, Cell dst, Cell src,
+                       std::optional<int64_t> length);
 
 /// How the local phase treated a call.
 enum class CallKind : uint8_t {
@@ -133,11 +138,14 @@ enum class CallKind : uint8_t {
   UnknownDecl,
   /// An indirect call whose callee pointer points only to functions known by
   /// symbol: the targets that are declarations give their effect (model or
-  /// unknown-call rule) now; the interprocedural phase connects the defined
-  /// ones.
+  /// unknown-call rule) now; the defined ones are not bound. Only without
+  /// setDeferIndirectCalls, as is the next kind; PointsToAnalysis defers.
   IndirectResolved,
   /// An indirect call whose targets are not known: the unknown-call rule.
   IndirectUnknown,
+  /// An indirect call left to the interprocedural phase
+  /// (LocalBuilder::setDeferIndirectCalls): recorded only, no effect yet.
+  IndirectDeferred,
 };
 
 llvm::StringRef getCallKindName(CallKind kind);
@@ -304,6 +312,14 @@ public:
   /// Incomplete. Call before build(). Off by default.
   void setFormalsComplete(bool complete) { formalsComplete = complete; }
 
+  /// Leave every indirect call to the interprocedural phase: record it as
+  /// CallKind::IndirectDeferred and give it no effect. Its callee pointer is
+  /// only known once the graphs of the callers and callees are joined, so a
+  /// local decision would apply the unknown-call rule to calls that the TU
+  /// graph resolves. The graph is then only sound together with that phase.
+  /// Call before build(). Off by default.
+  void setDeferIndirectCalls(bool defer) { deferIndirectCalls = defer; }
+
   /// Walk the body and return the finished graph. Call once. Under
   /// -cir-points-to-verify the graph is verified before it is returned.
   std::unique_ptr<FunctionGraph> build();
@@ -375,6 +391,12 @@ private:
   void visitStore(cir::StoreOp op);
   void visitAddressStep(mlir::Operation *op);
   void visitCast(cir::CastOp op);
+  void visitVTableAddrPoint(cir::VTableAddrPointOp op);
+  void visitVTTAddrPoint(cir::VTTAddrPointOp op);
+  /// cir.vtable.get_virtual_fn_addr / get_type_info: the cell \p offset
+  /// bytes from the one \p vptr points to.
+  void visitVPtrStep(mlir::Operation *op, mlir::Value vptr, int64_t offset);
+  void visitGetMethod(cir::GetMethodOp op);
   void visitCollapse(mlir::Operation *op, mlir::Value src);
   void visitAtomic(mlir::Operation *op, mlir::Value addr, mlir::Value stored,
                    mlir::Value loaded);
@@ -451,6 +473,7 @@ private:
   llvm::SmallVector<size_t, 0> indirectCalls;
   bool verifyErrors = false;
   bool formalsComplete = false;
+  bool deferIndirectCalls = false;
 };
 
 } // namespace cir::pointsto

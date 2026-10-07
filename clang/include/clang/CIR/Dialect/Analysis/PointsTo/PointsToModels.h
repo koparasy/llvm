@@ -50,14 +50,23 @@ class DataLayout;
 
 namespace cir::pointsto {
 
-/// What a model may use and do at a call site, besides the FunctionGraph.
+/// What a model may use and do at a call site: the graph the site's cells
+/// live in (a function's local graph, or the TU graph of the interprocedural
+/// phase when it resolves an indirect call to a declaration), and where to
+/// record deferred effects and copies.
 class ModelContext {
 public:
+  ModelContext(Graph &graph, const mlir::DataLayout &dataLayout,
+               llvm::SmallVectorImpl<DeferredEffect> &deferred,
+               llvm::SmallVectorImpl<MemTransferRecord> &memTransfers)
+      : graph(graph), dataLayout(dataLayout), deferred(deferred),
+        memTransfers(memTransfers) {}
+  /// The context of a call site of \p fg.
   ModelContext(FunctionGraph &fg, const mlir::DataLayout &dataLayout,
                llvm::SmallVectorImpl<DeferredEffect> &deferred)
-      : fg(fg), dataLayout(dataLayout), deferred(deferred) {}
+      : ModelContext(fg.getGraph(), dataLayout, deferred, fg.memTransfers) {}
 
-  Graph &getGraph() { return fg.getGraph(); }
+  Graph &getGraph() { return graph; }
   const mlir::DataLayout &getDataLayout() const { return dataLayout; }
 
   /// The value of argument \p index if it is an integer constant;
@@ -108,13 +117,14 @@ public:
   /// \p dst, like cir.libc.memcpy (see recordMemTransfer).
   void addMemTransfer(const CallSiteRecord &site, Cell dst, Cell src,
                       std::optional<int64_t> length) {
-    recordMemTransfer(fg, site.call, dst, src, length);
+    recordMemTransfer(graph, memTransfers, site.call, dst, src, length);
   }
 
 private:
-  FunctionGraph &fg;
+  Graph &graph;
   const mlir::DataLayout &dataLayout;
   llvm::SmallVectorImpl<DeferredEffect> &deferred;
+  llvm::SmallVectorImpl<MemTransferRecord> &memTransfers;
 };
 
 /// A library model.
@@ -129,10 +139,10 @@ public:
   virtual bool matches(cir::CIRCallOpInterface call,
                        cir::FuncOp calleeOrNull) const = 0;
 
-  /// Give the call its effect on \p fg. \p site holds the cells of the
-  /// arguments and the (fresh, empty) result node or slots.
-  virtual void apply(FunctionGraph &fg, CallSiteRecord &site,
-                     ModelContext &ctx) const = 0;
+  /// Give the call its effect on the graph of \p ctx. \p site holds the
+  /// cells of the arguments and the result node or slots; `site.callee` is
+  /// the modelled function, also when the call is indirect.
+  virtual void apply(CallSiteRecord &site, ModelContext &ctx) const = 0;
 
   /// A short name, printed on the call site (`model=<name>`).
   virtual llvm::StringRef name() const = 0;

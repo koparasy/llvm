@@ -29,21 +29,31 @@
 //  3. Bind every direct call to a defined callee: actuals to formals (slot by
 //     slot for aggregates), the result to the return cell. An argument past
 //     the callee's formals (a variadic argument) escapes.
-//  4. Give the indirect calls with a defined target the unknown-call rule
-//     (resolving them is a later step). Calls to declarations already got
-//     their effect, from a model or the unknown-call rule, in the local
-//     phase.
-//  5. Rerun the byte-range copy closure (closeMemTransfers) over every copy
-//     of the TU: the links the bindings added can match more offsets.
-//  6. Propagate External and Incomplete along the links to everything
-//     reachable, each node keeping its first reason. An indirect call the
-//     local phase resolved whose callee node is now External, Incomplete or
-//     not only functions gets the unknown-call rule; repeat until that
-//     changes nothing.
-//  7. Apply clobbersGlobals: every non-constant global that another TU can
-//     name or whose address escaped (its node is External or Incomplete)
-//     becomes External, Mod and Ref, the reason naming the first such call.
-//     Then propagate once more.
+//  4. Rerun the byte-range copy closure (closeMemTransfers) over every copy
+//     of the TU: the links the bindings added can match more offsets. Calls
+//     to declarations already got their effect, from a model or the
+//     unknown-call rule, in the local phase.
+//  5. To a fixpoint of all of the following rules:
+//     - propagate External and Incomplete along the links to everything
+//       reachable, each node keeping its first reason;
+//     - apply clobbersGlobals: every non-constant global that another TU can
+//       name or whose address escaped (its node is External or Incomplete)
+//       becomes External, Mod and Ref, the reason naming the first such
+//       call; then propagate again;
+//     - resolve the indirect calls (the local phase leaves them all here,
+//       LocalBuilder::setDeferIndirectCalls). A call whose callee node has
+//       only function origins and is neither External, Incomplete nor
+//       UnknownObj calls exactly those functions: each new target with a
+//       body is bound like a direct call, each declaration gets its model or
+//       the unknown-call rule. Any other callee node gets the unknown-call
+//       rule (Reason IndirectUnresolved). Binding merges nodes and so can
+//       give other callee nodes more targets; the copy closure reruns after
+//       every round that bound something. A round is one pass over the
+//       calls; after PointsToAnalysisOptions::maxIndirectRounds rounds that
+//       bound a target, a call that gains another one gets the unknown-call
+//       rule instead (Reason Budget). A callee node that is still empty (no
+//       origin, no flag) when nothing else changes gets the unknown-call
+//       rule too.
 //
 // Formals: a function's formals start Incomplete (Reason UnknownCaller)
 // unless all of its callers are visible: it has internal or private linkage
@@ -83,6 +93,10 @@ struct PointsToAnalysisOptions {
   /// formal starts Incomplete. Tests set it; the -cir-offload-assume-closed-tu
   /// flag maps onto it later.
   bool assumeClosedTU = false;
+  /// The number of rounds of indirect-call resolution that may bind new
+  /// targets; past it, a call that gains a target gets the unknown-call
+  /// rule (Reason Budget).
+  unsigned maxIndirectRounds = 32;
 };
 
 /// What the interprocedural phase did with a call site.
@@ -94,8 +108,13 @@ enum class CallResolution : uint8_t {
   /// A call to a declaration without a model: the unknown-call rule (in the
   /// local phase).
   Unknown,
-  /// An indirect call whose targets are not known, or include a defined
-  /// function: the unknown-call rule.
+  /// An indirect call whose callee pointer points only to known functions
+  /// (TUCallSite::targets): bound to the bodies, the declarations given
+  /// their model or the unknown-call rule.
+  Indirect,
+  /// An indirect call whose targets are not known (or that ran out of
+  /// rounds): the unknown-call rule, for TUCallSite::unresolvedWhy. The
+  /// targets bound before it became unresolved stay bound.
   IndirectUnresolved,
 };
 
@@ -108,6 +127,11 @@ struct TUCallSite {
   CallResolution resolution = CallResolution::Unknown;
   /// The callee bound, for CallResolution::Direct.
   cir::FuncOp callee;
+  /// The targets of an indirect call, in the order they were found (bound,
+  /// or given their model or the unknown-call rule).
+  llvm::SmallVector<mlir::FlatSymbolRefAttr, 2> targets;
+  /// Why an indirect call is CallResolution::IndirectUnresolved.
+  const Reason *unresolvedWhy = nullptr;
 };
 
 /// The roots of one function in the TU graph.
@@ -132,7 +156,14 @@ struct PointsToAnalysisStats {
   /// unified for them.
   size_t numDirectCalls = 0;
   size_t numBindings = 0;
+  /// Indirect calls by final resolution, the targets with a body bound for
+  /// them, the rounds that bound a target, and the calls that ran out of
+  /// rounds.
+  size_t numIndirectResolved = 0;
   size_t numIndirectUnresolved = 0;
+  size_t numIndirectTargetsBound = 0;
+  size_t numIndirectRounds = 0;
+  size_t numIndirectBudget = 0;
   size_t numClobberingCalls = 0;
   /// Functions whose formals start complete.
   size_t numCompleteFunctions = 0;
@@ -193,10 +224,22 @@ private:
   void run();
   void buildLocal(cir::FuncOp func, bool formalsComplete);
   void computeVisibleCallers();
-  /// Unify the actual/formal and result/return pairs of every direct call.
-  /// With \p dryRun, change nothing and count the pairs that are not unified
+  /// Unify the actual/formal and result/return pairs of every direct call,
+  /// and of every indirect call with the targets it was bound to. With
+  /// \p dryRun, change nothing and count the pairs that are not unified
   /// yet. Returns that count (or the number of pairs unified).
   size_t bindCalls(bool dryRun);
+  /// The same for \p call and the body of \p callee.
+  size_t bindCall(TUCallSite &call, const TUFunction &callee, bool dryRun);
+  /// One round of indirect-call resolution (see the file comment). With
+  /// \p finalize, the calls whose callee node is still empty get the
+  /// unknown-call rule. Returns whether a rule changed the graph; sets
+  /// \p bound if a target was bound.
+  bool resolveIndirectCalls(bool finalize, bool &bound);
+  /// Give \p call the effect of its target \p target, which has no body
+  /// here: a model, or the unknown-call rule.
+  void applyDeclarationTarget(TUCallSite &call, mlir::FlatSymbolRefAttr target,
+                              cir::FuncOp calleeOrNull);
   void applyUnknownCall(TUCallSite &call, const Reason *why);
   void propagateStatus();
   bool clobberGlobals();

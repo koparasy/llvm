@@ -69,6 +69,7 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.get_element", kHandled},        // Offset or array.
     {"cir.get_global", kHandled},         // Global/Function node per symbol.
     {"cir.get_member", kHandled},         // Constant offset.
+    {"cir.get_method", kHandled},         // Constant method, else unhandled.
     {"cir.get_runtime_member", kHandled}, // Collapse.
     {"cir.global", kHandled},             // Module level: GlobalNodes reads it.
     {"cir.if", kHandled},                 // RegionBranchOpInterface.
@@ -97,9 +98,13 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.try", kHandled},             // RegionBranchOpInterface.
     {"cir.try_call", kHandled},        // CallSiteRecord + BranchOpInterface.
     {"cir.vec.masked_load", kHandled}, // Ref; no pointer elements.
-    {"cir.vtable.get_vptr", kHandled}, // Identity (vptr at offset 0).
-    {"cir.while", kHandled},           // RegionBranchOpInterface.
-    {"cir.yield", kHandled},           // RegionBranchTerminatorOpInterface.
+    {"cir.vtable.address_point", kHandled},       // Vtable cell.
+    {"cir.vtable.get_type_info", kHandled},       // vptr - 1 pointer.
+    {"cir.vtable.get_virtual_fn_addr", kHandled}, // vptr + index pointers.
+    {"cir.vtable.get_vptr", kHandled},   // Identity (vptr at offset 0).
+    {"cir.vtt.address_point", kHandled}, // VTT cell.
+    {"cir.while", kHandled},             // RegionBranchOpInterface.
+    {"cir.yield", kHandled},             // RegionBranchTerminatorOpInterface.
 
     //===------------------------------------------------------------------===//
     // NoPointerSemantics, by family.
@@ -215,7 +220,7 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.objsize", kNoPtr},
     {"cir.ptr_diff", kNoPtr},
     // Member-pointer adjustments: offset arithmetic on !cir.data_member and
-    // !cir.method values, no object is accessed (get_method is Pessimistic).
+    // !cir.method values, no object is accessed (get_method is Handled).
     {"cir.base_data_member", kNoPtr},
     {"cir.base_method", kNoPtr},
     {"cir.derived_data_member", kNoPtr},
@@ -273,7 +278,6 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.eh.setjmp", kPessimistic},             // jmp_buf.
     {"cir.end_cleanup", kPessimistic},           // TODO: exception objects.
     {"cir.frame_address", kPessimistic},         // Frame internals.
-    {"cir.get_method", kPessimistic},            // TODO(T09): method pointers.
     {"cir.indirect_goto", kPessimistic},         // Label address.
     {"cir.init_catch_param", kPessimistic},      // TODO: exception objects.
     {"cir.resume.flat", kPessimistic},           // TODO: exception objects.
@@ -286,10 +290,6 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.va_copy", kPessimistic},               // Varargs are not modelled.
     {"cir.va_end", kPessimistic},                // Varargs are not modelled.
     {"cir.va_start", kPessimistic},              // Varargs are not modelled.
-    {"cir.vtable.address_point", kPessimistic},  // TODO(T09): vtables.
-    {"cir.vtable.get_type_info", kPessimistic},  // TODO(T09): vtables.
-    {"cir.vtable.get_virtual_fn_addr", kPessimistic}, // TODO(T09): vtables.
-    {"cir.vtt.address_point", kPessimistic},          // TODO(T09): vtables.
 };
 
 StringRef cir::pointsto::getOpClassName(OpClass cls) {

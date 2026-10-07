@@ -251,8 +251,7 @@ public:
                  AllocKind kind)
       : SymbolModel(name, citation, accept, getMinArgs(kind)), kind(kind) {}
 
-  void apply(FunctionGraph &fg, CallSiteRecord &site,
-             ModelContext &ctx) const override {
+  void apply(CallSiteRecord &site, ModelContext &ctx) const override {
     Graph &graph = ctx.getGraph();
     std::optional<int64_t> size;
     switch (kind) {
@@ -311,7 +310,6 @@ public:
       break;
     }
     ctx.setResult(site, heap);
-    (void)fg;
   }
 
 private:
@@ -390,8 +388,7 @@ public:
                        ArgAccess access)
       : SymbolModel(name, citation, accept, /*minArgs=*/0), access(access) {}
 
-  void apply(FunctionGraph &, CallSiteRecord &site,
-             ModelContext &ctx) const override {
+  void apply(CallSiteRecord &site, ModelContext &ctx) const override {
     switch (access) {
     case ArgAccess::None:
       break;
@@ -428,8 +425,7 @@ class EscapeArgsModel : public SymbolModel {
 public:
   using SymbolModel::SymbolModel;
 
-  void apply(FunctionGraph &, CallSiteRecord &site,
-             ModelContext &ctx) const override {
+  void apply(CallSiteRecord &site, ModelContext &ctx) const override {
     const Reason *why = ctx.makeReason(site, Reason::Kind::EscapedTo,
                                        ("kept by " + name()).str());
     ModelContext::forEachPointerArg(site, [&](Cell cell) {
@@ -508,8 +504,7 @@ public:
                     getMinArgs(kind)),
         kind(kind) {}
 
-  void apply(FunctionGraph &, CallSiteRecord &site,
-             ModelContext &ctx) const override {
+  void apply(CallSiteRecord &site, ModelContext &ctx) const override {
     Graph &graph = ctx.getGraph();
     std::optional<Cell> dst = ModelContext::getArg(site, 0);
     std::optional<Cell> src = ModelContext::getArg(site, 1);
@@ -674,8 +669,7 @@ public:
   // later stores through such a result writes the argument's object behind
   // the analysis's back, so the objects the result may point to must be
   // External, not just the fresh result node.
-  void apply(FunctionGraph &fg, CallSiteRecord &site,
-             ModelContext &ctx) const override {
+  void apply(CallSiteRecord &site, ModelContext &ctx) const override {
     auto call = dyn_cast_if_present<CIRCallOpInterface>(site.call);
     cir::FuncOp callee;
     if (site.callee)
@@ -695,7 +689,7 @@ public:
                          "may be returned by a memory_effects(none) call");
       if (returnsPointer)
         ModelContext::forEachPointerArg(site, [&](Cell cell) {
-          fg.getGraph().addFlags(cell, NodeFlags::External, why);
+          ctx.getGraph().addFlags(cell, NodeFlags::External, why);
         });
       ctx.setResultUnknown(site, NodeFlags::External | NodeFlags::Incomplete,
                            why);

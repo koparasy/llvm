@@ -1,0 +1,60 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1 print-stats=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1 print-stats=1 max-indirect-rounds=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CAP
+
+// A chain of indirect calls that takes two rounds: the first call's only
+// target, @set, stores @target into the slot the second call loads its
+// callee from. Before @set is bound the second callee node is empty (nothing
+// seen yet, so the call waits); after it, the node holds @target.
+//
+// With the default budget both calls resolve, in two rounds. With
+// max-indirect-rounds=1 the second call would gain a target in round 2, past
+// the budget: it gets the unknown-call rule, with a Budget reason, and its
+// argument escapes.
+
+!s32i = !cir.int<s, 32>
+!vty = !cir.func<(!cir.ptr<!s32i>)>
+!sty = !cir.func<(!cir.ptr<!cir.ptr<!vty>>)>
+
+// CHECK-LABEL: === calls
+// CHECK-NEXT: @main cir.call -> indirect -> {@set}
+// CHECK-NEXT: @main cir.call -> indirect -> {@target}
+// CHECK-LABEL: --- ci stats
+// CHECK: indirect calls resolved: 2
+// CHECK-NEXT: indirect calls unresolved: 0
+// CHECK-NEXT: indirect targets bound: 2
+// CHECK-NEXT: indirect rounds that bound a target: 2
+// CHECK-NEXT: indirect calls over the round budget: 0
+
+// CAP-LABEL: === TU graph
+// CAP: {{n[0-9]+}} [Stack|External|Mod|Ref] size=4 origins={stack(cir.alloca 'x' {{.*}})} links={} reasons={External: Budget(cir.call {{.*}}, "indirect-call rounds exhausted")
+// CAP-LABEL: === calls
+// CAP-NEXT: @main cir.call -> indirect -> {@set}
+// CAP-NEXT: @main cir.call -> indirect-unresolved (Budget, "indirect-call rounds exhausted")
+// CAP-LABEL: --- ci stats
+// CAP: indirect calls resolved: 1
+// CAP-NEXT: indirect calls unresolved: 1
+// CAP-NEXT: indirect targets bound: 1
+// CAP-NEXT: indirect rounds that bound a target: 1
+// CAP-NEXT: indirect calls over the round budget: 1
+// CAP: unresolved indirect calls by reason: 1
+// CAP-NEXT: Budget, "indirect-call rounds exhausted" 1
+
+module {
+cir.func internal @target(%q: !cir.ptr<!s32i>) {
+  cir.return
+}
+cir.func internal @set(%p: !cir.ptr<!cir.ptr<!vty>>) {
+  %g = cir.get_global @target : !cir.ptr<!vty>
+  cir.store %g, %p : !cir.ptr<!vty>, !cir.ptr<!cir.ptr<!vty>>
+  cir.return
+}
+cir.func @main() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!vty>>
+  %s = cir.get_global @set : !cir.ptr<!sty>
+  cir.call %s(%slot) : (!cir.ptr<!sty>, !cir.ptr<!cir.ptr<!vty>>) -> ()
+  %t = cir.load %slot : !cir.ptr<!cir.ptr<!vty>>, !cir.ptr<!vty>
+  cir.call %t(%x) : (!cir.ptr<!vty>, !cir.ptr<!s32i>) -> ()
+  cir.return
+}
+}

@@ -316,12 +316,24 @@ void GlobalNodes::initialize(Node *node, cir::GlobalOp global) {
   auto reason = [&](Reason::Kind kind, StringRef detail) {
     return graph.makeReason(kind, global, detail);
   };
+  // A vtable slot of a pure virtual (or deleted) function holds the ABI's
+  // stub. Calling it is undefined ([class.abstract]p6; Itanium C++ ABI
+  // 3.2.6: __cxa_pure_virtual "is called if the user calls a pure virtual
+  // function"), so no valid virtual call reaches it, and the slot is not
+  // linked. Linking it would unify the stub's one Function node across every
+  // slot that holds it, and with that every override placed in such a slot
+  // by a derived vtable unified with this one.
+  bool isVTable = isa<cir::VTableAttr>(*init);
   walkConstantPointers(
       *init, 0, dataLayout,
       [&](FlatSymbolRefAttr sym) { return getSymbolType(sym); },
       [&](int64_t offset, const ConstantPointer &pointer) {
         switch (pointer.kind) {
         case ConstantPointer::Kind::Symbol: {
+          if (isVTable && !pointer.asInteger &&
+              (pointer.symbol.getValue() == "__cxa_pure_virtual" ||
+               pointer.symbol.getValue() == "__cxa_deleted_virtual"))
+            return;
           Cell target = getCell(pointer, global);
           if (pointer.asInteger) {
             graph.addFlags(target, NodeFlags::External,

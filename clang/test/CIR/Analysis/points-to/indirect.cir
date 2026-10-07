@@ -1,0 +1,82 @@
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Indirect calls resolved on the TU graph. A call through an entry loaded
+// from a constant table of function pointers has the functions of the table
+// as targets (the table's slots share one node: a dynamic index makes it an
+// array). Each target with a body is bound like a direct call: the actual is
+// unified with the target's formal, the result with its return cell. The
+// targets' address is taken, so their formals are Incomplete, and x with
+// them; the callee node is not reachable from x, so the call stays resolved. A
+// target that is a declaration gets its model, or the unknown-call rule.
+//
+// A callee pointer that an external function's caller passes in may point
+// anywhere: the call is unresolved and gets the unknown-call rule.
+
+!s32i = !cir.int<s, 32>
+!fty = !cir.func<(!cir.ptr<!s32i>) -> !cir.ptr<!s32i>>
+!vty = !cir.func<(!cir.ptr<!s32i>)>
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[TABLE:n[0-9]+]] [Global|Ref] size=16 arr=8 origins={global(@table)} links={0->[[F:n[0-9]+]]+0}
+// CHECK-DAG: [[F]] [Function] size=0 origins={func(@inc), func(@id)} links={}
+// CHECK-DAG: [[X:n[0-9]+]] [Stack|Incomplete|Mod|Ref] size=4 origins={stack(cir.alloca 'x' {{.*}})} links={} reasons={Incomplete: UnknownCaller({{.*}}"formal #0")}
+// CHECK-DAG: [[Y:n[0-9]+]] [Stack|Mod] size=4 origins={stack(cir.alloca 'y' {{.*}})} links={}
+// CHECK-DAG: [[E:n[0-9]+]] [Stack|External|Mod|Ref] size=4 origins={stack(cir.alloca 'e' {{.*}})} links={}
+// CHECK-LABEL: === @inc formals=incomplete
+// CHECK-NEXT: @inc formal #0 -> [[X]]+0
+// CHECK-NEXT: @inc return -> [[X]]+0
+// CHECK-LABEL: === @id formals=incomplete
+// CHECK-NEXT: @id formal #0 -> [[X]]+0
+// CHECK-NEXT: @id return -> [[X]]+0
+// CHECK-LABEL: === @through_table
+// CHECK-DAG: @through_table x -> [[X]]+0
+// CHECK-DAG: @through_table r -> [[X]]+0
+// CHECK-LABEL: === calls
+// CHECK-NEXT: @through_table cir.call -> indirect -> {@id, @inc}
+// CHECK-NEXT: @through_free cir.call -> indirect -> {@free}
+// CHECK-NEXT: @from_param cir.call -> indirect-unresolved (IndirectUnresolved, "callee node is Incomplete")
+
+module {
+cir.func private @free(!cir.ptr<!s32i>)
+
+cir.func internal @inc(%p: !cir.ptr<!s32i>) -> !cir.ptr<!s32i> {
+  %v = cir.load %p : !cir.ptr<!s32i>, !s32i
+  cir.store %v, %p : !s32i, !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @id(%p: !cir.ptr<!s32i>) -> !cir.ptr<!s32i> {
+  cir.return %p : !cir.ptr<!s32i>
+}
+
+cir.global "private" constant internal @table = #cir.const_array<[#cir.global_view<@inc> : !cir.ptr<!fty>, #cir.global_view<@id> : !cir.ptr<!fty>]> : !cir.array<!cir.ptr<!fty> x 2>
+
+cir.func @through_table(%i: !s32i) -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %x_tag = cir.cast bitcast %x : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x"}
+  %t = cir.get_global @table : !cir.ptr<!cir.array<!cir.ptr<!fty> x 2>>
+  %slot = cir.get_element %t[%i : !s32i] : !cir.ptr<!cir.array<!cir.ptr<!fty> x 2>> -> !cir.ptr<!cir.ptr<!fty>>
+  %fp = cir.load %slot : !cir.ptr<!cir.ptr<!fty>>, !cir.ptr<!fty>
+  %r = cir.call %fp(%x) : (!cir.ptr<!fty>, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  %r_tag = cir.cast bitcast %r : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "r"}
+  %v = cir.load %r : !cir.ptr<!s32i>, !s32i
+  cir.return %v : !s32i
+}
+
+// A declaration target: the generic model of free (no pointer effect).
+cir.func @through_free() {
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!vty>>
+  %f = cir.get_global @free : !cir.ptr<!vty>
+  cir.store %f, %slot : !cir.ptr<!vty>, !cir.ptr<!cir.ptr<!vty>>
+  %fp = cir.load %slot : !cir.ptr<!cir.ptr<!vty>>, !cir.ptr<!vty>
+  cir.call %fp(%y) : (!cir.ptr<!vty>, !cir.ptr<!s32i>) -> ()
+  cir.return
+}
+
+// @from_param is external: whoever calls it chooses %fp.
+cir.func @from_param(%fp: !cir.ptr<!vty>) {
+  %e = cir.alloca "e" align(4) : !cir.ptr<!s32i>
+  cir.call %fp(%e) : (!cir.ptr<!vty>, !cir.ptr<!s32i>) -> ()
+  cir.return
+}
+}
