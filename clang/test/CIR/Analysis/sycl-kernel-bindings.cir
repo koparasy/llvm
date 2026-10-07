@@ -576,7 +576,7 @@ module attributes {cir.offload.container} {
     }
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
-    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+    cir.func @_ZTSZ4mainEUlvE_(%f0: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {field = "f0", kind = "pointer", path = ["f0"]}}, %f1: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {field = "f1", kind = "pointer", path = ["f1"]}}) cc(spir_kernel) {
       cir.return
     }
   }
@@ -588,6 +588,8 @@ module attributes {cir.offload.container} {
 // CHECK-NEXT: host-name @.str (sycl, optimizable)
 // CHECK-NEXT: const-args s=#cir.int<7> : !cir.int<s, 32>
 // CHECK-NEXT: no-alias f0 f1
+// CHECK-NEXT: no-alias-note f0: a USM allocation
+// CHECK-NEXT: no-alias-note f1: a USM allocation
 // CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
 // CHECK-NEXT: launch in @cg (sycl, all-visible), closure traced, global=[512], local=[128]
 
@@ -675,7 +677,7 @@ module attributes {cir.offload.container} {
     }
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
-    cir.func @_ZTSZ4mainEUlvE_() cc(spir_kernel) {
+    cir.func @_ZTSZ4mainEUlvE_(%c0: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {field = "c0", kind = "pointer", path = ["c0"]}}, %c1: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {field = "c1", kind = "pointer", path = ["c1"]}}) cc(spir_kernel) {
       cir.return
     }
   }
@@ -686,6 +688,8 @@ module attributes {cir.offload.container} {
 // CHECK-NEXT: kernel _ZTSZ4mainEUlvE_
 // CHECK-NEXT: host-name @.str (sycl, optimizable)
 // CHECK-NEXT: no-alias c0 c1
+// CHECK-NEXT: no-alias-note c0: a USM allocation
+// CHECK-NEXT: no-alias-note c1: a USM allocation
 // CHECK-NEXT: device @device_sycl_spir64 : @_ZTSZ4mainEUlvE_
 // CHECK-NEXT: launch in @cg (sycl, all-visible), closure traced, geometry none
 
@@ -886,10 +890,10 @@ module attributes {cir.offload.container} {
     }
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
-    cir.func @_ZTSZ4mainEUlvE0_() cc(spir_kernel) {
+    cir.func @_ZTSZ4mainEUlvE0_(%a0: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {field = "a0", kind = "pointer", path = ["a0"]}}, %a1: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {field = "a1", kind = "pointer", path = ["a1"]}}, %a2: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {field = "a2", kind = "pointer", path = ["a2"]}}, %a3: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {field = "a3", kind = "pointer", path = ["a3"]}}) cc(spir_kernel) {
       cir.return
     }
-    cir.func @_ZTSZ4mainEUlvE1_() cc(spir_kernel) {
+    cir.func @_ZTSZ4mainEUlvE1_(%b0: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {field = "b0", kind = "pointer", path = ["b0"]}}) cc(spir_kernel) {
       cir.return
     }
   }
@@ -901,3 +905,8 @@ module attributes {cir.offload.container} {
 // closures do not bleed: K0 gets its four distinct USM captures, K1 its one.
 // CHECK-DAG: no-alias a0 a1 a2 a3
 // CHECK-DAG: no-alias b0
+// CHECK-DAG: no-alias-note a0: a USM allocation
+// CHECK-DAG: no-alias-note a1: a USM allocation
+// CHECK-DAG: no-alias-note a2: a USM allocation
+// CHECK-DAG: no-alias-note a3: a USM allocation
+// CHECK-DAG: no-alias-note b0: a USM allocation

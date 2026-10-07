@@ -186,14 +186,23 @@ struct KernelBinding {
   // CUDA (stub-anchored).
   bool isTULocalOptimizable = false;
 
-  // SYCL only: names of closure capture fields whose captured pointer is, at
-  // EVERY visible launch site, backed by a USM allocation (malloc_device /
-  // malloc_shared / malloc_host) that is provably distinct from every other
-  // captured pointer of the same closure. The device kernel parameter bound to
-  // such a field can carry `llvm.noalias`. Populated only for TU-local
-  // optimizable bindings; empty when recovery could not prove distinctness
-  // (unresolved source, shared base, pointer arithmetic -> conservatively out).
+  // SYCL only: names of closure capture fields -- captured USM pointers and
+  // global-memory accessors -- whose memory is, at EVERY visible launch site,
+  // a USM allocation (malloc_device / malloc_shared / malloc_host) or the
+  // storage behind a buffer that is provably distinct from the memory of
+  // every other such capture of the same closure. The device kernel pointer
+  // parameter bound to such a field can carry `llvm.noalias`. Empty when
+  // recovery could not prove distinctness (unresolved source, shared base,
+  // pointer arithmetic, buffer of unknown origin -> conservatively out).
   llvm::StringSet<> syclNoAliasFields;
+
+  // SYCL only: for each noalias candidate field, the memory it resolved to if
+  // it is in syclNoAliasFields, or why it is not -- for remarks.
+  llvm::StringMap<std::string> syclNoAliasNotes;
+
+  // SYCL only: why noalias is off for every parameter of the kernel (e.g. a
+  // pointer or accessor nested in a captured struct), or empty.
+  std::string syclNoAliasBlocked;
 
   // SYCL only: closure capture fields whose stored SCALAR value is, at EVERY
   // visible launch site, the SAME compile-time constant. Maps the field name to
