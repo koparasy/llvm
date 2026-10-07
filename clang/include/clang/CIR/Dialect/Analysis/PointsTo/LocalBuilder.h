@@ -17,6 +17,11 @@
 // put in the scalar map, cellFor returns std::nullopt for it, and every rule
 // that would unify with or store such a value skips it.
 //
+// An aggregate SSA value (a record or array) that holds pointers maps to its
+// AggregateSlots instead: one entry per pointer inside it, giving the cell
+// that pointer points to. Every aggregate value whose type contains pointers
+// has such a record, whatever produced it.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef CLANG_CIR_DIALECT_ANALYSIS_POINTSTO_LOCALBUILDER_H
@@ -28,6 +33,7 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToGraph.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
@@ -39,6 +45,29 @@ class raw_ostream;
 } // namespace llvm
 
 namespace cir::pointsto {
+
+/// Whether values of \p type are pointers to the analysis (!cir.ptr and
+/// !cir.vptr).
+bool isPointerValueType(mlir::Type type);
+
+/// Whether \p value is a null pointer constant (`#cir.ptr<null>` or
+/// `#cir.zero` of pointer type), which has no cell.
+bool isNullPointerConstant(mlir::Value value);
+
+/// Whether \p value is a null pointer constant (`#cir.ptr<null>` or
+/// `#cir.zero`), which points to nothing and has no cell.
+bool isNullPointerConstant(mlir::Value value);
+
+/// The byte offsets of the pointers inside a value of \p type, sorted and
+/// unique; empty for a pointer or a type without pointers. Arrays are scanned
+/// up to their first 256 elements.
+llvm::SmallVector<int64_t, 2>
+getPointerSlotOffsets(mlir::Type type, const mlir::DataLayout &dataLayout);
+
+/// The pointers inside an aggregate SSA value: (byte offset, target cell),
+/// one entry per offset getPointerSlotOffsets returns for the value's type, in
+/// the same order. An empty Cell is a null pointer.
+using AggregateSlots = llvm::SmallVector<std::pair<int64_t, Cell>, 2>;
 
 /// A call recorded by the local phase. The local phase gives calls no
 /// semantics: it only remembers the cells involved, for the library models
@@ -54,6 +83,11 @@ struct CallSiteRecord {
   llvm::SmallVector<std::optional<Cell>, 4> args;
   /// A fresh node for a pointer result, std::nullopt otherwise.
   std::optional<Cell> result;
+  /// The slots of each aggregate argument that holds pointers: (argument
+  /// index, slots).
+  llvm::SmallVector<std::pair<unsigned, AggregateSlots>, 0> aggregateArgs;
+  /// Fresh slot nodes for an aggregate result that holds pointers.
+  std::optional<AggregateSlots> resultSlots;
 };
 
 /// The points-to graph of one function: the memory graph and the roots that
@@ -78,24 +112,38 @@ public:
     return it->second;
   }
 
+  /// The slots of the aggregate \p value, or nullptr if it has none (its type
+  /// holds no pointers, or the builder never saw it).
+  const AggregateSlots *lookupSlots(mlir::Value value) const {
+    auto it = aggregateMap.find(value);
+    return it == aggregateMap.end() ? nullptr : &it->second;
+  }
+
   /// Print the graph, then one line per formal, the return cell and one line
   /// per call site:
   /// \code
   ///   formal #<i> -> <cell>
   ///   return -> <cell>
   ///   call <op> [callee=<cell>] args={<i>: <cell>, ...} result=<cell>
+  ///       [slots={<i>: <slots>, ...}] [result.slots=<slots>]
   /// \endcode
   /// Only pointer formals and arguments are listed; a missing cell prints as
-  /// `null`.
+  /// `null`. Aggregate formals and returns print `formal #<i> -> <slots>` and
+  /// `return -> <slots>`, where <slots> is `{<offset>: <cell>, ...}`.
   void print(llvm::raw_ostream &os) const;
 
   /// What each pointer-typed SSA value of the function points to.
   llvm::DenseMap<mlir::Value, Cell> scalarMap;
+  /// The pointer slots of each aggregate SSA value that holds pointers.
+  llvm::DenseMap<mlir::Value, AggregateSlots> aggregateMap;
   /// One entry per entry-block argument: its cell, or std::nullopt for a
   /// non-pointer argument.
   llvm::SmallVector<std::optional<Cell>, 4> formals;
   /// What the function returns, if it returns a non-null pointer.
   std::optional<Cell> returnCell;
+  /// The slots of what the function returns, if it returns an aggregate that
+  /// holds pointers.
+  std::optional<AggregateSlots> returnSlots;
   /// The calls in the body, in walk order.
   llvm::SmallVector<CallSiteRecord, 4> callSites;
 
@@ -112,8 +160,15 @@ private:
 /// empty node, which is unified with the real cell once the definition is
 /// reached, so the visit order does not change the result.
 ///
-/// Ops without a rule here are passed to visitUnhandled, which only counts
-/// them for now; T04 makes it pessimistic.
+/// What happens to an op depends on its OpClass (OpClassification.h).
+/// Handled ops get their rule; NoPointerSemantics ops are skipped; Pessimistic
+/// ops, and ops missing from the table, go to visitUnhandled: the nodes of
+/// their pointer operands (and of the pointers inside aggregate operands)
+/// become Collapsed and External, and their pointer results (and the pointer
+/// slots of aggregate results) point to fresh UnknownObj nodes, External and
+/// Incomplete. Each such flag carries an UnhandledOp reason naming the op. A
+/// pointer or aggregate result that the op's rule left without a cell gets
+/// the same pessimistic treatment, so every value has a cell or slots.
 ///
 /// The data layout comes from the function's nearest enclosing module rather
 /// than from DataLayout::closest on an arbitrary op: in the offload container
@@ -127,16 +182,26 @@ public:
                         ReasonTable *reasons = nullptr);
   ~LocalBuilder();
 
-  /// Walk the body and return the finished graph. Call once.
+  /// Walk the body and return the finished graph. Call once. Under
+  /// -cir-points-to-verify the graph is verified before it is returned.
   std::unique_ptr<FunctionGraph> build();
 
-  /// The ops that hit the default rule, by op name: those with a pointer
-  /// operand or result in the first map, all of them in the second.
-  const llvm::StringMap<unsigned> &getUnhandledPointerOps() const {
-    return unhandledPointerOps;
+  /// Whether build() verified the graph and found violations (reported as
+  /// errors on the ops).
+  bool hadVerifyErrors() const { return verifyErrors; }
+
+  /// The ops that went to the pessimistic default, by op name: those that
+  /// touched a pointer (operand, result or a slot of either) or have memory
+  /// effects in the first map, all of them in the second, and those missing
+  /// from the classification table in the third.
+  const llvm::StringMap<unsigned> &getPessimisticOps() const {
+    return pessimisticOps;
   }
   const llvm::StringMap<unsigned> &getUnhandledOps() const {
     return unhandledOps;
+  }
+  const llvm::StringMap<unsigned> &getUnclassifiedOps() const {
+    return unclassifiedOps;
   }
 
   /// The data layout a function is analysed with: the one of its nearest
@@ -150,13 +215,39 @@ private:
   /// Record that \p value points to \p cell, unifying with any cell it got
   /// before.
   void define(mlir::Value value, Cell cell);
-  /// Unify the cells of two values (nothing if either has none).
+  /// Unify the cells of two values (nothing if either has none), or the
+  /// slots of two aggregate values slot by slot.
   void unifyValues(mlir::Value a, mlir::Value b, mlir::Operation *at);
-  /// The byte offsets of the pointers inside a value of type \p type.
-  llvm::ArrayRef<int64_t> getPointerOffsets(mlir::Type type);
+  /// The byte offsets of the pointers inside a value of type \p type
+  /// (cached; returned by value, as the cache may grow while it is used).
+  llvm::SmallVector<int64_t, 2> getPointerOffsets(mlir::Type type);
+  /// Whether \p type is a pointer or an aggregate holding pointers.
+  bool hasPointers(mlir::Type type);
+  /// The slots of the aggregate \p value, creating a fresh empty node per
+  /// slot the first time it is seen. std::nullopt if its type holds no
+  /// pointers.
+  std::optional<AggregateSlots> slotsFor(mlir::Value value);
+  /// Record the slots of \p value, unifying with any it got before.
+  void defineSlots(mlir::Value value, const AggregateSlots &slots);
+  /// Give \p value, a pointer or an aggregate holding pointers, fresh
+  /// UnknownObj targets, External and Incomplete, for reason \p why.
+  void defineUnknown(mlir::Value value, const Reason *why);
+  /// Define \p result as a copy of \p src (same cell or same slots).
+  void defineCopy(mlir::Value result, mlir::Value src);
 
   void visit(mlir::Operation *op);
-  void visitUnhandled(mlir::Operation *op);
+  void visitUnhandled(mlir::Operation *op, llvm::StringRef detail = {});
+  /// Give the results the op's rule did not define the pessimistic default.
+  void defineMissingResults(mlir::Operation *op);
+  /// Fill block arguments that no visited edge defined.
+  void defineBlockArguments();
+  void visitModRef(mlir::Value addr, mlir::Type accessType, bool mod, bool ref);
+  void visitConstant(cir::ConstantOp op);
+  void visitExtractMember(cir::ExtractMemberOp op);
+  void visitInsertMember(cir::InsertMemberOp op);
+  void visitRegionEntry(mlir::Operation *op);
+  /// Make sure \p value has a cell or slots and count it as defined.
+  void definePlaceholder(mlir::Value value);
   void visitAlloca(cir::AllocaOp op);
   void visitLoad(cir::LoadOp op);
   void visitStore(cir::StoreOp op);
@@ -178,12 +269,14 @@ private:
   std::unique_ptr<FunctionGraph> fg;
   /// One Global node per symbol.
   llvm::DenseMap<mlir::Attribute, Node *> globalNodes;
-  /// The pointers inside aggregate SSA values: (byte offset, target).
-  llvm::DenseMap<mlir::Value, llvm::SmallVector<std::pair<int64_t, Cell>, 2>>
-      aggregates;
   llvm::DenseMap<mlir::Type, llvm::SmallVector<int64_t, 2>> pointerOffsets;
-  llvm::StringMap<unsigned> unhandledPointerOps;
+  /// The values a rule defined (as opposed to placeholders created by a use
+  /// seen before the definition).
+  llvm::DenseSet<mlir::Value> defined;
+  llvm::StringMap<unsigned> pessimisticOps;
   llvm::StringMap<unsigned> unhandledOps;
+  llvm::StringMap<unsigned> unclassifiedOps;
+  bool verifyErrors = false;
 };
 
 } // namespace cir::pointsto

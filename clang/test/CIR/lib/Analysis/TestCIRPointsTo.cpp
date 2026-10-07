@@ -16,12 +16,17 @@
 //   <name>.region0#<i> -> <cell>     for the pointer arguments of a tagged
 //                                    function
 //
+// Every graph is checked with verifyFunctionGraph (the -cir-points-to-verify
+// self-check); a violation is an error on the offending op and fails the
+// pass.
+//
 // With print-stats, a summary of the whole input follows: functions, live
-// nodes, collapsed nodes, build time and the ops that hit the default rule.
+// nodes, collapsed nodes, build time and the ops that went pessimistic.
 //
 //===----------------------------------------------------------------------===//
 
 #include "clang/CIR/Dialect/Analysis/PointsTo/LocalBuilder.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -59,13 +64,23 @@ void printCell(raw_ostream &os, StringRef name, std::optional<Cell> cell) {
   os << "\n";
 }
 
+void printSlots(raw_ostream &os, StringRef name,
+                const AggregateSlots &slots) {
+  os << name << " -> {";
+  for (auto [i, slot] : llvm::enumerate(slots)) {
+    os << (i ? ", " : "") << slot.first << ": ";
+    Graph::printCell(os, slot.second);
+  }
+  os << "}\n";
+}
+
 void TestCIRPointsToPass::runOnOperation() {
   raw_ostream &os = llvm::outs();
   SymbolTableCollection symbols;
-  llvm::StringMap<unsigned> unhandledPointerOps, unhandledOps;
+  llvm::StringMap<unsigned> pessimisticOps, unhandledOps, unclassifiedOps;
   size_t numFuncs = 0, numNodes = 0, numCollapsed = 0, numOps = 0;
   llvm::TimeRecord buildTime;
-  bool failed = false;
+  bool anyFailed = false;
 
   getOperation()->walk([&](cir::FuncOp func) {
     if (func.isDeclaration())
@@ -77,12 +92,10 @@ void TestCIRPointsToPass::runOnOperation() {
     end -= start;
     buildTime += end;
 
-    std::string errors;
-    llvm::raw_string_ostream errorStream(errors);
-    if (!fg->getGraph().verify(&errorStream)) {
-      func.emitError() << "points-to graph failed to verify:\n" << errors;
-      failed = true;
-    }
+    // build() already verified the graph under -cir-points-to-verify.
+    if (isPointsToVerifyEnabled() ? builder.hadVerifyErrors()
+                                  : failed(verifyFunctionGraph(*fg)))
+      anyFailed = true;
 
     ++numFuncs;
     func.walk([&](Operation *) { ++numOps; });
@@ -90,10 +103,12 @@ void TestCIRPointsToPass::runOnOperation() {
       ++numNodes;
       numCollapsed += node->isCollapsed();
     }
-    for (const auto &entry : builder.getUnhandledPointerOps())
-      unhandledPointerOps[entry.getKey()] += entry.getValue();
+    for (const auto &entry : builder.getPessimisticOps())
+      pessimisticOps[entry.getKey()] += entry.getValue();
     for (const auto &entry : builder.getUnhandledOps())
       unhandledOps[entry.getKey()] += entry.getValue();
+    for (const auto &entry : builder.getUnclassifiedOps())
+      unclassifiedOps[entry.getKey()] += entry.getValue();
 
     if (!printGraphs)
       return;
@@ -113,6 +128,11 @@ void TestCIRPointsToPass::runOnOperation() {
                       cell);
         return;
       }
+      if (op->getNumResults())
+        if (const AggregateSlots *slots = fg->lookupSlots(op->getResult(0))) {
+          printSlots(os, name.getValue(), *slots);
+          return;
+        }
       printCell(os, name.getValue(),
                 op->getNumResults() ? fg->lookup(op->getResult(0))
                                     : std::nullopt);
@@ -137,11 +157,12 @@ void TestCIRPointsToPass::runOnOperation() {
        << "live nodes: " << numNodes << "\n"
        << "collapsed nodes: " << numCollapsed << "\n"
        << "build time (wall, s): " << buildTime.getWallTime() << "\n";
-    printTop("unhandled ops touching pointers", unhandledPointerOps);
-    printTop("unhandled ops", unhandledOps);
+    printTop("pessimistic ops (touching pointers or memory)", pessimisticOps);
+    printTop("ops sent to the pessimistic default", unhandledOps);
+    printTop("unclassified ops", unclassifiedOps);
   }
 
-  if (failed)
+  if (anyFailed)
     signalPassFailure();
 }
 

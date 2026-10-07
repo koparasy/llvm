@@ -12,6 +12,7 @@ add_distinct_clang_unittest(CIRUnitTests
   IntTypeABIAlignTest.cpp
   PointerLikeTest.cpp
   PointsToGraphTest.cpp
+  PointsToOpClassificationTest.cpp
   RecordMemberKindTest.cpp
   RecordTypeMetadataTest.cpp
   UnionTypeSizeTest.cpp

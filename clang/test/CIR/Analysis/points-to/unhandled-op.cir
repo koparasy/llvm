@@ -1,0 +1,61 @@
+// RUN: cir-opt %s -test-cir-points-to -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Ops classified Pessimistic: the nodes of their pointer operands become
+// Collapsed and External, their pointer results point to fresh unknown
+// objects. NoPointerSemantics ops leave the graph alone.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!rec_S = !cir.struct<"S" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+// cir.va_arg reads the va_list through %ap: the va_list node collapses (its
+// two slot targets merge) and becomes External; the pointer va_arg returns
+// points to an unknown object.
+
+// CHECK-LABEL: === @va_arg_ptr
+// CHECK-DAG: [[AB:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[AP:n[0-9]+]] [Stack|External|Collapsed|Mod] size=16 origins={stack(cir.alloca 'ap' {{.*}})} links={0->[[AB]]+0} reasons={External: UnhandledOp(cir.va_arg {{.*}}), Collapsed: UnhandledOp(cir.va_arg {{.*}})}
+// CHECK-DAG: [[U:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: UnhandledOp(cir.va_arg {{.*}}), External: UnhandledOp(cir.va_arg {{.*}})}
+// CHECK-DAG: arg -> [[U]]+0
+cir.func @va_arg_ptr() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %ap = cir.alloca "ap" align(8) : !cir.ptr<!rec_S>
+  %f0 = cir.get_member %ap[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %f1 = cir.get_member %ap[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %f1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %list = cir.cast bitcast %ap : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s8i>>
+  %r = cir.va_arg %list : (!cir.ptr<!cir.ptr<!s8i>>) -> !cir.ptr<!s32i>
+  %r_tag = cir.cast bitcast %r : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "arg"}
+  cir.return
+}
+
+// lifetime markers, pointer compares and ptr_diff have no pointer semantics:
+// x stays a plain Stack node.
+
+// CHECK-LABEL: === @no_pointer_semantics
+// CHECK: n{{[0-9]+}} [Stack] size=4 origins={stack(cir.alloca 'x' {{.*}})} links={}
+// CHECK-NOT: UnhandledOp
+// CHECK-LABEL: === @nonnull_constant
+cir.func @no_pointer_semantics() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  cir.lifetime.start %x : !cir.ptr<!s32i>
+  %c = cir.cmp ne %x, %y : !cir.ptr<!s32i>
+  %d = cir.ptr_diff %x, %y : !cir.ptr<!s32i> -> !cir.int<s, 64>
+  cir.lifetime.end %x : !cir.ptr<!s32i>
+  cir.return
+}
+
+// A non-null pointer constant is pessimistic until T05 models global_view.
+
+// CHECK-DAG: [[GV:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: UnhandledOp(cir.const {{.*}}"non-null pointer constant"), External: UnhandledOp(cir.const {{.*}})}
+// CHECK-DAG: gv -> [[GV]]+0
+cir.global external @g = #cir.int<0> : !s32i
+cir.func @nonnull_constant() {
+  %p = cir.const #cir.global_view<@g> : !cir.ptr<!s32i>
+  %p_tag = cir.cast bitcast %p : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "gv"}
+  cir.return
+}

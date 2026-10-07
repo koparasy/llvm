@@ -3,7 +3,9 @@ add_clang_library(MLIRCIRAnalysis
   CIRBasicAliasAnalysis.cpp
   CIRPointerDecomposition.cpp
   PointsTo/LocalBuilder.cpp
+  PointsTo/OpClassification.cpp
   PointsTo/PointsToGraph.cpp
+  PointsTo/PointsToVerifier.cpp
 
   LINK_LIBS PUBLIC
   MLIRCIR
