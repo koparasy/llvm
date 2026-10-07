@@ -1,0 +1,41 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci explain=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// A pointer stored into a global that another TU can name escapes: code in
+// that TU may read it back and store through it, or store any other pointer
+// into the global. So x's object (stored into @gp) is incomplete, and so is
+// what a load from @gp gives. @lp is internal and only this TU uses it:
+// y's object, stored there, stays complete.
+
+// CHECK-LABEL: === @publish
+// CHECK:      @publish gp -> {{n[0-9]+}}+0 incomplete (pointer may refer to unknown memory: it is an escaped pointer stored in a global visible to other translation units (escape-global.cir:[[#GP:]]))
+// CHECK-NEXT:     <- EscapedTo(cir.global escape-global.cir:[[#GP]]:1, "global visible to other TUs")
+// CHECK-NEXT: @publish x -> {{n[0-9]+}}+0 incomplete (pointer may refer to unknown memory: it is reachable from an escaped pointer stored in a global visible to other translation units (escape-global.cir:[[#GP]]))
+// CHECK-NEXT:     <- EscapedTo(cir.global escape-global.cir:[[#GP]]:1, "reachable from an incomplete node")
+// CHECK-NEXT:     <- EscapedTo(cir.global escape-global.cir:[[#GP]]:1, "global visible to other TUs")
+// CHECK-NEXT: @publish lp -> {{n[0-9]+}}+0 complete (pointer refers to known memory)
+// CHECK-NEXT: @publish y -> {{n[0-9]+}}+0 complete (pointer refers to known memory)
+// CHECK-LABEL: === @reload
+// CHECK:      @reload loaded -> {{n[0-9]+}}+0 incomplete (pointer may refer to unknown memory: it is reachable from an escaped pointer stored in a global visible to other translation units (escape-global.cir:[[#GP]]))
+
+!s32i = !cir.int<s, 32>
+
+module {
+cir.global external @gp = #cir.ptr<null> : !cir.ptr<!s32i>
+cir.global "private" internal @lp = #cir.ptr<null> : !cir.ptr<!s32i>
+cir.global "private" internal @x = #cir.int<0> : !s32i
+cir.global "private" internal @y = #cir.int<0> : !s32i
+cir.func @publish() {
+  %gp = cir.get_global @gp : !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "gp"}
+  %x = cir.get_global @x : !cir.ptr<!s32i> {test.ptr = "x"}
+  cir.store %x, %gp : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %lp = cir.get_global @lp : !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "lp"}
+  %y = cir.get_global @y : !cir.ptr<!s32i> {test.ptr = "y"}
+  cir.store %y, %lp : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+cir.func @reload() {
+  %gp = cir.get_global @gp : !cir.ptr<!cir.ptr<!s32i>>
+  %v = cir.load %gp : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "loaded"}
+  cir.return
+}
+}

@@ -20,9 +20,9 @@
 !fty = !cir.func<(!cir.ptr<!rec_B>) -> !cir.ptr<!s32i>>
 
 // CHECK-LABEL: === TU graph
-// CHECK-DAG: [[OBJ:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'd1' {{.*}}), stack(cir.alloca 'd2' {{.*}})} links={0->[[VT:n[0-9]+]]+16, 8->{{n[0-9]+}}+0}
-// CHECK-DAG: [[VT]] [Global|Ref] size=24 origins={global(@_ZTV2D1), global(@_ZTV2D2)} links={16->[[F:n[0-9]+]]+0}
-// CHECK-DAG: [[F]] [Function] size=0 origins={func(@_ZN2D11fEv), func(@_ZN2D21fEv)} links={}
+// CHECK-DAG: [[OBJ:n[0-9]+]] [Stack|Summary|Mod|Ref] size=16 origins={stack(cir.alloca 'd1' {{.*}}), stack(cir.alloca 'd2' {{.*}})} links={0->[[VT:n[0-9]+]]+16, 8->{{n[0-9]+}}+0}
+// CHECK-DAG: [[VT]] [Global|Summary|Ref] size=24 origins={global(@_ZTV2D1), global(@_ZTV2D2)} links={16->[[F:n[0-9]+]]+0}
+// CHECK-DAG: [[F]] [Function|Summary] size=0 origins={func(@_ZN2D11fEv), func(@_ZN2D21fEv)} links={}
 // CHECK-LABEL: === @_ZN2D11fEv formals=complete
 // CHECK-NEXT: @_ZN2D11fEv formal #0 -> [[OBJ]]+0
 // CHECK-LABEL: === @_ZN2D21fEv formals=complete

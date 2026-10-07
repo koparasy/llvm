@@ -1,0 +1,31 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci explain=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// What an externally visible function returns reaches callers in other TUs,
+// which may store through it or keep it: the returned object is incomplete.
+// @get_internal is internal and called only from this TU, so what it
+// returns stays complete.
+
+// CHECK-LABEL: === @get_external formals=incomplete
+// CHECK:      @get_external ret -> {{n[0-9]+}}+0 incomplete (pointer may refer to unknown memory: it is the return value of @get_external, which may have callers that are not analysed (escape-return.cir:[[#EXT:]]))
+// CHECK-NEXT:     <- UnknownCaller(cir.func escape-return.cir:[[#EXT]]:1, "returned to an unknown caller")
+// CHECK-LABEL: === @get_internal formals=complete
+// CHECK:      @get_internal ret -> {{n[0-9]+}}+0 complete (pointer refers to known memory)
+
+!s32i = !cir.int<s, 32>
+
+module {
+cir.global "private" internal @a = #cir.int<0> : !s32i
+cir.global "private" internal @b = #cir.int<0> : !s32i
+cir.func @get_external() -> !cir.ptr<!s32i> {
+  %a = cir.get_global @a : !cir.ptr<!s32i> {test.ptr = "ret"}
+  cir.return %a : !cir.ptr<!s32i>
+}
+cir.func internal @get_internal() -> !cir.ptr<!s32i> {
+  %b = cir.get_global @b : !cir.ptr<!s32i> {test.ptr = "ret"}
+  cir.return %b : !cir.ptr<!s32i>
+}
+cir.func @user() {
+  %r = cir.call @get_internal() : () -> !cir.ptr<!s32i>
+  cir.return
+}
+}

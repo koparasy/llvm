@@ -7,7 +7,7 @@
 // is one node that links to itself.
 
 // CHECK-LABEL: === TU graph
-// CHECK-DAG: [[AX:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'x' {{.*}}), stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[AX:n[0-9]+]] [Stack|Summary] size=4 origins={stack(cir.alloca 'x' {{.*}}), stack(cir.alloca 'a' {{.*}})} links={}
 // CHECK-DAG: [[L:n[0-9]+]] [Stack|Ref] size=8 origins={stack(cir.alloca 'head' {{.*}})} links={0->[[L]]+0}
 // CHECK-LABEL: === @even formals=complete
 // CHECK-NEXT: @even formal #0 -> [[AX]]+0

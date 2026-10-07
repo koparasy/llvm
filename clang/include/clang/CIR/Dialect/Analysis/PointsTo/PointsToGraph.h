@@ -149,6 +149,31 @@ struct Reason {
 /// Return the name of \p kind, for example "EscapedTo".
 llvm::StringRef getReasonKindName(Reason::Kind kind);
 
+/// Whether \p why is a reason Graph::markReachable derived for a node it
+/// reached: its detail is "reachable from ..." and its cause is the reason of
+/// the node the walk started from.
+bool isDerivedReason(const Reason *why);
+
+/// The reason \p why follows from after skipping every derived reason
+/// (isDerivedReason): the first cause of the chain.
+const Reason *getRootReason(const Reason *why);
+
+/// One sentence, the text remarks print, for why a pointer has the status
+/// \p why records, for example
+///   "it is reachable from an escaped pointer passed to @foo (t.cpp:12)".
+/// A derived reason reads "it is reachable from <root>", any other one
+/// "it is <root>", where <root> describes the first cause, ending with the
+/// file:line of its op (or "in @function" if the op has no file location).
+/// Each Reason::Kind has its own template; an unknown detail is quoted. The
+/// text is deterministic: it names ops, symbols and locations, never node ids
+/// or addresses. Null gives "no reason was recorded".
+std::string explain(const Reason *why);
+
+/// The chain of \p why, one entry per reason from \p why to its last cause,
+/// each as `<Kind>(<op> <file:line:col>[, "<detail>"])`, the format
+/// Graph::print uses for reasons.
+llvm::SmallVector<std::string, 4> explainChain(const Reason *why);
+
 /// Owns Reason objects so that pointers to them stay stable for the lifetime
 /// of the table. A table is either owned by one Graph or shared by many.
 class ReasonTable {

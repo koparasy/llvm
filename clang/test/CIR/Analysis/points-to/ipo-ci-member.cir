@@ -6,8 +6,8 @@
 // offsets 0 and 8.
 
 // CHECK-LABEL: === TU graph
-// CHECK-DAG: [[H1:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}})} links={}
-// CHECK-DAG: [[H2:n[0-9]+]] [Heap] size=8 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: [[H1:n[0-9]+]] [Heap|Summary] size=4 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: [[H2:n[0-9]+]] [Heap|Summary] size=8 origins={heap(cir.call {{.*}})} links={}
 // CHECK-DAG: [[OBJ:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'obj' {{.*}})} links={0->[[H1]]+0, 8->[[H2]]+0}
 // CHECK-LABEL: === @init formals=complete
 // CHECK-NEXT: @init formal #0 -> [[OBJ]]+0

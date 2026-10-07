@@ -36,7 +36,12 @@
 //   === @func formals=complete|incomplete
 //   @func formal #<i> -> <cell or slots>
 //   @func return -> <cell or slots>
-//   @func <name> -> <cell or slots>   for each tagged value, as above
+//   @func <name> -> <cell> complete|incomplete
+//                                     for each tagged pointer value (slots
+//                                     for an aggregate), as above; with
+//                                     explain=1 followed by " (<explain>)"
+//                                     and one "    <- <reason>" line per
+//                                     link of the reason chain
 //   === calls
 //   @caller <op> [@callee] -> direct @f | model <name> | unknown
 //                             | indirect -> {@f, @g}
@@ -47,7 +52,10 @@
 // max-indirect-rounds=<n> PointsToAnalysisOptions::maxIndirectRounds.
 // print-graphs=0 leaves out everything but the statistics, which end with one
 // line per unresolved indirect call: its location, its reason, and the first
-// reason the callee node got External or Incomplete.
+// reason the callee node got External or Incomplete. The statistics also
+// count the pointer values with a complete and an incomplete points-to set,
+// the Summary nodes by reason, and list the most frequent explanations of
+// the incomplete ones (top=<n>, default 10), with and without locations.
 //
 //===----------------------------------------------------------------------===//
 
@@ -95,6 +103,16 @@ struct TestCIRPointsToPass
                         llvm::cl::desc("In ci mode, assume every caller of "
                                        "every function is in the module"),
                         llvm::cl::init(false)};
+  Option<bool> explainSets{
+      *this, "explain",
+      llvm::cl::desc("In ci mode, explain the points-to set of each tagged "
+                     "value and print its reason chain"),
+      llvm::cl::init(false)};
+  Option<unsigned> topExplanations{
+      *this, "top",
+      llvm::cl::desc("In ci mode with print-stats, the number of most "
+                     "frequent explanations to list"),
+      llvm::cl::init(10)};
   Option<unsigned> maxIndirectRounds{
       *this, "max-indirect-rounds",
       llvm::cl::desc("In ci mode, the rounds of indirect-call resolution "
@@ -106,10 +124,11 @@ struct TestCIRPointsToPass
   void runCI();
 };
 
-void printCell(raw_ostream &os, StringRef name, std::optional<Cell> cell) {
+void printCell(raw_ostream &os, StringRef name, std::optional<Cell> cell,
+               StringRef suffix = {}) {
   os << name << " -> ";
   Graph::printCell(os, cell ? *cell : Cell());
-  os << "\n";
+  os << suffix << "\n";
 }
 
 void printSlots(raw_ostream &os, StringRef name,
@@ -173,10 +192,12 @@ void TestCIRPointsToPass::runOnOperation() {
   runLocal();
 }
 
-/// Print the tagged values of \p func with \p prefix before each line.
-template <typename LookupCell, typename LookupSlots>
+/// Print the tagged values of \p func with \p prefix before each line. The
+/// line of a pointer value ends with \p suffix(value).
+template <typename LookupCell, typename LookupSlots, typename Suffix>
 static void printTagged(raw_ostream &os, cir::FuncOp func, StringRef prefix,
-                        LookupCell lookupCell, LookupSlots lookupSlots) {
+                        LookupCell lookupCell, LookupSlots lookupSlots,
+                        Suffix suffix) {
   func.walk([&](Operation *op) {
     auto name = op->getAttrOfType<StringAttr>("test.ptr");
     if (!name)
@@ -186,7 +207,7 @@ static void printTagged(raw_ostream &os, cir::FuncOp func, StringRef prefix,
       for (BlockArgument arg : func.getArguments())
         if (std::optional<Cell> cell = lookupCell(arg))
           printCell(os, label + ".region0#" + std::to_string(arg.getArgNumber()),
-                    cell);
+                    cell, suffix(arg));
       return;
     }
     if (op->getNumResults())
@@ -194,8 +215,10 @@ static void printTagged(raw_ostream &os, cir::FuncOp func, StringRef prefix,
         printSlots(os, label, *slots);
         return;
       }
-    printCell(os, label,
-              op->getNumResults() ? lookupCell(op->getResult(0)) : std::nullopt);
+    if (!op->getNumResults())
+      return printCell(os, label, std::nullopt);
+    printCell(os, label, lookupCell(op->getResult(0)),
+              suffix(op->getResult(0)));
   });
 }
 
@@ -247,7 +270,20 @@ void TestCIRPointsToPass::runCI() {
           printCell(os, prefix + "return", fn->returnCell);
         if (fn->returnSlots)
           printSlots(os, prefix + "return", *fn->returnSlots);
-        printTagged(os, func, prefix, lookupCell, lookupSlots);
+        auto suffix = [&](Value value) {
+          ObjectSet set = analysis.pointsTo(value);
+          std::string out = set.complete ? " complete" : " incomplete";
+          if (!explainSets)
+            return out;
+          out += " (" + explain(set) + ")";
+          const Reason *why = set.why;
+          if (set.complete && !set.cells.empty())
+            why = set.cells.front().getNode()->getReason(NodeFlags::Summary);
+          for (const std::string &link : explainChain(why))
+            out += "\n    <- " + link;
+          return out;
+        };
+        printTagged(os, func, prefix, lookupCell, lookupSlots, suffix);
       }
       os << "=== calls\n";
       for (auto func : module.getOps<cir::FuncOp>()) {
@@ -328,7 +364,8 @@ void TestCIRPointsToPass::runCI() {
        << "\n"
        << "local phase time (wall, s): " << stats.localSeconds << "\n"
        << "analysis time (wall, s): " << stats.totalSeconds << "\n";
-    auto printMap = [&](StringRef title, const llvm::StringMap<unsigned> &map) {
+    auto printMap = [&](StringRef title, const llvm::StringMap<unsigned> &map,
+                        size_t limit = ~size_t(0)) {
       SmallVector<std::pair<unsigned, StringRef>> sorted;
       for (const auto &entry : map)
         sorted.emplace_back(entry.getValue(), entry.getKey());
@@ -336,9 +373,50 @@ void TestCIRPointsToPass::runCI() {
         return a.first != b.first ? a.first > b.first : a.second < b.second;
       });
       os << title << ": " << sorted.size() << "\n";
-      for (auto [count, name] : sorted)
+      for (auto [count, name] : llvm::ArrayRef(sorted).take_front(limit))
         os << "  " << name << " " << count << "\n";
     };
+    // The points-to set of every pointer value of the analysed functions.
+    size_t numComplete = 0, numIncompleteValues = 0;
+    llvm::StringMap<unsigned> explanations, rootReasons, summaryReasons;
+    auto countValue = [&](Value value) {
+      if (!isPointerValueType(value.getType()))
+        return;
+      ObjectSet set = analysis.pointsTo(value);
+      if (set.complete) {
+        ++numComplete;
+        return;
+      }
+      ++numIncompleteValues;
+      ++explanations[explain(set)];
+      const Reason *root = getRootReason(set.why);
+      std::string key = root ? formatReason(root) : std::string("-");
+      if (root != set.why)
+        key = "reachable from " + key;
+      ++rootReasons[key];
+    };
+    for (const auto &fn : analysis.getFunctions())
+      fn->func->walk([&](Operation *op) {
+        for (Region &region : op->getRegions())
+          for (Block &block : region)
+            for (BlockArgument arg : block.getArguments())
+              countValue(arg);
+        for (Value result : op->getResults())
+          countValue(result);
+      });
+    for (const Node *node : graph.nodes())
+      if (const Reason *why = node->getReason(NodeFlags::Summary))
+        ++summaryReasons[why->detail];
+    os << "recursive functions: " << stats.numRecursiveFunctions << "\n"
+       << "summary nodes: " << stats.numSummaryNodes << "\n"
+       << "pointer values with a complete set: " << numComplete << "\n"
+       << "pointer values with an incomplete set: " << numIncompleteValues
+       << "\n";
+    printMap("summary nodes by reason", summaryReasons);
+    printMap("incomplete pointer values by root reason", rootReasons,
+             topExplanations);
+    printMap("incomplete pointer values by explanation", explanations,
+             topExplanations);
     printMap("call sites by resolution", resolutions);
     printMap("collapsed nodes by reason", collapseReasons);
     llvm::StringMap<unsigned> unresolvedReasons;

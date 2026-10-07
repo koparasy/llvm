@@ -25,9 +25,9 @@
 
 // CHECK-LABEL: === TU graph
 // CHECK-DAG: [[CB:n[0-9]+]] [Heap|Mod|Ref] size=64 origins={heap(cir.call {{.*}})} links={0->[[VT:n[0-9]+]]+16}
-// CHECK-DAG: [[VT]] [Global|Ref] size=56 origins={global(@_ZTVSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE), global(@_ZTVSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE)} links={16->{{n[0-9]+}}+0, 24->{{n[0-9]+}}+0, 32->[[DISPOSE:n[0-9]+]]+0, 40->[[DESTROY:n[0-9]+]]+0, 48->[[DELETER:n[0-9]+]]+0}
+// CHECK-DAG: [[VT]] [Global|Summary|Ref] size=56 origins={global(@_ZTVSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE), global(@_ZTVSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE)} links={16->{{n[0-9]+}}+0, 24->{{n[0-9]+}}+0, 32->[[DISPOSE:n[0-9]+]]+0, 40->[[DESTROY:n[0-9]+]]+0, 48->[[DELETER:n[0-9]+]]+0}
 // CHECK-DAG: [[DISPOSE]] [Function] size=0 origins={func(@_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE10_M_disposeEv)} links={}
-// CHECK-DAG: [[DESTROY]] [Function] size=0 origins={func(@_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_destroyEv), func(@_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE10_M_destroyEv)} links={}
+// CHECK-DAG: [[DESTROY]] [Function|Summary] size=0 origins={func(@_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_destroyEv), func(@_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE10_M_destroyEv)} links={}
 // CHECK-DAG: [[DELETER]] [Function] size=0 origins={func(@_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE14_M_get_deleterERKSt9type_info)} links={}
 // CHECK-LABEL: === @_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE10_M_disposeEv formals=complete
 // CHECK-NEXT: formal #0 -> [[CB]]+0

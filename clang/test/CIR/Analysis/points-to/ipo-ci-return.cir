@@ -5,11 +5,12 @@
 // analysis binds both calls to the one return cell of @make: x and y point
 // to the same node, although they are two objects at run time. Telling them
 // apart needs heap cloning per call path, the motivation for the
-// context-sensitive phase.
+// context-sensitive phase. Until then the node is a Summary: it stands for
+// both objects, so it must never give MustAlias.
 
 // CHECK-LABEL: === TU graph
-// CHECK-NEXT: [[H:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}}ipo-ci-return.cir:{{[0-9]+}}:{{[0-9]+}})} links={}
-// CHECK-NOT: [Heap]
+// CHECK-NEXT: [[H:n[0-9]+]] [Heap|Summary] size=4 origins={heap(cir.call {{.*}}ipo-ci-return.cir:{{[0-9]+}}:{{[0-9]+}})} links={} reasons={Summary: SummaryObject({{.*}}, "several callers") <- SummaryObject({{.*}}, "several call sites")}
+// CHECK-NOT: [Heap
 // CHECK-LABEL: === @make formals=complete
 // CHECK-NEXT: @make return -> [[H]]+0
 // CHECK-LABEL: === @use

@@ -55,6 +55,12 @@
 //       origin, no flag) when nothing else changes gets the unknown-call
 //       rule too.
 //
+//  6. Mark the summary nodes (markSummaries): a node that may stand for
+//     more than one simultaneously live concrete object gets Summary, with a
+//     Reason{SummaryObject, op, "loop" | "recursion" | "several callers" |
+//     "merged origins"}. Alias queries never answer MustAlias for such a
+//     node.
+//
 // Formals: a function's formals start Incomplete (Reason UnknownCaller)
 // unless all of its callers are visible: it has internal or private linkage
 // and every use of its symbol is a direct call from a function this
@@ -149,6 +155,27 @@ struct TUFunction {
   llvm::SmallVector<TUCallSite, 4> callSites;
 };
 
+/// What a pointer may point to (PointsToAnalysis::pointsTo) or a memory cell
+/// may hold (PointsToAnalysis::objectsAt). With unification that is at most
+/// one cell.
+struct ObjectSet {
+  /// The resolved cells; empty for a null pointer or an empty slot.
+  llvm::SmallVector<Cell, 1> cells;
+  /// Whether the cells are all it may point to: no node is Incomplete,
+  /// External or UnknownObj, after status propagation.
+  bool complete = true;
+  /// Why the set is not complete: the first reason recorded on the node
+  /// (Incomplete before External). Null for a complete set.
+  const Reason *why = nullptr;
+};
+
+/// One line for \p set, the text remarks print:
+///  - an incomplete set: "pointer may refer to unknown memory: <explain(why)>";
+///  - a complete set: "pointer refers to known memory", followed by
+///    "; <explain>" of its Summary reason if the object is a summary;
+///  - a complete empty set: "pointer refers to no object".
+std::string explain(const ObjectSet &set);
+
 /// Counters of one run, for statistics and tests.
 struct PointsToAnalysisStats {
   size_t numFunctions = 0;
@@ -167,6 +194,10 @@ struct PointsToAnalysisStats {
   size_t numClobberingCalls = 0;
   /// Functions whose formals start complete.
   size_t numCompleteFunctions = 0;
+  /// Functions in a recursive call-graph SCC (direct calls and bound
+  /// indirect targets), and nodes marked Summary.
+  size_t numRecursiveFunctions = 0;
+  size_t numSummaryNodes = 0;
   /// Whether the TU-wide copy closure settled (rather than smashing).
   bool transfersSettled = true;
   size_t numLocalNodes = 0;
@@ -194,6 +225,16 @@ public:
   /// The slots of the aggregate \p value, or null.
   const AggregateSlots *slotsOf(mlir::Value value) const;
 
+  /// What the pointer \p value may point to. A null pointer constant gives
+  /// a complete empty set; a value the analysis has no cell for (not a
+  /// pointer, or not in an analysed function) an incomplete empty set.
+  ObjectSet pointsTo(mlir::Value value) const;
+  /// What the pointer slot at \p cell may hold: its link target. A slot
+  /// without a link holds nothing seen, which is all it may hold only if
+  /// its node is complete.
+  ObjectSet objectsAt(Cell cell) const;
+
+  mlir::ModuleOp getModule() const { return module; }
   Graph &getGraph() { return *graph; }
   const Graph &getGraph() const { return *graph; }
 
@@ -207,6 +248,13 @@ public:
 
   /// The TU node of the global or function \p sym, if any function names it.
   Node *getSymbolNode(mlir::FlatSymbolRefAttr sym) const;
+  /// The TU node of every global and function symbol some function names,
+  /// sorted by name.
+  llvm::SmallVector<std::pair<mlir::FlatSymbolRefAttr, Node *>, 0>
+  getSymbolNodes() const;
+
+  /// Whether \p func is in a recursive call-graph SCC.
+  bool isRecursive(cir::FuncOp func) const;
 
   const PointsToAnalysisStats &getStats() const { return stats; }
 
@@ -221,6 +269,9 @@ public:
   bool hadVerifyErrors() const { return verifyErrors; }
 
 private:
+  friend mlir::LogicalResult
+  verifyPointsToAnalysis(const PointsToAnalysis &analysis);
+
   void run();
   void buildLocal(cir::FuncOp func, bool formalsComplete);
   void computeVisibleCallers();
@@ -243,6 +294,12 @@ private:
   void applyUnknownCall(TUCallSite &call, const Reason *why);
   void propagateStatus();
   bool clobberGlobals();
+  /// Find the recursive functions: the call-graph SCCs with a cycle, over
+  /// the direct calls and the bound indirect targets.
+  void computeRecursion();
+  /// Set Summary on the nodes that may stand for more than one live object
+  /// (see the comment in the .cpp file).
+  void markSummaries();
 
   mlir::ModuleOp module;
   const PointsToModelRegistry *models;
@@ -261,6 +318,11 @@ private:
   /// The functions with local linkage whose every symbol use is a direct
   /// call from a function with a body.
   llvm::DenseSet<mlir::Operation *> visibleCallers;
+  /// The functions in a recursive SCC, with Reason{SummaryObject, func,
+  /// "recursion"}.
+  llvm::DenseMap<mlir::Operation *, const Reason *> recursive;
+  /// The reason pointsTo gives a value without a cell.
+  const Reason *notAnalysedWhy = nullptr;
   llvm::StringMap<unsigned> unhandledOps;
   PointsToAnalysisStats stats;
   bool verifyErrors = false;

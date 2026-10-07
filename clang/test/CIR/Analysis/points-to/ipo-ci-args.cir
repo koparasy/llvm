@@ -6,7 +6,7 @@
 // them apart. @g has one caller: c stays a node of its own.
 
 // CHECK-LABEL: === TU graph
-// CHECK-DAG: [[AB:n[0-9]+]] [Stack|Mod] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[AB:n[0-9]+]] [Stack|Summary|Mod] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
 // CHECK-DAG: [[C:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'c' {{.*}})} links={}
 // CHECK-LABEL: === @f formals=complete
 // CHECK-NEXT: @f formal #0 -> [[AB]]+0

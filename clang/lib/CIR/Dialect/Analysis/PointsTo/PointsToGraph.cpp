@@ -31,8 +31,10 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToGraph.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
@@ -123,6 +125,155 @@ StringRef cir::pointsto::getReasonKindName(Reason::Kind kind) {
     return "UnhandledOp";
   }
   llvm_unreachable("unknown reason kind");
+}
+
+/// The details of the reasons Graph::markReachable derives.
+static constexpr StringLiteral kReachableFromEscaped =
+    "reachable from an escaped pointer";
+static constexpr StringLiteral kReachableFromIncomplete =
+    "reachable from an incomplete node";
+
+bool cir::pointsto::isDerivedReason(const Reason *why) {
+  return why && why->cause &&
+         (why->detail == kReachableFromEscaped ||
+          why->detail == kReachableFromIncomplete);
+}
+
+const Reason *cir::pointsto::getRootReason(const Reason *why) {
+  while (isDerivedReason(why))
+    why = why->cause;
+  return why;
+}
+
+/// The name of the symbol \p op defines, or of the nearest enclosing op that
+/// defines one (the function an op is in), as "@name"; empty if none.
+static std::string getEnclosingSymbol(mlir::Operation *op) {
+  for (; op; op = op->getParentOp())
+    if (auto name = op->getAttrOfType<mlir::StringAttr>(
+            mlir::SymbolTable::getSymbolAttrName()))
+      return ("@" + name.getValue()).str();
+  return {};
+}
+
+/// " (file:line)" for \p op, " (in @function)" if it has no file location,
+/// or nothing.
+static std::string getLocationSuffix(mlir::Operation *op) {
+  if (!op)
+    return {};
+  if (auto loc = op->getLoc()->findInstanceOf<mlir::FileLineColLoc>())
+    return (" (" + sys::path::filename(loc.getFilename().getValue()) + ":" +
+            Twine(loc.getLine()) + ")")
+        .str();
+  std::string sym = getEnclosingSymbol(op);
+  return sym.empty() ? std::string() : " (in " + sym + ")";
+}
+
+/// Whether \p detail is a single symbol reference, "@name".
+static bool isSymbolDetail(StringRef detail) {
+  return detail.size() > 1 && detail.front() == '@' && !detail.contains(' ');
+}
+
+/// How a pointer escaped, for the detail of an EscapedTo reason: a phrase
+/// that follows "an escaped pointer".
+static std::string describeEscape(StringRef detail) {
+  if (isSymbolDetail(detail))
+    return ("passed to " + detail).str();
+  if (StringRef callee = detail;
+      callee.consume_back(" not analysed") && isSymbolDetail(callee))
+    return ("passed to " + callee + ", whose body is not analysed").str();
+  if (detail.consume_back(" may access the global"))
+    return detail == "an indirect callee"
+               ? std::string("stored in a global that an unresolved indirect "
+                             "callee may access")
+               : ("stored in a global that " + detail + " may access").str();
+  if (detail.consume_front("result of "))
+    return ("returned by " + detail).str();
+  if (detail.starts_with("kept by ") ||
+      detail.starts_with("may be returned by ") ||
+      detail.starts_with("written by "))
+    return detail.str();
+  return StringSwitch<std::string>(detail)
+      .Case("global visible to other TUs",
+            "stored in a global visible to other translation units")
+      .Case("variadic argument", "passed as a variadic argument")
+      .Case("address escaped as an integer", "converted to an integer")
+      .Case("pointer made from an integer", "made from an integer")
+      .Case("absolute address", "made from an absolute address")
+      .Case("symbol not found", "naming a symbol that does not exist")
+      .Case("alias chain too deep", "naming an alias chain that is too deep")
+      .Case("search of a null pointer", "returned by a search of a null "
+                                        "pointer")
+      .Default(("(\"" + detail + "\")").str());
+}
+
+/// A noun phrase for the root reason \p why, without its location.
+static std::string describeRoot(const Reason &why) {
+  StringRef detail = why.detail;
+  auto quoted = [&](StringRef prefix) {
+    return detail.empty() ? prefix.str()
+                          : (prefix + " (\"" + detail + "\")").str();
+  };
+  std::string opName =
+      why.op ? ("`" + why.op->getName().getStringRef() + "`").str()
+             : std::string("an operation");
+  std::string sym = getEnclosingSymbol(why.op);
+  if (sym.empty())
+    sym = "a function";
+  switch (why.kind) {
+  case Reason::Kind::EscapedTo:
+    return "an escaped pointer " + describeEscape(detail);
+  case Reason::Kind::UnknownCaller:
+    if (detail.consume_front("formal #"))
+      return ("parameter #" + detail + " of " + sym +
+              ", which may have callers that are not analysed")
+          .str();
+    if (detail == "returned to an unknown caller")
+      return "the return value of " + sym +
+             ", which may have callers that are not analysed";
+    if (detail == "dynamic initialization not analysed")
+      return "the global " + sym +
+             ", whose dynamic initialization is not analysed";
+    return quoted("a value that a caller that is not analysed may pass");
+  case Reason::Kind::IndirectUnresolved:
+    return quoted("a pointer passed to or returned from an indirect call "
+                  "whose targets are not known");
+  case Reason::Kind::Budget:
+    return quoted("a pointer the analysis stopped tracking when it ran out "
+                  "of budget");
+  case Reason::Kind::UnmodelledRole:
+    return quoted("a pointer passed to a runtime call that has no model");
+  case Reason::Kind::UnhandledOp:
+    if (!why.op)
+      return quoted("a value the analysis did not see");
+    return quoted("a pointer through " + opName +
+                  ", which the analysis does not model");
+  case Reason::Kind::CollapsedAt:
+    return quoted("an object made field-insensitive at " + opName);
+  case Reason::Kind::MergedAt:
+    if (isSymbolDetail(detail))
+      return ("an object merged with others by binding a call to " + detail)
+          .str();
+    if (detail == "one node per global symbol")
+      return "an object merged with the other copies of a global";
+    return quoted("an object merged with others at " + opName);
+  case Reason::Kind::SummaryObject:
+    return StringSwitch<std::string>(detail)
+        .Case("loop", "an object allocated in a loop")
+        .Case("recursion", "an object of a recursive function")
+        .Case("several callers",
+              "an object allocated in a function that may run several times")
+        .Case("merged origins", "an object with several origins")
+        .Default(quoted("an object that stands for several objects"));
+  }
+  llvm_unreachable("unknown reason kind");
+}
+
+std::string cir::pointsto::explain(const Reason *why) {
+  if (!why)
+    return "no reason was recorded";
+  const Reason *root = getRootReason(why);
+  return (root == why ? "it is " : "it is reachable from ") +
+         describeRoot(*root) + getLocationSuffix(root->op);
 }
 
 const Reason *ReasonTable::make(Reason::Kind kind, mlir::Operation *op,
@@ -304,11 +455,11 @@ size_t Graph::markReachable(Cell from, NodeFlags flags, const Reason *why,
     const Reason *r = why;
     if (node != root && why) {
       if (!derived)
-        derived = makeReason(why->kind, why->op,
-                             flags == NodeFlags::Incomplete
-                                 ? "reachable from an incomplete node"
-                                 : "reachable from an escaped pointer",
-                             why);
+        derived =
+            makeReason(why->kind, why->op,
+                       flags == NodeFlags::Incomplete ? kReachableFromIncomplete
+                                                      : kReachableFromEscaped,
+                       why);
       r = derived;
     }
     addFlags(Cell(node), flags, r);
@@ -669,6 +820,18 @@ static void printOrigin(raw_ostream &os, const Origin &origin) {
     os << '#' << origin.ctx;
 }
 
+/// Print \p r alone, without its causes.
+static void printOneReason(raw_ostream &os, const Reason *r) {
+  os << getReasonKindName(r->kind) << '(';
+  printOp(os, r->op);
+  if (!r->detail.empty()) {
+    os << ", \"";
+    printEscapedString(r->detail, os);
+    os << '"';
+  }
+  os << ')';
+}
+
 static void printReason(raw_ostream &os, const Reason *r) {
   constexpr unsigned maxCauses = 4;
   for (unsigned depth = 0; r; r = r->cause, ++depth) {
@@ -678,15 +841,19 @@ static void printReason(raw_ostream &os, const Reason *r) {
     }
     if (depth)
       os << " <- ";
-    os << getReasonKindName(r->kind) << '(';
-    printOp(os, r->op);
-    if (!r->detail.empty()) {
-      os << ", \"";
-      printEscapedString(r->detail, os);
-      os << '"';
-    }
-    os << ')';
+    printOneReason(os, r);
   }
+}
+
+SmallVector<std::string, 4> cir::pointsto::explainChain(const Reason *why) {
+  SmallVector<std::string, 4> chain;
+  for (; why; why = why->cause) {
+    std::string line;
+    raw_string_ostream os(line);
+    printOneReason(os, why);
+    chain.push_back(std::move(line));
+  }
+  return chain;
 }
 
 void Graph::printCell(raw_ostream &os, Cell cell) {

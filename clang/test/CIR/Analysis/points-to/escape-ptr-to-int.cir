@@ -1,0 +1,26 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci explain=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// An address converted to an integer escapes: the integer may be stored,
+// hashed or turned back into a pointer anywhere, which the analysis does not
+// follow. So x's object is incomplete. A pointer made from an integer may
+// point to anything: a fresh unknown object.
+
+// CHECK-LABEL: === @f
+// CHECK:      @f x -> {{n[0-9]+}}+0 incomplete (pointer may refer to unknown memory: it is an escaped pointer converted to an integer (escape-ptr-to-int.cir:[[#CAST:]]))
+// CHECK-NEXT:     <- EscapedTo(cir.cast escape-ptr-to-int.cir:[[#CAST]]:{{[0-9]+}}, "address escaped as an integer")
+// CHECK-NEXT: @f y -> {{n[0-9]+}}+0 complete (pointer refers to known memory)
+// CHECK-NEXT: @f back -> {{n[0-9]+}}+0 incomplete (pointer may refer to unknown memory: it is an escaped pointer made from an integer (escape-ptr-to-int.cir:[[#BACK:]]))
+// CHECK-NEXT:     <- EscapedTo(cir.cast escape-ptr-to-int.cir:[[#BACK]]:{{[0-9]+}}, "pointer made from an integer")
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+
+module {
+cir.func @f() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i> {test.ptr = "x"}
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i> {test.ptr = "y"}
+  %xi = cir.cast ptr_to_int %x : !cir.ptr<!s32i> -> !s64i
+  %back = cir.cast int_to_ptr %xi : !s64i -> !cir.ptr<!s32i> {test.ptr = "back"}
+  cir.return
+}
+}

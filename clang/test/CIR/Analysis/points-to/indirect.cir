@@ -18,10 +18,10 @@
 
 // CHECK-LABEL: === TU graph
 // CHECK-DAG: [[TABLE:n[0-9]+]] [Global|Ref] size=16 arr=8 origins={global(@table)} links={0->[[F:n[0-9]+]]+0}
-// CHECK-DAG: [[F]] [Function] size=0 origins={func(@inc), func(@id)} links={}
+// CHECK-DAG: [[F]] [Function|Summary] size=0 origins={func(@inc), func(@id)} links={}
 // CHECK-DAG: [[X:n[0-9]+]] [Stack|Incomplete|Mod|Ref] size=4 origins={stack(cir.alloca 'x' {{.*}})} links={} reasons={Incomplete: UnknownCaller({{.*}}"formal #0")}
 // CHECK-DAG: [[Y:n[0-9]+]] [Stack|Mod] size=4 origins={stack(cir.alloca 'y' {{.*}})} links={}
-// CHECK-DAG: [[E:n[0-9]+]] [Stack|External|Mod|Ref] size=4 origins={stack(cir.alloca 'e' {{.*}})} links={}
+// CHECK-DAG: [[E:n[0-9]+]] [Stack|External|Summary|Mod|Ref] size=4 origins={stack(cir.alloca 'e' {{.*}})} links={}
 // CHECK-LABEL: === @inc formals=incomplete
 // CHECK-NEXT: @inc formal #0 -> [[X]]+0
 // CHECK-NEXT: @inc return -> [[X]]+0

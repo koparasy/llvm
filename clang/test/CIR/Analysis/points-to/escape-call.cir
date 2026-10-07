@@ -1,0 +1,39 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci explain=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=PLAIN
+
+// A pointer passed to an external declaration escapes: the callee may keep
+// it, store through it, and read or write what it reaches. So pp's object is
+// External (it was passed), and so is p's (it is reachable from pp's): the
+// callee may have stored any pointer into either. q's object never escapes,
+// but @caller may be re-entered through @foo (it is external and calls code
+// we don't see), so q's object stands for several live objects.
+
+// CHECK-LABEL: === @caller
+// CHECK:      @caller pp -> {{n[0-9]+}}+0 incomplete (pointer may refer to unknown memory: it is an escaped pointer passed to @foo (escape-call.cir:[[#CALL:]]))
+// CHECK-NEXT:     <- EscapedTo(cir.call escape-call.cir:[[#CALL]]:3, "@foo")
+// CHECK-NEXT: @caller p -> {{n[0-9]+}}+0 incomplete (pointer may refer to unknown memory: it is reachable from an escaped pointer passed to @foo (escape-call.cir:[[#CALL]]))
+// CHECK-NEXT:     <- EscapedTo(cir.call escape-call.cir:[[#CALL]]:3, "reachable from an escaped pointer")
+// CHECK-NEXT:     <- EscapedTo(cir.call escape-call.cir:[[#CALL]]:3, "@foo")
+// CHECK-NEXT: @caller q -> {{n[0-9]+}}+0 complete (pointer refers to known memory; it is an object that stands for several objects ("may be re-entered") (escape-call.cir:{{[0-9]+}}))
+
+// Without explain=1 only the status is printed.
+// PLAIN:      @caller pp -> {{n[0-9]+}}+0 incomplete{{$}}
+// PLAIN-NEXT: @caller p -> {{n[0-9]+}}+0 incomplete{{$}}
+// PLAIN-NEXT: @caller q -> {{n[0-9]+}}+0 complete{{$}}
+
+!s32i = !cir.int<s, 32>
+
+module {
+cir.func private @foo(!cir.ptr<!cir.ptr<!s32i>>)
+cir.func @caller() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %pp = cir.alloca "pp" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %pp : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @foo(%pp) : (!cir.ptr<!cir.ptr<!s32i>>) -> ()
+  %pp_tag = cir.cast bitcast %pp : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "pp"}
+  %p = cir.load %pp : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "p"}
+  %q = cir.cast bitcast %y : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "q"}
+  cir.return
+}
+}

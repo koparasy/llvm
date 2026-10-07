@@ -1,0 +1,145 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci explain=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=OPEN
+
+// Summary nodes: a node that may stand for more than one simultaneously live
+// object. MustAlias must never be answered for one.
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @malloc(!u64i) -> !cir.ptr<!void>
+
+// An allocation in a structured loop: one node for every iteration's object,
+// and they are all live at the end.
+// CHECK-LABEL: === @in_loop
+// CHECK:      @in_loop p -> {{n[0-9]+}}+0 complete (pointer refers to known memory; it is an object allocated in a loop (summary.cir:[[#@LINE+8]]))
+// CHECK-NEXT:     <- SummaryObject(cir.call summary.cir:[[#@LINE+7]]:{{[0-9]+}}, "loop")
+cir.func @in_loop() {
+  %c4 = cir.const #cir.int<4> : !u64i
+  cir.while {
+    %c = cir.const #cir.bool<true> : !cir.bool
+    cir.condition(%c)
+  } do {
+    %p = cir.call @malloc(%c4) {test.ptr = "p"} : (!u64i) -> !cir.ptr<!void>
+    cir.yield
+  }
+  cir.return
+}
+
+// The same as a CFG cycle, as in a flattened function.
+// CHECK-LABEL: === @in_cfg_loop
+// CHECK:      @in_cfg_loop p -> {{n[0-9]+}}+0 complete (pointer refers to known memory; it is an object allocated in a loop (summary.cir:[[#@LINE+5]]))
+cir.func @in_cfg_loop(%c: !cir.bool) {
+  %c4 = cir.const #cir.int<4> : !u64i
+  cir.br ^bb1
+^bb1:
+  %p = cir.call @malloc(%c4) {test.ptr = "p"} : (!u64i) -> !cir.ptr<!void>
+  cir.brcond %c ^bb1, ^bb2
+^bb2:
+  cir.return
+}
+
+// A stack object of a recursive function: the activations of @rec are live
+// at the same time, and each has its own `local`.
+// CHECK-LABEL: === @rec
+// CHECK:      @rec local -> {{n[0-9]+}}+0 complete (pointer refers to known memory; it is an object of a recursive function (summary.cir:[[#@LINE+4]]))
+// CHECK-NEXT:     <- SummaryObject(cir.alloca 'local' summary.cir:[[#@LINE+3]]:{{[0-9]+}}, "recursion")
+// CHECK-NEXT:     <- SummaryObject(cir.func summary.cir:[[#@LINE+1]]:1, "recursion")
+cir.func internal @rec(%c: !cir.bool) {
+  %local = cir.alloca "local" align(4) : !cir.ptr<!s32i> {test.ptr = "local"}
+  cir.brcond %c ^bb1, ^bb2
+^bb1:
+  cir.call @rec(%c) : (!cir.bool) -> ()
+  cir.br ^bb2
+^bb2:
+  cir.return
+}
+cir.func @rec_root(%c: !cir.bool) {
+  cir.call @rec(%c) : (!cir.bool) -> ()
+  cir.return
+}
+
+// A factory called from two sites: its heap node stands for both objects.
+// CHECK-LABEL: === @factory2
+// CHECK:      @factory2 p -> {{n[0-9]+}}+0 complete (pointer refers to known memory; it is an object allocated in a function that may run several times (summary.cir:[[#@LINE+5]]))
+// CHECK-NEXT:     <- SummaryObject(cir.call summary.cir:[[#@LINE+4]]:{{[0-9]+}}, "several callers")
+// CHECK-NEXT:     <- SummaryObject(cir.call summary.cir:{{[0-9]+}}:{{[0-9]+}}, "several call sites")
+cir.func internal @factory2() -> !cir.ptr<!void> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %p = cir.call @malloc(%c4) {test.ptr = "p"} : (!u64i) -> !cir.ptr<!void>
+  cir.return %p : !cir.ptr<!void>
+}
+cir.func @use_two() {
+  %a = cir.call @factory2() : () -> !cir.ptr<!void>
+  %b = cir.call @factory2() : () -> !cir.ptr<!void>
+  cir.return
+}
+
+// A factory with one call site, from a function that runs once: one object,
+// a singleton. Without closed-tu, @use_one may be called from other TUs any
+// number of times, so the object is a summary (OPEN).
+// CHECK-LABEL: === @factory1
+// CHECK:      @factory1 p -> {{n[0-9]+}}+0 complete (pointer refers to known memory){{$}}
+// CHECK-NOT:      <-
+// OPEN-LABEL: === @factory1
+// OPEN:       @factory1 p -> {{n[0-9]+}}+0 complete (pointer refers to known memory; it is an object allocated in a function that may run several times (summary.cir:[[#@LINE+6]]))
+// OPEN-NEXT:      <- SummaryObject(cir.call summary.cir:[[#@LINE+5]]:{{[0-9]+}}, "several callers")
+// OPEN-NEXT:      <- SummaryObject(cir.call summary.cir:{{[0-9]+}}:{{[0-9]+}}, "caller may run several times")
+// OPEN-NEXT:      <- SummaryObject(cir.func summary.cir:{{[0-9]+}}:1, "unknown caller")
+cir.func internal @factory1() -> !cir.ptr<!void> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %p = cir.call @malloc(%c4) {test.ptr = "p"} : (!u64i) -> !cir.ptr<!void>
+  cir.return %p : !cir.ptr<!void>
+}
+cir.func @use_one() {
+  %a = cir.call @factory1() : () -> !cir.ptr<!void>
+  cir.return
+}
+
+// A stack object of a function called twice from straight-line code stays a
+// singleton, also without closed-tu: the two activations of @twice are not
+// live at the same time, and a pointer to `s` that outlives its activation
+// dangles, so using it is UB. Within any one activation, `s` is one object.
+// CHECK-LABEL: === @twice
+// CHECK:      @twice s -> {{n[0-9]+}}+0 complete (pointer refers to known memory){{$}}
+// OPEN-LABEL: === @twice
+// OPEN:       @twice s -> {{n[0-9]+}}+0 complete (pointer refers to known memory){{$}}
+cir.func internal @twice() {
+  %s = cir.alloca "s" align(4) : !cir.ptr<!s32i> {test.ptr = "s"}
+  cir.return
+}
+cir.func @use_stack() {
+  cir.call @twice() : () -> ()
+  cir.call @twice() : () -> ()
+  cir.return
+}
+// Re-entry through code we don't see: @reent is external (it may have
+// callers we don't see) and calls the unknown @opaque, which may call back
+// into it while its frame is live, so its stack object is a summary.
+// @no_reent is internal with only direct callers: never re-entered, its
+// stack object stays a singleton although it calls @opaque too.
+
+// Under closed-tu nothing has callers we don't see, so neither is.
+
+// OPEN:      @reent r -> {{n[0-9]+}}+0 complete ({{.*}}"may be re-entered"
+// OPEN:      @no_reent s -> {{n[0-9]+}}+0 complete (pointer refers to known memory){{$}}
+// CHECK:     @reent r -> {{n[0-9]+}}+0 complete (pointer refers to known memory){{$}}
+// CHECK:     @no_reent s -> {{n[0-9]+}}+0 complete (pointer refers to known memory){{$}}
+cir.func private @opaque()
+cir.func @reent() {
+  %r = cir.alloca "r" align(4) : !cir.ptr<!s32i> {test.ptr = "r"}
+  cir.call @opaque() : () -> ()
+  cir.return
+}
+cir.func internal @no_reent() {
+  %s = cir.alloca "s" align(4) : !cir.ptr<!s32i> {test.ptr = "s"}
+  cir.call @opaque() : () -> ()
+  cir.return
+}
+cir.func @no_reent_root() {
+  cir.call @no_reent() : () -> ()
+  cir.return
+}
+}

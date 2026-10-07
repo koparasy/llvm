@@ -8,11 +8,14 @@
 
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "mlir/Analysis/CallGraph.h"
+#include "mlir/IR/RegionGraphTraits.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/GlobalNodes.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
+#include "clang/CIR/Interfaces/CIRLoopOpInterface.h"
 #include "clang/CIR/Interfaces/CIROpInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SCCIterator.h"
@@ -60,6 +63,77 @@ const AggregateSlots *PointsToAnalysis::slotsOf(Value value) const {
   return it == aggregateMap.end() ? nullptr : &it->second;
 }
 
+/// The set of the single cell \p cell, complete unless its node is
+/// Incomplete, External or UnknownObj.
+static ObjectSet makeObjectSet(Cell cell) {
+  ObjectSet set;
+  Cell resolved = cell.resolve();
+  set.cells.push_back(resolved);
+  const Node *node = resolved.getNode();
+  if (hasAny(node->getFlags(), NodeFlags::Incomplete | NodeFlags::External |
+                                   NodeFlags::UnknownObj)) {
+    set.complete = false;
+    set.why = node->getReason(NodeFlags::Incomplete);
+    if (!set.why)
+      set.why = node->getReason(NodeFlags::External);
+  }
+  return set;
+}
+
+ObjectSet PointsToAnalysis::pointsTo(Value value) const {
+  if (Cell cell = scalarMap.lookup(value))
+    return makeObjectSet(cell);
+  ObjectSet set;
+  if (isPointerValueType(value.getType()) && isNullPointerConstant(value))
+    return set;
+  set.complete = false;
+  set.why = notAnalysedWhy;
+  return set;
+}
+
+ObjectSet PointsToAnalysis::objectsAt(Cell cell) const {
+  ObjectSet set;
+  if (!cell) {
+    set.complete = false;
+    set.why = notAnalysedWhy;
+    return set;
+  }
+  if (std::optional<Cell> target = graph->lookupLink(cell))
+    return makeObjectSet(*target);
+  // Nothing seen stored there: that is all unless code we don't see may
+  // have stored something (by propagation, a link target of an External or
+  // Incomplete node carries the flag too).
+  ObjectSet holder = makeObjectSet(cell);
+  set.complete = holder.complete;
+  set.why = holder.why;
+  return set;
+}
+
+std::string cir::pointsto::explain(const ObjectSet &set) {
+  if (!set.complete)
+    return "pointer may refer to unknown memory: " + explain(set.why);
+  if (set.cells.empty())
+    return "pointer refers to no object";
+  std::string out = "pointer refers to known memory";
+  for (Cell cell : set.cells)
+    if (const Reason *why = cell.getNode()->getReason(NodeFlags::Summary))
+      return out + "; " + explain(why);
+  return out;
+}
+
+SmallVector<std::pair<FlatSymbolRefAttr, Node *>, 0>
+PointsToAnalysis::getSymbolNodes() const {
+  SmallVector<std::pair<FlatSymbolRefAttr, Node *>, 0> result =
+      globals->getSymbolNodes();
+  for (auto &[sym, node] : result)
+    node = Cell(node).getNode();
+  return result;
+}
+
+bool PointsToAnalysis::isRecursive(cir::FuncOp func) const {
+  return recursive.contains(func.getOperation());
+}
+
 const TUFunction *PointsToAnalysis::getFunction(cir::FuncOp func) const {
   return functionMap.lookup(func.getOperation());
 }
@@ -88,6 +162,8 @@ void PointsToAnalysis::run() {
       cir::PointerType::get(cir::VoidType::get(module.getContext()));
   unsigned pointerSize = dataLayout->getTypeSize(voidPtrTy).getFixedValue();
   graph = std::make_unique<Graph>(pointerSize, &reasons);
+  notAnalysedWhy =
+      reasons.make(Reason::Kind::UnhandledOp, nullptr, "value not analysed");
   globals = std::make_unique<GlobalNodes>(*graph, *dataLayout, symbols, module);
 
   computeVisibleCallers();
@@ -172,6 +248,10 @@ void PointsToAnalysis::run() {
         ++stats.numIndirectUnresolved;
     }
 
+  // The graph is final: no rule merges nodes any more.
+  computeRecursion();
+  markSummaries();
+
 #ifndef NDEBUG
   // Unification is monotone: once every call is bound, binding them again
   // must merge nothing.
@@ -188,6 +268,8 @@ void PointsToAnalysis::run() {
                          << errors;
       verifyErrors = true;
     }
+    if (failed(verifyPointsToAnalysis(*this)))
+      verifyErrors = true;
   }
 
   llvm::TimeRecord total = llvm::TimeRecord::getCurrentTime(false);
@@ -677,4 +759,276 @@ bool PointsToAnalysis::clobberGlobals() {
       }
     }
   return changed;
+}
+
+//===----------------------------------------------------------------------===//
+// Summary objects
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// A function of the call graph computeRecursion walks; the root is a
+/// pseudo-node that calls every function, so that one scc_iterator walk
+/// visits them all.
+struct CallNode {
+  SmallVector<CallNode *, 4> callees;
+  unsigned index = 0;
+};
+} // namespace
+
+namespace llvm {
+template <> struct GraphTraits<CallNode *> {
+  using NodeRef = CallNode *;
+  using ChildIteratorType = SmallVectorImpl<CallNode *>::iterator;
+  static NodeRef getEntryNode(CallNode *node) { return node; }
+  static ChildIteratorType child_begin(NodeRef node) {
+    return node->callees.begin();
+  }
+  static ChildIteratorType child_end(NodeRef node) {
+    return node->callees.end();
+  }
+};
+} // namespace llvm
+
+/// Call \p fn with the index (into \p functions) of every callee with a body
+/// that \p call is bound to: the direct callee, or the bound indirect
+/// targets.
+template <typename Fn>
+static void forEachBoundCallee(const TUCallSite &call,
+                               const DenseMap<Operation *, unsigned> &indexOf,
+                               SymbolTableCollection &symbols, ModuleOp module,
+                               Fn fn) {
+  if (call.resolution == CallResolution::Direct) {
+    auto it = indexOf.find(cir::FuncOp(call.callee).getOperation());
+    if (it != indexOf.end())
+      fn(it->second);
+    return;
+  }
+  for (FlatSymbolRefAttr target : call.targets) {
+    auto func = symbols.lookupNearestSymbolFrom<cir::FuncOp>(module, target);
+    auto it = func ? indexOf.find(func.getOperation()) : indexOf.end();
+    if (it != indexOf.end())
+      fn(it->second);
+  }
+}
+
+void PointsToAnalysis::computeRecursion() {
+  // The call graph of the final bindings: mlir::CallGraph sees only the
+  // direct calls, and a bound indirect target can close a cycle too.
+  // Recursion through code we don't see (an escaped function pointer that
+  // a library calls back) is not a cycle here; see markSummaries.
+  DenseMap<Operation *, unsigned> indexOf;
+  for (auto [i, fn] : llvm::enumerate(functions))
+    indexOf[fn->func.getOperation()] = i;
+  SmallVector<CallNode, 0> nodes(functions.size() + 1);
+  CallNode &root = nodes.back();
+  for (auto [i, fn] : llvm::enumerate(functions)) {
+    nodes[i].index = i;
+    root.callees.push_back(&nodes[i]);
+    for (const TUCallSite &call : fn->callSites)
+      forEachBoundCallee(call, indexOf, symbols, module, [&](unsigned callee) {
+        nodes[i].callees.push_back(&nodes[callee]);
+      });
+  }
+  for (auto it = llvm::scc_begin(&root); !it.isAtEnd(); ++it) {
+    if (!it.hasCycle())
+      continue;
+    for (CallNode *node : *it) {
+      if (node == &root)
+        continue;
+      Operation *func = functions[node->index]->func.getOperation();
+      recursive[func] =
+          reasons.make(Reason::Kind::SummaryObject, func, "recursion");
+    }
+  }
+  stats.numRecursiveFunctions = recursive.size();
+}
+
+namespace {
+/// Whether an op may run more than once per activation of its function.
+class LoopInfo {
+public:
+  /// SOUNDNESS: true if an enclosing region may repeat (a LoopOpInterface,
+  /// a repetitive region of a RegionBranchOpInterface, or any region of an
+  /// op that implements neither, such as cir.array.ctor) or an enclosing
+  /// block is on a CFG cycle (a flattened loop).
+  bool isInLoop(Operation *op) {
+    for (Operation *cur = op; cur; cur = cur->getParentOp()) {
+      Block *block = cur->getBlock();
+      if (!block)
+        return false;
+      if (isOnCycle(block))
+        return true;
+      Region *region = block->getParent();
+      Operation *parent = region->getParentOp();
+      if (!parent || isa<ModuleOp, cir::FuncOp>(parent))
+        return false;
+      if (isa<cir::LoopOpInterface>(parent))
+        return true;
+      auto branch = dyn_cast<RegionBranchOpInterface>(parent);
+      if (!branch || branch.isRepetitiveRegion(region->getRegionNumber()))
+        return true;
+    }
+    return false;
+  }
+
+private:
+  bool isOnCycle(Block *block) {
+    Region *region = block->getParent();
+    // The entry block has no predecessors, so a one-block region has no
+    // cycle.
+    if (region->hasOneBlock())
+      return false;
+    auto [it, inserted] = cyclicBlocks.try_emplace(region);
+    if (inserted)
+      for (auto scc = llvm::scc_begin(region); !scc.isAtEnd(); ++scc)
+        if (scc.hasCycle())
+          it->second.insert(scc->begin(), scc->end());
+    return it->second.contains(block);
+  }
+
+  DenseMap<Region *, llvm::SmallPtrSet<Block *, 8>> cyclicBlocks;
+};
+} // namespace
+
+void PointsToAnalysis::markSummaries() {
+  // A node is a summary if it may stand for more than one simultaneously
+  // live concrete object:
+  //  - it has more than one origin, or an origin and the UnknownObj kind
+  //    ("merged origins");
+  //  - a heap origin whose allocation may run more than once per activation
+  //    of its function: inside a loop or on a CFG cycle ("loop");
+  //  - a stack or heap origin of a function in a recursive SCC: two
+  //    activations are live at once ("recursion");
+  //  - a heap origin of a function that may run more than once
+  //    ("several callers"): it has an unknown caller (its formals are not
+  //    complete), its address is taken, it has more than one call site, a
+  //    call site in a loop, or a caller that may itself run more than once.
+  //    The heap objects of the activations all outlive them. The
+  //    context-sensitive phase refines this per call path.
+  // Global, function and ghost origins stand for one object each.
+  //
+  // A stack object of a non-recursive function stays a singleton even if
+  // the function is called twice from straight-line code: the two
+  // activations are not live at the same time, and a pointer to the object
+  // that outlives its activation is dangling, so using it is UB. Each
+  // object is alive in a single activation, which is where a query about
+  // it is asked. The same holds for an alloca in a loop body: each
+  // iteration's object is dead before the next one is made.
+  //
+  // Recursion through code we don't see is covered conservatively: a stack
+  // object is also a summary ("may be re-entered") when its function can be
+  // entered from code we don't see (an unknown caller or a taken address)
+  // and itself calls code we don't see (an unknown or unresolved call),
+  // since that code may call back into it while the activation is live.
+  DenseMap<Operation *, unsigned> indexOf;
+  for (auto [i, fn] : llvm::enumerate(functions))
+    indexOf[fn->func.getOperation()] = i;
+  size_t n = functions.size();
+  LoopInfo loops;
+
+  // Why each function may run more than once while its heap objects live.
+  SmallVector<const Reason *, 0> runsMany(n, nullptr);
+  SmallVector<unsigned, 0> numCallSites(n, 0);
+  SmallVector<Operation *, 0> secondCallSite(n, nullptr);
+  SmallVector<SmallVector<std::pair<unsigned, Operation *>, 4>, 0> callees(n);
+  for (auto [i, fn] : llvm::enumerate(functions))
+    for (const TUCallSite &call : fn->callSites)
+      forEachBoundCallee(call, indexOf, symbols, module, [&](unsigned callee) {
+        callees[i].emplace_back(callee, call.site.call);
+        if (++numCallSites[callee] == 2)
+          secondCallSite[callee] = call.site.call;
+        if (!runsMany[callee] && loops.isInLoop(call.site.call))
+          runsMany[callee] = reasons.make(Reason::Kind::SummaryObject,
+                                          call.site.call, "called in a loop");
+      });
+  llvm::DenseSet<StringRef> addressTaken;
+  for (auto [sym, node] : globals->getSymbolNodes())
+    addressTaken.insert(sym.getValue());
+  for (auto [i, fn] : llvm::enumerate(functions)) {
+    if (runsMany[i])
+      continue;
+    Operation *func = fn->func.getOperation();
+    if (const Reason *why = recursive.lookup(func))
+      runsMany[i] = why;
+    else if (!fn->formalsComplete)
+      runsMany[i] =
+          reasons.make(Reason::Kind::SummaryObject, func, "unknown caller");
+    else if (addressTaken.contains(fn->func.getSymName()))
+      runsMany[i] =
+          reasons.make(Reason::Kind::SummaryObject, func, "address taken");
+    else if (secondCallSite[i])
+      runsMany[i] = reasons.make(Reason::Kind::SummaryObject, secondCallSite[i],
+                                 "several call sites");
+  }
+  // A callee of a function that runs more than once does too.
+  SmallVector<unsigned, 0> worklist;
+  for (unsigned i = 0; i != n; ++i)
+    if (runsMany[i])
+      worklist.push_back(i);
+  while (!worklist.empty()) {
+    unsigned caller = worklist.pop_back_val();
+    for (auto [callee, op] : callees[caller]) {
+      if (runsMany[callee])
+        continue;
+      runsMany[callee] =
+          reasons.make(Reason::Kind::SummaryObject, op,
+                       "caller may run several times", runsMany[caller]);
+      worklist.push_back(callee);
+    }
+  }
+
+  // Why each function may have two live activations through code we don't
+  // see: it can be entered from there and calls out to there.
+  SmallVector<const Reason *, 0> reentered(n, nullptr);
+  for (auto [i, fn] : llvm::enumerate(functions)) {
+    if (fn->formalsComplete && !addressTaken.contains(fn->func.getSymName()))
+      continue;
+    for (const TUCallSite &call : fn->callSites)
+      if (call.resolution == CallResolution::Unknown ||
+          call.resolution == CallResolution::IndirectUnresolved) {
+        reentered[i] = reasons.make(Reason::Kind::SummaryObject, call.site.call,
+                                    "may be re-entered through unknown code");
+        break;
+      }
+  }
+
+  // The reason \p node is a summary, or null.
+  auto summaryReason = [&](const Node *node) -> const Reason * {
+    ArrayRef<Origin> origins = node->getOrigins();
+    if (origins.empty())
+      return nullptr;
+    if (origins.size() > 1 || hasAny(node->getFlags(), NodeFlags::UnknownObj))
+      return reasons.make(Reason::Kind::SummaryObject,
+                          origins[origins.size() > 1 ? 1 : 0].site,
+                          "merged origins");
+    const Origin &origin = origins.front();
+    bool heap = origin.kind == Origin::Kind::HeapCall;
+    if (!origin.site || (!heap && origin.kind != Origin::Kind::Alloca))
+      return nullptr;
+    if (heap && loops.isInLoop(origin.site))
+      return reasons.make(Reason::Kind::SummaryObject, origin.site, "loop");
+    auto func = origin.site->getParentOfType<cir::FuncOp>();
+    auto it = func ? indexOf.find(func.getOperation()) : indexOf.end();
+    if (it == indexOf.end())
+      return nullptr;
+    if (const Reason *rec = recursive.lookup(func.getOperation()))
+      return reasons.make(Reason::Kind::SummaryObject, origin.site, "recursion",
+                          rec);
+    if (heap && runsMany[it->second])
+      return reasons.make(Reason::Kind::SummaryObject, origin.site,
+                          "several callers", runsMany[it->second]);
+    if (!heap && reentered[it->second])
+      return reasons.make(Reason::Kind::SummaryObject, origin.site,
+                          "may be re-entered", reentered[it->second]);
+    return nullptr;
+  };
+
+  stats.numSummaryNodes = 0;
+  for (Node *node : graph->nodes()) {
+    const Reason *why = summaryReason(node);
+    if (!why)
+      continue;
+    graph->addFlags(Cell(node), NodeFlags::Summary, why);
+    ++stats.numSummaryNodes;
+  }
 }

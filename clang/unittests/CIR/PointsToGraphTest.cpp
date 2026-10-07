@@ -8,9 +8,12 @@
 
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToGraph.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -681,6 +684,214 @@ TEST(PointsToGraphTest, PrintNegativeOffset) {
   EXPECT_VERIFIED(g);
   EXPECT_EQ(printed(g), "n0 [] size=0 origins={} links={-8->n1-16}\n"
                         "n1 [] size=0 origins={} links={}\n");
+}
+
+//===----------------------------------------------------------------------===//
+// 10. Explanations.
+//===----------------------------------------------------------------------===//
+
+TEST(PointsToGraphTest, ExplainReasons) {
+  mlir::MLIRContext context;
+  context.loadDialect<cir::CIRDialect>();
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+    !s32i = !cir.int<s, 32>
+    module {
+      cir.func private @foo(!cir.ptr<!s32i>)
+      cir.func @f(%p: !cir.ptr<!s32i>) {
+        %x = cir.alloca "x" align(4) : !cir.ptr<!s32i> loc("dir/t.cpp":3:5)
+        cir.call @foo(%x) : (!cir.ptr<!s32i>) -> () loc("dir/t.cpp":12:3)
+        %y = cir.alloca "y" align(4) : !cir.ptr<!s32i> loc(unknown)
+        cir.return
+      } loc("dir/t.cpp":1:1)
+    }
+  )mlir",
+                                              &context);
+  ASSERT_TRUE(module);
+  mlir::Operation *call = nullptr, *func = nullptr, *noLoc = nullptr;
+  module->walk([&](cir::CallOp op) { call = op; });
+  module->walk([&](cir::FuncOp op) {
+    if (!op.isDeclaration())
+      func = op;
+  });
+  module->walk([&](cir::AllocaOp op) {
+    if (op.getName() == "y")
+      noLoc = op;
+  });
+  ASSERT_TRUE(call && func && noLoc);
+
+  Graph g;
+  using K = Reason::Kind;
+  auto text = [&](K kind, mlir::Operation *op, llvm::StringRef detail) {
+    return explain(g.makeReason(kind, op, detail));
+  };
+  EXPECT_EQ(explain(nullptr), "no reason was recorded");
+
+  // EscapedTo, for each detail the analysis makes.
+  EXPECT_EQ(text(K::EscapedTo, call, "@foo"),
+            "it is an escaped pointer passed to @foo (t.cpp:12)");
+  EXPECT_EQ(text(K::EscapedTo, call, "@foo not analysed"),
+            "it is an escaped pointer passed to @foo, whose body is not "
+            "analysed (t.cpp:12)");
+  EXPECT_EQ(text(K::EscapedTo, call, "@foo may access the global"),
+            "it is an escaped pointer stored in a global that @foo may access "
+            "(t.cpp:12)");
+  EXPECT_EQ(
+      text(K::EscapedTo, call, "an indirect callee may access the global"),
+      "it is an escaped pointer stored in a global that an unresolved "
+      "indirect callee may access (t.cpp:12)");
+  EXPECT_EQ(text(K::EscapedTo, call, "global visible to other TUs"),
+            "it is an escaped pointer stored in a global visible to other "
+            "translation units (t.cpp:12)");
+  EXPECT_EQ(text(K::EscapedTo, call, "variadic argument"),
+            "it is an escaped pointer passed as a variadic argument "
+            "(t.cpp:12)");
+  EXPECT_EQ(text(K::EscapedTo, call, "address escaped as an integer"),
+            "it is an escaped pointer converted to an integer (t.cpp:12)");
+  EXPECT_EQ(text(K::EscapedTo, call, "result of strdup"),
+            "it is an escaped pointer returned by strdup (t.cpp:12)");
+  EXPECT_EQ(text(K::EscapedTo, call, "something new"),
+            "it is an escaped pointer (\"something new\") (t.cpp:12)");
+
+  // UnknownCaller names the function.
+  EXPECT_EQ(text(K::UnknownCaller, func, "formal #0"),
+            "it is parameter #0 of @f, which may have callers that are not "
+            "analysed (t.cpp:1)");
+  EXPECT_EQ(text(K::UnknownCaller, func, "returned to an unknown caller"),
+            "it is the return value of @f, which may have callers that are "
+            "not analysed (t.cpp:1)");
+
+  // The other kinds.
+  EXPECT_EQ(text(K::IndirectUnresolved, call, "callee node is External"),
+            "it is a pointer passed to or returned from an indirect call "
+            "whose targets are not known (\"callee node is External\") "
+            "(t.cpp:12)");
+  EXPECT_EQ(text(K::Budget, call, "indirect-call rounds exhausted"),
+            "it is a pointer the analysis stopped tracking when it ran out of "
+            "budget (\"indirect-call rounds exhausted\") (t.cpp:12)");
+  EXPECT_EQ(text(K::UnmodelledRole, call, "submit"),
+            "it is a pointer passed to a runtime call that has no model "
+            "(\"submit\") (t.cpp:12)");
+  EXPECT_EQ(text(K::UnhandledOp, call, "result without a rule"),
+            "it is a pointer through `cir.call`, which the analysis does not "
+            "model (\"result without a rule\") (t.cpp:12)");
+  EXPECT_EQ(text(K::UnhandledOp, nullptr, "value not analysed"),
+            "it is a value the analysis did not see (\"value not analysed\")");
+  EXPECT_EQ(text(K::CollapsedAt, call, ""),
+            "it is an object made field-insensitive at `cir.call` (t.cpp:12)");
+  EXPECT_EQ(text(K::MergedAt, call, "@foo"),
+            "it is an object merged with others by binding a call to @foo "
+            "(t.cpp:12)");
+  EXPECT_EQ(text(K::SummaryObject, call, "loop"),
+            "it is an object allocated in a loop (t.cpp:12)");
+  EXPECT_EQ(text(K::SummaryObject, call, "recursion"),
+            "it is an object of a recursive function (t.cpp:12)");
+  EXPECT_EQ(text(K::SummaryObject, call, "several callers"),
+            "it is an object allocated in a function that may run several "
+            "times (t.cpp:12)");
+  EXPECT_EQ(text(K::SummaryObject, call, "merged origins"),
+            "it is an object with several origins (t.cpp:12)");
+
+  // An op without a file location is placed by its function.
+  EXPECT_EQ(text(K::EscapedTo, noLoc, "@foo"),
+            "it is an escaped pointer passed to @foo (in @f)");
+
+  // A derived reason reads "reachable from" its root, through any number of
+  // derivations.
+  Node *a = g.makeNode(NodeFlags::Stack);
+  Node *b = g.makeNode(NodeFlags::Stack);
+  Node *c = g.makeNode(NodeFlags::Stack);
+  g.setLink(Cell(a), Cell(b));
+  g.setLink(Cell(b), Cell(c));
+  const Reason *root = g.makeReason(K::EscapedTo, call, "@foo");
+  g.markReachable(Cell(a), NodeFlags::External, root);
+  const Reason *derived = b->getReason(NodeFlags::External);
+  EXPECT_TRUE(isDerivedReason(derived));
+  EXPECT_FALSE(isDerivedReason(root));
+  EXPECT_EQ(getRootReason(derived), root);
+  const Reason *twice = g.makeReason(
+      K::EscapedTo, call, "reachable from an escaped pointer", derived);
+  EXPECT_EQ(getRootReason(twice), root);
+  std::string expected = "it is reachable from an escaped pointer passed to "
+                         "@foo (t.cpp:12)";
+  EXPECT_EQ(explain(derived), expected);
+  EXPECT_EQ(explain(twice), expected);
+
+  // The chain, one entry per reason.
+  llvm::SmallVector<std::string, 4> chain = explainChain(derived);
+  ASSERT_EQ(chain.size(), 2u);
+  EXPECT_EQ(chain[0], "EscapedTo(cir.call t.cpp:12:3, \"reachable from an "
+                      "escaped pointer\")");
+  EXPECT_EQ(chain[1], "EscapedTo(cir.call t.cpp:12:3, \"@foo\")");
+  EXPECT_TRUE(explainChain(nullptr).empty());
+}
+
+//===----------------------------------------------------------------------===//
+// 11. The TU self-check catches a broken invariant.
+//===----------------------------------------------------------------------===//
+
+TEST(PointsToGraphTest, VerifyAnalysisInvariants) {
+  mlir::MLIRContext context;
+  context.loadDialect<cir::CIRDialect>();
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+    !s32i = !cir.int<s, 32>
+    module {
+      cir.func @f() {
+        %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+        %pp = cir.alloca "pp" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+        cir.store %x, %pp : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+        cir.return
+      }
+    }
+  )mlir",
+                                              &context);
+  ASSERT_TRUE(module);
+  mlir::Value x, pp;
+  module->walk([&](cir::AllocaOp op) {
+    (op.getName() == "x" ? x : pp) = op.getResult();
+  });
+  std::string messages;
+  mlir::ScopedDiagnosticHandler handler(&context, [&](mlir::Diagnostic &diag) {
+    messages += diag.str() + "\n";
+    return mlir::success();
+  });
+
+  {
+    PointsToAnalysis analysis(*module);
+    EXPECT_TRUE(mlir::succeeded(verifyPointsToAnalysis(analysis)));
+    EXPECT_TRUE(analysis.pointsTo(x).complete);
+    // What pp's slot holds is x's object.
+    ObjectSet held = analysis.objectsAt(analysis.cellOf(pp));
+    ASSERT_EQ(held.cells.size(), 1u);
+    EXPECT_EQ(held.cells[0], analysis.cellOf(x).resolve());
+    EXPECT_TRUE(held.complete);
+    EXPECT_EQ(explain(held), "pointer refers to known memory");
+  }
+  EXPECT_EQ(messages, "");
+
+  // External without propagation to the link target.
+  {
+    PointsToAnalysis analysis(*module);
+    Graph &g = analysis.getGraph();
+    g.addFlags(analysis.cellOf(pp), NodeFlags::External,
+               g.makeReason(Reason::Kind::EscapedTo, nullptr, "@foo"));
+    EXPECT_FALSE(analysis.pointsTo(pp).complete);
+    EXPECT_TRUE(analysis.pointsTo(x).complete);
+    EXPECT_TRUE(mlir::failed(verifyPointsToAnalysis(analysis)));
+    EXPECT_NE(messages.find("is External but"), std::string::npos) << messages;
+  }
+  messages.clear();
+
+  // Summary without a SummaryObject reason.
+  {
+    PointsToAnalysis analysis(*module);
+    analysis.getGraph().addFlags(analysis.cellOf(x), NodeFlags::Summary);
+    EXPECT_TRUE(mlir::failed(verifyPointsToAnalysis(analysis)));
+    EXPECT_NE(messages.find("Summary without a SummaryObject reason"),
+              std::string::npos)
+        << messages;
+  }
 }
 
 } // namespace

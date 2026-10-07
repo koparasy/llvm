@@ -8,6 +8,8 @@
 
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/LocalBuilder.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
+#include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Interfaces/CIROpInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/CommandLine.h"
@@ -118,4 +120,148 @@ LogicalResult Verifier::run() {
 
 LogicalResult cir::pointsto::verifyFunctionGraph(const FunctionGraph &fg) {
   return Verifier(fg).run();
+}
+
+LogicalResult
+cir::pointsto::verifyPointsToAnalysis(const PointsToAnalysis &analysis) {
+  ModuleOp module = analysis.getModule();
+  const Graph &graph = analysis.getGraph();
+  bool ok = true;
+  std::string errors;
+  llvm::raw_string_ostream os(errors);
+  auto nodeName = [](const Node *node) {
+    return "n" + std::to_string(node->getId());
+  };
+
+  // Every cell held resolves to a live node.
+  size_t numDangling = 0;
+  auto checkCell = [&](Cell cell) {
+    if (cell && cell.getNode()->isForwarded())
+      ++numDangling;
+  };
+  auto checkSlots = [&](const AggregateSlots &slots) {
+    for (auto [off, cell] : slots)
+      checkCell(cell);
+  };
+  for (auto [value, cell] : analysis.scalarMap)
+    checkCell(cell);
+  for (const auto &[value, slots] : analysis.aggregateMap)
+    checkSlots(slots);
+  for (const std::unique_ptr<TUFunction> &fn : analysis.getFunctions()) {
+    for (const std::optional<Cell> &formal : fn->formals)
+      if (formal)
+        checkCell(*formal);
+    for (const std::optional<AggregateSlots> &slots : fn->formalSlots)
+      if (slots)
+        checkSlots(*slots);
+    if (fn->returnCell)
+      checkCell(*fn->returnCell);
+    if (fn->returnSlots)
+      checkSlots(*fn->returnSlots);
+    for (const TUCallSite &call : fn->callSites) {
+      if (call.site.calleePtr)
+        checkCell(*call.site.calleePtr);
+      for (const std::optional<Cell> &arg : call.site.args)
+        if (arg)
+          checkCell(*arg);
+      if (call.site.result)
+        checkCell(*call.site.result);
+    }
+  }
+  if (numDangling) {
+    os << numDangling << " cells resolve to a forwarded node\n";
+    ok = false;
+  }
+
+  for (const Node *node : graph.nodes()) {
+    if (node->isForwarded()) {
+      os << nodeName(node) << " is live and forwarded\n";
+      ok = false;
+    }
+    // Status propagation is closed.
+    for (NodeFlags flag : {NodeFlags::External, NodeFlags::Incomplete}) {
+      if (!node->hasFlags(flag))
+        continue;
+      for (auto [off, target] : node->getLinks())
+        if (!target.getNode()->hasFlags(flag)) {
+          os << nodeName(node) << " is " << getFlagName(flag) << " but "
+             << nodeName(target.getNode()) << ", which it links to at " << off
+             << ", is not\n";
+          ok = false;
+        }
+    }
+    if (node->hasFlags(NodeFlags::Summary)) {
+      const Reason *why = node->getReason(NodeFlags::Summary);
+      if (!why || why->kind != Reason::Kind::SummaryObject) {
+        os << nodeName(node) << " is Summary without a SummaryObject reason\n";
+        ok = false;
+      }
+    }
+  }
+
+  // Resolved indirect calls call only the targets found (T09's rule).
+  bool anyClobber = false;
+  for (const std::unique_ptr<TUFunction> &fn : analysis.getFunctions())
+    for (const TUCallSite &call : fn->callSites) {
+      anyClobber |= call.site.clobbersGlobals;
+      if (call.resolution != CallResolution::Indirect)
+        continue;
+      auto report = [&]() -> InFlightDiagnostic {
+        ok = false;
+        return call.site.call->emitError()
+               << "points-to: resolved indirect call ";
+      };
+      if (!call.site.calleePtr) {
+        report() << "has no callee cell";
+        continue;
+      }
+      const Node *callee = call.site.calleePtr->getNode();
+      if (hasAny(callee->getFlags(), NodeFlags::UnknownObj |
+                                         NodeFlags::External |
+                                         NodeFlags::Incomplete)) {
+        report() << "has a callee node that is "
+                 << toString(callee->getFlags() &
+                             (NodeFlags::UnknownObj | NodeFlags::External |
+                              NodeFlags::Incomplete));
+        continue;
+      }
+      for (const Origin &origin : callee->getOrigins()) {
+        auto sym = dyn_cast_if_present<FlatSymbolRefAttr>(origin.sym);
+        if (origin.kind != Origin::Kind::FuncSym || !sym) {
+          report() << "has a callee node with an origin that is not a "
+                      "function";
+          break;
+        }
+        if (!llvm::is_contained(call.targets, sym)) {
+          report() << "has a callee node with the function " << sym
+                   << ", which is not among its targets";
+          break;
+        }
+      }
+    }
+
+  // clobbersGlobals has been applied.
+  if (anyClobber) {
+    constexpr NodeFlags clobber =
+        NodeFlags::External | NodeFlags::Mod | NodeFlags::Ref;
+    SymbolTableCollection symbols;
+    for (auto [sym, node] : analysis.getSymbolNodes()) {
+      auto global = symbols.lookupNearestSymbolFrom<cir::GlobalOp>(module, sym);
+      if (!global || global.getConstant())
+        continue;
+      if (cir::isLocalLinkage(global.getLinkage()) &&
+          !hasAny(node->getFlags(),
+                  NodeFlags::External | NodeFlags::Incomplete))
+        continue;
+      if (!node->hasFlags(clobber)) {
+        os << "global " << sym << " (" << nodeName(node)
+           << ") is not clobbered by the unknown calls\n";
+        ok = false;
+      }
+    }
+  }
+
+  if (!errors.empty())
+    module.emitError() << "points-to analysis failed to verify:\n" << errors;
+  return success(ok);
 }
