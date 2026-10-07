@@ -12,6 +12,7 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Inliner.h"
 #include "mlir/Transforms/InliningUtils.h"
@@ -23,8 +24,12 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+
+#define DEBUG_TYPE "kernel-binding-table"
 
 using namespace cir;
 
@@ -894,17 +899,6 @@ static void inlineLaunchChain(mlir::ModuleOp clone) {
   }
 }
 
-// A memory-access path step, root-to-leaf: a named struct member or a constant
-// array index.
-namespace {
-struct PathStep {
-  llvm::StringRef member;
-  int64_t index = 0;
-  bool isIndex = false;
-};
-using AccessPath = llvm::SmallVector<PathStep, 6>;
-} // namespace
-
 // The constant integer `v` holds, seeing through integral/bitcast reinterprets,
 // or nullopt if it is not a compile-time constant integer.
 static std::optional<int64_t> asConstInt(mlir::Value v) {
@@ -925,193 +919,287 @@ static std::optional<int64_t> asConstInt(mlir::Value v) {
   return std::nullopt;
 }
 
-// Peel pointer-navigation ops off `ptr`, recording the access path from the
-// root object down to `ptr`. base_class_addr and bitcast are offset-0
-// reinterprets (the base subobject shares the head), so they add no step;
-// array_to_ptrdecay yields element 0. Returns the root pointer (an alloca or an
-// opaque value) with `path` filled root-to-leaf.
-static mlir::Value decomposePointer(mlir::Value ptr, AccessPath &path) {
-  AccessPath rev;
-  while (mlir::Operation *def = ptr.getDefiningOp()) {
-    if (auto gm = mlir::dyn_cast<cir::GetMemberOp>(def)) {
-      PathStep s;
-      s.member = gm.getName();
-      rev.push_back(s);
-      ptr = gm.getAddr();
-      continue;
-    }
-    if (auto ge = mlir::dyn_cast<cir::GetElementOp>(def)) {
-      PathStep s;
-      s.isIndex = true;
-      s.index = asConstInt(ge.getIndex()).value_or(-1);
-      rev.push_back(s);
-      ptr = ge.getBase();
-      continue;
-    }
-    if (auto bca = mlir::dyn_cast<cir::BaseClassAddrOp>(def)) {
-      ptr = bca.getSrcAddr();
-      continue;
-    }
-    if (auto cast = mlir::dyn_cast<cir::CastOp>(def)) {
-      if (cast.getKind() == cir::CastKind::bitcast) {
-        ptr = cast.getSrc();
+namespace {
+/// A memory cell: `size` bytes at byte `offset` into the object `root`
+/// addresses. `root` is an alloca or an opaque pointer value.
+struct MemLoc {
+  mlir::Value root;
+  int64_t offset = 0;
+};
+
+/// Reads back, on the collapsed launch clone, the value the host stored into a
+/// memory cell, through the by-value aggregate copies and by-reference captures
+/// the launch shims build. Cells are byte ranges from the data layout rather
+/// than member names, so a read survives a reinterpret of the object -- e.g.
+/// the x86-64 ABI coercing a 16-byte closure into an anonymous `{ptr, ptr}`
+/// on its way into queue::submit.
+///
+/// The reads are flow-insensitive, so a value is returned only when every
+/// write that may reach the cell agrees on it: a cell with two different
+/// writes, a partially overlapping write, a constructor or assignment run on
+/// an overlapping object, or any call handed a pointer into a strict
+/// subobject overlapping the cell reads as unknown. Writes are found through
+/// every pointer derived from the root, including one spilled to a stack slot
+/// and reloaded. Two kinds of access are assumed to only read: a call (other
+/// than a constructor or assignment) handed the whole object -- on the launch
+/// path those are setKernelFunc, the HostKernel constructor's source operand,
+/// and operator() -- and a pointer stored into an aggregate rather than
+/// spilled to a slot.
+class MemoryReader {
+public:
+  explicit MemoryReader(mlir::ModuleOp module) : dl(module) {}
+
+  /// The root object and constant byte offset `ptr` addresses. Member,
+  /// constant-index element and base-class steps add their offsets;
+  /// reinterprets add none; a pointer loaded from memory is replaced by the
+  /// pointer stored there (a spill slot or a by-reference capture).
+  MemLoc decompose(mlir::Value ptr, unsigned depth = 0) {
+    MemLoc loc{ptr, 0};
+    for (unsigned i = 0; i < 64 && loc.root; ++i) {
+      mlir::Operation *def = loc.root.getDefiningOp();
+      if (!def)
+        break;
+      if (auto gm = mlir::dyn_cast<cir::GetMemberOp>(def)) {
+        auto rec = mlir::dyn_cast<cir::RecordType>(
+            gm.getAddr().getType().getPointee());
+        if (!rec || rec.isUnion())
+          break;
+        loc.offset += rec.getElementOffset(dl, gm.getIndex());
+        loc.root = gm.getAddr();
         continue;
       }
-      if (cast.getKind() == cir::CastKind::array_to_ptrdecay) {
-        PathStep s;
-        s.isIndex = true;
-        s.index = 0;
-        rev.push_back(s);
-        ptr = cast.getSrc();
+      if (auto ge = mlir::dyn_cast<cir::GetElementOp>(def)) {
+        std::optional<int64_t> idx = asConstInt(ge.getIndex());
+        if (!idx)
+          break;
+        loc.offset += *idx * static_cast<int64_t>(dl.getTypeSize(
+                                 ge.getResult().getType().getPointee()));
+        loc.root = ge.getBase();
         continue;
       }
-    }
-    break;
-  }
-  for (auto it = rev.rbegin(); it != rev.rend(); ++it)
-    path.push_back(*it);
-  return ptr;
-}
-
-static bool stepEq(const PathStep &a, const PathStep &b) {
-  if (a.isIndex != b.isIndex)
-    return false;
-  return a.isIndex ? a.index == b.index : a.member == b.member;
-}
-
-// If `pre` is a prefix of `full`, returns the remaining suffix; else nullopt.
-static std::optional<AccessPath> matchPrefix(const AccessPath &pre,
-                                             const AccessPath &full) {
-  if (pre.size() > full.size())
-    return std::nullopt;
-  for (size_t i = 0; i < pre.size(); ++i)
-    if (!stepEq(pre[i], full[i]))
-      return std::nullopt;
-  return AccessPath(full.begin() + pre.size(), full.end());
-}
-
-// The SSA value stored into memory cell (`root` + `target` path) -- defined
-// below; forward-declared so resolveScalarAt can dereference a by-reference
-// capture (read the pointer a closure field holds, then read through it).
-static mlir::Value storedValueAt(mlir::Value root, const AccessPath &target,
-                                 unsigned depth);
-
-// Resolve the constant integer stored at memory cell (`root` + `target` path),
-// following whole-object and sub-object writes back through the aggregate
-// load/store/copy/bitcast chain the launch shims build. Returns nullopt if the
-// cell is not written by a compile-time constant.
-static std::optional<int64_t>
-resolveScalarAt(mlir::Value root, const AccessPath &target, unsigned depth) {
-  if (depth > 64 || !root)
-    return std::nullopt;
-
-  // A loaded value carries the bytes of the object it was loaded from; read the
-  // same path within that object.
-  if (auto load = root.getDefiningOp<cir::LoadOp>()) {
-    mlir::Value addr = load.getAddr();
-    // A `[&]`-captured aggregate (e.g. an nd_range built from a captured range)
-    // reaches the kernel as `load(load(&local))`: the address is itself a
-    // loaded reference. Resolve the pointer it holds (through the by-value
-    // closure copies) and read within the object it points at -- one
-    // dereference beyond the plain aggregate-copy chain. This is what recovers
-    // geometry / scalar captures on the q.submit(handler) path, where the sizes
-    // live in the caller and reach the launch only by reference.
-    if (auto ref = addr.getDefiningOp<cir::LoadOp>()) {
-      AccessPath rp;
-      mlir::Value rr = decomposePointer(ref.getAddr(), rp);
-      if (mlir::Value real = storedValueAt(rr, rp, depth + 1)) {
-        AccessPath p;
-        mlir::Value r = decomposePointer(real, p);
-        p.append(target.begin(), target.end());
-        return resolveScalarAt(r, p, depth + 1);
-      }
-    }
-    AccessPath p;
-    mlir::Value r = decomposePointer(addr, p);
-    p.append(target.begin(), target.end());
-    return resolveScalarAt(r, p, depth + 1);
-  }
-
-  // Gather every pointer that addresses into `root`'s storage: `root` itself
-  // and the results of the navigation ops (get_member / get_element /
-  // base_class / bitcast) applied to it, transitively. A store into a subfield
-  // writes through such a navigation result, so it is a user of that result,
-  // not of `root`.
-  llvm::SmallVector<mlir::Value, 16> aliases{root};
-  llvm::SmallPtrSet<mlir::Operation *, 32> seen;
-  for (unsigned ai = 0; ai < aliases.size(); ++ai) {
-    mlir::Value ptr = aliases[ai];
-    for (mlir::Operation *user : ptr.getUsers()) {
-      if (mlir::isa<cir::GetMemberOp, cir::GetElementOp, cir::BaseClassAddrOp>(
-              user)) {
-        aliases.push_back(user->getResult(0));
+      if (auto bca = mlir::dyn_cast<cir::BaseClassAddrOp>(def)) {
+        loc.offset += bca.getOffset().getZExtValue();
+        loc.root = bca.getSrcAddr();
         continue;
       }
-      if (auto cast = mlir::dyn_cast<cir::CastOp>(user)) {
+      if (auto cast = mlir::dyn_cast<cir::CastOp>(def)) {
         if (cast.getKind() == cir::CastKind::bitcast ||
-            cast.getKind() == cir::CastKind::array_to_ptrdecay)
-          aliases.push_back(cast.getResult());
-        continue;
+            cast.getKind() == cir::CastKind::address_space ||
+            cast.getKind() == cir::CastKind::array_to_ptrdecay) {
+          loc.root = cast.getSrc();
+          continue;
+        }
+        break;
       }
-      mlir::Value destPtr, srcVal;
-      bool isCopy = false;
-      if (auto st = mlir::dyn_cast<cir::StoreOp>(user)) {
-        destPtr = st.getAddr();
-        srcVal = st.getValue();
-      } else if (auto cp = mlir::dyn_cast<cir::CopyOp>(user)) {
-        destPtr = cp.getDst();
-        srcVal = cp.getSrc();
-        isCopy = true;
-      } else {
-        continue;
+      if (auto load = mlir::dyn_cast<cir::LoadOp>(def)) {
+        if (depth > 32)
+          break;
+        mlir::Value stored = loadedValue(load, depth + 1);
+        if (!stored)
+          break;
+        MemLoc inner = decompose(stored, depth + 1);
+        inner.offset += loc.offset;
+        return inner;
       }
-      // Only a write *through this pointer* (not one that merely uses it as a
-      // stored value) writes the aggregate here.
-      if (destPtr != ptr)
-        continue;
-      if (!seen.insert(user).second)
-        continue;
-      AccessPath sp;
-      mlir::Value sroot = decomposePointer(destPtr, sp);
-      if (sroot != root)
-        continue;
-      std::optional<AccessPath> rem = matchPrefix(sp, target);
-      if (!rem)
-        continue;
-
-      if (isCopy) {
-        // cir.copy transfers a subobject from a source pointer; read the
-        // remaining path within that source.
-        AccessPath p;
-        mlir::Value r = decomposePointer(srcVal, p);
-        p.append(rem->begin(), rem->end());
-        if (auto v = resolveScalarAt(r, p, depth + 1))
-          return v;
-        continue;
-      }
-      if (rem->empty()) {
-        // Exact scalar cell.
-        if (auto v = asConstInt(srcVal))
-          return v;
-        // A loaded scalar: re-resolve it as a root so the load handling (and
-        // its by-reference dereference) applies.
-        if (srcVal.getDefiningOp<cir::LoadOp>())
-          if (auto v = resolveScalarAt(srcVal, {}, depth + 1))
-            return v;
-        continue;
-      }
-      // The store wrote an enclosing aggregate; its value must be a loaded
-      // aggregate -- read the remaining path within its source object. Recurse
-      // with the loaded value as the root (rather than decomposing its address
-      // here) so the top-level load handling dereferences a by-reference
-      // capture.
-      if (srcVal.getDefiningOp<cir::LoadOp>())
-        if (auto v = resolveScalarAt(srcVal, *rem, depth + 1))
-          return v;
+      break;
     }
+    return loc;
   }
-  return std::nullopt;
-}
+
+  /// The value a load reads, if a unique write of it reaches the loaded cell.
+  mlir::Value loadedValue(cir::LoadOp load, unsigned depth = 0) {
+    mlir::Type ty = load.getResult().getType();
+    return valueAt(decompose(load.getAddr(), depth), dl.getTypeSize(ty), depth);
+  }
+
+  /// The value written into the `size`-byte cell at `loc`, or null when it is
+  /// not determined by a unique write (see the class comment).
+  mlir::Value valueAt(MemLoc loc, uint64_t size, unsigned depth = 0) {
+    if (!loc.root || depth > 32)
+      return {};
+    // A loaded aggregate carries the bytes of the object it was loaded from.
+    if (auto load = loc.root.getDefiningOp<cir::LoadOp>();
+        load && !mlir::isa<cir::PointerType>(load.getResult().getType())) {
+      MemLoc src = decompose(load.getAddr(), depth + 1);
+      src.offset += loc.offset;
+      return valueAt(src, size, depth + 1);
+    }
+
+    mlir::Value result;
+    bool conflict = false;
+    auto merge = [&](mlir::Value v) {
+      if (!v || (result && result != v))
+        conflict = true;
+      else
+        result = v;
+    };
+
+    // Every pointer into the root's storage, with its offset from the root.
+    llvm::SmallVector<std::pair<mlir::Value, int64_t>, 16> aliases{
+        {loc.root, 0}};
+    llvm::SmallPtrSet<mlir::Value, 16> seenAlias{loc.root};
+    for (unsigned ai = 0; ai < aliases.size() && !conflict; ++ai) {
+      auto [ptr, base] = aliases[ai];
+      for (mlir::Operation *user : ptr.getUsers()) {
+        if (mlir::isa<cir::GetMemberOp, cir::GetElementOp, cir::BaseClassAddrOp,
+                      cir::CastOp>(user)) {
+          mlir::Value res = user->getResult(0);
+          if (!mlir::isa<cir::PointerType>(res.getType()))
+            continue;
+          MemLoc sub = decompose(res, depth + 1);
+          if (sub.root != loc.root) {
+            // A step decompose cannot see through (a dynamic index): the
+            // pointer may address any byte of the object.
+            conflict = true;
+            break;
+          }
+          if (seenAlias.insert(res).second)
+            aliases.push_back({res, sub.offset});
+          continue;
+        }
+        int64_t lo = base;
+        if (auto st = mlir::dyn_cast<cir::StoreOp>(user)) {
+          if (st.getAddr() != ptr) {
+            // The pointer itself is spilled: its reloads alias the root too.
+            forEachLoadOf(decompose(st.getAddr(), depth + 1),
+                          [&](cir::LoadOp reload) {
+                            if (seenAlias.insert(reload.getResult()).second)
+                              aliases.push_back({reload.getResult(), base});
+                          });
+            continue;
+          }
+          mlir::Type ty = st.getValue().getType();
+          int64_t hi = lo + dl.getTypeSize(ty);
+          if (!overlaps(lo, hi, loc.offset, size))
+            continue;
+          if (lo == loc.offset && hi - lo == static_cast<int64_t>(size) &&
+              !mlir::isa<cir::RecordType, cir::ArrayType>(ty)) {
+            merge(st.getValue());
+            continue;
+          }
+          if (!covers(lo, hi, loc.offset, size)) {
+            conflict = true;
+            break;
+          }
+          // An enclosing aggregate written whole: read within its source.
+          auto srcLoad = st.getValue().getDefiningOp<cir::LoadOp>();
+          if (!srcLoad) {
+            conflict = true;
+            break;
+          }
+          MemLoc src = decompose(srcLoad.getAddr(), depth + 1);
+          src.offset += loc.offset - lo;
+          merge(valueAt(src, size, depth + 1));
+          continue;
+        }
+        if (auto cp = mlir::dyn_cast<cir::CopyOp>(user)) {
+          if (cp.getDst() != ptr)
+            continue;
+          int64_t hi = lo + dl.getTypeSize(cp.getDst().getType().getPointee());
+          if (!overlaps(lo, hi, loc.offset, size))
+            continue;
+          if (!covers(lo, hi, loc.offset, size)) {
+            conflict = true;
+            break;
+          }
+          MemLoc src = decompose(cp.getSrc(), depth + 1);
+          src.offset += loc.offset - lo;
+          merge(valueAt(src, size, depth + 1));
+          continue;
+        }
+        if (auto call = mlir::dyn_cast<cir::CallOp>(user)) {
+          auto ptrTy = mlir::dyn_cast<cir::PointerType>(ptr.getType());
+          if (!ptrTy)
+            continue;
+          int64_t hi = lo + dl.getTypeSize(ptrTy.getPointee());
+          if (!overlaps(lo, hi, loc.offset, size))
+            continue;
+          bool whole = base == 0 && hi >= rootSize(loc.root);
+          if (!whole || writesReceiver(call, ptr)) {
+            conflict = true;
+            break;
+          }
+        }
+      }
+    }
+    return conflict ? mlir::Value{} : result;
+  }
+
+  /// The constant integer in the `size`-byte cell at `loc`, following a
+  /// stored value that is itself loaded from memory.
+  std::optional<int64_t> constIntAt(MemLoc loc, uint64_t size) {
+    mlir::Value v = valueAt(loc, size);
+    for (unsigned i = 0; i < 16 && v; ++i) {
+      if (std::optional<int64_t> c = asConstInt(v))
+        return c;
+      auto load = v.getDefiningOp<cir::LoadOp>();
+      if (!load)
+        break;
+      v = loadedValue(load);
+    }
+    return std::nullopt;
+  }
+
+  /// The cell of the member named `name` of the record `obj` points at, found
+  /// from a get_member on it.
+  std::optional<MemLoc> memberLoc(mlir::Value obj, llvm::StringRef name) {
+    for (mlir::Operation *u : obj.getUsers())
+      if (auto gm = mlir::dyn_cast<cir::GetMemberOp>(u))
+        if (gm.getName() == name)
+          return decompose(gm.getResult());
+    return std::nullopt;
+  }
+
+  uint64_t sizeOf(mlir::Type ty) const { return dl.getTypeSize(ty); }
+
+private:
+  /// Calls `fn` on every load of exactly the cell `slot`.
+  template <typename Fn> void forEachLoadOf(MemLoc slot, Fn fn) {
+    if (!slot.root)
+      return;
+    // Loads can go through any view of the slot; walk those.
+    llvm::SmallVector<mlir::Value, 8> ptrs{slot.root};
+    for (unsigned i = 0; i < ptrs.size() && i < 64; ++i)
+      for (mlir::Operation *u : ptrs[i].getUsers()) {
+        if (auto load = mlir::dyn_cast<cir::LoadOp>(u)) {
+          MemLoc at = decompose(load.getAddr());
+          if (at.root == slot.root && at.offset == slot.offset)
+            fn(load);
+          continue;
+        }
+        if (mlir::isa<cir::GetMemberOp, cir::GetElementOp, cir::CastOp>(u))
+          ptrs.push_back(u->getResult(0));
+      }
+  }
+
+  /// Whether `call` constructs or assigns the object `ptr` addresses.
+  static bool writesReceiver(cir::CallOp call, mlir::Value ptr) {
+    if (call.getArgOperands().empty() || call.getArgOperands()[0] != ptr)
+      return false;
+    if (call.isIndirect())
+      return true;
+    auto callee = mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
+        call, call.getCalleeAttr());
+    if (!callee)
+      return true;
+    return callee.isCxxConstructor() || callee.isCxxSpecialAssignment();
+  }
+
+  int64_t rootSize(mlir::Value root) const {
+    auto ptrTy = mlir::dyn_cast<cir::PointerType>(root.getType());
+    return ptrTy ? static_cast<int64_t>(dl.getTypeSize(ptrTy.getPointee())) : 0;
+  }
+
+  static bool overlaps(int64_t lo, int64_t hi, int64_t off, uint64_t size) {
+    return lo < off + static_cast<int64_t>(size) && off < hi;
+  }
+  static bool covers(int64_t lo, int64_t hi, int64_t off, uint64_t size) {
+    return lo <= off && off + static_cast<int64_t>(size) <= hi;
+  }
+
+  mlir::DataLayout dl;
+};
+} // namespace
 
 // Follow a spill slot: `v = load(slot)` where `slot` was `store(ptr, slot)`.
 // Returns the stored pointer, so a value reloaded before the launch resolves to
@@ -1163,34 +1251,36 @@ static mlir::Value stripAggregateCopy(mlir::Value v) {
   return v;
 }
 
-// The value stored into `view`'s named field, or null. Matches the get_member
-// naming the field and the store into it.
-static mlir::Value findFieldStoredValue(mlir::Value view,
-                                        llvm::StringRef field) {
-  for (mlir::Operation *u : view.getUsers()) {
-    auto gm = mlir::dyn_cast<cir::GetMemberOp>(u);
-    if (!gm || gm.getName() != field)
-      continue;
-    for (mlir::Operation *gu : gm.getResult().getUsers())
-      if (auto st = mlir::dyn_cast<cir::StoreOp>(gu))
-        if (st.getAddr() == gm.getResult())
-          return st.getValue();
-  }
-  return {};
-}
-
 // Recover the constant nd_range geometry from the nd_range_view pointer operand
 // of a runtime launch call (on the inlined clone). The view constructor stored
 // interior pointers into its MGlobalSize/MLocalSize fields that alias the
 // nd_range object's array slots; trace those back to the constant stores.
-static SyclGeometry traceNDRange(mlir::Value viewOperand) {
+static SyclGeometry traceNDRange(MemoryReader &reader,
+                                 mlir::Value viewOperand) {
   SyclGeometry g;
+  // The member names live on the original view object, whose fields the view
+  // constructor wrote; the operand may be a by-value copy of it.
   mlir::Value view = stripAggregateCopy(stripToPointerObject(viewOperand));
   if (!view)
     return g;
+  MemLoc viewLoc = reader.decompose(view);
+
+  auto fieldValue = [&](llvm::StringRef field) -> mlir::Value {
+    for (mlir::Operation *u : view.getUsers()) {
+      auto gm = mlir::dyn_cast<cir::GetMemberOp>(u);
+      if (!gm || gm.getName() != field)
+        continue;
+      MemLoc loc = reader.decompose(gm.getResult());
+      if (loc.root != viewLoc.root)
+        return {};
+      return reader.valueAt(
+          loc, reader.sizeOf(gm.getResult().getType().getPointee()));
+    }
+    return {};
+  };
 
   unsigned dims = 0;
-  if (mlir::Value d = findFieldStoredValue(view, "MDims"))
+  if (mlir::Value d = fieldValue("MDims"))
     if (auto dv = asConstInt(d))
       dims = static_cast<unsigned>(*dv);
   if (dims == 0 || dims > 3)
@@ -1198,11 +1288,11 @@ static SyclGeometry traceNDRange(mlir::Value viewOperand) {
   g.dims = dims;
 
   // Read `dims` consecutive elements of the size array a field points at. The
-  // field holds &common_array[0]; vary the trailing constant index per dim.
+  // field holds &common_array[0].
   auto readSizes =
       [&](llvm::StringRef field,
           llvm::SmallVectorImpl<std::optional<int64_t>> &out) -> bool {
-    mlir::Value interior = findFieldStoredValue(view, field);
+    mlir::Value interior = fieldValue(field);
     if (!interior)
       return false;
     // A plain-range launch stores a null pointer for MLocalSize (no explicit
@@ -1211,13 +1301,15 @@ static SyclGeometry traceNDRange(mlir::Value viewOperand) {
       if (auto p = mlir::dyn_cast<cir::ConstPtrAttr>(c.getValue()))
         if (p.isNullValue())
           return false;
-    AccessPath base;
-    mlir::Value root = decomposePointer(interior, base);
+    auto ptrTy = mlir::dyn_cast<cir::PointerType>(interior.getType());
+    if (!ptrTy)
+      return false;
+    uint64_t elt = reader.sizeOf(ptrTy.getPointee());
+    MemLoc base = reader.decompose(interior);
     for (unsigned i = 0; i < dims; ++i) {
-      AccessPath p = base;
-      if (!p.empty() && p.back().isIndex)
-        p.back().index = static_cast<int64_t>(i);
-      out.push_back(resolveScalarAt(root, p, 0));
+      MemLoc p = base;
+      p.offset += i * elt;
+      out.push_back(reader.constIntAt(p, elt));
     }
     return true;
   };
@@ -1256,115 +1348,17 @@ static bool isUSMAllocCall(cir::CallOp call) {
          callee->contains("malloc_shared") || callee->contains("malloc_host");
 }
 
-// The SSA value stored into memory cell (`root` + `target` path), following the
-// aggregate load/store/copy/bitcast chain back to the write -- the
-// pointer-value analogue of resolveScalarAt (same traversal; returns the stored
-// Value at the leaf instead of a constant int). Null if the cell is not written
-// by a value we can name. Used to read back a captured pointer through the
-// by-value closure copies a handler-submit builds.
-static mlir::Value storedValueAt(mlir::Value root, const AccessPath &target,
-                                 unsigned depth) {
-  if (depth > 64 || !root)
-    return {};
-
-  // A loaded value carries the bytes of the object it was loaded from; read the
-  // same path within that object.
-  if (auto load = root.getDefiningOp<cir::LoadOp>()) {
-    AccessPath p;
-    mlir::Value r = decomposePointer(load.getAddr(), p);
-    p.append(target.begin(), target.end());
-    return storedValueAt(r, p, depth + 1);
-  }
-
-  llvm::SmallVector<mlir::Value, 16> aliases{root};
-  llvm::SmallPtrSet<mlir::Operation *, 32> seen;
-  for (unsigned ai = 0; ai < aliases.size(); ++ai) {
-    mlir::Value ptr = aliases[ai];
-    for (mlir::Operation *user : ptr.getUsers()) {
-      if (mlir::isa<cir::GetMemberOp, cir::GetElementOp, cir::BaseClassAddrOp>(
-              user)) {
-        aliases.push_back(user->getResult(0));
-        continue;
-      }
-      if (auto cast = mlir::dyn_cast<cir::CastOp>(user)) {
-        if (cast.getKind() == cir::CastKind::bitcast ||
-            cast.getKind() == cir::CastKind::array_to_ptrdecay)
-          aliases.push_back(cast.getResult());
-        continue;
-      }
-      mlir::Value destPtr, srcVal;
-      bool isCopy = false;
-      if (auto st = mlir::dyn_cast<cir::StoreOp>(user)) {
-        destPtr = st.getAddr();
-        srcVal = st.getValue();
-      } else if (auto cp = mlir::dyn_cast<cir::CopyOp>(user)) {
-        destPtr = cp.getDst();
-        srcVal = cp.getSrc();
-        isCopy = true;
-      } else {
-        continue;
-      }
-      if (destPtr != ptr || !seen.insert(user).second)
-        continue;
-      AccessPath sp;
-      mlir::Value sroot = decomposePointer(destPtr, sp);
-      if (sroot != root)
-        continue;
-      std::optional<AccessPath> rem = matchPrefix(sp, target);
-      if (!rem)
-        continue;
-      if (isCopy) {
-        AccessPath p;
-        mlir::Value r = decomposePointer(srcVal, p);
-        p.append(rem->begin(), rem->end());
-        if (mlir::Value v = storedValueAt(r, p, depth + 1))
-          return v;
-        continue;
-      }
-      if (rem->empty())
-        return srcVal; // The value written to this exact cell.
-      // The store wrote an enclosing aggregate; its value must be a loaded
-      // aggregate -- read the remaining path within its source object.
-      if (auto load = srcVal.getDefiningOp<cir::LoadOp>()) {
-        AccessPath p;
-        mlir::Value r = decomposePointer(load.getAddr(), p);
-        p.append(rem->begin(), rem->end());
-        if (mlir::Value v = storedValueAt(r, p, depth + 1))
-          return v;
-      }
-    }
-  }
-  return {};
-}
-
-// The pointer value found in memory at address `addr`, dereferencing one
-// reference level. A `[&]`-captured pointer is threaded as `&local` through the
-// closure copies, and the device kernel reads it as `load(load(&local))`: the
-// inner load yields the reference `&local`, the outer load the pointer stored
-// in `local`. When `addr` is itself a loaded reference, resolve the pointer it
-// holds and read through it; otherwise read the store into `addr`'s cell.
-// Forwards the by-value aggregate copies via storedValueAt.
-static mlir::Value contentsAt(mlir::Value addr, unsigned depth) {
-  if (depth > 64 || !addr)
-    return {};
-  addr = stripToPointerObject(addr);
-  if (auto load = addr.getDefiningOp<cir::LoadOp>()) {
-    mlir::Value ref = contentsAt(load.getAddr(), depth + 1);
-    return ref ? contentsAt(ref, depth + 1) : mlir::Value{};
-  }
-  AccessPath path;
-  mlir::Value root = decomposePointer(addr, path);
-  return storedValueAt(root, path, depth);
-}
-
 // Follow a captured-pointer field's stored value back to the USM allocation
-// that produced it, seeing through spill slots and offset-0 reinterprets. Only
-// a value that resolves to a USM allocation call is an allocation identity;
-// pointer arithmetic (a + offset), an opaque parameter, a global or a buffer
-// stops the walk and yields null -- conservatively "not a distinct allocation".
-static cir::CallOp resolveUSMAllocation(mlir::Value v) {
+// that produced it, seeing through offset-0 reinterprets and through values
+// reloaded from memory -- a spill slot, or a `[&]`-captured pointer read
+// through the closure copies (which is what lets noalias fire on the common
+// q.submit(handler) path, where the USM allocations live in the caller and
+// reach the closure only by reference). Only a value that resolves to a USM
+// allocation call is an allocation identity; pointer arithmetic (a + offset),
+// an opaque parameter, a global or a buffer stops the walk and yields null --
+// conservatively "not a distinct allocation".
+static cir::CallOp resolveUSMAllocation(MemoryReader &reader, mlir::Value v) {
   for (unsigned i = 0; i < 24 && v; ++i) {
-    v = stripToPointerObject(v);
     mlir::Operation *def = v.getDefiningOp();
     if (!def)
       return {};
@@ -1376,18 +1370,11 @@ static cir::CallOp resolveUSMAllocation(mlir::Value v) {
         v = cast.getSrc();
         continue;
       }
+      return {};
     }
-    // A `[&]`-captured pointer read through the closure copies is not a spill
-    // slot but a genuine memory load; resolve its contents (with one reference
-    // dereference) back to the allocation. This is what lets noalias fire on
-    // the common q.submit(handler) path, where the USM allocations live in the
-    // caller and reach the closure only by reference.
     if (auto load = mlir::dyn_cast<cir::LoadOp>(def)) {
-      mlir::Value c = contentsAt(load.getAddr(), 0);
-      if (c && c != v) {
-        v = c;
-        continue;
-      }
+      v = reader.loadedValue(load);
+      continue;
     }
     return {};
   }
@@ -1447,24 +1434,41 @@ static mlir::Value traceClosureObject(mlir::Value closureOperand) {
   return hostKernelRef;
 }
 
-// The captured pointer fields of a closure object and the value written into
-// each: every cir.get_member whose field is a pointer capture (its pointee is
-// itself a pointer) and which is stored a value.
-static void collectClosurePointerFields(
-    mlir::Value closure,
+// The capture fields of a closure object accepted by `wanted` (on the field's
+// type) and the value written into each, read by layout so a field written
+// only through a by-value copy of the closure is found too. A field whose
+// value is not determined by a unique write is reported with a null value.
+template <typename Pred>
+static void collectClosureFields(
+    MemoryReader &reader, mlir::Value closure, Pred wanted,
     llvm::SmallVectorImpl<std::pair<llvm::StringRef, mlir::Value>> &out) {
   if (!closure)
     return;
+  MemLoc closureLoc = reader.decompose(closure);
+  llvm::StringSet<> seen;
   for (mlir::Operation *user : closure.getUsers()) {
     auto gm = mlir::dyn_cast<cir::GetMemberOp>(user);
-    if (!gm)
+    if (!gm || !wanted(gm.getResult().getType().getPointee()))
       continue;
-    auto ptrType = mlir::dyn_cast<cir::PointerType>(gm.getResult().getType());
-    if (!ptrType || !mlir::isa<cir::PointerType>(ptrType.getPointee()))
+    if (!seen.insert(gm.getName()).second)
       continue;
-    if (mlir::Value stored = findFieldStoredValue(closure, gm.getName()))
-      out.emplace_back(gm.getName(), stored);
+    MemLoc loc = reader.decompose(gm.getResult());
+    mlir::Value stored;
+    if (loc.root == closureLoc.root)
+      stored = reader.valueAt(
+          loc, reader.sizeOf(gm.getResult().getType().getPointee()));
+    out.emplace_back(gm.getName(), stored);
   }
+}
+
+// The captured pointer fields of a closure object and the value written into
+// each.
+static void collectClosurePointerFields(
+    MemoryReader &reader, mlir::Value closure,
+    llvm::SmallVectorImpl<std::pair<llvm::StringRef, mlir::Value>> &out) {
+  collectClosureFields(
+      reader, closure,
+      [](mlir::Type t) { return mlir::isa<cir::PointerType>(t); }, out);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1502,27 +1506,17 @@ static mlir::TypedAttr asConstScalar(mlir::Value v) {
   return {};
 }
 
-// The scalar capture fields of a closure object and the value written into
-// each: every cir.get_member whose field is a scalar (its pointee is an
-// int/float/bool, i.e. not a pointer capture) and which is stored a value.
+// The scalar capture fields (int/float/bool, not a pointer/accessor) of a
+// closure object and the value written into each.
 static void collectClosureScalarFields(
-    mlir::Value closure,
+    MemoryReader &reader, mlir::Value closure,
     llvm::SmallVectorImpl<std::pair<llvm::StringRef, mlir::Value>> &out) {
-  if (!closure)
-    return;
-  for (mlir::Operation *user : closure.getUsers()) {
-    auto gm = mlir::dyn_cast<cir::GetMemberOp>(user);
-    if (!gm)
-      continue;
-    auto ptrType = mlir::dyn_cast<cir::PointerType>(gm.getResult().getType());
-    if (!ptrType)
-      continue;
-    mlir::Type pointee = ptrType.getPointee();
-    if (!mlir::isa<cir::IntType, cir::FPTypeInterface, cir::BoolType>(pointee))
-      continue;
-    if (mlir::Value stored = findFieldStoredValue(closure, gm.getName()))
-      out.emplace_back(gm.getName(), stored);
-  }
+  collectClosureFields(
+      reader, closure,
+      [](mlir::Type t) {
+        return mlir::isa<cir::IntType, cir::FPTypeInterface, cir::BoolType>(t);
+      },
+      out);
 }
 
 // Fold one launch site's closure into the running constant-argument agreement
@@ -1530,11 +1524,12 @@ static void collectClosureScalarFields(
 // a non-constant is simply absent. Agreement is ANDed across sites: a field
 // survives only if present with the SAME constant at this site and every
 // earlier one, so a disagreeing or non-constant store at any site drops it.
-static void foldClosureConstArgs(mlir::Value closureOperand, bool &seenAnySite,
+static void foldClosureConstArgs(MemoryReader &reader,
+                                 mlir::Value closureOperand, bool &seenAnySite,
                                  llvm::StringMap<mlir::TypedAttr> &consts) {
   mlir::Value closure = traceClosureObject(closureOperand);
   llvm::SmallVector<std::pair<llvm::StringRef, mlir::Value>, 4> fields;
-  collectClosureScalarFields(closure, fields);
+  collectClosureScalarFields(reader, closure, fields);
 
   llvm::StringMap<mlir::TypedAttr> here;
   for (auto &f : fields) {
@@ -1569,19 +1564,25 @@ static void foldClosureConstArgs(mlir::Value closureOperand, bool &seenAnySite,
 // that does not resolve (pointer arithmetic, shared base, opaque) poisons
 // itself and, being possibly-aliasing, every other field. Eligibility is ANDed
 // across sites, so a field kept here must have held at every earlier site.
-static void foldClosureNoAlias(mlir::Value closureOperand, bool &seenAnySite,
+static void foldClosureNoAlias(MemoryReader &reader, mlir::Value closureOperand,
+                               bool &seenAnySite,
                                llvm::StringMap<bool> &eligible) {
   mlir::Value closure = traceClosureObject(closureOperand);
   llvm::SmallVector<std::pair<llvm::StringRef, mlir::Value>, 4> fields;
-  collectClosurePointerFields(closure, fields);
+  collectClosurePointerFields(reader, closure, fields);
+  LLVM_DEBUG(llvm::dbgs() << "noalias: closure " << closure << " with "
+                          << fields.size() << " pointer fields\n");
 
   // Assign a dense id per distinct allocation; -1 marks an unresolved source.
   llvm::SmallVector<int> allocId(fields.size(), -1);
   llvm::DenseMap<mlir::Operation *, int> ids;
   for (auto [i, f] : llvm::enumerate(fields)) {
-    if (cir::CallOp alloc = resolveUSMAllocation(f.second))
+    if (cir::CallOp alloc = resolveUSMAllocation(reader, f.second))
       allocId[i] =
           ids.try_emplace(alloc.getOperation(), ids.size()).first->second;
+    LLVM_DEBUG(llvm::dbgs()
+               << "noalias: field '" << f.first << "' stored " << f.second
+               << " -> allocation " << allocId[i] << "\n");
   }
 
   llvm::StringMap<bool> here;
@@ -1648,6 +1649,8 @@ static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
   // so the handler-submit launch collapses into the user function too.
   bridgeSubmitCGF(*clone);
   inlineLaunchChain(*clone);
+  LLVM_DEBUG(llvm::dbgs() << "collapsed launch clone:\n" << *clone << "\n");
+  MemoryReader reader(*clone);
 
   clone->walk([&](cir::CallOp call) {
     if (!isGetDeviceKernelInfoCall(call))
@@ -1656,10 +1659,13 @@ static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
     if (!nameString)
       return;
     std::optional<RecoveredLaunch> launch = recoverLaunch(call->getResult(0));
+    llvm::StringRef kernel = getGlobalStringValue(nameString);
+    LLVM_DEBUG(llvm::dbgs()
+               << "launch of " << kernel << ": "
+               << (launch ? "recovered" : "not recovered") << "\n");
     if (!launch)
       return;
-    llvm::StringRef kernel = getGlobalStringValue(nameString);
-    SyclGeometry geom = traceNDRange(launch->geometry);
+    SyclGeometry geom = traceNDRange(reader, launch->geometry);
     result[kernel] = geom;
     // Fold this launch's closure into the kernel's noalias eligibility, but
     // only for the collapsed launch sites in user code. Inlining leaves a copy
@@ -1671,10 +1677,11 @@ static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
     if (enclosing && !isLaunchChainCallee(enclosing) &&
         !enclosing->hasAttr("cir.sycl.cg_body") && launch->closure) {
       bool seen = seenSite.lookup(kernel);
-      foldClosureNoAlias(launch->closure, seen, eligible[kernel]);
+      foldClosureNoAlias(reader, launch->closure, seen, eligible[kernel]);
       seenSite[kernel] = seen;
       bool constSeen = constSeenSite.lookup(kernel);
-      foldClosureConstArgs(launch->closure, constSeen, constEligible[kernel]);
+      foldClosureConstArgs(reader, launch->closure, constSeen,
+                           constEligible[kernel]);
       constSeenSite[kernel] = constSeen;
     }
   });

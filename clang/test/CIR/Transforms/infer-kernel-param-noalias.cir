@@ -201,3 +201,151 @@ module attributes {cir.offload.container} {
     }
   }
 }
+
+// -----
+
+// ABI-coerced closure copy: on x86-64 a 16-byte closure passed by value is
+// coerced to an anonymous {ptr, ptr} whose members carry no names (as on the
+// way into queue::submit with a [&] command group capturing two variables).
+// The captured pointers are read back by byte offset through the round trip,
+// so both parameters are still marked.
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_lam = !cir.struct<"lam" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!void = !cir.void
+!rec_coerce = !cir.struct<{data !cir.ptr<!void>, data !cir.ptr<!void>}>
+!rec_dlam = !cir.struct<"dlam" {data !cir.ptr<!s32i, target_address_space(4)>, data !cir.ptr<!s32i, target_address_space(4)>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIiEEPv() -> !cir.ptr<!s32i>
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>)
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      %pa = cir.call @_ZN4sycl3_V113malloc_deviceIiEEPv() : () -> !cir.ptr<!s32i>
+      %pb = cir.call @_ZN4sycl3_V113malloc_deviceIiEEPv() : () -> !cir.ptr<!s32i>
+      %tmp = cir.alloca "tmp" align(8) : !cir.ptr<!rec_lam>
+      %ta = cir.get_member %tmp[0] {name = "a"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!s32i>>
+      cir.store %pa, %ta : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+      %tb = cir.get_member %tmp[1] {name = "b"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!s32i>>
+      cir.store %pb, %tb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+      %c0 = cir.alloca "coerce" align(8) : !cir.ptr<!rec_lam>
+      %c1 = cir.alloca "coerce" align(8) : !cir.ptr<!rec_coerce>
+      %tv = cir.load %tmp : !cir.ptr<!rec_lam>, !rec_lam
+      cir.store %tv, %c0 : !rec_lam, !cir.ptr<!rec_lam>
+      %c0v = cir.cast bitcast %c0 : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_coerce>
+      %e0p = cir.get_member %c0v[0] {name = ""} : !cir.ptr<!rec_coerce> -> !cir.ptr<!cir.ptr<!void>>
+      %e0 = cir.load %e0p : !cir.ptr<!cir.ptr<!void>>, !cir.ptr<!void>
+      %e1p = cir.get_member %c0v[1] {name = ""} : !cir.ptr<!rec_coerce> -> !cir.ptr<!cir.ptr<!void>>
+      %e1 = cir.load %e1p : !cir.ptr<!cir.ptr<!void>>, !cir.ptr<!void>
+      %d0p = cir.get_member %c1[0] {name = ""} : !cir.ptr<!rec_coerce> -> !cir.ptr<!cir.ptr<!void>>
+      cir.store %e0, %d0p : !cir.ptr<!void>, !cir.ptr<!cir.ptr<!void>>
+      %d1p = cir.get_member %c1[1] {name = ""} : !cir.ptr<!rec_coerce> -> !cir.ptr<!cir.ptr<!void>>
+      cir.store %e1, %d1p : !cir.ptr<!void>, !cir.ptr<!cir.ptr<!void>>
+      %c1l = cir.cast bitcast %c1 : !cir.ptr<!rec_coerce> -> !cir.ptr<!rec_lam>
+      %lv = cir.load %c1l : !cir.ptr<!rec_lam>, !rec_lam
+      cir.store %lv, %lam : !rec_lam, !cir.ptr<!rec_lam>
+      %fa = cir.get_member %lam[0] {name = "a"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!s32i>>
+      %fb = cir.get_member %lam[1] {name = "b"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!s32i>>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // CHECK: cir.func @_ZTSZ4mainEUlvE_(
+    // CHECK-SAME: %arg0: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "a"{{[^}]*}}}, llvm.noalias}
+    // CHECK-SAME: %arg1: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "b"{{[^}]*}}}, llvm.noalias}
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "a", kind = "pointer", path = ["a"]}}, %arg1: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "b", kind = "pointer", path = ["b"]}}, %arg2: !cir.ptr<!s32i, target_address_space(3)>) cc(spir_kernel) {
+      %0 = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      %fa = cir.get_member %0[0] {name = "a"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
+      %ca = cir.cast address_space %arg0 : !cir.ptr<!s32i, target_address_space(1)> -> !cir.ptr<!s32i, target_address_space(4)>
+      cir.store %ca, %fa : !cir.ptr<!s32i, target_address_space(4)>, !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
+      %fb = cir.get_member %0[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
+      %cb = cir.cast address_space %arg1 : !cir.ptr<!s32i, target_address_space(1)> -> !cir.ptr<!s32i, target_address_space(4)>
+      cir.store %cb, %fb : !cir.ptr<!s32i, target_address_space(4)>, !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
+      cir.return
+    }
+  }
+}
+
+// -----
+
+// A field written twice: "b" is stored from a distinct allocation and then
+// overwritten with "a"'s. The flow-insensitive read-back sees two different
+// writes, so "b" is unknown -- and, being possibly aliasing, so is "a".
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_lam = !cir.struct<"lam" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_dlam = !cir.struct<"dlam" {data !cir.ptr<!s32i, target_address_space(4)>, data !cir.ptr<!s32i, target_address_space(4)>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIiEEPv() -> !cir.ptr<!s32i>
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>)
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      %pa = cir.call @_ZN4sycl3_V113malloc_deviceIiEEPv() : () -> !cir.ptr<!s32i>
+      %pb = cir.call @_ZN4sycl3_V113malloc_deviceIiEEPv() : () -> !cir.ptr<!s32i>
+      %pc = cir.call @_ZN4sycl3_V113malloc_deviceIiEEPv() : () -> !cir.ptr<!s32i>
+      %fa = cir.get_member %lam[0] {name = "a"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!s32i>>
+      cir.store %pa, %fa : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+      %fb = cir.get_member %lam[1] {name = "b"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!s32i>>
+      cir.store %pb, %fb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+      %fb2 = cir.get_member %lam[1] {name = "b"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!s32i>>
+      cir.store %pa, %fb2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // CHECK: cir.func @_ZTSZ4mainEUlvE_(
+    // CHECK-NOT: llvm.noalias
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "a", kind = "pointer", path = ["a"]}}, %arg1: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {field = "b", kind = "pointer", path = ["b"]}}, %arg2: !cir.ptr<!s32i, target_address_space(3)>) cc(spir_kernel) {
+      %0 = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      %fa = cir.get_member %0[0] {name = "a"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
+      %ca = cir.cast address_space %arg0 : !cir.ptr<!s32i, target_address_space(1)> -> !cir.ptr<!s32i, target_address_space(4)>
+      cir.store %ca, %fa : !cir.ptr<!s32i, target_address_space(4)>, !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
+      %fb = cir.get_member %0[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
+      %cb = cir.cast address_space %arg1 : !cir.ptr<!s32i, target_address_space(1)> -> !cir.ptr<!s32i, target_address_space(4)>
+      cir.store %cb, %fb : !cir.ptr<!s32i, target_address_space(4)>, !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
+      cir.return
+    }
+  }
+}
+
