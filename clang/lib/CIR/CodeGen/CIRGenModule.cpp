@@ -3864,31 +3864,106 @@ void CIRGenModule::emitSYCLKernelArgAccessorMetadata(
                 mlir::DenseBoolArrayAttr::get(&getMLIRContext(), accessorPtrs));
 }
 
-/// Whether `rd` is the class `name` declared directly in namespace `ns`
-/// (looking through inline namespaces such as sycl::_V1).
-static bool isClassInNamespace(const CXXRecordDecl *rd, llvm::StringRef ns,
-                               llvm::StringRef name) {
-  if (!rd || !rd->getIdentifier() || rd->getName() != name)
-    return false;
-  const DeclContext *dc = rd->getDeclContext();
-  while (const auto *nd = dyn_cast<NamespaceDecl>(dc)) {
-    if (!nd->isInline())
-      return nd->getIdentifier() && nd->getName() == ns &&
-             nd->getDeclContext()->getRedeclContext()->isTranslationUnit();
-    dc = nd->getDeclContext();
-  }
-  return false;
-}
-
 /// The record a parameter type names, through references.
 static const CXXRecordDecl *paramRecord(QualType type) {
   return type.getNonReferenceType()->getAsCXXRecordDecl();
 }
 
-/// The role of a SYCL host API function the offload combine traces buffer
-/// and accessor identity through (see KernelBindingTable), or empty. On the
-/// host the SYCL classes carry no sycl_type attribute, so they are recognized
-/// by their declarations:
+/// Whether `dc` is the namespace `path` (outermost first, e.g. {"sycl",
+/// "detail"}) nested directly in the translation unit, looking through inline
+/// namespaces such as sycl::_V1.
+static bool isNamespacePath(const DeclContext *dc,
+                            llvm::ArrayRef<llvm::StringRef> path) {
+  while (!path.empty()) {
+    const auto *nd = dyn_cast<NamespaceDecl>(dc);
+    if (!nd)
+      return false;
+    dc = nd->getDeclContext();
+    if (nd->isInline())
+      continue;
+    if (!nd->getIdentifier() || nd->getName() != path.back())
+      return false;
+    path = path.drop_back();
+  }
+  while (const auto *nd = dyn_cast<NamespaceDecl>(dc)) {
+    if (!nd->isInline())
+      return false;
+    dc = nd->getDeclContext();
+  }
+  return dc->getRedeclContext()->isTranslationUnit();
+}
+
+/// Whether `rd` is the class `name` declared directly in the namespace `path`
+/// (looking through inline namespaces such as sycl::_V1).
+static bool isClassInNamespacePath(const CXXRecordDecl *rd,
+                                   llvm::ArrayRef<llvm::StringRef> path,
+                                   llvm::StringRef name) {
+  return rd && rd->getIdentifier() && rd->getName() == name &&
+         isNamespacePath(rd->getDeclContext(), path);
+}
+
+/// Whether `rd` is the class `name` declared directly in namespace `ns`.
+static bool isClassInNamespace(const CXXRecordDecl *rd, llvm::StringRef ns,
+                               llvm::StringRef name) {
+  return isClassInNamespacePath(rd, {ns}, name);
+}
+
+/// Whether `fd` is named `name`.
+static bool isNamed(const FunctionDecl *fd, llvm::StringRef name) {
+  return fd->getIdentifier() && fd->getName() == name;
+}
+
+/// Whether `fd` is named one of `names`.
+static bool isNamedOneOf(const FunctionDecl *fd,
+                         llvm::ArrayRef<llvm::StringRef> names) {
+  return fd->getIdentifier() && llvm::is_contained(names, fd->getName());
+}
+
+/// Whether `d` is declared, at any depth, inside the top-level namespace
+/// `sycl`.
+static bool isWithinSYCL(const Decl *d) {
+  const NamespaceDecl *outermost = nullptr;
+  for (const DeclContext *dc = d->getDeclContext(); dc; dc = dc->getParent())
+    if (const auto *nd = dyn_cast<NamespaceDecl>(dc))
+      outermost = nd;
+  return outermost && outermost->getIdentifier() &&
+         outermost->getName() == "sycl";
+}
+
+/// The source-level index of the kernel or command-group function object
+/// parameter of a launch API function: the last parameter whose type (through
+/// references) is a lambda or a class declared outside namespace sycl. The
+/// other parameters of these functions (ranges, events, properties,
+/// reductions, code locations) are SYCL classes or scalars. -1 when there is
+/// none, e.g. for the overloads launching a prebuilt sycl::kernel.
+static int functorParamIndex(const FunctionDecl *fd) {
+  for (const ParmVarDecl *param : llvm::reverse(fd->parameters()))
+    if (const CXXRecordDecl *rec = paramRecord(param->getType()))
+      if (rec->isLambda() || !isWithinSYCL(rec))
+        return param->getFunctionScopeIndex();
+  return -1;
+}
+
+/// The source-level index of the first parameter of `fd` whose type (through
+/// references) is the class `name` in namespace `ns`, or -1.
+static int paramIndexOfClass(const FunctionDecl *fd,
+                             llvm::ArrayRef<llvm::StringRef> ns,
+                             llvm::StringRef name) {
+  for (const ParmVarDecl *param : fd->parameters())
+    if (const CXXRecordDecl *rec = paramRecord(param->getType()))
+      if (isClassInNamespacePath(rec, ns, name))
+        return param->getFunctionScopeIndex();
+  return -1;
+}
+
+/// The role of a SYCL host API function the offload combine and the points-to
+/// analysis trace buffer and accessor identity and kernel launches through
+/// (see KernelBindingTable), or empty. On the host the SYCL classes carry no
+/// sycl_type attribute, so they are recognized by their declarations
+/// (namespace, class and name, through inline namespaces), never by mangled
+/// name. Roles on internal (sycl::detail or private) glue mark it so it can be
+/// skipped or recorded; the models attach to the spec-defined public API.
+/// Buffer identity:
 ///   buffer.alloc        buffer(range, ...): fresh storage
 ///   buffer.host_ptr     buffer(T *hostData, range, ...): may use hostData
 ///   buffer.copy         buffer copy/move constructor: same storage
@@ -3902,14 +3977,165 @@ static const CXXRecordDecl *paramRecord(QualType type) {
 ///   accessor.assign     accessor::operator=
 ///   accessor.other      any other accessor constructor
 ///   vector.data         std::vector::data
+/// Kernel launch (arg: the command-group or kernel function object, found as
+/// the last lambda or non-SYCL class parameter unless stated otherwise; an
+/// overload without one, e.g. launching a prebuilt sycl::kernel, is untagged):
+///   queue.submit        queue::submit(CGF, ...)
+///   queue.kernel        queue::parallel_for / single_task shortcuts
+///   queue.submit_impl   queue::submit_{with,without}_event[_impl]
+///                       (private); arg: the type_erased_cgfo_ty
+///   queue.kernel_impl   queue::parallel_for_impl (private)
+///   cgfo.ctor           detail::type_erased_cgfo_ty(F &&): stores &F and the
+///                       invoker that calls it; arg 0
+///   handler.kernel      handler::parallel_for / single_task /
+///                       parallel_for_work_group
+///   handler.kernel_impl handler::parallel_for_lambda_impl /
+///                       parallel_for_impl (private)
+///   handler.wrap_kernel   handler::wrap_kernel (private); arg 0
+///   handler.store_lambda  handler::StoreLambda (private): wraps the kernel in
+///                       a detail::HostKernel; arg 0
+///   handler.set_kernel_func  handler::setKernelFunc(void *) and
+///                       setDeviceKernelInfo<K>(void *) (private); arg 0, the
+///                       closure pointer
+///   handler.set_kernel_info  handler::setDeviceKernelInfoPtr (private); arg 0
+///   handler.set_ndrange handler::setNDRangeDescriptor and
+///                       convertToRangeViewAndSetDescriptor (private); arg 0
+///   hostkernel.ctor     detail::HostKernel / HostKernelRef constructors from
+///                       the kernel object; arg 0
+///   launch.direct       detail::submit_kernel_direct[_parallel_for,
+///                       _single_task] (the queue shortcut path)
+///   launch.direct_impl  submit_kernel_direct_{with,without}_event_impl (the
+///                       runtime boundary); arg: the HostKernelRefBase
+///   kernel.info         detail::getDeviceKernelInfo<K>() (the templated
+///                       kernel-name marker; not the non-template lookups)
+///   kernel.wrapper      detail::KernelWrapperHelperFuncs::kernel_* (the
+///                       kernel entry point, a no-op on the host); arg 0
+/// Geometry (arg 0):
+///   ndrange.ctor, range.ctor, id.ctor  sycl::nd_range / range / id
+///                       constructors
+///   ndrange_view.ctor   detail::nd_range_view constructors
+///   array.ctor          detail::array constructors (the base of range/id)
+/// USM:
+///   usm.alloc           sycl::malloc_{device,shared,host}, sycl::malloc and
+///                       the aligned_alloc* forms, also in
+///                       ext::oneapi::experimental (memory pools); arg: the
+///                       size or count
+///   usm.free            sycl::free; arg 0, the pointer
 /// `argIndex` receives the source-level parameter index (not counting `this`)
-/// of the buffer, accessor or host pointer the role reads, where it has one.
+/// of the buffer, accessor, host pointer, function object or other operand
+/// the role reads, where it has one.
 llvm::StringRef CIRGenModule::getSYCLHostAPIRole(const FunctionDecl *fd,
                                                  unsigned &argIndex) {
+  // A role whose argument index was searched for: untagged if not found.
+  auto withArg = [&](llvm::StringRef role, int index) -> llvm::StringRef {
+    if (index < 0)
+      return {};
+    argIndex = index;
+    return role;
+  };
+
   const auto *md = dyn_cast<CXXMethodDecl>(fd);
-  if (!md)
+  if (!md) {
+    const DeclContext *dc = fd->getDeclContext();
+    bool inSYCL = isNamespacePath(dc, {"sycl"});
+    if (inSYCL ||
+        isNamespacePath(dc, {"sycl", "ext", "oneapi", "experimental"})) {
+      if (isNamedOneOf(
+              fd, {"malloc_device", "malloc_shared", "malloc_host", "malloc"}))
+        return "usm.alloc";
+      if (isNamedOneOf(fd, {"aligned_alloc_device", "aligned_alloc_shared",
+                            "aligned_alloc_host", "aligned_alloc"})) {
+        argIndex = 1;
+        return "usm.alloc";
+      }
+    }
+    if (inSYCL) {
+      if (isNamed(fd, "free"))
+        return "usm.free";
+      if (isNamedOneOf(fd, {"submit_kernel_direct_with_event_impl",
+                            "submit_kernel_direct_without_event_impl"}))
+        return withArg(
+            "launch.direct_impl",
+            paramIndexOfClass(fd, {"sycl", "detail"}, "HostKernelRefBase"));
+      return {};
+    }
+    if (isNamespacePath(dc, {"sycl", "detail"})) {
+      if (isNamedOneOf(fd, {"submit_kernel_direct",
+                            "submit_kernel_direct_parallel_for",
+                            "submit_kernel_direct_single_task"}))
+        return withArg("launch.direct", functorParamIndex(fd));
+      if (isNamed(fd, "getDeviceKernelInfo") && fd->getPrimaryTemplate())
+        return "kernel.info";
+    }
     return {};
+  }
   const CXXRecordDecl *rd = md->getParent();
+
+  if (isClassInNamespace(rd, "sycl", "queue")) {
+    if (isNamed(md, "submit"))
+      return withArg("queue.submit", functorParamIndex(md));
+    if (isNamedOneOf(md, {"parallel_for", "single_task"}))
+      return withArg("queue.kernel", functorParamIndex(md));
+    if (isNamedOneOf(md,
+                     {"submit_with_event", "submit_without_event",
+                      "submit_with_event_impl", "submit_without_event_impl"}))
+      return withArg(
+          "queue.submit_impl",
+          paramIndexOfClass(md, {"sycl", "detail"}, "type_erased_cgfo_ty"));
+    if (isNamed(md, "parallel_for_impl"))
+      return withArg("queue.kernel_impl", functorParamIndex(md));
+    return {};
+  }
+
+  if (isClassInNamespace(rd, "sycl", "handler")) {
+    if (isNamedOneOf(
+            md, {"parallel_for", "single_task", "parallel_for_work_group"}))
+      return withArg("handler.kernel", functorParamIndex(md));
+    if (isNamedOneOf(md, {"parallel_for_lambda_impl", "parallel_for_impl"}))
+      return withArg("handler.kernel_impl", functorParamIndex(md));
+    if (md->getNumParams() == 0)
+      return {};
+    if (isNamed(md, "wrap_kernel"))
+      return "handler.wrap_kernel";
+    if (isNamed(md, "StoreLambda"))
+      return "handler.store_lambda";
+    if (isNamed(md, "setKernelFunc") ||
+        (isNamed(md, "setDeviceKernelInfo") && md->getPrimaryTemplate()))
+      return "handler.set_kernel_func";
+    if (isNamed(md, "setDeviceKernelInfoPtr"))
+      return "handler.set_kernel_info";
+    if (isNamedOneOf(
+            md, {"setNDRangeDescriptor", "convertToRangeViewAndSetDescriptor"}))
+      return "handler.set_ndrange";
+    return {};
+  }
+
+  if (isClassInNamespacePath(rd, {"sycl", "detail"},
+                             "KernelWrapperHelperFuncs") &&
+      md->getNumParams() >= 1 &&
+      isNamedOneOf(md, {"kernel_single_task", "kernel_parallel_for",
+                        "kernel_parallel_for_work_group"}))
+    return "kernel.wrapper";
+
+  if (const auto *launchCtor = dyn_cast<CXXConstructorDecl>(md)) {
+    if (isClassInNamespace(rd, "sycl", "nd_range"))
+      return "ndrange.ctor";
+    if (isClassInNamespace(rd, "sycl", "range"))
+      return "range.ctor";
+    if (isClassInNamespace(rd, "sycl", "id"))
+      return "id.ctor";
+    if (isClassInNamespacePath(rd, {"sycl", "detail"}, "nd_range_view"))
+      return "ndrange_view.ctor";
+    if (isClassInNamespacePath(rd, {"sycl", "detail"}, "array"))
+      return "array.ctor";
+    if (!launchCtor->isCopyOrMoveConstructor()) {
+      if (isClassInNamespacePath(rd, {"sycl", "detail"}, "type_erased_cgfo_ty"))
+        return "cgfo.ctor";
+      if (isClassInNamespacePath(rd, {"sycl", "detail"}, "HostKernel") ||
+          isClassInNamespacePath(rd, {"sycl", "detail"}, "HostKernelRef"))
+        return "hostkernel.ctor";
+    }
+  }
   const auto *ctor = dyn_cast<CXXConstructorDecl>(md);
   bool isAssign = md->getOverloadedOperator() == OO_Equal;
 

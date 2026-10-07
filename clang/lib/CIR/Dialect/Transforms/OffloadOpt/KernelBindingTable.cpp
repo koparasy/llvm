@@ -720,9 +720,13 @@ static cir::GlobalOp resolveLaunchedNameString(cir::CallOp call) {
 static bool isLaunchChainCallee(cir::FuncOp fn) {
   // The buffer and accessor API stays a call: its role is how buffer identity
   // is traced (a buffer constructor also matches the range-constructor shape
-  // below).
-  if (fn->hasAttr(CIRDialect::getSYCLHostAPIAttrName()))
-    return false;
+  // below). The launch-path roles do not change what is inlined here.
+  if (auto role = fn->getAttrOfType<mlir::StringAttr>(
+          CIRDialect::getSYCLHostAPIAttrName()))
+    if (role.getValue().starts_with("buffer.") ||
+        role.getValue().starts_with("accessor.") ||
+        role.getValue().starts_with("vector."))
+      return false;
   llvm::StringRef n = fn.getName();
   if (n.starts_with("_ZN4sycl3_V136submit_kernel_direct_with_event_impl"))
     return false;
