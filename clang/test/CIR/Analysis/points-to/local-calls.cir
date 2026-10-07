@@ -7,7 +7,7 @@
 !s32i = !cir.int<s, 32>
 
 module {
-cir.global external @g = #cir.int<0> : !s32i
+cir.global "private" internal @g = #cir.int<0> : !s32i
 cir.func private @take(!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
 cir.func private @may_throw(!cir.ptr<!s32i>)
 

@@ -49,14 +49,13 @@ cir.func @insert_extract() {
   cir.return
 }
 
-// A constant record holding a global_view goes through the pessimistic
-// default until T05: each slot points to an unknown object.
+// A constant record holding a global_view: the slot points to the global's
+// node, the null slot to nothing.
 
 // CHECK-LABEL: === @const_record
-// CHECK-DAG: [[U0:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: UnhandledOp(cir.const {{.*}}, "aggregate constant holding pointers"), {{.*}}}
-// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=24 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[U0]]+0, 16->[[U1:n[0-9]+]]+0}
-// CHECK-DAG: [[U1]] [UnknownObj|Incomplete|External]
-cir.global external @g = #cir.int<0> : !s32i
+// CHECK-DAG: [[G:n[0-9]+]] [Global] size=4 origins={global(@g)} links={}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=24 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[G]]+0}
+cir.global "private" internal @g = #cir.int<0> : !s32i
 cir.func @const_record() {
   %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
   %c = cir.const #cir.const_record<{#cir.global_view<@g> : !cir.ptr<!s32i>, #cir.int<1> : !s32i, #cir.ptr<null> : !cir.ptr<!s32i>}> : !rec_S

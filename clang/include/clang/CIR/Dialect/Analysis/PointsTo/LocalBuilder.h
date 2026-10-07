@@ -30,6 +30,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/GlobalNodes.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToGraph.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/ADT/DenseMap.h"
@@ -54,20 +55,59 @@ bool isPointerValueType(mlir::Type type);
 /// `#cir.zero` of pointer type), which has no cell.
 bool isNullPointerConstant(mlir::Value value);
 
-/// Whether \p value is a null pointer constant (`#cir.ptr<null>` or
-/// `#cir.zero`), which points to nothing and has no cell.
-bool isNullPointerConstant(mlir::Value value);
+/// What getPointerSlotOffsets left out of a type's pointer offsets.
+struct SlotTruncation {
+  /// Set when an array holding pointers was too long to scan: the pointer
+  /// slots past its first 256 elements are missing from the offsets.
+  bool truncated = false;
+  /// When every truncated array starts at offset 0 of the type and they all
+  /// have the same element size, that size: memory accessed through the type
+  /// must then be treated as an array of it, which folds the missing slots
+  /// onto the scanned ones. std::nullopt otherwise: the memory must be
+  /// collapsed.
+  std::optional<uint64_t> arrayElemSize;
+};
 
 /// The byte offsets of the pointers inside a value of \p type, sorted and
 /// unique; empty for a pointer or a type without pointers. Arrays are scanned
-/// up to their first 256 elements.
+/// up to their first 256 elements; if one was longer, \p truncation (when
+/// given) says how to stay sound.
 llvm::SmallVector<int64_t, 2>
-getPointerSlotOffsets(mlir::Type type, const mlir::DataLayout &dataLayout);
+getPointerSlotOffsets(mlir::Type type, const mlir::DataLayout &dataLayout,
+                      SlotTruncation *truncation = nullptr);
 
 /// The pointers inside an aggregate SSA value: (byte offset, target cell),
 /// one entry per offset getPointerSlotOffsets returns for the value's type, in
 /// the same order. An empty Cell is a null pointer.
 using AggregateSlots = llvm::SmallVector<std::pair<int64_t, Cell>, 2>;
+
+/// A memory-to-memory copy (cir.copy, cir.libc.memcpy or cir.libc.memmove).
+/// After the walk, the builder unifies, for every offset k in [0, length) at
+/// which either side has a link, the target of dst+k with the target of
+/// src+k, until nothing changes. An unknown length (kUnknown) relates every
+/// offset k >= 0, which over-approximates whatever the length is.
+///
+/// The interprocedural phase must apply the same closure again after it adds
+/// links to the nodes (by cloning callees or callers into the graph): a link
+/// that appears later on one side is not on the other side yet.
+struct MemTransferRecord {
+  static constexpr uint64_t kUnknown = ~uint64_t(0);
+  mlir::Operation *op = nullptr;
+  Cell dst;
+  Cell src;
+  uint64_t length = 0;
+};
+
+/// Apply the copies \p transfers to \p graph until no link changes (see
+/// MemTransferRecord). A side whose node is collapsed holds its pointers at
+/// every offset: the other side gets that link at each pointer-aligned
+/// offset in the range. A range over arrays with too many offsets to list
+/// (a long or unknown length) makes both sides arrays of one element size
+/// and relates one offset per element class. A copy that fits none of this,
+/// or a closure that does not settle, collapses both nodes and unifies their
+/// links instead, which is sound but coarse.
+void closeMemTransfers(Graph &graph,
+                       llvm::ArrayRef<MemTransferRecord> transfers);
 
 /// A call recorded by the local phase. The local phase gives calls no
 /// semantics: it only remembers the cells involved, for the library models
@@ -146,6 +186,8 @@ public:
   std::optional<AggregateSlots> returnSlots;
   /// The calls in the body, in walk order.
   llvm::SmallVector<CallSiteRecord, 4> callSites;
+  /// The copies of a known length, in walk order.
+  llvm::SmallVector<MemTransferRecord, 0> memTransfers;
 
 private:
   cir::FuncOp func;
@@ -259,6 +301,24 @@ private:
   void visitCall(cir::CIRCallOpInterface op);
   void visitGetGlobal(cir::GetGlobalOp op);
   void visitReturn(cir::ReturnOp op);
+  void visitCopy(cir::CopyOp op);
+  void visitMemTransfer(mlir::Operation *op, mlir::Value dst, mlir::Value src,
+                        mlir::Value length);
+  void visitMemChr(cir::MemChrOp op);
+  /// Collapse the nodes of \p dst and \p src and unify their single links:
+  /// a copy whose extent or layout is unknown.
+  void copyFieldInsensitive(Cell dst, Cell src, mlir::Operation *op,
+                            llvm::StringRef detail);
+  /// If \p type has pointer slots getPointerSlotOffsets did not scan, smash
+  /// the node of \p addr, which holds a value of \p type, so that the
+  /// scanned slots stand for the missing ones (see SlotTruncation).
+  void smashIfTruncated(Cell addr, mlir::Type type, mlir::Operation *op);
+  /// The slots of the constant aggregate \p value of type \p type, or
+  /// std::nullopt if part of it is not understood.
+  std::optional<AggregateSlots>
+  constantSlots(mlir::Attribute value, mlir::Type type, mlir::Operation *op);
+  /// The cell a pointer constant points to.
+  Cell constantPointerCell(const ConstantPointer &pointer, mlir::Operation *op);
   void visitRegionTerminator(mlir::Operation *op);
   void visitBranch(mlir::Operation *op);
 
@@ -267,9 +327,15 @@ private:
   mlir::SymbolTableCollection *symbols;
   std::unique_ptr<mlir::SymbolTableCollection> ownedSymbols;
   std::unique_ptr<FunctionGraph> fg;
-  /// One Global node per symbol.
-  llvm::DenseMap<mlir::Attribute, Node *> globalNodes;
-  llvm::DenseMap<mlir::Type, llvm::SmallVector<int64_t, 2>> pointerOffsets;
+  /// One Global or Function node per symbol, with its initializer linked.
+  std::unique_ptr<GlobalNodes> globals;
+  struct PointerLayout {
+    llvm::SmallVector<int64_t, 2> offsets;
+    SlotTruncation truncation;
+  };
+  /// Cached; returned by value, as the cache may grow while it is used.
+  PointerLayout getPointerLayout(mlir::Type type);
+  llvm::DenseMap<mlir::Type, PointerLayout> pointerLayouts;
   /// The values a rule defined (as opposed to placeholders created by a use
   /// seen before the definition).
   llvm::DenseSet<mlir::Value> defined;

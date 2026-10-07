@@ -38,7 +38,7 @@ cir.func @va_arg_ptr() {
 // CHECK-LABEL: === @no_pointer_semantics
 // CHECK: n{{[0-9]+}} [Stack] size=4 origins={stack(cir.alloca 'x' {{.*}})} links={}
 // CHECK-NOT: UnhandledOp
-// CHECK-LABEL: === @nonnull_constant
+// CHECK-LABEL: === @pessimistic_result
 cir.func @no_pointer_semantics() {
   %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
   %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
@@ -49,13 +49,13 @@ cir.func @no_pointer_semantics() {
   cir.return
 }
 
-// A non-null pointer constant is pessimistic until T05 models global_view.
+// A Pessimistic op with a pointer result: the result points to an unknown
+// object.
 
-// CHECK-DAG: [[GV:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: UnhandledOp(cir.const {{.*}}"non-null pointer constant"), External: UnhandledOp(cir.const {{.*}})}
-// CHECK-DAG: gv -> [[GV]]+0
-cir.global external @g = #cir.int<0> : !s32i
-cir.func @nonnull_constant() {
-  %p = cir.const #cir.global_view<@g> : !cir.ptr<!s32i>
-  %p_tag = cir.cast bitcast %p : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "gv"}
+// CHECK-DAG: [[SS:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: UnhandledOp(cir.stacksave {{.*}}), External: UnhandledOp(cir.stacksave {{.*}})}
+// CHECK-DAG: ss -> [[SS]]+0
+cir.func @pessimistic_result() {
+  %p = cir.stacksave : !cir.ptr<!s8i>
+  %p_tag = cir.cast bitcast %p : !cir.ptr<!s8i> -> !cir.ptr<!s8i> {test.ptr = "ss"}
   cir.return
 }

@@ -1,0 +1,89 @@
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// cir.copy is a typed load of the pointee from src plus a store of it to
+// dst: each pointer slot of the type links to the same target on both
+// sides (Ref on src, Mod on dst). After the walk, a byte-range closure also
+// copies pointers stored where the type has none. A pointee of unknown size
+// collapses both nodes and unifies their single links.
+
+!s32i = !cir.int<s, 32>
+!u8i = !cir.int<u, 8>
+!rec_S = !cir.struct<"S" {data !cir.ptr<!s32i>, data !s32i, data !cir.ptr<!s32i>}>
+!rec_Buf = !cir.struct<"Buf" {data !cir.array<!u8i x 16>}>
+!rec_Opaque = !cir.struct<"Opaque" incomplete>
+
+// The copy's slots alias the original targets.
+
+// CHECK-LABEL: === @copy_record
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=24 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0, 16->[[B]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod|Ref] size=24 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0, 16->[[B]]+0}
+// CHECK-DAG: loaded -> [[B]]+0
+cir.func @copy_record() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_S>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
+  %f0 = cir.get_member %src[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.copy %src to %dst : !cir.ptr<!rec_S>
+  // Stored after the copy in walk order: still seen through dst, since the
+  // copy linked the slots of both sides.
+  %f2 = cir.get_member %src[2] {name = "f2"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %f2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %d2 = cir.get_member %dst[2] {name = "d2"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %v = cir.load %d2 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %v_tag = cir.cast bitcast %v : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "loaded"}
+  cir.return
+}
+
+// A pointer stored in a byte buffer (an object constructed in place) is not a
+// slot of the copied type; the byte-range closure copies it anyway.
+
+// CHECK-LABEL: === @copy_punned
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'src' {{.*}})} links={8->[[A]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=16 origins={stack(cir.alloca 'dst' {{.*}})} links={8->[[A]]+0}
+cir.func @copy_punned() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_Buf>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_Buf>
+  %bytes = cir.get_member %src[0] {name = "bytes"} : !cir.ptr<!rec_Buf> -> !cir.ptr<!cir.array<!u8i x 16>>
+  %eight = cir.const #cir.int<8> : !s32i
+  %byte8 = cir.get_element %bytes[%eight : !s32i] : !cir.ptr<!cir.array<!u8i x 16>> -> !cir.ptr<!u8i>
+  %slot = cir.cast bitcast %byte8 : !cir.ptr<!u8i> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.copy %src to %dst : !cir.ptr<!rec_Buf>
+  cir.return
+}
+
+// An incomplete pointee: the extent and layout of the copy are unknown, so
+// both nodes collapse and their single links are unified.
+
+// CHECK-LABEL: === @copy_opaque
+// CHECK-DAG: [[T:n[0-9]+]] [] size=0 origins={} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Incomplete|Collapsed|Ref] size=0 origins={} links={0->[[T]]+0} reasons={Incomplete: UnknownCaller(cir.func {{.*}}, "formal #1"), Collapsed: CollapsedAt(cir.copy {{.*}}, "copy of a type of unknown size")}
+// CHECK-DAG: [[DST:n[0-9]+]] [Incomplete|Collapsed|Mod] size=0 origins={} links={0->[[T]]+0} reasons={Incomplete: UnknownCaller(cir.func {{.*}}, "formal #0"), Collapsed: CollapsedAt(cir.copy {{.*}}, "copy of a type of unknown size")}
+cir.func @copy_opaque(%dst: !cir.ptr<!rec_Opaque>, %src: !cir.ptr<!rec_Opaque>) {
+  cir.copy %src to %dst : !cir.ptr<!rec_Opaque>
+  cir.return
+}
+
+// skip_tail_padding copies the data bytes only; the pointer slots are all in
+// them.
+
+!rec_T = !cir.struct<"T" {data !cir.ptr<!s32i>, data !s32i}>
+
+// CHECK-LABEL: === @copy_skip_tail_padding
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=16 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0}
+cir.func @copy_skip_tail_padding() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_T>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_T>
+  %f0 = cir.get_member %src[0] {name = "f0"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.copy %src to %dst skip_tail_padding : !cir.ptr<!rec_T>
+  cir.return
+}

@@ -1,0 +1,72 @@
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Arrays are scanned for pointer slots up to their first 256 elements. A
+// load, store or copy through a type with a longer array of pointers smashes
+// the node so that the scanned slots stand for the missing ones: an array of
+// the element size when the long array starts at offset 0 of the type, a
+// collapse otherwise. A pointer stored past the scanned elements is then
+// still copied.
+
+!s32i = !cir.int<s, 32>
+!arr1000 = !cir.array<!cir.ptr<!s32i> x 1000>
+!rec_Tail = !cir.struct<"Tail" {data !s32i, data !arr1000}>
+
+// The aggregate value of type !arr1000 is loaded from src and stored to dst.
+// The pointer stored into element 500 (offset 4000) reaches dst.
+
+// CHECK-LABEL: === @aggregate_value
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=8000 arr=8 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod|Ref] size=8000 arr=8 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0}
+// CHECK-DAG: loaded -> [[A]]+0
+cir.func @aggregate_value() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!arr1000>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!arr1000>
+  %i = cir.const #cir.int<500> : !s32i
+  %e = cir.get_element %src[%i : !s32i] : !cir.ptr<!arr1000> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %e : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %v = cir.load %src : !cir.ptr<!arr1000>, !arr1000
+  cir.store %v, %dst : !arr1000, !cir.ptr<!arr1000>
+  %j = cir.const #cir.int<700> : !s32i
+  %f = cir.get_element %dst[%j : !s32i] : !cir.ptr<!arr1000> -> !cir.ptr<!cir.ptr<!s32i>>
+  %w = cir.load %f : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %w_tag = cir.cast bitcast %w : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "loaded"}
+  cir.return
+}
+
+// The same through cir.copy.
+
+// CHECK-LABEL: === @copy
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=8000 arr=8 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=8000 arr=8 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0}
+cir.func @copy() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!arr1000>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!arr1000>
+  %i = cir.const #cir.int<999> : !s32i
+  %e = cir.get_element %src[%i : !s32i] : !cir.ptr<!arr1000> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %e : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.copy %src to %dst : !cir.ptr<!arr1000>
+  cir.return
+}
+
+// The long array at a non-zero offset of a record: the nodes collapse.
+
+// CHECK-LABEL: === @nested
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Collapsed|Mod|Ref] size=8008 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0} reasons={Collapsed: CollapsedAt(cir.load {{.*}}, "array too long to scan")}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Collapsed|Mod] size=8008 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0} reasons={Collapsed: CollapsedAt(cir.store {{.*}}, "array too long to scan")}
+cir.func @nested() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_Tail>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_Tail>
+  %arr = cir.get_member %src[1] {name = "arr"} : !cir.ptr<!rec_Tail> -> !cir.ptr<!arr1000>
+  %i = cir.const #cir.int<600> : !s32i
+  %e = cir.get_element %arr[%i : !s32i] : !cir.ptr<!arr1000> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %e : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %v = cir.load %src : !cir.ptr<!rec_Tail>, !rec_Tail
+  cir.store %v, %dst : !rec_Tail, !cir.ptr<!rec_Tail>
+  cir.return
+}

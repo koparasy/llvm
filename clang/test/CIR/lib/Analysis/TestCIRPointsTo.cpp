@@ -77,7 +77,8 @@ void printSlots(raw_ostream &os, StringRef name,
 void TestCIRPointsToPass::runOnOperation() {
   raw_ostream &os = llvm::outs();
   SymbolTableCollection symbols;
-  llvm::StringMap<unsigned> pessimisticOps, unhandledOps, unclassifiedOps;
+  llvm::StringMap<unsigned> pessimisticOps, unhandledOps, unclassifiedOps,
+      collapseReasons;
   size_t numFuncs = 0, numNodes = 0, numCollapsed = 0, numOps = 0;
   llvm::TimeRecord buildTime;
   bool anyFailed = false;
@@ -101,7 +102,21 @@ void TestCIRPointsToPass::runOnOperation() {
     func.walk([&](Operation *) { ++numOps; });
     for (const Node *node : fg->getGraph().nodes()) {
       ++numNodes;
-      numCollapsed += node->isCollapsed();
+      if (!node->isCollapsed())
+        continue;
+      ++numCollapsed;
+      std::string key;
+      if (const Reason *why = node->getReason(NodeFlags::Collapsed)) {
+        key = getReasonKindName(why->kind).str();
+        key += "(";
+        key += why->op ? why->op->getName().getStringRef().str() : "-";
+        if (!why->detail.empty())
+          key += ", \"" + why->detail.str() + "\"";
+        key += ")";
+      } else {
+        key = "<no reason>";
+      }
+      ++collapseReasons[key];
     }
     for (const auto &entry : builder.getPessimisticOps())
       pessimisticOps[entry.getKey()] += entry.getValue();
@@ -140,14 +155,15 @@ void TestCIRPointsToPass::runOnOperation() {
   });
 
   if (printStats) {
-    auto printTop = [&](StringRef title, const llvm::StringMap<unsigned> &map) {
+    auto printTop = [&](StringRef title, const llvm::StringMap<unsigned> &map,
+                        StringRef unit = "op names") {
       SmallVector<std::pair<unsigned, StringRef>> sorted;
       for (const auto &entry : map)
         sorted.emplace_back(entry.getValue(), entry.getKey());
       llvm::sort(sorted, [](const auto &a, const auto &b) {
         return a.first != b.first ? a.first > b.first : a.second < b.second;
       });
-      os << title << ": " << sorted.size() << " op names\n";
+      os << title << ": " << sorted.size() << " " << unit << "\n";
       for (auto [count, name] : sorted)
         os << "  " << name << " " << count << "\n";
     };
@@ -157,6 +173,7 @@ void TestCIRPointsToPass::runOnOperation() {
        << "live nodes: " << numNodes << "\n"
        << "collapsed nodes: " << numCollapsed << "\n"
        << "build time (wall, s): " << buildTime.getWallTime() << "\n";
+    printTop("collapsed nodes by reason", collapseReasons, "reasons");
     printTop("pessimistic ops (touching pointers or memory)", pessimisticOps);
     printTop("ops sent to the pessimistic default", unhandledOps);
     printTop("unclassified ops", unclassifiedOps);

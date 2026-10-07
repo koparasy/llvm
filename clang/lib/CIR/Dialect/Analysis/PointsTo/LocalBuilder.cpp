@@ -19,7 +19,19 @@
 //    record's slots with the member's replaced by the inserted value's.
 //  - cir.freeze, cir.launder: the operand's cell or slots.
 //  - Integer-only memory accesses (bitfields, atomic flags, memset,
-//    clear_padding, masked vector loads): Mod and/or Ref only.
+//    clear_padding, masked vector loads, strlen): Mod and/or Ref only.
+//  - cir.copy: a typed load of the pointee plus a store of it (the pointer
+//    slots of the type share their targets on both sides), and a byte-range
+//    copy record. cir.libc.memcpy/memmove of a constant length: a byte-range
+//    copy record (an unknown length: a range without an end). After the
+//    walk, closeMemTransfers unifies the targets at every offset either side
+//    of a record has a link at. A cir.copy of a type of unknown size
+//    collapses both nodes and unifies their single links.
+//  - cir.libc.memchr: the source's node at an unknown offset (collapse).
+//  - cir.vtable.get_vptr: the object's cell (the vptr is at offset 0).
+//  - A load, store or copy through a type with arrays too long to scan for
+//    pointer slots smashes the node (an array of the element size, or a
+//    collapse) so that the scanned slots stand for the missing ones.
 //  - Address arithmetic (get_member, get_element, ptr_stride, base/derived
 //    class addresses, complex real/imag pointers, bitcast, address_space and
 //    array_to_ptrdecay casts): the operand's cell plus the constant byte
@@ -38,9 +50,13 @@
 //  - Atomics: a load of the old value plus a store of the new one.
 //  - Calls: recorded only. A pointer result gets a fresh node, an aggregate
 //    result fresh slot nodes.
-//  - cir.get_global: one Global (or Function) node per symbol.
-//  - cir.const: a null pointer has no cell, a zero/undef/poison aggregate
-//    null slots; any other pointer-holding constant is pessimistic (T05).
+//  - cir.get_global: one Global (or Function) node per symbol, its
+//    initializer linked (GlobalNodes).
+//  - cir.const: a null pointer has no cell; #cir.global_view and
+//    #cir.global_offset point into the symbol's node at their byte offset; a
+//    non-null #cir.ptr<N> points to an unknown object; an aggregate constant
+//    gets one slot per pointer it holds (null for zero/undef/poison). A
+//    symbol address held as an integer makes its node External.
 //  - Entry block arguments: a fresh Incomplete node each (each slot, for an
 //    aggregate).
 //
@@ -64,6 +80,8 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <limits>
 
 #define DEBUG_TYPE "cir-points-to"
 
@@ -197,6 +215,8 @@ LocalBuilder::LocalBuilder(cir::FuncOp func, SymbolTableCollection *symbols,
   auto voidPtrTy = cir::PointerType::get(cir::VoidType::get(func.getContext()));
   unsigned pointerSize = dataLayout.getTypeSize(voidPtrTy).getFixedValue();
   fg = std::make_unique<FunctionGraph>(func, pointerSize, reasons);
+  globals = std::make_unique<GlobalNodes>(fg->getGraph(), dataLayout,
+                                          *this->symbols, func);
 }
 
 LocalBuilder::~LocalBuilder() = default;
@@ -319,7 +339,8 @@ void LocalBuilder::unifyValues(Value a, Value b, Operation *at) {
 
 static void collectPointerOffsets(Type type, int64_t base,
                                   const mlir::DataLayout &dataLayout,
-                                  SmallVectorImpl<int64_t> &out) {
+                                  SmallVectorImpl<int64_t> &out,
+                                  SlotTruncation &truncation) {
   if (isPointerType(type)) {
     out.push_back(base);
     return;
@@ -330,12 +351,14 @@ static void collectPointerOffsets(Type type, int64_t base,
     for (unsigned i = 0, e = recordTy.getNumElements(); i != e; ++i)
       collectPointerOffsets(recordTy.getElementType(i),
                             base + recordTy.getElementOffset(dataLayout, i),
-                            dataLayout, out);
+                            dataLayout, out, truncation);
     return;
   }
   if (auto arrayTy = dyn_cast<cir::ArrayType>(type)) {
     SmallVector<int64_t> elemOffsets;
-    collectPointerOffsets(arrayTy.getElementType(), 0, dataLayout, elemOffsets);
+    SlotTruncation elemTruncation;
+    collectPointerOffsets(arrayTy.getElementType(), 0, dataLayout, elemOffsets,
+                          elemTruncation);
     std::optional<int64_t> elemSize =
         getTypeSizeInBytes(arrayTy.getElementType(), dataLayout);
     if (elemOffsets.empty() || !elemSize)
@@ -345,26 +368,50 @@ static void collectPointerOffsets(Type type, int64_t base,
     for (uint64_t k = 0; k != count; ++k)
       for (int64_t off : elemOffsets)
         out.push_back(base + k * *elemSize + off);
+
+    // Record what was left out: this array if it is too long, and whatever
+    // the element type left out, once per scanned element.
+    auto record = [&](int64_t at, std::optional<uint64_t> elem) {
+      std::optional<uint64_t> smash = at == 0 ? elem : std::nullopt;
+      if (!truncation.truncated) {
+        truncation.truncated = true;
+        truncation.arrayElemSize = smash;
+      } else if (truncation.arrayElemSize != smash) {
+        truncation.arrayElemSize = std::nullopt;
+      }
+    };
+    if (arrayTy.getSize() > kMaxScannedArrayElems)
+      record(base, *elemSize);
+    if (elemTruncation.truncated)
+      for (uint64_t k = 0; k != count; ++k)
+        record(base + k * *elemSize, elemTruncation.arrayElemSize);
   }
 }
 
-SmallVector<int64_t, 2>
-cir::pointsto::getPointerSlotOffsets(Type type,
-                                     const mlir::DataLayout &dataLayout) {
+SmallVector<int64_t, 2> cir::pointsto::getPointerSlotOffsets(
+    Type type, const mlir::DataLayout &dataLayout, SlotTruncation *truncation) {
   SmallVector<int64_t, 2> offsets;
+  SlotTruncation local;
+  SlotTruncation &out = truncation ? *truncation : local;
+  out = SlotTruncation();
   if (isPointerType(type))
     return offsets;
-  collectPointerOffsets(type, 0, dataLayout, offsets);
+  collectPointerOffsets(type, 0, dataLayout, offsets, out);
   llvm::sort(offsets);
   offsets.erase(llvm::unique(offsets), offsets.end());
   return offsets;
 }
 
-SmallVector<int64_t, 2> LocalBuilder::getPointerOffsets(Type type) {
-  auto [it, inserted] = pointerOffsets.try_emplace(type);
+LocalBuilder::PointerLayout LocalBuilder::getPointerLayout(Type type) {
+  auto [it, inserted] = pointerLayouts.try_emplace(type);
   if (inserted)
-    it->second = getPointerSlotOffsets(type, dataLayout);
+    it->second.offsets =
+        getPointerSlotOffsets(type, dataLayout, &it->second.truncation);
   return it->second;
+}
+
+SmallVector<int64_t, 2> LocalBuilder::getPointerOffsets(Type type) {
+  return getPointerLayout(type).offsets;
 }
 
 bool LocalBuilder::hasPointers(Type type) {
@@ -408,6 +455,7 @@ std::unique_ptr<FunctionGraph> LocalBuilder::build() {
       visit(op);
   });
   defineBlockArguments();
+  closeMemTransfers(graph, fg->memTransfers);
 
   if (isPointsToVerifyEnabled())
     verifyErrors = failed(verifyFunctionGraph(*fg));
@@ -550,7 +598,32 @@ void LocalBuilder::visit(Operation *op) {
                       /*ref=*/true);
         })
         .Case<cir::MemSetOp>([&](cir::MemSetOp op) {
+          // A byte pattern makes no pointer (zero writes null), and a
+          // flow-insensitive graph never removes a link.
           visitModRef(op.getDst(), {}, /*mod=*/true, /*ref=*/false);
+          std::optional<Cell> dst = cellFor(op.getDst());
+          std::optional<int64_t> length = getConstantIndex(op.getLen());
+          if (dst && length && *length > 0)
+            fg->getGraph().growSize(dst->getNode(), dst->getOffset() + *length);
+        })
+        .Case<cir::CopyOp>([&](auto op) { visitCopy(op); })
+        .Case<cir::MemCpyOp>([&](cir::MemCpyOp op) {
+          visitMemTransfer(op, op.getDst(), op.getSrc(), op.getLen());
+        })
+        .Case<cir::MemMoveOp>([&](cir::MemMoveOp op) {
+          visitMemTransfer(op, op.getDst(), op.getSrc(), op.getLen());
+        })
+        .Case<cir::MemChrOp>([&](auto op) { visitMemChr(op); })
+        .Case<cir::StrLenOp>([&](cir::StrLenOp op) {
+          visitModRef(op.getString(), {}, /*mod=*/false, /*ref=*/true);
+        })
+        .Case<cir::VTableGetVPtrOp>([&](cir::VTableGetVPtrOp op) {
+          // The vptr is at offset 0 of the object: like a bitcast.
+          defineCopy(op.getResult(), op.getSrc());
+        })
+        .Case<cir::LocalInitOp>([](cir::LocalInitOp) {
+          // The walk visits the ctor and dtor regions as part of the
+          // function; the op itself moves no pointer.
         })
         .Case<cir::ClearPaddingOp>([&](cir::ClearPaddingOp op) {
           visitModRef(op.getArg(), {}, /*mod=*/true, /*ref=*/false);
@@ -675,16 +748,24 @@ void LocalBuilder::visitLoad(cir::LoadOp op) {
   if (std::optional<int64_t> size = getTypeSizeInBytes(type, dataLayout))
     graph.growSize(addr->getNode(), addr->getOffset() + *size);
 
+  // A new link can collapse the node (a misaligned slot, a byte array).
+  const Reason *why = nullptr;
+  auto reason = [&] {
+    if (!why)
+      why = graph.makeReason(Reason::Kind::CollapsedAt, op);
+    return why;
+  };
   if (isPointerType(type)) {
-    define(op.getResult(), graph.getLink(*addr));
+    define(op.getResult(), graph.getLink(*addr, reason()));
     return;
   }
   SmallVector<int64_t, 2> offsets = getPointerOffsets(type);
   if (offsets.empty())
     return;
+  smashIfTruncated(*addr, type, op);
   AggregateSlots slots;
   for (int64_t off : offsets)
-    slots.emplace_back(off, graph.getLink(shift(*addr, off)));
+    slots.emplace_back(off, graph.getLink(shift(*addr, off), reason()));
   defineSlots(op.getResult(), slots);
 }
 
@@ -713,6 +794,7 @@ void LocalBuilder::visitStore(cir::StoreOp op) {
   std::optional<AggregateSlots> slots = slotsFor(value);
   if (!slots)
     return;
+  smashIfTruncated(*addr, value.getType(), op);
   for (auto [off, target] : *slots)
     if (target)
       graph.setLink(shift(*addr, off), target, reason());
@@ -797,24 +879,129 @@ void LocalBuilder::visitInsertMember(cir::InsertMemberOp op) {
   defineSlots(op.getResult(), slots);
 }
 
+Cell LocalBuilder::constantPointerCell(const ConstantPointer &pointer,
+                                       Operation *op) {
+  Graph &graph = fg->getGraph();
+  switch (pointer.kind) {
+  case ConstantPointer::Kind::Symbol:
+    return globals->getCell(pointer, op);
+  case ConstantPointer::Kind::Absolute:
+    return globals->makeUnknown(
+        graph.makeReason(Reason::Kind::EscapedTo, op, "absolute address"));
+  case ConstantPointer::Kind::Unknown:
+    break;
+  }
+  return globals->makeUnknown(graph.makeReason(Reason::Kind::UnhandledOp, op,
+                                               "constant not understood"));
+}
+
+std::optional<AggregateSlots>
+LocalBuilder::constantSlots(Attribute value, Type type, Operation *op) {
+  Graph &graph = fg->getGraph();
+  PointerLayout layout = getPointerLayout(type);
+  AggregateSlots slots;
+  for (int64_t off : layout.offsets)
+    slots.emplace_back(off, Cell());
+  bool understood = true;
+  // With a truncated layout some pointers have no slot: every slot then
+  // stands for all of them.
+  bool truncated = layout.truncation.truncated;
+  Cell merged;
+  walkConstantPointers(
+      value, 0, dataLayout,
+      [&](FlatSymbolRefAttr sym) { return globals->getSymbolType(sym); },
+      [&](int64_t off, const ConstantPointer &pointer) {
+        if (pointer.asInteger) {
+          graph.addFlags(globals->getCell(pointer, op), NodeFlags::External,
+                         graph.makeReason(Reason::Kind::EscapedTo, op,
+                                          "address escaped as an integer"));
+          return;
+        }
+        if (pointer.kind == ConstantPointer::Kind::Unknown) {
+          understood = false;
+          return;
+        }
+        Cell target = constantPointerCell(pointer, op);
+        if (truncated) {
+          if (!merged)
+            merged = target;
+          else
+            graph.unify(merged, target,
+                        graph.makeReason(Reason::Kind::MergedAt, op));
+          return;
+        }
+        auto it =
+            llvm::lower_bound(slots, off, [](const auto &slot, int64_t o) {
+              return slot.first < o;
+            });
+        if (it == slots.end() || it->first != off) {
+          // A pointer where the type has none: the attribute and the type
+          // disagree.
+          understood = false;
+          return;
+        }
+        if (!it->second)
+          it->second = target;
+        else
+          graph.unify(it->second, target,
+                      graph.makeReason(Reason::Kind::MergedAt, op));
+      });
+  if (!understood)
+    return std::nullopt;
+  if (truncated && merged)
+    for (auto &slot : slots)
+      slot.second = merged;
+  return slots;
+}
+
 void LocalBuilder::visitConstant(cir::ConstantOp op) {
   Type type = op.getType();
-  if (!hasPointers(type) || isNullPointer(op.getResult()))
+  Attribute value = op.getValue();
+  Graph &graph = fg->getGraph();
+  auto symbolType = [&](FlatSymbolRefAttr sym) {
+    return globals->getSymbolType(sym);
+  };
+  if (!hasPointers(type)) {
+    // A symbol address held as an integer escapes, like a ptr_to_int cast.
+    walkConstantPointers(
+        value, 0, dataLayout, symbolType,
+        [&](int64_t, const ConstantPointer &pointer) {
+          if (pointer.kind == ConstantPointer::Kind::Symbol)
+            graph.addFlags(globals->getCell(pointer, op), NodeFlags::External,
+                           graph.makeReason(Reason::Kind::EscapedTo, op,
+                                            "address escaped as an integer"));
+        });
+    return;
+  }
+  if (isNullPointer(op.getResult()))
     return; // A null pointer constant has no cell (see cellFor).
+
   if (isPointerType(type)) {
-    // TODO(T05): #cir.global_view and other non-null pointer constants.
-    visitUnhandled(op, "non-null pointer constant");
+    // &g + offset, an absolute address, or (undef, poison) nothing.
+    std::optional<Cell> cell;
+    bool understood = true;
+    walkConstantPointers(value, 0, dataLayout, symbolType,
+                         [&](int64_t off, const ConstantPointer &pointer) {
+                           if (off != 0 || pointer.asInteger || cell) {
+                             understood = false;
+                             return;
+                           }
+                           cell = constantPointerCell(pointer, op);
+                         });
+    if (!understood) {
+      visitUnhandled(op, "pointer constant not understood");
+      return;
+    }
+    define(op.getResult(), cell ? *cell : Cell(graph.makeNode()));
     return;
   }
-  if (isa<cir::ZeroAttr, cir::UndefAttr, cir::PoisonAttr>(op.getValue())) {
-    AggregateSlots slots;
-    for (int64_t off : getPointerOffsets(type))
-      slots.emplace_back(off, Cell());
-    defineSlots(op.getResult(), slots);
+
+  std::optional<AggregateSlots> slots = constantSlots(value, type, op);
+  if (!slots) {
+    visitUnhandled(op, "aggregate constant not understood");
     return;
   }
-  // TODO(T05): walk the initializer (null, global_view, function pointers).
-  visitUnhandled(op, "aggregate constant holding pointers");
+  defineSlots(op.getResult(), *slots);
 }
 
 void LocalBuilder::visitAddressStep(Operation *op) {
@@ -964,25 +1151,282 @@ void LocalBuilder::visitCall(CIRCallOpInterface op) {
 }
 
 void LocalBuilder::visitGetGlobal(cir::GetGlobalOp op) {
+  define(op.getAddr(), Cell(globals->getNode(op.getNameAttr())));
+}
+
+void LocalBuilder::smashIfTruncated(Cell addr, Type type, Operation *op) {
+  PointerLayout layout = getPointerLayout(type);
+  if (!layout.truncation.truncated)
+    return;
   Graph &graph = fg->getGraph();
-  FlatSymbolRefAttr sym = op.getNameAttr();
-  Node *&node = globalNodes[sym];
-  if (!node) {
-    // TODO(T05): the initializer.
-    Operation *target = symbols->lookupNearestSymbolFrom(op, sym);
-    if (isa_and_present<cir::FuncOp>(target)) {
-      node = graph.makeNode(Origin{Origin::Kind::FuncSym, nullptr, sym},
-                            NodeFlags::Function);
-    } else {
-      node = graph.makeNode(Origin{Origin::Kind::GlobalSym, nullptr, sym},
-                            NodeFlags::Global);
-      if (auto globalOp = dyn_cast_if_present<cir::GlobalOp>(target))
-        if (std::optional<int64_t> size =
-                getTypeSizeInBytes(globalOp.getSymType(), dataLayout))
-          graph.growSize(node, *size);
+  const Reason *why =
+      graph.makeReason(Reason::Kind::CollapsedAt, op, "array too long to scan");
+  if (layout.truncation.arrayElemSize)
+    graph.markArray(addr.getNode(), *layout.truncation.arrayElemSize, why);
+  else
+    graph.collapse(addr.getNode(), why);
+}
+
+void LocalBuilder::copyFieldInsensitive(Cell dst, Cell src, Operation *op,
+                                        StringRef detail) {
+  Graph &graph = fg->getGraph();
+  const Reason *why = graph.makeReason(Reason::Kind::CollapsedAt, op, detail);
+  graph.collapse(dst.getNode(), why);
+  graph.collapse(src.getNode(), why);
+  graph.unify(graph.getLink(dst, why), graph.getLink(src, why), why);
+}
+
+void LocalBuilder::visitCopy(cir::CopyOp op) {
+  std::optional<Cell> dst = cellFor(op.getDst());
+  std::optional<Cell> src = cellFor(op.getSrc());
+  if (!dst || !src)
+    return; // Copying from or to null is UB.
+  Graph &graph = fg->getGraph();
+  graph.addFlags(*dst, NodeFlags::Mod);
+  graph.addFlags(*src, NodeFlags::Ref);
+  Type type = op.getType().getPointee();
+  if (!getTypeSizeInBytes(type, dataLayout)) {
+    copyFieldInsensitive(*dst, *src, op, "copy of a type of unknown size");
+    return;
+  }
+  uint64_t length = op.getCopySizeInBytes(dataLayout);
+  graph.growSize(dst->getNode(), dst->getOffset() + length);
+  graph.growSize(src->getNode(), src->getOffset() + length);
+
+  // A typed load of the pointee from src plus a store of it to dst: the
+  // pointer slots of the type link to the same targets on both sides. The
+  // links exist from now on, so pointers stored into either side later in
+  // the walk are seen by both.
+  smashIfTruncated(*dst, type, op);
+  smashIfTruncated(*src, type, op);
+  const Reason *why = nullptr;
+  for (int64_t off : getPointerOffsets(type)) {
+    if (off >= static_cast<int64_t>(length))
+      break; // Tail padding that skip_tail_padding leaves alone.
+    if (!why)
+      why = graph.makeReason(Reason::Kind::CollapsedAt, op);
+    graph.setLink(shift(*dst, off), graph.getLink(shift(*src, off)), why);
+  }
+  // Pointers stored where the type has none (a byte buffer holding an object
+  // constructed in place, a union member the type does not show) are copied
+  // too: by the byte-range closure after the walk.
+  fg->memTransfers.push_back({op, *dst, *src, length});
+}
+
+void LocalBuilder::visitMemTransfer(Operation *op, Value dstValue,
+                                    Value srcValue, Value lengthValue) {
+  std::optional<Cell> dst = cellFor(dstValue);
+  std::optional<Cell> src = cellFor(srcValue);
+  if (!dst || !src)
+    return; // Copying from or to null is UB.
+  Graph &graph = fg->getGraph();
+  graph.addFlags(*dst, NodeFlags::Mod);
+  graph.addFlags(*src, NodeFlags::Ref);
+  // Like cir.copy over the bytes [0, length), without a type: done by the
+  // closure after the walk, once every link of the function is known. An
+  // unknown length is a range without an end: the closure relates every
+  // offset at or after the two cells, which over-approximates any length.
+  std::optional<int64_t> length = getConstantIndex(lengthValue);
+  if (length && *length <= 0)
+    return;
+  if (length) {
+    graph.growSize(dst->getNode(), dst->getOffset() + *length);
+    graph.growSize(src->getNode(), src->getOffset() + *length);
+  }
+  fg->memTransfers.push_back(
+      {op, *dst, *src,
+       length ? static_cast<uint64_t>(*length) : MemTransferRecord::kUnknown});
+}
+
+void LocalBuilder::visitMemChr(cir::MemChrOp op) {
+  Graph &graph = fg->getGraph();
+  std::optional<Cell> src = cellFor(op.getSrc());
+  if (!src) {
+    define(op.getResult(), Cell(graph.makeNode()));
+    return;
+  }
+  graph.addFlags(*src, NodeFlags::Ref);
+  // The result points into the searched range at an unknown offset.
+  graph.collapse(src->getNode(),
+                 graph.makeReason(Reason::Kind::CollapsedAt, op,
+                                  "pointer into the searched range"));
+  define(op.getResult(), *src);
+}
+
+//===----------------------------------------------------------------------===//
+// Copy closure
+//===----------------------------------------------------------------------===//
+
+/// More (offset) pairs than this in one copy, or more rounds than this over
+/// all copies, and the copy is done field-insensitively instead.
+static constexpr size_t kMaxTransferSlots = 1024;
+static constexpr unsigned kMaxTransferRounds = 64;
+
+/// The offsets k in [0, length) at which the cell \p at (resolved, on a node
+/// that is not collapsed) has a link on its node. With \p onePerLink, only
+/// the smallest such k per link (on an array node the others are the same
+/// slot). False if there are more than kMaxTransferSlots.
+static bool collectLinkedOffsets(Cell at, int64_t length,
+                                 SmallVectorImpl<int64_t> &out,
+                                 bool onePerLink = false) {
+  const Node *node = at.getRawNode();
+  int64_t base = at.getRawOffset();
+  std::optional<uint64_t> elem = node->getArrayElemSize();
+  for (const auto &link : node->getLinks()) {
+    int64_t k = link.first - base;
+    if (!elem) {
+      if (k >= 0 && k < length)
+        out.push_back(k);
+      continue;
+    }
+    int64_t e = static_cast<int64_t>(*elem);
+    for (k = ((k % e) + e) % e; k < length; k += e) {
+      out.push_back(k);
+      if (onePerLink)
+        break;
+      if (out.size() > kMaxTransferSlots)
+        return false;
     }
   }
-  define(op.getAddr(), Cell(node));
+  return out.size() <= kMaxTransferSlots;
+}
+
+/// The offsets k in [0, length) at which the cell \p at (resolved, on a node
+/// that is not collapsed) is pointer-aligned within its node, one per
+/// distinct normalized offset. False if there are more than
+/// kMaxTransferSlots.
+static bool collectAlignedOffsets(Cell at, int64_t length, int64_t pointerSize,
+                                  SmallVectorImpl<int64_t> &out) {
+  const Node *node = at.getRawNode();
+  int64_t base = at.getRawOffset();
+  int64_t k = ((-base % pointerSize) + pointerSize) % pointerSize;
+  // On an array node the offsets repeat every element: the ones below one
+  // element are a representative of each.
+  std::optional<uint64_t> elem = node->getArrayElemSize();
+  int64_t end = elem ? std::min<int64_t>(length, *elem) : length;
+  for (; k < end; k += pointerSize) {
+    out.push_back(k);
+    if (out.size() > kMaxTransferSlots)
+      return false;
+  }
+  return true;
+}
+
+namespace {
+/// Applies one MemTransferRecord.
+struct TransferApplier {
+  Graph &graph;
+  const MemTransferRecord &record;
+  const Reason *why = nullptr;
+
+  const Reason *reason() {
+    if (!why)
+      why = graph.makeReason(Reason::Kind::CollapsedAt, record.op,
+                             "copied range");
+    return why;
+  }
+
+  /// Unify the targets of the slots \p a and \p b. Return whether that
+  /// changed the graph.
+  bool unifySlots(Cell a, Cell b) {
+    std::optional<Cell> la = graph.lookupLink(a);
+    std::optional<Cell> lb = graph.lookupLink(b);
+    if (la && lb && la->resolve() == lb->resolve())
+      return false;
+    graph.unify(graph.getLink(a, reason()), graph.getLink(b, reason()),
+                reason());
+    return true;
+  }
+
+  /// Collapse both sides and unify their single links.
+  bool smash() {
+    Cell dst = record.dst.resolve(), src = record.src.resolve();
+    bool changed =
+        !dst.getRawNode()->isCollapsed() || !src.getRawNode()->isCollapsed();
+    graph.collapse(dst.getRawNode(), reason());
+    graph.collapse(src.getRawNode(), reason());
+    return unifySlots(record.dst, record.src) || changed;
+  }
+
+  bool apply() {
+    Cell dst = record.dst.resolve(), src = record.src.resolve();
+    int64_t length = static_cast<int64_t>(
+        std::min<uint64_t>(record.length, std::numeric_limits<int64_t>::max()));
+    bool dstCollapsed = dst.getRawNode()->isCollapsed();
+    bool srcCollapsed = src.getRawNode()->isCollapsed();
+    if (dstCollapsed && srcCollapsed)
+      return unifySlots(dst, src);
+
+    SmallVector<int64_t> offsets;
+    if (dstCollapsed || srcCollapsed) {
+      // The collapsed side holds its pointers at every offset, so every slot
+      // of the other side in the range gets its link: the ones it has and,
+      // if the collapsed side holds a pointer, every pointer-aligned one.
+      Cell collapsed = dstCollapsed ? dst : src;
+      Cell other = dstCollapsed ? src : dst;
+      if (!collectLinkedOffsets(other, length, offsets, /*onePerLink=*/true))
+        return smash();
+      if (graph.lookupLink(collapsed) &&
+          !collectAlignedOffsets(other, length, graph.getPointerSize(),
+                                 offsets))
+        return smash();
+      llvm::sort(offsets);
+      offsets.erase(llvm::unique(offsets), offsets.end());
+      bool changed = false;
+      for (int64_t k : offsets)
+        changed |= unifySlots(shift(other, k), collapsed);
+      return changed;
+    }
+
+    if (!collectLinkedOffsets(dst, length, offsets) ||
+        !collectLinkedOffsets(src, length, offsets) ||
+        offsets.size() > kMaxTransferSlots) {
+      // Too many offsets: a long (or unknown) range over an array. The
+      // offsets of a range over arrays repeat every element, so make both
+      // sides arrays of one element size and take one offset per class.
+      offsets.clear();
+      std::optional<uint64_t> dstElem = dst.getRawNode()->getArrayElemSize();
+      std::optional<uint64_t> srcElem = src.getRawNode()->getArrayElemSize();
+      if ((!dstElem && !srcElem) ||
+          (dstElem && srcElem && *dstElem != *srcElem))
+        return smash();
+      if (!dstElem || !srcElem) {
+        graph.markArray((dstElem ? src : dst).getRawNode(),
+                        dstElem ? *dstElem : *srcElem, reason());
+        return true; // Applied as two arrays in the next round.
+      }
+      int64_t elem = static_cast<int64_t>(*dstElem);
+      for (Cell side : {dst, src})
+        for (const auto &link : side.getRawNode()->getLinks()) {
+          int64_t k = ((link.first - side.getRawOffset()) % elem + elem) % elem;
+          if (k < length)
+            offsets.push_back(k);
+        }
+    }
+    llvm::sort(offsets);
+    offsets.erase(llvm::unique(offsets), offsets.end());
+    bool changed = false;
+    for (int64_t k : offsets)
+      changed |= unifySlots(shift(record.dst, k), shift(record.src, k));
+    return changed;
+  }
+};
+} // namespace
+
+void cir::pointsto::closeMemTransfers(Graph &graph,
+                                      ArrayRef<MemTransferRecord> transfers) {
+  // Unification is symmetric, so this treats dst and src alike: it only
+  // ever adds links and merges targets, which over-approximates the
+  // one-directional copy. That is the DSA treatment of memcpy, with offsets.
+  for (unsigned round = 0; round != kMaxTransferRounds; ++round) {
+    bool changed = false;
+    for (const MemTransferRecord &record : transfers)
+      changed |= TransferApplier{graph, record}.apply();
+    if (!changed)
+      return;
+  }
+  for (const MemTransferRecord &record : transfers)
+    TransferApplier{graph, record}.smash();
 }
 
 void LocalBuilder::visitReturn(cir::ReturnOp op) {

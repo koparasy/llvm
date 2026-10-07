@@ -1,0 +1,171 @@
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// cir.libc.memcpy / memmove copy bytes without a type. After the walk the
+// builder unifies, for every offset k in the copied range at which either
+// side has a link, the target of dst+k with the target of src+k, until
+// nothing changes. Unification is symmetric, so this over-approximates the
+// one-directional copy (the DSA treatment, with offsets). An unknown length
+// is a range without an end: every offset at or after the two cells. memset
+// writes no pointer: Mod only.
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_S = !cir.struct<"S" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+
+// A constant length over a struct of two pointers: both slots copied. The
+// slot stored after the memcpy in walk order is copied too.
+
+// CHECK-LABEL: === @memcpy_struct
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0, 8->[[B]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=16 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0, 8->[[B]]+0}
+cir.func @memcpy_struct() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_S>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
+  %f0 = cir.get_member %src[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %s = cir.cast bitcast %src : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %d = cir.cast bitcast %dst : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %len = cir.const #cir.int<16> : !u64i
+  cir.libc.memcpy %len bytes from %s to %d : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  %f1 = cir.get_member %src[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %f1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+// A constant length that covers the first slot only.
+
+// CHECK-LABEL: === @memcpy_prefix
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0, 8->[[B]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=16 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0}
+cir.func @memcpy_prefix() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_S>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
+  %f0 = cir.get_member %src[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %f1 = cir.get_member %src[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %f1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %s = cir.cast bitcast %src : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %d = cir.cast bitcast %dst : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %len = cir.const #cir.int<8> : !u64i
+  cir.libc.memcpy %len bytes from %s to %d : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  cir.return
+}
+
+// An unknown length relates every offset at or after the two cells: the
+// slots stay separate, nothing collapses. Copying into &dst[1] shifts them
+// by 16 bytes.
+
+// CHECK-LABEL: === @memcpy_unknown_length
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0, 8->[[B]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=32 origins={stack(cir.alloca 'dst' {{.*}})} links={16->[[A]]+0, 24->[[B]]+0}
+// CHECK-NOT: Collapsed
+// CHECK-LABEL: === @memmove_arrays
+cir.func @memcpy_unknown_length(%n: !u64i) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_S>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!cir.array<!rec_S x 2>>
+  %f0 = cir.get_member %src[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %f1 = cir.get_member %src[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %f1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %s = cir.cast bitcast %src : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %one = cir.const #cir.int<1> : !s32i
+  %d1 = cir.get_element %dst[%one : !s32i] : !cir.ptr<!cir.array<!rec_S x 2>> -> !cir.ptr<!rec_S>
+  %d = cir.cast bitcast %d1 : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  cir.libc.memcpy %n bytes from %s to %d : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  cir.return
+}
+
+// memmove of an unknown length from an array of S (a dynamic index made it an
+// array of 16-byte elements) into a plain buffer: the buffer becomes an array
+// of the same element size and each element offset class is related once.
+
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=64 arr=16 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0, 8->[[B]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=64 arr=16 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0, 8->[[B]]+0}
+cir.func @memmove_arrays(%i: !s32i, %n: !u64i) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!cir.array<!rec_S x 4>>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!cir.array<!rec_S x 4>>
+  %e = cir.get_element %src[%i : !s32i] : !cir.ptr<!cir.array<!rec_S x 4>> -> !cir.ptr<!rec_S>
+  %f0 = cir.get_member %e[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %f1 = cir.get_member %e[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %f1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %s = cir.cast bitcast %src : !cir.ptr<!cir.array<!rec_S x 4>> -> !cir.ptr<!void>
+  %d = cir.cast bitcast %dst : !cir.ptr<!cir.array<!rec_S x 4>> -> !cir.ptr<!void>
+  cir.libc.memmove %n bytes from %s to %d : !cir.ptr<!void>, !cir.ptr<!void>, !u64i
+  cir.return
+}
+
+// A collapsed source holds its pointer at every offset: each pointer-aligned
+// slot of the copied range of dst gets its link.
+
+// CHECK-LABEL: === @memcpy_from_collapsed
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Collapsed|Mod|Ref] size=16 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=16 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0, 8->[[A]]+0}
+cir.func @memcpy_from_collapsed(%mask: !s64i) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_S>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
+  %m = cir.ptr_mask %src, %mask : (!cir.ptr<!rec_S>, !s64i) -> !cir.ptr<!rec_S>
+  %raw = cir.cast bitcast %m : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %raw : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %s = cir.cast bitcast %src : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %d = cir.cast bitcast %dst : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %len = cir.const #cir.int<16> : !u64i
+  cir.libc.memcpy %len bytes from %s to %d : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  cir.return
+}
+
+// memset writes no pointer: Mod only, the existing link stays.
+
+// CHECK-LABEL: === @memset
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=16 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0}
+cir.func @memset() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
+  %f0 = cir.get_member %dst[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %d = cir.cast bitcast %dst : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %len = cir.const #cir.int<16> : !u64i
+  %zero = cir.const #cir.int<0> : !u8i
+  cir.libc.memset %len bytes at %d to %zero : !cir.ptr<!void>, !u8i, !u64i
+  cir.return
+}
+
+// memchr returns a pointer into the searched range at an unknown offset: the
+// source node collapses and the result points into it.
+
+// CHECK-LABEL: === @memchr
+// CHECK-DAG: [[BUF:n[0-9]+]] [Stack|Collapsed|Ref] size=16 origins={stack(cir.alloca 'buf' {{.*}})} links={} reasons={Collapsed: CollapsedAt(cir.libc.memchr {{.*}}, "pointer into the searched range")}
+// CHECK-DAG: found -> [[BUF]]+0
+cir.func @memchr(%pattern: !s32i) {
+  %buf = cir.alloca "buf" align(8) : !cir.ptr<!cir.array<!u8i x 16>>
+  %s = cir.cast bitcast %buf : !cir.ptr<!cir.array<!u8i x 16>> -> !cir.ptr<!void>
+  %len = cir.const #cir.int<16> : !u64i
+  %r = cir.libc.memchr(%s, %pattern, %len) : !cir.ptr<!void>, !s32i, !u64i
+  %r_tag = cir.cast bitcast %r : !cir.ptr<!void> -> !cir.ptr<!void> {test.ptr = "found"}
+  cir.return
+}
+}

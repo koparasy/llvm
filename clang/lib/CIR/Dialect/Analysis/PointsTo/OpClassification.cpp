@@ -51,7 +51,8 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.complex.imag_ptr", kHandled}, // Constant offset.
     {"cir.complex.real_ptr", kHandled}, // Constant offset.
     {"cir.condition", kHandled},        // RegionBranchTerminatorOpInterface.
-    {"cir.const", kHandled}, // Null: no cell; the rest is pessimistic.
+    {"cir.const", kHandled}, // Null, global_view, absolute, aggregates.
+    {"cir.copy", kHandled},  // Typed slots + byte-range closure.
     {"cir.coro.suspend_point", kHandled}, // RegionBranchTerminatorOpInterface.
     {"cir.coroutine", kHandled},          // RegionBranchOpInterface.
     {"cir.derived_class_addr", kHandled}, // Constant offset.
@@ -66,12 +67,17 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.get_global", kHandled},         // Global/Function node per symbol.
     {"cir.get_member", kHandled},         // Constant offset.
     {"cir.get_runtime_member", kHandled}, // Collapse.
+    {"cir.global", kHandled},             // Module level: GlobalNodes reads it.
     {"cir.if", kHandled},                 // RegionBranchOpInterface.
     {"cir.indirect_br", kHandled},        // BranchOpInterface.
     {"cir.insert_member", kHandled},      // Aggregate slots.
     {"cir.launder", kHandled},            // Identity.
+    {"cir.libc.memchr", kHandled},        // Collapse the source.
+    {"cir.libc.memcpy", kHandled},        // Byte-range closure.
+    {"cir.libc.memmove", kHandled},       // Byte-range closure.
     {"cir.libc.memset", kHandled},     // Mod; a byte pattern makes no pointer.
     {"cir.load", kHandled},            // Link / aggregate slots.
+    {"cir.local_init", kHandled},      // Its regions are walked.
     {"cir.ptr_mask", kHandled},        // Collapse.
     {"cir.ptr_stride", kHandled},      // Offset or array.
     {"cir.resume", kHandled},          // RegionBranchTerminatorOpInterface.
@@ -79,6 +85,7 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.scope", kHandled},           // RegionBranchOpInterface.
     {"cir.select", kHandled},          // Unify.
     {"cir.set_bitfield", kHandled},    // Mod on an integer.
+    {"cir.std.strlen", kHandled},      // Ref.
     {"cir.store", kHandled},           // Link / aggregate slots.
     {"cir.switch", kHandled},          // RegionBranchOpInterface.
     {"cir.switch.flat", kHandled},     // BranchOpInterface.
@@ -86,6 +93,7 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.try", kHandled},             // RegionBranchOpInterface.
     {"cir.try_call", kHandled},        // CallSiteRecord + BranchOpInterface.
     {"cir.vec.masked_load", kHandled}, // Ref; no pointer elements.
+    {"cir.vtable.get_vptr", kHandled}, // Identity (vptr at offset 0).
     {"cir.while", kHandled},           // RegionBranchOpInterface.
     {"cir.yield", kHandled},           // RegionBranchTerminatorOpInterface.
 
@@ -247,7 +255,6 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.block_address", kPessimistic},         // Label address.
     {"cir.catch_param", kPessimistic},           // TODO: exception objects.
     {"cir.construct_catch_param", kPessimistic}, // TODO: exception objects.
-    {"cir.copy", kPessimistic},                  // TODO(T05): cir.copy.
     {"cir.coro.intrinsic.alloc", kPessimistic},  // Coroutines.
     {"cir.coro.intrinsic.begin", kPessimistic},  // Coroutines.
     {"cir.coro.intrinsic.destroy", kPessimistic}, // Coroutines.
@@ -266,19 +273,13 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.end_cleanup", kPessimistic},            // TODO: exception objects.
     {"cir.frame_address", kPessimistic},          // Frame internals.
     {"cir.get_method", kPessimistic},             // TODO(T09): method pointers.
-    {"cir.global", kPessimistic},                 // TODO(T05): module level.
     {"cir.indirect_goto", kPessimistic},          // Label address.
     {"cir.init_catch_param", kPessimistic},       // TODO: exception objects.
-    {"cir.libc.memchr", kPessimistic},            // TODO(T06): result into src.
-    {"cir.libc.memcpy", kPessimistic},            // TODO(T05): memcpy family.
-    {"cir.libc.memmove", kPessimistic},           // TODO(T05): memcpy family.
-    {"cir.local_init", kPessimistic},             // TODO(T05): static locals.
     {"cir.resume.flat", kPessimistic},            // TODO: exception objects.
     {"cir.return_address", kPessimistic},         // Frame internals.
     {"cir.stackrestore", kPessimistic},           // Frame internals.
     {"cir.stacksave", kPessimistic},              // Frame internals.
     {"cir.std.find", kPessimistic},               // TODO(T06): library model.
-    {"cir.std.strlen", kPessimistic},             // TODO(T06): library model.
     {"cir.throw", kPessimistic},                  // TODO: exception objects.
     {"cir.try_throw", kPessimistic},              // TODO: exception objects.
     {"cir.va_arg", kPessimistic},                 // Varargs are not modelled.
@@ -288,7 +289,6 @@ static const OpClassEntry kOpClassificationTable[] = {
     {"cir.vtable.address_point", kPessimistic},   // TODO(T09): vtables.
     {"cir.vtable.get_type_info", kPessimistic},   // TODO(T09): vtables.
     {"cir.vtable.get_virtual_fn_addr", kPessimistic}, // TODO(T09): vtables.
-    {"cir.vtable.get_vptr", kPessimistic},            // TODO(T09): vtables.
     {"cir.vtt.address_point", kPessimistic},          // TODO(T09): vtables.
 };
 

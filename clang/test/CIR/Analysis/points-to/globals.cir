@@ -1,0 +1,185 @@
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Global nodes and their initializers. The first time a function graph makes
+// the node of a global, the pointer slots of the global's initializer are
+// linked to the nodes of the symbols they name (at the byte offset the
+// #cir.global_view indices give), transitively. A global that another TU can
+// write, or that is only declared, is External|Incomplete; a constant with an
+// initializer is trusted; a global with a ctor region is Incomplete.
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!fnty = !cir.func<(!s32i) -> !s32i>
+!rec_P = !cir.struct<"P" {data !cir.ptr<!s32i>, data !s32i, data !cir.ptr<!s32i>}>
+!rec_vt = !cir.struct<{data !cir.array<!cir.ptr<!u8i> x 4>}>
+
+module {
+cir.global "private" internal @arr = #cir.zero : !cir.array<!s32i x 4>
+cir.global "private" internal @other = #cir.int<7> : !s32i
+
+// &arr[2] is 8 bytes into @arr.
+cir.global "private" internal @p = #cir.global_view<@arr, [2]> : !cir.ptr<!s32i>
+
+// A record holding two pointers: &other at 0, &arr[1] at 16. The null
+// member links nothing.
+cir.global "private" internal @rec = #cir.const_record<{#cir.global_view<@other> : !cir.ptr<!s32i>, #cir.int<1> : !s32i, #cir.global_view<@arr, [1]> : !cir.ptr<!s32i>}> : !rec_P
+cir.global "private" internal @recnull = #cir.const_record<{#cir.ptr<null> : !cir.ptr<!s32i>, #cir.int<1> : !s32i, #cir.ptr<null> : !cir.ptr<!s32i>}> : !rec_P
+
+// A view of a record member: &rec.f2 is 16 bytes into @rec.
+cir.global "private" internal @pf = #cir.global_view<@rec, [2]> : !cir.ptr<!cir.ptr<!s32i>>
+
+// Two globals that point to each other.
+cir.global "private" internal @cyc_a = #cir.global_view<@cyc_b> : !cir.ptr<!u8i>
+cir.global "private" internal @cyc_b = #cir.global_view<@cyc_a> : !cir.ptr<!u8i>
+
+// CHECK-LABEL: === @pointer_globals
+// CHECK-DAG: [[P:n[0-9]+]] [Global|Ref] size=8 origins={global(@p)} links={0->[[ARR:n[0-9]+]]+8}
+// CHECK-DAG: [[ARR]] [Global] size=16 origins={global(@arr)} links={}
+// CHECK-DAG: [[REC:n[0-9]+]] [Global|Ref] size=24 origins={global(@rec)} links={0->[[OTHER:n[0-9]+]]+0, 16->[[ARR]]+4}
+// CHECK-DAG: [[OTHER]] [Global] size=4 origins={global(@other)} links={}
+// CHECK-DAG: [[RECNULL:n[0-9]+]] [Global] size=24 origins={global(@recnull)} links={}
+// CHECK-DAG: [[PF:n[0-9]+]] [Global] size=8 origins={global(@pf)} links={0->[[REC]]+16}
+// CHECK-DAG: [[CA:n[0-9]+]] [Global] size=8 origins={global(@cyc_a)} links={0->[[CB:n[0-9]+]]+0}
+// CHECK-DAG: [[CB]] [Global] size=8 origins={global(@cyc_b)} links={0->[[CA]]+0}
+// CHECK-DAG: loaded -> [[ARR]]+8
+// CHECK-DAG: field -> [[ARR]]+4
+cir.func @pointer_globals() {
+  %p = cir.get_global @p : !cir.ptr<!cir.ptr<!s32i>>
+  %v = cir.load %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %v_tag = cir.cast bitcast %v : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "loaded"}
+  %r = cir.get_global @rec : !cir.ptr<!rec_P>
+  %f2 = cir.get_member %r[2] {name = "f2"} : !cir.ptr<!rec_P> -> !cir.ptr<!cir.ptr<!s32i>>
+  %w = cir.load %f2 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %w_tag = cir.cast bitcast %w : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "field"}
+  %rn = cir.get_global @recnull : !cir.ptr<!rec_P>
+  %pf = cir.get_global @pf : !cir.ptr<!cir.ptr<!cir.ptr<!s32i>>>
+  %ca = cir.get_global @cyc_a : !cir.ptr<!cir.ptr<!u8i>>
+  cir.return
+}
+
+// A function pointer table: each slot links to a Function node.
+
+cir.func private @f1(!s32i) -> !s32i
+cir.func private @f2(!s32i) -> !s32i
+cir.global "private" internal @table = #cir.const_array<[#cir.global_view<@f1> : !cir.ptr<!fnty>, #cir.global_view<@f2> : !cir.ptr<!fnty>]> : !cir.array<!cir.ptr<!fnty> x 2>
+
+// CHECK-LABEL: === @function_table
+// CHECK-DAG: [[T:n[0-9]+]] [Global|Ref] size=16 origins={global(@table)} links={0->[[F1:n[0-9]+]]+0, 8->[[F2:n[0-9]+]]+0}
+// CHECK-DAG: [[F1]] [Function] size=0 origins={func(@f1)} links={}
+// CHECK-DAG: [[F2]] [Function] size=0 origins={func(@f2)} links={}
+// CHECK-DAG: call cir.call callee=[[F2]]+0 args={} result=null
+cir.func @function_table(%x: !s32i) -> !s32i {
+  %t = cir.get_global @table : !cir.ptr<!cir.array<!cir.ptr<!fnty> x 2>>
+  %one = cir.const #cir.int<1> : !s32i
+  %slot = cir.get_element %t[%one : !s32i] : !cir.ptr<!cir.array<!cir.ptr<!fnty> x 2>> -> !cir.ptr<!cir.ptr<!fnty>>
+  %fp = cir.load %slot : !cir.ptr<!cir.ptr<!fnty>>, !cir.ptr<!fnty>
+  %r = cir.call %fp(%x) : (!cir.ptr<!fnty>, !s32i) -> !s32i
+  cir.return %r : !s32i
+}
+
+// A vtable: its slots link to the RTTI object and to the virtual functions,
+// for the virtual-call resolution of the interprocedural phase.
+
+cir.func private @_ZN1A1fEv()
+cir.global "private" constant external @_ZTI1A : !cir.ptr<!u8i>
+cir.global constant linkonce_odr @_ZTV1A = #cir.vtable<{#cir.const_array<[#cir.ptr<null> : !cir.ptr<!u8i>, #cir.global_view<@_ZTI1A> : !cir.ptr<!u8i>, #cir.global_view<@_ZN1A1fEv> : !cir.ptr<!u8i>, #cir.ptr<null> : !cir.ptr<!u8i>]> : !cir.array<!cir.ptr<!u8i> x 4>}> : !rec_vt
+
+// CHECK-LABEL: === @vtable
+// CHECK-DAG: [[VT:n[0-9]+]] [Global] size=32 origins={global(@_ZTV1A)} links={8->[[TI:n[0-9]+]]+0, 16->[[FA:n[0-9]+]]+0}
+// CHECK-DAG: [[TI]] [Global|Incomplete|External] size=8 origins={global(@_ZTI1A)} links={} reasons={Incomplete: EscapedTo(cir.global {{.*}}, "global visible to other TUs"), External: EscapedTo(cir.global {{.*}}, "global visible to other TUs")}
+// CHECK-DAG: [[FA]] [Function] size=0 origins={func(@_ZN1A1fEv)} links={}
+// CHECK-DAG: vt -> [[VT]]+16
+cir.func @vtable() {
+  %v = cir.const #cir.global_view<@_ZTV1A, [0 : i32, 2 : i32]> : !cir.ptr<!u8i>
+  %v_tag = cir.cast bitcast %v : !cir.ptr<!u8i> -> !cir.ptr<!u8i> {test.ptr = "vt"}
+  cir.return
+}
+
+// An external declaration and a non-constant external definition are
+// flagged: another TU may define or write them.
+
+cir.global "private" external @ext_decl : !cir.ptr<!s32i>
+cir.global external @ext_def = #cir.global_view<@other> : !cir.ptr<!s32i>
+
+// CHECK-LABEL: === @external_globals
+// CHECK-DAG: [[DECL:n[0-9]+]] [Global|Incomplete|External] size=8 origins={global(@ext_decl)} links={} reasons={Incomplete: EscapedTo(cir.global {{.*}}, "global visible to other TUs"), External: EscapedTo(cir.global {{.*}}, "global visible to other TUs")}
+// CHECK-DAG: [[DEF:n[0-9]+]] [Global|Incomplete|External] size=8 origins={global(@ext_def)} links={0->[[OTHER:n[0-9]+]]+0} reasons={Incomplete: EscapedTo(cir.global {{.*}}, "global visible to other TUs"), External: EscapedTo(cir.global {{.*}}, "global visible to other TUs")}
+// CHECK-DAG: [[OTHER]] [Global] size=4 origins={global(@other)} links={}
+cir.func @external_globals() {
+  %d = cir.get_global @ext_decl : !cir.ptr<!cir.ptr<!s32i>>
+  %e = cir.get_global @ext_def : !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+// An external constant with an initializer is trusted: writing it is UB, and
+// its linkage does not let another definition replace the initializer. A
+// weak constant may be replaced at link time: flagged.
+
+cir.global constant external @ext_const = #cir.global_view<@other> : !cir.ptr<!s32i>
+cir.global constant weak @weak_const = #cir.global_view<@other> : !cir.ptr<!s32i>
+
+// CHECK-LABEL: === @external_constant
+// CHECK-DAG: [[C:n[0-9]+]] [Global] size=8 origins={global(@ext_const)} links={0->[[OTHER:n[0-9]+]]+0}
+// CHECK-DAG: [[W:n[0-9]+]] [Global|Incomplete|External] size=8 origins={global(@weak_const)} links={0->[[OTHER]]+0}
+// CHECK-DAG: [[OTHER]] [Global] size=4 origins={global(@other)} links={}
+cir.func @external_constant() {
+  %c = cir.get_global @ext_const : !cir.ptr<!cir.ptr<!s32i>>
+  %w = cir.get_global @weak_const : !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+// A global with a ctor region (dynamic initialization): the region is not
+// part of any function graph, so the node is Incomplete. A dtor region
+// likewise.
+
+cir.func private @make_ptr(!cir.ptr<!cir.ptr<!s32i>>)
+cir.global "private" internal @dyn = ctor : !cir.ptr<!s32i> {
+  %0 = cir.get_global @dyn : !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @make_ptr(%0) : (!cir.ptr<!cir.ptr<!s32i>>) -> ()
+}
+
+// CHECK-LABEL: === @ctor_global
+// CHECK-DAG: [[DYN:n[0-9]+]] [Global|Incomplete] size=8 origins={global(@dyn)} links={} reasons={Incomplete: UnknownCaller(cir.global {{.*}}, "dynamic initialization not analysed")}
+cir.func @ctor_global() {
+  %d = cir.get_global @dyn : !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+// Pointer constants in a function: a view with indices, an absolute address
+// (an unknown object), an alias (the node of its aliasee) and a symbol
+// address held as an integer (the node escapes).
+
+cir.global "private" internal @esc = #cir.int<0> : !s32i
+cir.global external @al alias(@arr) : !cir.array<!s32i x 4>
+
+// CHECK-LABEL: === @pointer_constants
+// CHECK-DAG: [[ARR:n[0-9]+]] [Global] size=16 origins={global(@arr)} links={}
+// CHECK-DAG: [[ABS:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: EscapedTo(cir.const {{.*}}, "absolute address"), External: EscapedTo(cir.const {{.*}}, "absolute address")}
+// CHECK-DAG: [[ESC:n[0-9]+]] [Global|External] size=4 origins={global(@esc)} links={} reasons={External: EscapedTo(cir.const {{.*}}, "address escaped as an integer")}
+// CHECK-DAG: view -> [[ARR]]+12
+// CHECK-DAG: abs -> [[ABS]]+0
+// CHECK-DAG: alias -> [[ARR]]+0
+cir.func @pointer_constants() {
+  %v = cir.const #cir.global_view<@arr, [3]> : !cir.ptr<!s32i>
+  %v_tag = cir.cast bitcast %v : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "view"}
+  %a = cir.const #cir.ptr<4096 : i64> : !cir.ptr<!s32i>
+  %a_tag = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "abs"}
+  %al = cir.get_global @al : !cir.ptr<!cir.array<!s32i x 4>>
+  %al_tag = cir.cast bitcast %al : !cir.ptr<!cir.array<!s32i x 4>> -> !cir.ptr<!cir.array<!s32i x 4>> {test.ptr = "alias"}
+  %i = cir.const #cir.global_view<@esc> : !s64i
+  cir.return
+}
+
+// An aggregate constant: one slot per pointer it holds.
+
+// CHECK-LABEL: === @aggregate_constant
+// CHECK-DAG: [[OTHER:n[0-9]+]] [Global] size=4 origins={global(@other)} links={}
+// CHECK-DAG: [[ARR:n[0-9]+]] [Global] size=16 origins={global(@arr)} links={}
+// CHECK-DAG: agg -> {0: [[OTHER]]+0, 16: [[ARR]]+8}
+cir.func @aggregate_constant() {
+  %c = cir.const #cir.const_record<{#cir.global_view<@other> : !cir.ptr<!s32i>, #cir.int<1> : !s32i, #cir.global_view<@arr, [2]> : !cir.ptr<!s32i>}> : !rec_P
+  %c_tag = cir.freeze %c : !rec_P {test.ptr = "agg"}
+  cir.return
+}
+}
