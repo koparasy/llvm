@@ -3956,6 +3956,64 @@ static int paramIndexOfClass(const FunctionDecl *fd,
   return -1;
 }
 
+/// Whether parameter \p index of `fd` is a pointer.
+static bool isPointerParam(const FunctionDecl *fd, unsigned index) {
+  return index < fd->getNumParams() &&
+         fd->getParamDecl(index)->getType()->isPointerType();
+}
+
+/// Whether parameter \p index of `fd` is a sycl::accessor (by value or
+/// reference).
+static bool isAccessorParam(const FunctionDecl *fd, unsigned index) {
+  return index < fd->getNumParams() &&
+         isClassInNamespace(paramRecord(fd->getParamDecl(index)->getType()),
+                            "sycl", "accessor");
+}
+
+/// The role of an explicit memory command of the queue or handler class
+/// (`prefix` is "queue." or "handler."): memcpy, copy, memset and fill, by
+/// the shape of their first two parameters. Empty for the other overloads
+/// (device_global, shared_ptr) and other members.
+static llvm::StringRef
+getSYCLMemoryCommandRole(const CXXMethodDecl *md, bool isHandler,
+                         unsigned &argIndex,
+                         std::optional<unsigned> &srcIndex) {
+  bool p0 = isPointerParam(md, 0), p1 = isPointerParam(md, 1);
+  if (isNamed(md, "memcpy") && p0 && p1) {
+    argIndex = 0;
+    srcIndex = 1;
+    return isHandler ? "handler.memcpy" : "queue.memcpy";
+  }
+  if (isNamed(md, "memset") && p0)
+    return isHandler ? "handler.memset" : "queue.memset";
+  if (isNamed(md, "fill")) {
+    if (p0)
+      return isHandler ? "handler.fill" : "queue.fill";
+    if (isHandler && isAccessorParam(md, 0))
+      return "handler.fill_accessor";
+    return {};
+  }
+  if (!isNamed(md, "copy"))
+    return {};
+  bool a0 = isAccessorParam(md, 0), a1 = isAccessorParam(md, 1);
+  llvm::StringRef role;
+  if (p0 && p1)
+    role = isHandler ? "handler.copy" : "queue.copy";
+  else if (!isHandler)
+    return {};
+  else if (a0 && p1)
+    role = "handler.copy_from_accessor";
+  else if (p0 && a1)
+    role = "handler.copy_to_accessor";
+  else if (a0 && a1)
+    role = "handler.copy_accessors";
+  else
+    return {};
+  argIndex = 1;
+  srcIndex = 0;
+  return role;
+}
+
 /// The role of a SYCL host API function the offload combine and the points-to
 /// analysis trace buffer and accessor identity and kernel launches through
 /// (see KernelBindingTable), or empty. On the host the SYCL classes carry no
@@ -3972,10 +4030,14 @@ static int paramIndexOfClass(const FunctionDecl *fd,
 ///   buffer.reinterpret  buffer::reinterpret: the source's storage
 ///   buffer.assign       buffer::operator=
 ///   buffer.get_access   buffer::get_access(handler &, ...): a device accessor
+///   buffer.dtor         buffer destructor: drops a reference; the last one
+///                       may write the storage back to the host memory
 ///   accessor.from_buffer  accessor(buffer &, ...)
 ///   accessor.copy       accessor copy/move constructor
 ///   accessor.assign     accessor::operator=
 ///   accessor.other      any other accessor constructor
+///   accessor.dtor       accessor, host_accessor and local_accessor
+///                       destructors: drop a reference
 ///   vector.data         std::vector::data
 /// Kernel launch (arg: the command-group or kernel function object, found as
 /// the last lambda or non-SYCL class parameter unless stated otherwise; an
@@ -4021,11 +4083,33 @@ static int paramIndexOfClass(const FunctionDecl *fd,
 ///                       ext::oneapi::experimental (memory pools); arg: the
 ///                       size or count
 ///   usm.free            sycl::free; arg 0, the pointer
+/// Explicit memory commands (arg: the destination; for a copy, arg2 the
+/// source; a pointer parameter unless the role names an accessor; the
+/// device_global and shared_ptr overloads are untagged):
+///   queue.memcpy        queue::memcpy(dest, src, n, ...); arg 0, arg2 1
+///   queue.copy          queue::copy(src, dest, count, ...); arg 1, arg2 0
+///   queue.memset        queue::memset(ptr, value, n, ...); arg 0
+///   queue.fill          queue::fill(ptr, pattern, count, ...); arg 0
+///   handler.memcpy      handler::memcpy(dest, src, n); arg 0, arg2 1
+///   handler.copy        handler::copy(src, dest, count); arg 1, arg2 0
+///   handler.copy_from_accessor  handler::copy(accessor src, dest *);
+///                       arg 1, arg2 0
+///   handler.copy_to_accessor  handler::copy(const src *, accessor dest);
+///                       arg 1, arg2 0
+///   handler.copy_accessors  handler::copy(accessor src, accessor dest);
+///                       arg 1, arg2 0
+///   handler.memset      handler::memset(ptr, value, n); arg 0
+///   handler.fill        handler::fill(ptr, pattern, count); arg 0
+///   handler.fill_accessor  handler::fill(accessor dest, pattern); arg 0
+/// queue::wait and event::wait are untagged: they take no user pointer (the
+/// asynchronous accesses they synchronize with are the models' concern).
 /// `argIndex` receives the source-level parameter index (not counting `this`)
 /// of the buffer, accessor, host pointer, function object or other operand
-/// the role reads, where it has one.
-llvm::StringRef CIRGenModule::getSYCLHostAPIRole(const FunctionDecl *fd,
-                                                 unsigned &argIndex) {
+/// the role reads, where it has one; `srcIndex` the source operand of a
+/// two-operand memory command (`cir.sycl_host_api_arg2`).
+llvm::StringRef
+CIRGenModule::getSYCLHostAPIRole(const FunctionDecl *fd, unsigned &argIndex,
+                                 std::optional<unsigned> &srcIndex) {
   // A role whose argument index was searched for: untagged if not found.
   auto withArg = [&](llvm::StringRef role, int index) -> llvm::StringRef {
     if (index < 0)
@@ -4072,6 +4156,10 @@ llvm::StringRef CIRGenModule::getSYCLHostAPIRole(const FunctionDecl *fd,
   const CXXRecordDecl *rd = md->getParent();
 
   if (isClassInNamespace(rd, "sycl", "queue")) {
+    if (llvm::StringRef role = getSYCLMemoryCommandRole(md, /*isHandler=*/false,
+                                                        argIndex, srcIndex);
+        !role.empty())
+      return role;
     if (isNamed(md, "submit"))
       return withArg("queue.submit", functorParamIndex(md));
     if (isNamedOneOf(md, {"parallel_for", "single_task"}))
@@ -4093,6 +4181,10 @@ llvm::StringRef CIRGenModule::getSYCLHostAPIRole(const FunctionDecl *fd,
       return withArg("handler.kernel", functorParamIndex(md));
     if (isNamedOneOf(md, {"parallel_for_lambda_impl", "parallel_for_impl"}))
       return withArg("handler.kernel_impl", functorParamIndex(md));
+    if (llvm::StringRef role = getSYCLMemoryCommandRole(md, /*isHandler=*/true,
+                                                        argIndex, srcIndex);
+        !role.empty())
+      return role;
     if (md->getNumParams() == 0)
       return {};
     if (isNamed(md, "wrap_kernel"))
@@ -4138,6 +4230,16 @@ llvm::StringRef CIRGenModule::getSYCLHostAPIRole(const FunctionDecl *fd,
   }
   const auto *ctor = dyn_cast<CXXConstructorDecl>(md);
   bool isAssign = md->getOverloadedOperator() == OO_Equal;
+
+  if (isa<CXXDestructorDecl>(md)) {
+    if (isClassInNamespace(rd, "sycl", "buffer"))
+      return "buffer.dtor";
+    if (isClassInNamespace(rd, "sycl", "accessor") ||
+        isClassInNamespace(rd, "sycl", "host_accessor") ||
+        isClassInNamespace(rd, "sycl", "local_accessor"))
+      return "accessor.dtor";
+    return {};
+  }
 
   if (isClassInNamespace(rd, "std", "vector"))
     return md->getIdentifier() && md->getName() == "data" ? "vector.data" : "";
@@ -4270,12 +4372,16 @@ cir::FuncOp CIRGenModule::getOrCreateCIRFunction(
 
   if (getLangOpts().SYCLIsHost && funcDecl) {
     unsigned argIndex = 0;
-    llvm::StringRef role = getSYCLHostAPIRole(funcDecl, argIndex);
+    std::optional<unsigned> srcIndex;
+    llvm::StringRef role = getSYCLHostAPIRole(funcDecl, argIndex, srcIndex);
     if (!role.empty()) {
       funcOp->setAttr(cir::CIRDialect::getSYCLHostAPIAttrName(),
                       builder.getStringAttr(role));
       funcOp->setAttr(cir::CIRDialect::getSYCLHostAPIArgAttrName(),
                       builder.getI32IntegerAttr(argIndex));
+      if (srcIndex)
+        funcOp->setAttr(cir::CIRDialect::getSYCLHostAPIArg2AttrName(),
+                        builder.getI32IntegerAttr(*srcIndex));
     }
   }
 

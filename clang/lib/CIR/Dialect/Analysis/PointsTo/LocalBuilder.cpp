@@ -1579,7 +1579,7 @@ void cir::pointsto::recordMemTransfer(FunctionGraph &fg, Operation *op,
 
 void cir::pointsto::recordMemTransfer(
     Graph &graph, SmallVectorImpl<MemTransferRecord> &transfers, Operation *op,
-    Cell dst, Cell src, std::optional<int64_t> length) {
+    Cell dst, Cell src, std::optional<int64_t> length, bool ghosts) {
   graph.addFlags(dst, NodeFlags::Mod);
   graph.addFlags(src, NodeFlags::Ref);
   // Like cir.copy over the bytes [0, length), without a type: done by the
@@ -1594,7 +1594,8 @@ void cir::pointsto::recordMemTransfer(
   }
   transfers.push_back(
       {op, dst, src,
-       length ? static_cast<uint64_t>(*length) : MemTransferRecord::kUnknown});
+       length ? static_cast<uint64_t>(*length) : MemTransferRecord::kUnknown,
+       ghosts});
 }
 
 void LocalBuilder::visitMemTransfer(Operation *op, Value dstValue,
@@ -1913,7 +1914,7 @@ struct TransferApplier {
     return changed;
   }
 
-  bool apply() { return applyLinks() | applyGhosts(); }
+  bool apply() { return applyLinks() | (record.ghosts && applyGhosts()); }
 
   bool applyLinks() {
     Cell dst = record.dst.resolve(), src = record.src.resolve();

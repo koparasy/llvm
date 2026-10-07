@@ -492,8 +492,8 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
   }
 
   for (const MemTransferRecord &record : fg->memTransfers)
-    memTransfers.push_back(
-        {record.op, map(record.dst), map(record.src), record.length});
+    memTransfers.push_back({record.op, map(record.dst), map(record.src),
+                            record.length, record.ghosts});
   for (const LaunchRecord &local : fg->launches) {
     LaunchRecord launch = local;
     launch.closure = mapOpt(local.closure);

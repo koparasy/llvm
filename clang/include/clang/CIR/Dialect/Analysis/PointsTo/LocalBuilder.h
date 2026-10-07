@@ -99,6 +99,11 @@ struct MemTransferRecord {
   Cell dst;
   Cell src;
   uint64_t length = 0;
+  /// Whether the ghost links in the range are copied too (a byte copy of a
+  /// handle is the same handle). False for a model that relates the contents
+  /// of two objects whose ghosts describe different things (a SYCL buffer's
+  /// storage and host memory).
+  bool ghosts = true;
 };
 
 /// Apply the copies \p transfers to \p graph until no link changes (see
@@ -120,11 +125,12 @@ bool closeMemTransfers(Graph &graph,
 /// cir.libc.memmove and the memcpy-family library models.
 void recordMemTransfer(FunctionGraph &fg, mlir::Operation *op, Cell dst,
                        Cell src, std::optional<int64_t> length);
-/// The same on \p graph, appending the record to \p transfers.
+/// The same on \p graph, appending the record to \p transfers; \p ghosts as
+/// in MemTransferRecord.
 void recordMemTransfer(Graph &graph,
                        llvm::SmallVectorImpl<MemTransferRecord> &transfers,
                        mlir::Operation *op, Cell dst, Cell src,
-                       std::optional<int64_t> length);
+                       std::optional<int64_t> length, bool ghosts = true);
 
 /// How the local phase treated a call.
 enum class CallKind : uint8_t {

@@ -687,8 +687,10 @@ ModRefResult PointsToAnalysis::getCallModRef(Operation *call,
     return ModRefResult::getModAndRef();
   // SOUNDNESS: a USM allocation is also accessed by device code, which runs
   // asynchronously and is synchronized with by calls (a wait, an event, the
-  // next command) whose arguments need not reach the allocation.
-  if (node->hasFlags(NodeFlags::HasUSM))
+  // next command) whose arguments need not reach the allocation. So is the
+  // memory an asynchronous command reads or writes (AsyncAccess).
+  if (node->hasFlags(NodeFlags::HasUSM) ||
+      node->hasFlags(NodeFlags::AsyncAccess))
     return ModRefResult::getModAndRef();
   // SOUNDNESS: a call (and everything it calls) reaches an existing object
   // only through a pointer: one it is passed, one it loads from memory it

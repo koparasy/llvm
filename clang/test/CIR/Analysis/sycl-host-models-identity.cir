@@ -205,9 +205,9 @@ module attributes {cir.offload.container} {
 // vectors: their storages are one node. Legacy reads each call's own operand.
 // Context-sensitive cloning (T17) separates them.
 // PT-LABEL: === launches
-// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H:n[0-9]+]]+0 [Mod|Ref] complete
-// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H]]+0
-// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H]]+0
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H:n[0-9]+]]+0 [Mod|Ref] complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H]]+0
+// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H]]+0
 // PT-NEXT: same A B
 // PT-NEXT: same A C
 // PT-NEXT: same B C
@@ -736,9 +736,9 @@ module attributes {cir.offload.container} {
 // Agree (not no-alias). Points-to: v.mid is a constant stride into the same vector
 // storage node, so C is the same memory; legacy: unknown provenance.
 // PT-LABEL: === launches
-// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H:n[0-9]+]]+0
-// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H]]+0
-// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H]]+0
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H:n[0-9]+]]+0
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H]]+0
+// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H]]+0
 // PT-NEXT: same A B
 // PT-NEXT: same A C
 // PT-NEXT: same B C
@@ -830,7 +830,7 @@ module attributes {cir.offload.container} {
 // Agree.
 // PT-LABEL: === launches
 // PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
-// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[U2:n[0-9]+]]+0 [Heap|Summary|Mod|Ref|HasUSM] complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[U2:n[0-9]+]]+0 [Heap|Summary|Mod|Ref|HasUSM] complete
 // PT-NEXT: field P pointer target=[[U1:n[0-9]+]]+0 [Heap|Summary|Ref|HasUSM] complete
 // PT-NEXT: no-alias A B P
 
@@ -910,7 +910,7 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note A: 'A' and 'P' use the same memory, buffer 'ba' over a USM allocation
 // Agree.
 // PT-LABEL: === launches
-// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[U:n[0-9]+]]+0
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[U:n[0-9]+]]+0
 // PT-NEXT: field P pointer target=[[U]]+0
 // PT-NEXT: same A P
 // PT-NEXT: no-alias{{$}}

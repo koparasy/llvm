@@ -153,10 +153,11 @@ public:
   }
 
   /// Record a copy of \p length bytes (std::nullopt: unknown) from \p src to
-  /// \p dst, like cir.libc.memcpy (see recordMemTransfer).
+  /// \p dst, like cir.libc.memcpy (see recordMemTransfer); without the ghost
+  /// links if not \p ghosts.
   void addMemTransfer(const CallSiteRecord &site, Cell dst, Cell src,
-                      std::optional<int64_t> length) {
-    recordMemTransfer(graph, memTransfers, site.call, dst, src, length);
+                      std::optional<int64_t> length, bool ghosts = true) {
+    recordMemTransfer(graph, memTransfers, site.call, dst, src, length, ghosts);
   }
 
 private:

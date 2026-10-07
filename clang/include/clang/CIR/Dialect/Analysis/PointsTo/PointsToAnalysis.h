@@ -359,7 +359,8 @@ public:
   ///    name; otherwise Ref if no code ever writes the node, Mod if none
   ///    ever reads it, and ModRef if both (context-insensitive, so coarse).
   ///    A HasUSM node (a USM allocation, which device code may access while
-  ///    the host runs) is ModRef for every call;
+  ///    the host runs) or AsyncAccess node (memory an asynchronous command
+  ///    accesses) is ModRef for every call;
   ///  - any other op: NoModRef if it has no memory effect but allocation,
   ///    ModRef otherwise.
   mlir::ModRefResult getModRef(mlir::Operation *op, mlir::Value location) const;

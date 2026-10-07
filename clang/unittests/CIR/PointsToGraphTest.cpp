@@ -466,6 +466,8 @@ TEST(PointsToGraphTest, FlagsOriginsReasons) {
   EXPECT_EQ(toString(NodeFlags::None), "");
   EXPECT_EQ(toString(NodeFlags::Heap | NodeFlags::Summary | NodeFlags::HasUSM),
             "Heap|Summary|HasUSM");
+  EXPECT_EQ(toString(NodeFlags::Stack | NodeFlags::AsyncAccess),
+            "Stack|AsyncAccess");
 }
 
 //===----------------------------------------------------------------------===//

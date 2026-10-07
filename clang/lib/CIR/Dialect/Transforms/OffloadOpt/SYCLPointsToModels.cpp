@@ -46,6 +46,9 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/MathExtras.h"
+
+#include <algorithm>
 
 using namespace mlir;
 using namespace cir;
@@ -442,8 +445,15 @@ protected:
     if (kind == Kind::HostPtr)
       if (std::optional<Cell> host = ModelContext::getArg(site, self + 1)) {
         graph.setGhostLink(storage, getSYCLHostField(), *host);
-        // The runtime reads it, and writes it back on destruction.
+        // The runtime reads it, and writes it back on destruction
+        // (`sec:buf-sync-rules`, PI 6019-6021): the storage's contents are
+        // the host memory's, so the pointers a memory command copies into or
+        // out of the storage (the storage node's links) are related to the
+        // host memory's. The transfer closure relates both directions; the
+        // ghost links describe the objects, not their contents.
         ctx.modRef(host, /*mod=*/true, /*ref=*/true);
+        ctx.addMemTransfer(site, storage, *host, std::nullopt,
+                           /*ghosts=*/false);
         written.push_back(self + 1);
       }
     graph.setGhostLink(*handle, getSYCLStorageField(), storage);
@@ -802,6 +812,242 @@ protected:
   }
 };
 
+/// buffer.dtor, accessor.dtor: a handle destructor.
+///
+/// SPEC (`sec:buf-sync-rules`, PI 5979-6087): "When a buffer value is
+/// destroyed, the reference count is decremented"; only the last reference
+/// destroys the buffer, which for a buffer constructed from hostData "will
+/// block until all work in queues on the buffer have completed, then copy
+/// the contents of the buffer back to the host memory (if required)"
+/// (PI 6019-6021). An accessor is a reference to its buffer (reference
+/// semantics, PI 295-330); destroying it only drops that reference. So the
+/// destructor reads the handle and keeps nothing: no escape. A buffer's
+/// write-back writes the storage's `$host` memory: Mod on it. The buffer
+/// constructor already set Mod and Ref on that memory and related its
+/// contents to the storage's (see BufferCtorModel), so the effect holds even
+/// where the storage is only known after binding; the call reaches it through
+/// the handle's `$storage` and `$host` ghost links. A buffer whose write-back
+/// target set_final_data changed has escaped to that (unmodelled) call.
+class HandleDtorModel : public RoleModel {
+public:
+  HandleDtorModel(StringRef role, StringRef citation, bool isBuffer)
+      : RoleModel(role, citation), isBuffer(isBuffer) {}
+
+protected:
+  bool applyRole(CallSiteRecord &site, ModelContext &ctx,
+                 cir::FuncOp callee) const override {
+    unsigned self = hasSRet(callee) ? 1 : 0;
+    std::optional<Cell> handle = ModelContext::getArg(site, self);
+    if (!handle || site.result || site.resultSlots)
+      return false;
+    Graph &graph = ctx.getGraph();
+    if (isBuffer)
+      if (std::optional<Cell> storage =
+              graph.lookupGhostLink(*handle, getSYCLStorageField()))
+        if (std::optional<Cell> host =
+                graph.lookupGhostLink(*storage, getSYCLHostField()))
+          ctx.modRef(host, /*mod=*/true, /*ref=*/true);
+    refOperands(site, ctx);
+    return true;
+  }
+
+private:
+  bool isBuffer;
+};
+
+/// The explicit memory commands of the queue and the handler.
+///
+/// SPEC (`subsec:explicitmemory`, PI 15326-15540, table.members.handler.copy;
+/// the queue shortcuts, PI 4458-4620, are "equivalent to calling
+/// queue::submit with a command group function that calls" the handler
+/// form):
+///  - handler::memcpy "copies numBytes of data from the pointer src to the
+///    pointer dest"; handler::copy(src, dest, count) copies count elements
+///    of T; an accessor copy "copies the contents of the memory object
+///    accessed by src into the memory pointed to by dest" (and back, and
+///    between two accessors);
+///  - memset "fills numBytes bytes of memory beginning at address ptr with
+///    value"; fill "replicates the provided pattern into the memory at
+///    address ptr" (or into the memory object an accessor accesses).
+/// The runtime copies bytes and keeps no pointer to user memory: a copy is a
+/// byte-range transfer (like memcpy, C17 6.2.6.1p4: a pointer copied
+/// byte-wise is a pointer) with Mod on the destination and Ref on the
+/// source, and nothing escapes. A fill relates the pattern's pointer slots
+/// to every element of the destination. An accessor side is its buffer's
+/// `$storage` (whose contents the storage node's links stand for; its ghost
+/// links are not contents and are not copied). The
+/// command runs asynchronously, after the call returns and until a later
+/// call synchronizes with it (an event or queue wait), so the host memory it
+/// reads or writes is AsyncAccess: ModRef for every call. The returned event
+/// is a fresh runtime object.
+class MemoryCommandModel : public RoleModel {
+public:
+  enum class Kind {
+    Copy,         // (dest, src) pointers
+    Set,          // (ptr, int value, n)
+    Fill,         // (ptr, const T &pattern, count)
+    FromAccessor, // (accessor src, dest *)
+    ToAccessor,   // (const src *, accessor dest)
+    Accessors,    // (accessor src, accessor dest)
+    FillAccessor, // (accessor dest, const T &pattern)
+  };
+  MemoryCommandModel(StringRef role, StringRef citation, Kind kind)
+      : RoleModel(role, citation), kind(kind) {}
+
+protected:
+  bool applyRole(CallSiteRecord &site, ModelContext &ctx,
+                 cir::FuncOp callee) const override {
+    if (!callee)
+      return false;
+    bool sret = hasSRet(callee);
+    // The memory commands are methods: past `sret` and `this`, the source
+    // parameters before the destination and source are pointers (an accessor
+    // passed by value is passed by address), so the role's indices map
+    // directly onto the operands.
+    unsigned first = (sret ? 1 : 0) + 1;
+    auto roleOperand = [&](StringRef attrName) -> std::optional<unsigned> {
+      auto attr = callee->getAttrOfType<IntegerAttr>(attrName);
+      if (!attr)
+        return std::nullopt;
+      unsigned index = first + attr.getInt();
+      if (index >= site.args.size())
+        return std::nullopt;
+      return index;
+    };
+    std::optional<unsigned> dstIndex =
+        roleOperand(CIRDialect::getSYCLHostAPIArgAttrName());
+    if (!dstIndex)
+      return false;
+    bool hasSource = kind == Kind::Copy || kind == Kind::FromAccessor ||
+                     kind == Kind::ToAccessor || kind == Kind::Accessors;
+    std::optional<unsigned> srcIndex;
+    if (hasSource) {
+      srcIndex = roleOperand(CIRDialect::getSYCLHostAPIArg2AttrName());
+      if (!srcIndex || *srcIndex == *dstIndex)
+        return false;
+    }
+    if (!sret && (site.result || site.resultSlots))
+      return false;
+
+    Graph &graph = ctx.getGraph();
+    bool dstIsAccessor = kind == Kind::ToAccessor || kind == Kind::Accessors ||
+                         kind == Kind::FillAccessor;
+    bool srcIsAccessor = kind == Kind::FromAccessor || kind == Kind::Accessors;
+    // The memory a side denotes: the pointer's object, or the storage of the
+    // accessor's buffer. Null pointers copy nothing (the runtime throws).
+    auto memoryOf = [&](unsigned index,
+                        bool isAccessor) -> std::optional<Cell> {
+      std::optional<Cell> cell = ModelContext::getArg(site, index);
+      if (!cell || !isAccessor)
+        return cell;
+      ctx.modRef(cell, /*mod=*/false, /*ref=*/true);
+      return graph.getGhostLink(
+          *cell, getSYCLStorageField(),
+          ctx.makeReason(site, Reason::Kind::MergedAt,
+                         (role + ": accessor storage").str()));
+    };
+    // Host memory a command accesses after the call returns.
+    auto async = [&](std::optional<Cell> cell, bool isAccessor) {
+      if (cell && !isAccessor)
+        graph.addFlags(*cell, NodeFlags::AsyncAccess);
+    };
+
+    std::optional<Cell> dst = memoryOf(*dstIndex, dstIsAccessor);
+    SmallVector<unsigned, 3> done{*dstIndex};
+    switch (kind) {
+    case Kind::Copy:
+    case Kind::FromAccessor:
+    case Kind::ToAccessor:
+    case Kind::Accessors: {
+      std::optional<Cell> src = memoryOf(*srcIndex, srcIsAccessor);
+      done.push_back(*srcIndex);
+      if (dst && src)
+        ctx.addMemTransfer(site, *dst, *src,
+                           copyLength(site, ctx, *dstIndex, *srcIndex),
+                           /*ghosts=*/!dstIsAccessor && !srcIsAccessor);
+      else
+        ctx.modRef(dst, /*mod=*/true, /*ref=*/false);
+      async(dst, dstIsAccessor);
+      async(src, srcIsAccessor);
+      break;
+    }
+    case Kind::Set:
+      ctx.modRef(dst, /*mod=*/true, /*ref=*/false);
+      async(dst, false);
+      break;
+    case Kind::Fill:
+    case Kind::FillAccessor: {
+      ctx.modRef(dst, /*mod=*/true, /*ref=*/false);
+      async(dst, dstIsAccessor);
+      // The pattern: `const T &`, after the destination.
+      unsigned patternIndex = *dstIndex + 1;
+      std::optional<Cell> pattern = ModelContext::getArg(site, patternIndex);
+      if (!pattern)
+        break;
+      done.push_back(patternIndex);
+      ctx.modRef(pattern, /*mod=*/false, /*ref=*/true);
+      async(pattern, false);
+      auto ptr = dyn_cast_if_present<cir::PointerType>(
+          getOperandType(site, patternIndex));
+      if (!dst || !ptr)
+        break;
+      Type elem = ptr.getPointee();
+      if (!isPointerValueType(elem) &&
+          getPointerSlotOffsets(elem, ctx.getDataLayout()).empty())
+        break;
+      // Every element of the destination holds the pattern's pointers.
+      uint64_t size = ctx.getDataLayout().getTypeSize(elem).getFixedValue();
+      if (size == 0)
+        break;
+      graph.markArray(dst->getNode(), size,
+                      ctx.makeReason(site, Reason::Kind::CollapsedAt,
+                                     (role + ": filled").str()));
+      ctx.addMemTransfer(site, *dst, *pattern, static_cast<int64_t>(size),
+                         /*ghosts=*/!dstIsAccessor);
+      break;
+    }
+    }
+    if (sret)
+      if (std::optional<Cell> event = ModelContext::getArg(site, 0)) {
+        setRuntimeInternals(site, ctx, 0, *event);
+        ctx.modRef(event, /*mod=*/true, /*ref=*/false);
+        done.push_back(0);
+      }
+    refOperands(site, ctx, done);
+    return true;
+  }
+
+private:
+  /// The bytes a pointer-to-pointer copy moves, if constant: memcpy's
+  /// numBytes, or copy's count times the size of the element type.
+  std::optional<int64_t> copyLength(const CallSiteRecord &site,
+                                    ModelContext &ctx, unsigned dstIndex,
+                                    unsigned srcIndex) const {
+    if (kind != Kind::Copy)
+      return std::nullopt;
+    // The count follows the two pointers.
+    std::optional<int64_t> count =
+        ctx.getConstantArg(site, std::max(dstIndex, srcIndex) + 1);
+    if (!count || role.ends_with(".memcpy"))
+      return count;
+    auto ptr =
+        dyn_cast_if_present<cir::PointerType>(getOperandType(site, dstIndex));
+    if (!ptr || isa<cir::VoidType>(ptr.getPointee()))
+      return std::nullopt;
+    int64_t bytes;
+    if (llvm::MulOverflow(
+            *count,
+            static_cast<int64_t>(ctx.getDataLayout()
+                                     .getTypeSize(ptr.getPointee())
+                                     .getFixedValue()),
+            bytes))
+      return std::nullopt;
+    return bytes;
+  }
+
+  Kind kind;
+};
+
 } // namespace
 
 void cir::registerSYCLPointsToModels(PointsToModelRegistry &registry) {
@@ -866,8 +1112,39 @@ void cir::registerSYCLPointsToModels(PointsToModelRegistry &registry) {
       std::make_unique<OtherAccessorModel>(
           "accessor.other",
           "SYCL 2020 table.accessors.command.buffer.constructors (PI 7802ff)"));
+  constexpr StringLiteral bufSync =
+      "SYCL 2020 sec:buf-sync-rules (PI 5979-6021)";
+  registry.addRoleModel(
+      "buffer.dtor", std::make_unique<HandleDtorModel>("buffer.dtor", bufSync,
+                                                       /*isBuffer=*/true));
+  registry.addRoleModel("accessor.dtor",
+                        std::make_unique<HandleDtorModel>(
+                            "accessor.dtor",
+                            "SYCL 2020 sec:reference-semantics (PI 295-330)",
+                            /*isBuffer=*/false));
   // vector.data is not modelled: its body is analysed, so a host pointer
   // reaches the vector's storage.
+
+  // Explicit memory commands.
+  using MemKind = MemoryCommandModel::Kind;
+  constexpr StringLiteral explicitMemory =
+      "SYCL 2020 subsec:explicitmemory (PI 15326-15540), queue shortcuts "
+      "(PI 4458-4620)";
+  for (auto [role, kind] :
+       {std::pair{StringLiteral("queue.memcpy"), MemKind::Copy},
+        {StringLiteral("queue.copy"), MemKind::Copy},
+        {StringLiteral("handler.memcpy"), MemKind::Copy},
+        {StringLiteral("handler.copy"), MemKind::Copy},
+        {StringLiteral("queue.memset"), MemKind::Set},
+        {StringLiteral("handler.memset"), MemKind::Set},
+        {StringLiteral("queue.fill"), MemKind::Fill},
+        {StringLiteral("handler.fill"), MemKind::Fill},
+        {StringLiteral("handler.copy_from_accessor"), MemKind::FromAccessor},
+        {StringLiteral("handler.copy_to_accessor"), MemKind::ToAccessor},
+        {StringLiteral("handler.copy_accessors"), MemKind::Accessors},
+        {StringLiteral("handler.fill_accessor"), MemKind::FillAccessor}})
+    registry.addRoleModel(
+        role, std::make_unique<MemoryCommandModel>(role, explicitMemory, kind));
 
   // USM.
   registry.addRoleModel(

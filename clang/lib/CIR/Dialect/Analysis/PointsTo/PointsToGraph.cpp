@@ -53,7 +53,7 @@ using namespace cir::pointsto;
 // NodeFlags
 //===----------------------------------------------------------------------===//
 
-static constexpr unsigned numFlagBits = 13;
+static constexpr unsigned numFlagBits = 14;
 
 StringRef cir::pointsto::getFlagName(NodeFlags bit) {
   switch (bit) {
@@ -83,6 +83,8 @@ StringRef cir::pointsto::getFlagName(NodeFlags bit) {
     return "Ref";
   case NodeFlags::HasUSM:
     return "HasUSM";
+  case NodeFlags::AsyncAccess:
+    return "AsyncAccess";
   default:
     return "?";
   }

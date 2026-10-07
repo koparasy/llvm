@@ -37,6 +37,7 @@ public:
   template <typename U> buffer<U, D> reinterpret(range<D> r) const;
   accessor<T, D> get_access(handler &h);
   range<D> get_range() const;
+  ~buffer();
 };
 template <typename T, int D> class accessor {
 public:
@@ -46,6 +47,17 @@ public:
   accessor();
   accessor &operator=(const accessor &other);
   T &operator[](unsigned long i) const;
+  ~accessor();
+};
+template <typename T, int D> class host_accessor : public accessor<T, D> {
+public:
+  host_accessor(buffer<T, D> &b);
+  ~host_accessor();
+};
+template <typename T, int D> class local_accessor {
+public:
+  local_accessor(const range<D> &r, handler &h);
+  ~local_accessor();
 };
 } // namespace _V1
 } // namespace sycl
@@ -54,6 +66,7 @@ namespace other {
 template <typename T, int D> class buffer {
 public:
   buffer(const sycl::range<D> &r);
+  ~buffer();
 };
 } // namespace other
 
@@ -79,6 +92,13 @@ public:
 // CHECK-NOT: @_ZNK4sycl3_V16bufferIfLi1EE9get_rangeEv(
 // CHECK-DAG: cir.func {{.*}}@_ZN5other6bufferIfLi1EEC1ERKN4sycl3_V15rangeILi1EEE(
 // CHECK-NOT: @_ZN5other6bufferIfLi1EEC1ERKN4sycl3_V15rangeILi1EEE(
+// The destructors are declared last; another class's is not tagged.
+// CHECK-DAG: cir.func {{.*}}@_ZN4sycl3_V16bufferIfLi1EED1Ev({{.*}} attributes {cir.sycl_host_api = "buffer.dtor", cir.sycl_host_api_arg = 0 : i32
+// CHECK-DAG: cir.func {{.*}}@_ZN4sycl3_V18accessorIfLi1EED1Ev({{.*}} attributes {cir.sycl_host_api = "accessor.dtor", cir.sycl_host_api_arg = 0 : i32
+// CHECK-DAG: cir.func {{.*}}@_ZN4sycl3_V113host_accessorIfLi1EED1Ev({{.*}} attributes {cir.sycl_host_api = "accessor.dtor", cir.sycl_host_api_arg = 0 : i32
+// CHECK-DAG: cir.func {{.*}}@_ZN4sycl3_V114local_accessorIfLi1EED1Ev({{.*}} attributes {cir.sycl_host_api = "accessor.dtor", cir.sycl_host_api_arg = 0 : i32
+// CHECK-DAG: cir.func {{.*}}@_ZN5other6bufferIfLi1EED1Ev(
+// CHECK-NOT: @_ZN5other6bufferIfLi1EED1Ev(
 void use(sycl::handler &h, std::vector<float> &v, int n) {
   sycl::range<1> r{{4}};
   sycl::id<1> o{{0}};
@@ -95,6 +115,8 @@ void use(sycl::handler &h, std::vector<float> &v, int n) {
   sycl::accessor<float, 1> w(x);
   sycl::accessor<float, 1> e;
   e = y;
+  sycl::host_accessor<float, 1> ha(b);
+  sycl::local_accessor<float, 1> la(r, h);
   (void)v.begin();
   (void)a.get_range();
   other::buffer<float, 1> ob(r);
@@ -107,11 +129,28 @@ void use(sycl::handler &h, std::vector<float> &v, int n) {
 // -> HostKernel -> setDeviceKernelInfo chain, and the queue shortcut
 // queue::parallel_for -> detail::submit_kernel_direct_parallel_for ->
 // HostKernelRef -> submit_kernel_direct_with_event_impl.
+namespace std {
+template <typename T> struct shared_ptr {
+  T *p;
+};
+} // namespace std
+
 namespace sycl {
 inline namespace _V1 {
 class handler;
 class kernel {};
-class event {};
+class event {
+public:
+  void wait();
+};
+template <typename T, int D> class accessor {
+public:
+  accessor(const accessor &other);
+  ~accessor();
+};
+namespace ext::oneapi::experimental {
+template <typename T> class device_global {};
+} // namespace ext::oneapi::experimental
 template <int D> struct range {
   unsigned long v[D];
   range(unsigned long a) { v[0] = a; }
@@ -219,6 +258,20 @@ public:
     StoreLambda<Kn>(k);
   }
   void parallel_for(range<1> r, kernel k);
+
+  // Explicit memory commands.
+  void memcpy(void *d, const void *s, unsigned long n);
+  template <typename T>
+  void memcpy(ext::oneapi::experimental::device_global<T> &d, const void *s,
+              unsigned long n);
+  void memset(void *p, int v, unsigned long n);
+  template <typename T> void fill(void *p, const T &pattern, unsigned long n);
+  template <typename T> void fill(accessor<T, 1> d, const T &pattern);
+  template <typename T> void copy(const T *s, T *d, unsigned long n);
+  template <typename T> void copy(accessor<T, 1> s, T *d);
+  template <typename T> void copy(const T *s, accessor<T, 1> d);
+  template <typename T> void copy(accessor<T, 1> s, accessor<T, 1> d);
+  template <typename T> void copy(accessor<T, 1> s, std::shared_ptr<T> d);
 };
 class queue {
   event submit_with_event_impl(const detail::type_erased_cgfo_ty &cgf) const;
@@ -239,6 +292,13 @@ public:
         *this, rv, hk, &detail::getDeviceKernelInfo<Kn>());
   }
   event memset(void *p, int v, unsigned long n);
+  event memcpy(void *d, const void *s, unsigned long n);
+  template <typename T>
+  event memcpy(ext::oneapi::experimental::device_global<T> &d, const void *s,
+               unsigned long n);
+  template <typename T> event fill(void *p, const T &pattern, unsigned long n);
+  template <typename T> event copy(const T *s, T *d, unsigned long n);
+  void wait();
 };
 void *malloc_device(unsigned long bytes, const queue &q);
 template <typename T> T *malloc_device(unsigned long count, const queue &q) {
@@ -296,6 +356,20 @@ template <int D> struct range {
 // LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V120aligned_alloc_sharedEmmRKNS0_5queueE({{.*}} attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 1 : i32
 // LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V14freeEPvRKNS0_5queueE({{.*}} attributes {cir.sycl_host_api = "usm.free", cir.sycl_host_api_arg = 0 : i32
 
+// Explicit memory commands; arg is the destination, arg2 the source.
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V15queue6memcpyEPvPKvm({{.*}} attributes {cir.sycl_host_api = "queue.memcpy", cir.sycl_host_api_arg = 0 : i32, cir.sycl_host_api_arg2 = 1 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V15queue6memsetEPvim({{.*}} attributes {cir.sycl_host_api = "queue.memset", cir.sycl_host_api_arg = 0 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V15queue4fillIiEENS0_5eventEPvRKT_m({{.*}} attributes {cir.sycl_host_api = "queue.fill", cir.sycl_host_api_arg = 0 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V15queue4copyIfEENS0_5eventEPKT_PS4_m({{.*}} attributes {cir.sycl_host_api = "queue.copy", cir.sycl_host_api_arg = 1 : i32, cir.sycl_host_api_arg2 = 0 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V17handler6memcpyEPvPKvm({{.*}} attributes {cir.sycl_host_api = "handler.memcpy", cir.sycl_host_api_arg = 0 : i32, cir.sycl_host_api_arg2 = 1 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V17handler6memsetEPvim({{.*}} attributes {cir.sycl_host_api = "handler.memset", cir.sycl_host_api_arg = 0 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V17handler4fillIPfEEvPvRKT_m({{.*}} attributes {cir.sycl_host_api = "handler.fill", cir.sycl_host_api_arg = 0 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V17handler4fillIfEEvNS0_8accessorIT_Li1EEERKS4_({{.*}} attributes {cir.sycl_host_api = "handler.fill_accessor", cir.sycl_host_api_arg = 0 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V17handler4copyIfEEvPKT_PS3_m({{.*}} attributes {cir.sycl_host_api = "handler.copy", cir.sycl_host_api_arg = 1 : i32, cir.sycl_host_api_arg2 = 0 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V17handler4copyIfEEvNS0_8accessorIT_Li1EEEPS4_({{.*}} attributes {cir.sycl_host_api = "handler.copy_from_accessor", cir.sycl_host_api_arg = 1 : i32, cir.sycl_host_api_arg2 = 0 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V17handler4copyIfEEvPKT_NS0_8accessorIS3_Li1EEE({{.*}} attributes {cir.sycl_host_api = "handler.copy_to_accessor", cir.sycl_host_api_arg = 1 : i32, cir.sycl_host_api_arg2 = 0 : i32
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V17handler4copyIfEEvNS0_8accessorIT_Li1EEES5_({{.*}} attributes {cir.sycl_host_api = "handler.copy_accessors", cir.sycl_host_api_arg = 1 : i32, cir.sycl_host_api_arg2 = 0 : i32
+
 // Not tagged: a launch without a function object (prebuilt sycl::kernel),
 // the non-template kernel-info lookup, the invoker trampoline, other queue
 // API, the HostKernel bases, and same-named functions outside sycl. UNTAGGED
@@ -306,8 +380,18 @@ template <int D> struct range {
 // UNTAGGED-NOT: @_ZN4sycl3_V16detail19getDeviceKernelInfoERKNS1_23CompileTimeKernelInfoTyE(
 // LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V16detail19type_erased_cgfo_ty7invokerI{{[^(]*}}4callEPKvS8_(
 // UNTAGGED-NOT: @_ZN4sycl3_V16detail19type_erased_cgfo_ty7invokerI{{[^(]*}}4callEPKvS8_(
-// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V15queue6memsetEPvim(
-// UNTAGGED-NOT: @_ZN4sycl3_V15queue6memsetEPvim(
+// The device_global and shared_ptr memory-command overloads and the waits
+// are untagged too.
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V15queue6memcpyIiEENS0_5eventERNS0_3ext6oneapi12experimental13device_globalIT_EEPKvm(
+// UNTAGGED-NOT: @_ZN4sycl3_V15queue6memcpyIiEENS0_5eventERNS0_3ext6oneapi12experimental13device_globalIT_EEPKvm(
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V17handler6memcpyIiEEvRNS0_3ext6oneapi12experimental13device_globalIT_EEPKvm(
+// UNTAGGED-NOT: @_ZN4sycl3_V17handler6memcpyIiEEvRNS0_3ext6oneapi12experimental13device_globalIT_EEPKvm(
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V17handler4copyIfEEvNS0_8accessorIT_Li1EEESt10shared_ptrIS4_E(
+// UNTAGGED-NOT: @_ZN4sycl3_V17handler4copyIfEEvNS0_8accessorIT_Li1EEESt10shared_ptrIS4_E(
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V15queue4waitEv(
+// UNTAGGED-NOT: @_ZN4sycl3_V15queue4waitEv(
+// LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V15event4waitEv(
+// UNTAGGED-NOT: @_ZN4sycl3_V15event4waitEv(
 // LAUNCH-DAG: cir.func {{.*}}@_ZN4sycl3_V16detail17HostKernelRefBaseC2Ev(
 // UNTAGGED-NOT: @_ZN4sycl3_V16detail17HostKernelRefBaseC2Ev(
 // LAUNCH-DAG: cir.func {{.*}}@_ZN5other13malloc_deviceEmRKN4sycl3_V15queueE(
@@ -318,7 +402,11 @@ class K1;
 class K2;
 class K3;
 class K4;
+sycl::accessor<float, 1> &someAccessor();
+sycl::ext::oneapi::experimental::device_global<int> &someDeviceGlobal();
 void launch(sycl::queue &q, sycl::kernel kobj) {
+  sycl::accessor<float, 1> &acc = someAccessor();
+  sycl::ext::oneapi::experimental::device_global<int> &dg = someDeviceGlobal();
   float *a = sycl::malloc_device<float>(16, q);
   void *b = sycl::aligned_alloc_shared(64, 16, q);
   void *c = other::malloc_device(16, q);
@@ -330,10 +418,27 @@ void launch(sycl::queue &q, sycl::kernel kobj) {
     h.parallel_for<K2>(ndr, [=](sycl::id<1>) { a[0] = 2; });
     h.single_task<K3>([=] { a[0] = 3; });
     h.parallel_for(sycl::range<1>(16), kobj);
+    float *fp = a;
+    h.memcpy(a, b, 16);
+    h.memcpy(dg, b, 4);
+    h.memset(a, 0, 16);
+    h.fill(b, fp, 2);
+    h.fill(acc, 1.0f);
+    h.copy(fp, a, 4);
+    h.copy(acc, a);
+    h.copy(fp, acc);
+    h.copy(acc, acc);
+    h.copy(acc, std::shared_ptr<float>{a});
   });
   q.parallel_for<K4>(sycl::range<1>(16), [=](sycl::id<1>) { a[0] = 4; });
   q.single_task<K4>([=] { a[0] = 5; });
   q.memset(b, 0, 16);
+  q.memcpy(b, a, 16);
+  q.memcpy(dg, a, 4);
+  q.fill(b, 7, 4);
+  float *fa = a;
+  q.copy(fa, a, 4).wait();
+  q.wait();
   sycl::free(a, q);
   sycl::free(b, q);
   (void)c;

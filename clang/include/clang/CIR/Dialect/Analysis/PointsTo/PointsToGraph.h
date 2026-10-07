@@ -108,12 +108,17 @@ enum class NodeFlags : uint32_t {
   Mod = 1u << 10,
   Ref = 1u << 11,
   HasUSM = 1u << 12,
+  /// Accessed by code we don't see while the host runs, until a later call
+  /// synchronizes with it (the host memory of an asynchronous SYCL memory
+  /// command). Not spread along links: the access is to the node's bytes.
+  AsyncAccess = 1u << 13,
 
   KindMask = Stack | Heap | Global | Ghost | Function | UnknownObj,
-  StatusMask = Incomplete | External | Collapsed | Summary | Mod | Ref | HasUSM,
+  StatusMask = Incomplete | External | Collapsed | Summary | Mod | Ref |
+      HasUSM | AsyncAccess,
   All = KindMask | StatusMask,
 
-  LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/HasUSM)
+  LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/AsyncAccess)
 };
 
 /// Return true if any bit of \p mask is set in \p flags.
