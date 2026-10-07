@@ -33,6 +33,8 @@
 // RUN: cir-opt %S/indirect-cap.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/indirect.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/indirect.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/instrument.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/instrument.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-ci-args.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-ci-args.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-ci-globals.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null

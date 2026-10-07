@@ -33,6 +33,7 @@
 namespace cir::test {
 void registerTestCIRAliasAnalysisPass();
 void registerTestCIRPointsToPass();
+void registerTestCIRPointsToInstrumentPass();
 void registerPrintKernelBindingsPass();
 void registerCopyKernelPass();
 } // namespace cir::test
@@ -54,6 +55,7 @@ int main(int argc, char **argv) {
 #ifdef CLANG_INCLUDE_TESTS
   cir::test::registerTestCIRAliasAnalysisPass();
   cir::test::registerTestCIRPointsToPass();
+  cir::test::registerTestCIRPointsToInstrumentPass();
   cir::test::registerPrintKernelBindingsPass();
   cir::test::registerCopyKernelPass();
 #endif

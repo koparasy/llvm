@@ -1,0 +1,113 @@
+// RUN: cir-opt %s -test-cir-points-to-instrument='table=%t.table print-candidates=1' | FileCheck %s
+// RUN: FileCheck %s --check-prefix=TABLE --input-file=%t.table
+
+// -test-cir-points-to-instrument inserts a call to __cir_pt_check before the
+// later access of every pair of accesses the points-to analysis calls
+// NoAlias, with the two pointers cast to !cir.ptr<!void>, the sizes and the
+// pair id as !u64i. Pairs it does not call NoAlias get no check. The side
+// table lists the checked pairs (and, with print-candidates=1, the others,
+// as "cand").
+
+!s32i = !cir.int<s, 32>
+!u8i = !cir.int<u, 8>
+!u32i = !cir.int<u, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+
+// The check is declared once.
+// CHECK: cir.func private @__cir_pt_check(!cir.ptr<!void>, !u64i, !cir.ptr<!void>, !u64i, !u64i)
+// CHECK-NOT: @__cir_pt_check(!cir.ptr<!void>, !u64i
+
+// A local that never escapes vs an incomplete formal: NoAlias, checked
+// before the second store (pair 0).
+// CHECK-LABEL: cir.func @noalias(
+// CHECK: cir.store %{{.*}}, %[[A:.*]] : !s32i
+// CHECK: %[[VA:.*]] = cir.cast bitcast %[[A]] : !cir.ptr<!s32i> -> !cir.ptr<!void>
+// CHECK: %[[SA:.*]] = cir.const #cir.int<4> : !u64i
+// CHECK: %[[VP:.*]] = cir.cast bitcast %arg0 : !cir.ptr<!s32i> -> !cir.ptr<!void>
+// CHECK: %[[SP:.*]] = cir.const #cir.int<4> : !u64i
+// CHECK: %[[ID:.*]] = cir.const #cir.int<0> : !u64i
+// CHECK: cir.call @__cir_pt_check(%[[VA]], %[[SA]], %[[VP]], %[[SP]], %[[ID]]) nothrow
+// CHECK-NEXT: cir.store %{{.*}}, %arg0 : !s32i
+// CHECK-NEXT: cir.return
+// TABLE: 0 @noalias unescaped-object store(cir.alloca 'a'@{{.*}}) 4 | store(formal#0) 4 at cir.store@{{.*}} | a: an object that never escaped; b: {{.*}}
+cir.func @noalias(%p: !cir.ptr<!s32i>) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %one = cir.const #cir.int<1> : !s32i
+  cir.store %one, %a : !s32i, !cir.ptr<!s32i>
+  cir.store %one, %p : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+
+// Two incomplete formals: MayAlias, no check (candidate 1).
+// CHECK-LABEL: cir.func @mayalias(
+// CHECK-NOT: __cir_pt_check
+// CHECK: cir.return
+// TABLE: cand 1 @mayalias MayAlias both-unknown store(formal#0) 4 | store(formal#1) 4
+cir.func @mayalias(%p: !cir.ptr<!s32i>, %q: !cir.ptr<!s32i>) {
+  %one = cir.const #cir.int<1> : !s32i
+  cir.store %one, %p : !s32i, !cir.ptr<!s32i>
+  cir.store %one, %q : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+
+// A memcpy of a length known only at run time: the two operands of one op
+// are a pair, checked before it with the length operand as both sizes
+// (pair 2).
+// CHECK-LABEL: cir.func @memcpy_dyn(
+// CHECK: %[[N:.*]] = cir.cast integral %arg1 : !u32i -> !u64i
+// CHECK: cir.call @__cir_pt_check(%{{.*}}, %[[N]], %arg0, %[[N]], %{{.*}}) nothrow
+// CHECK-NEXT: cir.libc.memcpy %[[N]] bytes
+// TABLE: 2 @memcpy_dyn unescaped-object memcpy.dst(cir.cast@{{.*}}) dyn | memcpy.src(formal#0) dyn at cir.libc.memcpy@{{.*}}
+cir.func @memcpy_dyn(%src: !cir.ptr<!void>, %n: !u32i) {
+  %buf = cir.alloca "buf" align(1) : !cir.ptr<!cir.array<!u8i x 64>>
+  %d = cir.cast bitcast %buf : !cir.ptr<!cir.array<!u8i x 64>> -> !cir.ptr<!void>
+  %len = cir.cast integral %n : !u32i -> !u64i
+  cir.libc.memcpy %len bytes from %src to %d : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  cir.return
+}
+
+// Two stores in the two branches of a cir.if, through allocas made inside
+// each branch: no point that both addresses dominate, so x and y are never
+// paired. Each of them is paired with a and c, whose addresses dominate the
+// branch stores, and is checked there (pairs 3, 4, 6, 7); a and c are
+// checked before the store after the cir.if (pair 5).
+// CHECK-LABEL: cir.func @branches(
+// CHECK: cir.if
+// CHECK-COUNT-2: cir.call @__cir_pt_check
+// CHECK-NEXT: cir.store
+// CHECK: } else {
+// CHECK-COUNT-2: cir.call @__cir_pt_check
+// CHECK-NEXT: cir.store
+// CHECK: }
+// CHECK-NEXT: cir.cast bitcast %0
+// CHECK: cir.call @__cir_pt_check
+// CHECK-NEXT: cir.store
+// CHECK-NEXT: cir.return
+// TABLE: 3 @branches distinct-objects store(cir.alloca 'a'@{{.*}}) 4 | store(cir.alloca 'x'@{{.*}}) 4
+// TABLE: 4 @branches distinct-objects store(cir.alloca 'a'@{{.*}}) 4 | store(cir.alloca 'y'@{{.*}}) 4
+// TABLE: 5 @branches distinct-objects store(cir.alloca 'a'@{{.*}}) 4 | store(cir.alloca 'c'@{{.*}}) 4
+// TABLE: 6 @branches distinct-objects store(cir.alloca 'x'@{{.*}}) 4 | store(cir.alloca 'c'@{{.*}}) 4
+// TABLE: 7 @branches distinct-objects store(cir.alloca 'y'@{{.*}}) 4 | store(cir.alloca 'c'@{{.*}}) 4
+// TABLE: # functions 4 candidates 8 noalias 7 checks 7
+// TABLE: # rule distinct-objects 5
+// TABLE: # rule unescaped-object 2
+cir.func @branches(%cond: !cir.bool) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %c = cir.alloca "c" align(4) : !cir.ptr<!s32i>
+  %one = cir.const #cir.int<1> : !s32i
+  cir.store %one, %a : !s32i, !cir.ptr<!s32i>
+  cir.if %cond {
+    %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+    cir.store %one, %x : !s32i, !cir.ptr<!s32i>
+  } else {
+    %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+    cir.store %one, %y : !s32i, !cir.ptr<!s32i>
+  }
+  cir.store %one, %c : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+
+}

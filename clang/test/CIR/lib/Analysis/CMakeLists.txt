@@ -1,6 +1,7 @@
 add_clang_library(CIRTestAnalysis
   TestCIRAliasAnalysis.cpp
   TestCIRPointsTo.cpp
+  TestCIRPointsToInstrument.cpp
   TestKernelBindings.cpp
   TestCopyKernel.cpp
 

@@ -1,0 +1,455 @@
+//===- TestCIRPointsToInstrument.cpp - Check points-to facts at run time --===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// -test-cir-points-to-instrument turns the NoAlias answers of the points-to
+// analysis into run-time checks (dynamic points-to validation, after Mock,
+// Das, Chambers and Eggers, "Dynamic points-to sets: a comparison with static
+// analyses", PASTE 2001). For every function with a body it:
+//
+//  1. collects the address operands of its memory accesses, each with the
+//     number of bytes it touches: cir.load, cir.store, cir.copy (dst, src),
+//     cir.libc.memcpy and cir.libc.memmove (dst, src), cir.libc.memset and
+//     the atomics (fetch, xchg, cmpxchg, test_and_set, clear). An access
+//     whose size is neither a constant nor an SSA length is left out;
+//  2. pairs every two accesses (p at X, q at Y) with p != q, picking the
+//     later one as the check point: Y if X dominates it, X if Y dominates it,
+//     else whichever one the other address (and its length) dominates. A
+//     pair with no such point is not a candidate. Candidates get ids in
+//     module order (function, then the accesses in walk order), which depend
+//     on the IR alone, not on the analysis;
+//  3. asks PointsToAnalysis::aliasWithRule(p, q, sizeA, sizeB), and keeps the
+//     NoAlias candidates. If a function has more than max-pairs-per-func
+//     (default 64, 0 = all), it keeps the first ones by a hash of the seed
+//     and the id;
+//  4. inserts before the check point
+//       cir.call @__cir_pt_check(p, sizeA, q, sizeB, id)
+//     with the pointers cast to !cir.ptr<!void> and the sizes and id as
+//     !u64i, and declares __cir_pt_check once in the module.
+//
+// The runtime (clang/test/CIR/Analysis/points-to/Inputs/pt_check_runtime.c)
+// aborts with "PT-VIOLATION <id>" if the two byte ranges overlap. A
+// violation is an unsound NoAlias, and the side table names the pair.
+//
+// Options:
+//   closed-tu=1               PointsToAnalysisOptions::assumeClosedTU
+//   max-pairs-per-func=<n>    as above
+//   seed=<s>                  the sampling seed
+//   table=<path>              write the side table: one line per check,
+//                               <id> @<func> <rule> <a> | <b> at <loc> | why
+//                             where <a> and <b> are "<access>(<def>) <size>"
+//                             and why is explainAlias; then the totals
+//   print-candidates=1        also write every candidate that is not
+//                             checked, prefixed with "cand", with its answer
+//   inject-false-noalias=<id> test only: treat candidate <id> as NoAlias
+//                             (and always check it), whatever the analysis
+//                             says. A negative control: when the pair
+//                             really aliases, the run must abort.
+//
+// Caveat: the static answer is about the objects p and q point to while both
+// are live. A pointer to a freed object compared with a new allocation that
+// reuses its memory is a false violation; reduce any violation before
+// blaming the analysis.
+//
+//===----------------------------------------------------------------------===//
+
+#include "mlir/IR/Dominance.h"
+#include "mlir/Pass/Pass.h"
+#include "clang/CIR/Dialect/Analysis/CIRPointerDecomposition.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
+#include "clang/CIR/Dialect/Builder/CIRBaseBuilder.h"
+#include "clang/CIR/Dialect/IR/CIRDialect.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <limits>
+#include <optional>
+
+using namespace mlir;
+using namespace cir::pointsto;
+
+namespace {
+
+constexpr llvm::StringLiteral kCheckName = "__cir_pt_check";
+constexpr uint64_t kNoInjection = std::numeric_limits<uint64_t>::max();
+
+/// One address operand of a memory access.
+struct Access {
+  Operation *op;
+  Value addr;
+  /// What the access is: "load", "store", "copy.dst", ...
+  StringRef role;
+  /// The size for the static query: a constant, or kUnknownSize.
+  uint64_t querySize;
+  /// The size the check passes: a constant (if querySize is one) or the
+  /// length operand of the op.
+  std::optional<uint64_t> constSize;
+  Value dynSize;
+};
+
+/// A pair of accesses checked before \p point.
+struct Candidate {
+  uint64_t id;
+  unsigned a, b;
+  Operation *point;
+  AliasAnswer answer;
+  bool injected = false;
+};
+
+/// splitmix64: a hash that is the same in every run (llvm::hash_combine is
+/// seeded per process in builds with assertions).
+uint64_t mix(uint64_t x) {
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+/// "file:line:col" of the first file location in \p loc, or "?".
+std::string formatLoc(Location loc) {
+  std::string out = "?";
+  loc->walk([&](Location inner) {
+    if (auto file = dyn_cast<FileLineColLoc>(inner)) {
+      out = (llvm::sys::path::filename(file.getFilename().getValue()) + ":" +
+             Twine(file.getLine()) + ":" + Twine(file.getColumn()))
+                .str();
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return out;
+}
+
+/// The op that defines \p value and where, or the block argument.
+std::string describeValue(Value value) {
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    Operation *parent = arg.getOwner()->getParentOp();
+    bool entry = arg.getOwner()->isEntryBlock() && isa<cir::FuncOp>(parent);
+    return ((entry ? "formal#" : "blockarg#") + Twine(arg.getArgNumber()))
+        .str();
+  }
+  Operation *def = value.getDefiningOp();
+  std::string name = def->getName().getStringRef().str();
+  if (auto alloca = dyn_cast<cir::AllocaOp>(def))
+    name += " '" + alloca.getName().str() + "'";
+  else if (auto global = dyn_cast<cir::GetGlobalOp>(def))
+    name += " @" + global.getName().str();
+  else if (auto call = dyn_cast<cir::CallOp>(def); call && call.getCallee())
+    name += " @" + call.getCallee()->str();
+  return name + "@" + formatLoc(def->getLoc());
+}
+
+struct TestCIRPointsToInstrumentPass
+    : public PassWrapper<TestCIRPointsToInstrumentPass,
+                         OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestCIRPointsToInstrumentPass)
+
+  TestCIRPointsToInstrumentPass() = default;
+  TestCIRPointsToInstrumentPass(const TestCIRPointsToInstrumentPass &pass)
+      : PassWrapper(pass) {}
+
+  StringRef getArgument() const final {
+    return "test-cir-points-to-instrument";
+  }
+  StringRef getDescription() const final {
+    return "Insert run-time overlap checks for points-to NoAlias facts.";
+  }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<cir::CIRDialect>();
+  }
+
+  Option<bool> closedTU{
+      *this, "closed-tu",
+      llvm::cl::desc("Points-to: assume every caller is in the module"),
+      llvm::cl::init(false)};
+  Option<unsigned> maxPairs{
+      *this, "max-pairs-per-func",
+      llvm::cl::desc("The most pairs checked per function (0 = all)"),
+      llvm::cl::init(64)};
+  Option<unsigned> seed{*this, "seed", llvm::cl::desc("The sampling seed"),
+                        llvm::cl::init(1)};
+  Option<std::string> tablePath{
+      *this, "table", llvm::cl::desc("Write the side table to this file"),
+      llvm::cl::init("")};
+  Option<bool> printCandidates{
+      *this, "print-candidates",
+      llvm::cl::desc("Also write the candidates that are not checked"),
+      llvm::cl::init(false)};
+  Option<uint64_t> injectFalseNoAlias{
+      *this, "inject-false-noalias",
+      llvm::cl::desc("Test only: check this candidate as if it were NoAlias"),
+      llvm::cl::init(kNoInjection)};
+
+  void runOnOperation() override;
+};
+
+/// The accesses of \p func, in walk order.
+SmallVector<Access> collectAccesses(cir::FuncOp func,
+                                    const DataLayout &dataLayout) {
+  SmallVector<Access> accesses;
+  auto add = [&](Operation *op, Value addr, StringRef role,
+                 std::optional<uint64_t> size, Value dynSize = {}) {
+    auto ptrTy = dyn_cast<cir::PointerType>(addr.getType());
+    // Host code only: a pointer in another address space is left out.
+    if (!ptrTy || ptrTy.getAddrSpace())
+      return;
+    if (!size) {
+      std::optional<int64_t> bytes =
+          cir::getTypeSizeInBytes(ptrTy.getPointee(), dataLayout);
+      if (bytes && *bytes >= 0)
+        size = static_cast<uint64_t>(*bytes);
+    }
+    Access access{op, addr, role, PointsToAnalysis::kUnknownSize, size, {}};
+    if (size)
+      access.querySize = *size;
+    else if (dynSize && isa<cir::IntType>(dynSize.getType()))
+      access.dynSize = dynSize;
+    else
+      return;
+    accesses.push_back(access);
+  };
+  // A memory op's length: a constant, or the operand itself.
+  auto length = [](Value len) -> std::pair<std::optional<uint64_t>, Value> {
+    std::optional<int64_t> constant = cir::getConstantIndex(len);
+    if (constant && *constant >= 0)
+      return {static_cast<uint64_t>(*constant), Value()};
+    return {std::nullopt, len};
+  };
+  func.walk([&](Operation *op) {
+    llvm::TypeSwitch<Operation *>(op)
+        .Case<cir::LoadOp>([&](cir::LoadOp load) {
+          add(op, load.getAddr(), "load", std::nullopt);
+        })
+        .Case<cir::StoreOp>([&](cir::StoreOp store) {
+          add(op, store.getAddr(), "store", std::nullopt);
+        })
+        .Case<cir::CopyOp>([&](cir::CopyOp copy) {
+          uint64_t size = copy.getCopySizeInBytes(dataLayout);
+          add(op, copy.getDst(), "copy.dst", size);
+          add(op, copy.getSrc(), "copy.src", size);
+        })
+        .Case<cir::MemCpyOp, cir::MemMoveOp>([&](auto mem) {
+          auto [size, dyn] = length(mem.getLen());
+          bool isCopy = isa<cir::MemCpyOp>(op);
+          add(op, mem.getDst(), isCopy ? "memcpy.dst" : "memmove.dst", size,
+              dyn);
+          add(op, mem.getSrc(), isCopy ? "memcpy.src" : "memmove.src", size,
+              dyn);
+        })
+        .Case<cir::MemSetOp>([&](cir::MemSetOp mem) {
+          auto [size, dyn] = length(mem.getLen());
+          add(op, mem.getDst(), "memset.dst", size, dyn);
+        })
+        .Case<cir::AtomicFetchOp, cir::AtomicXchgOp, cir::AtomicCmpXchgOp,
+              cir::AtomicTestAndSetOp, cir::AtomicClearOp>([&](auto atomic) {
+          add(op, atomic.getPtr(), "atomic", std::nullopt);
+        });
+  });
+  return accesses;
+}
+
+void TestCIRPointsToInstrumentPass::runOnOperation() {
+  ModuleOp module = getOperation();
+  MLIRContext *ctx = &getContext();
+
+  PointsToModelRegistry registry;
+  registerGenericModels(registry);
+  PointsToAnalysisOptions options;
+  options.assumeClosedTU = closedTU;
+  PointsToAnalysis pt(module, &registry, options);
+  DataLayout dataLayout(module);
+
+  std::unique_ptr<llvm::raw_fd_ostream> table;
+  if (!tablePath.empty()) {
+    std::error_code error;
+    table = std::make_unique<llvm::raw_fd_ostream>(tablePath, error,
+                                                   llvm::sys::fs::OF_Text);
+    if (error) {
+      module.emitError() << "cannot open " << tablePath << ": "
+                         << error.message();
+      return signalPassFailure();
+    }
+    *table << "# test-cir-points-to-instrument closed-tu=" << closedTU
+           << " max-pairs-per-func=" << maxPairs << " seed=" << seed << "\n";
+  }
+
+  // All the queries run before the IR changes.
+  struct FunctionPlan {
+    cir::FuncOp func;
+    SmallVector<Access> accesses;
+    SmallVector<Candidate> checks;
+  };
+  SmallVector<FunctionPlan> plans;
+  uint64_t nextId = 0, numCandidates = 0, numNoAlias = 0;
+  llvm::StringMap<unsigned> checkedRules;
+
+  auto describeAccess = [](const Access &access) {
+    std::string size = access.constSize ? std::to_string(*access.constSize)
+                                        : std::string("dyn");
+    return (access.role + "(" + describeValue(access.addr) + ") " + size)
+        .str();
+  };
+
+  for (cir::FuncOp func : module.getOps<cir::FuncOp>()) {
+    if (func.isDeclaration())
+      continue;
+    FunctionPlan plan{func, collectAccesses(func, dataLayout), {}};
+    DominanceInfo dom(func);
+    const SmallVector<Access> &accesses = plan.accesses;
+    // Whether the operands a check of \p access needs are available at
+    // \p point.
+    auto available = [&](const Access &access, Operation *point) {
+      if (access.op == point)
+        return true;
+      if (!dom.properlyDominates(access.addr, point))
+        return false;
+      return !access.dynSize || dom.properlyDominates(access.dynSize, point);
+    };
+    SmallVector<Candidate> noAlias;
+    for (unsigned j = 0; j < accesses.size(); ++j)
+      for (unsigned i = 0; i < j; ++i) {
+        const Access &a = accesses[i], &b = accesses[j];
+        if (a.addr == b.addr)
+          continue;
+        Operation *point = nullptr;
+        if (a.op == b.op || dom.properlyDominates(a.op, b.op))
+          point = b.op;
+        else if (dom.properlyDominates(b.op, a.op))
+          point = a.op;
+        else if (available(a, b.op))
+          point = b.op;
+        else if (available(b, a.op))
+          point = a.op;
+        if (!point || !available(a, point) || !available(b, point))
+          continue;
+        Candidate candidate{nextId++, i, j, point,
+                            pt.aliasWithRule(a.addr, b.addr, a.querySize,
+                                             b.querySize)};
+        ++numCandidates;
+        if (candidate.id == injectFalseNoAlias)
+          candidate.injected = true;
+        if (candidate.answer.result.isNo())
+          ++numNoAlias;
+        if (candidate.answer.result.isNo() || candidate.injected) {
+          noAlias.push_back(candidate);
+        } else if (table && printCandidates) {
+          *table << "cand " << candidate.id << " @" << func.getSymName()
+                 << " " << candidate.answer.result << " "
+                 << getAliasRuleName(candidate.answer.rule) << " "
+                 << describeAccess(a) << " | " << describeAccess(b) << "\n";
+        }
+      }
+
+    // Sample: the injected pair, then the first ones by hash.
+    if (maxPairs && noAlias.size() > maxPairs) {
+      auto key = [&](const Candidate &c) {
+        return c.injected ? 0 : mix(mix(seed) ^ c.id) | 1;
+      };
+      llvm::stable_sort(noAlias, [&](const Candidate &x, const Candidate &y) {
+        return key(x) < key(y);
+      });
+      if (table && printCandidates)
+        for (const Candidate &c :
+             llvm::ArrayRef(noAlias).drop_front(maxPairs))
+          *table << "cand " << c.id << " @" << func.getSymName()
+                 << " NoAlias(not sampled) "
+                 << getAliasRuleName(c.answer.rule) << " "
+                 << describeAccess(accesses[c.a]) << " | "
+                 << describeAccess(accesses[c.b]) << "\n";
+      noAlias.truncate(maxPairs);
+      llvm::sort(noAlias, [](const Candidate &x, const Candidate &y) {
+        return x.id < y.id;
+      });
+    }
+    for (const Candidate &c : noAlias) {
+      const Access &a = accesses[c.a], &b = accesses[c.b];
+      StringRef rule =
+          c.injected ? StringRef("injected") : getAliasRuleName(c.answer.rule);
+      ++checkedRules[rule];
+      if (!table)
+        continue;
+      *table << c.id << " @" << func.getSymName() << " " << rule;
+      if (c.injected)
+        *table << "(really " << c.answer.result << " "
+               << getAliasRuleName(c.answer.rule) << ")";
+      *table << " " << describeAccess(a) << " | " << describeAccess(b)
+             << " at " << c.point->getName() << "@"
+             << formatLoc(c.point->getLoc()) << " | "
+             << pt.explainAlias(a.addr, b.addr, a.querySize, b.querySize)
+             << "\n";
+    }
+    plan.checks = std::move(noAlias);
+    plans.push_back(std::move(plan));
+  }
+
+  // Instrument.
+  cir::CIRBaseBuilderTy builder(*ctx);
+  cir::PointerType voidPtrTy = builder.getVoidPtrTy();
+  cir::IntType u64Ty = builder.getUIntNTy(64);
+  uint64_t numChecks = 0;
+  for (const FunctionPlan &plan : plans)
+    numChecks += plan.checks.size();
+  if (numChecks) {
+    auto check = module.lookupSymbol<cir::FuncOp>(kCheckName);
+    if (!check) {
+      builder.setInsertionPointToStart(module.getBody());
+      auto fnTy = cir::FuncType::get({voidPtrTy, u64Ty, voidPtrTy, u64Ty, u64Ty},
+                                     cir::VoidType::get(ctx));
+      check = cir::FuncOp::create(builder, module.getLoc(), kCheckName, fnTy);
+      check.setLinkageAttr(cir::GlobalLinkageKindAttr::get(
+          ctx, cir::GlobalLinkageKind::ExternalLinkage));
+      SymbolTable::setSymbolVisibility(check, SymbolTable::Visibility::Private);
+    }
+    for (const FunctionPlan &plan : plans)
+      for (const Candidate &c : plan.checks) {
+        builder.setInsertionPoint(c.point);
+        Location loc = c.point->getLoc();
+        auto pointer = [&](const Access &access) -> Value {
+          if (access.addr.getType() == voidPtrTy)
+            return access.addr;
+          return builder.createBitcast(loc, access.addr, voidPtrTy);
+        };
+        auto size = [&](const Access &access) -> Value {
+          if (access.constSize)
+            return builder.getConstantInt(loc, u64Ty, *access.constSize);
+          if (access.dynSize.getType() == u64Ty)
+            return access.dynSize;
+          return builder.createIntCast(access.dynSize, u64Ty);
+        };
+        const Access &a = plan.accesses[c.a], &b = plan.accesses[c.b];
+        SmallVector<Value, 5> args{pointer(a), size(a), pointer(b), size(b),
+                                   builder.getConstantInt(loc, u64Ty, c.id)};
+        cir::CallOp call = builder.createCallOp(loc, check, args);
+        call.setNothrow(true);
+      }
+  }
+
+  if (table) {
+    *table << "# functions " << plans.size() << " candidates " << numCandidates
+           << " noalias " << numNoAlias << " checks " << numChecks << "\n";
+    SmallVector<std::pair<StringRef, unsigned>> rules;
+    for (const auto &entry : checkedRules)
+      rules.emplace_back(entry.getKey(), entry.getValue());
+    llvm::sort(rules);
+    for (auto [rule, count] : rules)
+      *table << "# rule " << rule << " " << count << "\n";
+  }
+}
+
+} // namespace
+
+namespace cir {
+namespace test {
+void registerTestCIRPointsToInstrumentPass() {
+  PassRegistration<TestCIRPointsToInstrumentPass>();
+}
+} // namespace test
+} // namespace cir
