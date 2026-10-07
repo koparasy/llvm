@@ -30,6 +30,21 @@
 // unknown memory". Graph::getLink creates an empty target node on demand,
 // Graph::lookupLink reads without creating.
 //
+// Ghost links
+// -----------
+// Besides its byte-offset links, a node has named ghost links: abstract
+// properties that a library model attaches to an object and that no byte of
+// it holds, such as the storage a SYCL buffer handle refers to. A ghost link
+// is keyed by (offset, GhostField): the offset of the sub-object it describes
+// (a closure holding three accessors has one `$storage` ghost per accessor
+// field) and an interned name. Ghost links never occupy bytes: they are kept
+// apart from the links, so they never collide with a real pointer slot or
+// make a node misaligned, whatever the array element size. Their offsets
+// follow the node's normalization (0 on a collapsed node, modulo the element
+// size on an array), and two ghost links that land on the same key unify
+// their targets. Unification, cloning, reachability and printing treat them
+// like links.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef CLANG_CIR_DIALECT_ANALYSIS_POINTSTO_POINTSTOGRAPH_H
@@ -216,6 +231,35 @@ struct Origin {
 };
 
 //===----------------------------------------------------------------------===//
+// GhostField
+//===----------------------------------------------------------------------===//
+
+/// The interned name of a ghost link (see the file comment). A model plug-in
+/// gets its fields once, for example `GhostField::get("$storage")`. The same
+/// name always gives the same field, in every graph; the ids order fields by
+/// first registration.
+class GhostField {
+public:
+  GhostField() = default;
+
+  /// The field named \p name, registering it the first time. Thread-safe.
+  static GhostField get(llvm::StringRef name);
+
+  /// The registered name; empty for the null field.
+  llvm::StringRef getName() const;
+  uint32_t getId() const { return id; }
+  explicit operator bool() const { return id != 0; }
+
+  friend bool operator==(GhostField a, GhostField b) { return a.id == b.id; }
+  friend bool operator!=(GhostField a, GhostField b) { return a.id != b.id; }
+  friend bool operator<(GhostField a, GhostField b) { return a.id < b.id; }
+
+private:
+  explicit GhostField(uint32_t id) : id(id) {}
+  uint32_t id = 0;
+};
+
+//===----------------------------------------------------------------------===//
 // Cell
 //===----------------------------------------------------------------------===//
 
@@ -260,6 +304,14 @@ private:
 // Node
 //===----------------------------------------------------------------------===//
 
+/// A ghost link: the target of the ghost field \p field of the sub-object at
+/// \p offset.
+struct GhostLink {
+  int64_t offset;
+  GhostField field;
+  Cell target;
+};
+
 /// An abstract memory object. Nodes are created and mutated only by Graph.
 class Node {
 public:
@@ -282,6 +334,10 @@ public:
   /// The outgoing links as (offset, resolved target), sorted by offset.
   llvm::SmallVector<std::pair<int64_t, Cell>, 4> getLinks() const;
   size_t getNumLinks() const { return links.size(); }
+
+  /// The ghost links with resolved targets, sorted by (offset, field).
+  llvm::SmallVector<GhostLink, 2> getGhostLinks() const;
+  size_t getNumGhostLinks() const { return ghosts.size(); }
 
   llvm::ArrayRef<Origin> getOrigins() const { return origins; }
 
@@ -308,6 +364,8 @@ private:
   std::optional<uint64_t> arrayElemSize;
   /// Pointer slots: (byte offset, target), sorted and unique by offset.
   llvm::SmallVector<std::pair<int64_t, Cell>, 2> links;
+  /// Ghost links, sorted and unique by (offset, field id).
+  llvm::SmallVector<GhostLink, 0> ghosts;
   llvm::SmallVector<Origin, 1> origins;
   /// First reason per status bit, sorted by bit.
   llvm::SmallVector<std::pair<NodeFlags, const Reason *>, 0> reasons;
@@ -377,11 +435,11 @@ public:
   /// reason yet, record \p why (if non-null).
   void addFlags(Cell cell, NodeFlags flags, const Reason *why = nullptr);
   /// Set the status bits \p flags on the node of \p from and on every node
-  /// reachable from it through links (all of a node's links, whatever the
-  /// offset of \p from). The node of \p from records \p why; the nodes
-  /// reached from it record one derived reason, "reachable from an escaped
-  /// pointer", whose cause is \p why. The walk is iterative with a visited
-  /// set, so cycles and long chains are fine. \p flags must not contain
+  /// reachable from it through links and ghost links (all of a node's links,
+  /// whatever the offset of \p from). The node of \p from records \p why; the
+  /// nodes reached from it record one derived reason, "reachable from an
+  /// escaped pointer", whose cause is \p why. The walk is iterative with a
+  /// visited set, so cycles and long chains are fine. \p flags must not contain
   /// Collapsed (collapsing would rewrite the links being walked). Returns the
   /// number of nodes visited.
   ///
@@ -408,10 +466,21 @@ public:
   /// unify the old target with \p to.
   void setLink(Cell from, Cell to, const Reason *why = nullptr);
 
+  /// The target of the ghost field \p field of the sub-object at \p from.
+  /// If there is none yet, create an empty target node and link to it.
+  Cell getGhostLink(Cell from, GhostField field, const Reason *why = nullptr);
+  /// The target of that ghost link, without creating anything.
+  std::optional<Cell> lookupGhostLink(Cell from, GhostField field) const;
+  /// Make the ghost field \p field of \p from point to \p to. If it already
+  /// points somewhere, unify the old target with \p to.
+  void setGhostLink(Cell from, GhostField field, Cell to,
+                    const Reason *why = nullptr);
+
   /// Make \p a and \p b denote the same cell. Merges their nodes with the
   /// right offset shift, ORs the flags, unions the origins, keeps the
   /// survivor's reasons (and the merged-in node's for bits the survivor has
-  /// none for), grows the size, and unifies the targets of colliding links.
+  /// none for), grows the size, and unifies the targets of colliding links
+  /// and of colliding ghost links.
   /// The work runs off a worklist, so arbitrarily long chains are fine.
   /// \p why is recorded if the merge collapses a node.
   ///
@@ -425,7 +494,9 @@ public:
 
   /// Make the node field-insensitive: every offset maps to 0, all link
   /// targets are unified into the single link at 0, the array element size
-  /// is dropped, and the Collapsed flag is set (with \p why).
+  /// is dropped, and the Collapsed flag is set (with \p why). Ghost links
+  /// move to offset 0 too; those of one field unify, those of different
+  /// fields stay apart.
   void collapse(Node *node, const Reason *why = nullptr);
 
   /// Take offsets on \p node modulo \p elemSize from now on. Existing links
@@ -437,7 +508,8 @@ public:
   /// Deep-copy the nodes reachable from \p roots into \p dst. Flags are
   /// masked with \p keepMask (status reasons follow their bits), origins are
   /// copied with their ctx, and reasons are copied into dst's table unless it
-  /// is shared with this graph. Links, including cycles, are reproduced.
+  /// is shared with this graph. Links and ghost links, including cycles, are
+  /// reproduced.
   CloneMap cloneInto(Graph &dst, llvm::ArrayRef<Cell> roots,
                      NodeFlags keepMask = NodeFlags::All) const;
 
@@ -452,7 +524,8 @@ public:
   /// Print one line per live node in creation-id order:
   /// \code
   ///   n<id> [<flags>] size=<n>[ arr=<elem>] origins={<origin>, ...}
-  ///     links={<off>-><cell>, ...}[ reasons={<Flag>: <reason>, ...}]
+  ///     links={<off>-><cell>, ...}[ ghost={<off>:<field>-><cell>, ...}]
+  ///     [ reasons={<Flag>: <reason>, ...}]
   /// \endcode
   /// (on one line). A cell prints as `n<id>+<off>` or `n<id>-<off>`. An origin
   /// prints as `<kind>(<what>)`, where kind is stack, global, heap, ghost or
@@ -470,7 +543,9 @@ public:
   /// at least a pointer apart (also across an array element boundary); live
   /// nodes reachable from links are not forwarded; forwarded nodes hold no
   /// state; collapsed nodes have at most one link, at 0, and no element size;
-  /// array offsets are in [0, elemSize). Report problems to \p errs if given.
+  /// array offsets are in [0, elemSize); ghost links are sorted and unique,
+  /// normalized like offsets, and resolve to live nodes. Report problems to
+  /// \p errs if given.
   bool verify(llvm::raw_ostream *errs = nullptr) const;
 
 private:
@@ -484,6 +559,11 @@ private:
   void markArrayImpl(Node *node, uint64_t elemSize, const Reason *why,
                      Worklist &worklist);
   void insertLink(Node *node, int64_t offset, Cell target, Worklist &worklist);
+  void insertGhost(Node *node, int64_t offset, GhostField field, Cell target,
+                   Worklist &worklist);
+  /// Re-key the ghost links of \p node after its normalization changed
+  /// (collapse, markArray).
+  void renormalizeGhosts(Node *node, Worklist &worklist);
   void collapseIfMisaligned(Node *node, const Reason *why, Worklist &worklist);
   bool isMisaligned(const Node *node) const;
   static void recordReason(Node *node, NodeFlags bit, const Reason *why);

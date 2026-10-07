@@ -91,3 +91,10 @@
 // RUN: cir-opt %S/virtual-shared-ptr.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/vtable-ops.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/vtable-ops.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// The SYCL models (sycl=1), on the SYCL tests in the parent directory. The
+// identity cases are offload containers, whose nested modules the pass does
+// not analyse; they are listed so that they keep parsing.
+// RUN: cir-opt %S/../sycl-host-models.cir -split-input-file -test-cir-alias-analysis='use-points-to=1 sycl=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/../sycl-host-models.cir -split-input-file -test-cir-alias-analysis='use-points-to=1 sycl=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/../sycl-host-models-identity.cir -split-input-file -test-cir-alias-analysis='use-points-to=1 sycl=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/../sycl-host-models-identity.cir -split-input-file -test-cir-alias-analysis='use-points-to=1 sycl=1 closed-tu=1' -o /dev/null 2>/dev/null

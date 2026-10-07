@@ -65,12 +65,19 @@
 // and explainAlias. CIRPointsToAliasAnalysis wraps them as an
 // mlir::AliasAnalysis implementation.
 //
+// Replaced definitions: a call that a model which replacesDefinition()
+// accepts is modelled in the local phase and never bound, even if its callee
+// has a body. A function with a body every use of which is such a call, or a
+// direct call from another such function, is skipped: not analysed at all.
+// A function with a caller of either kind is not bound to that caller, so
+// its formals are Incomplete whatever the other rules say.
+//
 // Formals: a function's formals start Incomplete (Reason UnknownCaller)
 // unless all of its callers are visible: it has internal or private linkage
 // and every use of its symbol is a direct call from a function this
-// analysis walks. PointsToAnalysisOptions::assumeClosedTU treats every
-// function that way. The return cell of a function that may have unknown
-// callers is Incomplete too: what it returns reaches code we don't see.
+// analysis walks, bound to the body. PointsToAnalysisOptions::assumeClosedTU
+// treats every function that way. The return cell of a function that may have
+// unknown callers is Incomplete too: what it returns reaches code we don't see.
 // Complete formals are revised in the fixpoint of step 5: a function whose
 // Function node turns External (its address escaped to code we don't see),
 // or that is a target of an unresolved indirect call, may be called by code
@@ -94,6 +101,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -115,6 +123,11 @@ struct PointsToAnalysisOptions {
   /// targets; past it, a call that gains a target gets the unknown-call
   /// rule (Reason Budget).
   unsigned maxIndirectRounds = 32;
+  /// If set, called on a registry the analysis owns, which is asked before
+  /// the registry passed to the constructor (its fallback): how a client
+  /// adds a plug-in's models (the SYCL ones, from OffloadOpt) without this
+  /// library depending on the plug-in.
+  std::function<void(PointsToModelRegistry &)> extraModels;
 };
 
 /// What the interprocedural phase did with a call site.
@@ -269,6 +282,11 @@ struct PointsToAnalysisStats {
   /// indirect targets), and nodes marked Summary.
   size_t numRecursiveFunctions = 0;
   size_t numSummaryNodes = 0;
+  /// Calls to a function with a body that a model replaced, and the
+  /// functions with a body that are not analysed because every use of them
+  /// is such a call (or a call from another such function).
+  size_t numReplacedCalls = 0;
+  size_t numSkippedFunctions = 0;
   /// Whether the TU-wide copy closure settled (rather than smashing).
   bool transfersSettled = true;
   size_t numLocalNodes = 0;
@@ -339,7 +357,9 @@ public:
   ///    External, Incomplete nor UnknownObj) and is not reachable from the
   ///    call's pointer arguments, its result, or a global the callee may
   ///    name; otherwise Ref if no code ever writes the node, Mod if none
-  ///    ever reads it, and ModRef if both (context-insensitive, so coarse);
+  ///    ever reads it, and ModRef if both (context-insensitive, so coarse).
+  ///    A HasUSM node (a USM allocation, which device code may access while
+  ///    the host runs) is ModRef for every call;
   ///  - any other op: NoModRef if it has no memory effect but allocation,
   ///    ModRef otherwise.
   mlir::ModRefResult getModRef(mlir::Operation *op, mlir::Value location) const;
@@ -366,6 +386,17 @@ public:
   /// Whether \p func is in a recursive call-graph SCC.
   bool isRecursive(cir::FuncOp func) const;
 
+  /// The kernel launches the models recorded, their cells in the TU graph,
+  /// in function processing order.
+  llvm::ArrayRef<LaunchRecord> getLaunches() const { return launches; }
+
+  /// Whether \p func has a body but is not analysed, because every use of it
+  /// is a call that a model replaces (see PointsToModel::replacesDefinition)
+  /// or a call from another such function.
+  bool isSkipped(cir::FuncOp func) const {
+    return skipped.contains(func.getOperation());
+  }
+
   const PointsToAnalysisStats &getStats() const { return stats; }
 
   /// The ops the local phase sent to the pessimistic default, summed over
@@ -384,6 +415,11 @@ private:
 
   void run();
   void buildLocal(cir::FuncOp func, bool formalsComplete);
+  /// Whether \p func has a body directly in the module and is not skipped.
+  bool isAnalysed(cir::FuncOp func) const;
+  /// Find the calls a model replaces, the functions skipped because of them,
+  /// and the functions whose callers include an unbound one.
+  void computeReplacedCalls();
   void computeVisibleCallers();
   /// Unify the actual/formal and result/return pairs of every direct call,
   /// and of every indirect call with the targets it was bound to. With
@@ -444,6 +480,8 @@ private:
 
   mlir::ModuleOp module;
   const PointsToModelRegistry *models;
+  /// The registry of PointsToAnalysisOptions::extraModels, if any.
+  std::unique_ptr<PointsToModelRegistry> ownedModels;
   PointsToAnalysisOptions options;
   mlir::SymbolTableCollection symbols;
   ReasonTable reasons;
@@ -457,8 +495,17 @@ private:
   llvm::DenseMap<mlir::Value, AggregateSlots> aggregateMap;
   llvm::SmallVector<MemTransferRecord, 0> memTransfers;
   /// The functions with local linkage whose every symbol use is a direct
-  /// call from a function with a body.
+  /// call from an analysed function, bound to its body.
   llvm::DenseSet<mlir::Operation *> visibleCallers;
+  /// The calls to a function with a body that a model replaces.
+  llvm::DenseSet<mlir::Operation *> replacedCalls;
+  /// The functions with a body that are not analysed (isSkipped).
+  llvm::DenseSet<mlir::Operation *> skipped;
+  /// The functions some caller of which is not bound to their body: a call a
+  /// model replaces, or a call from a skipped function. Their formals are
+  /// never complete, closed TU or not.
+  llvm::DenseSet<mlir::Operation *> unboundCallers;
+  llvm::SmallVector<LaunchRecord, 0> launches;
   /// The functions in a recursive SCC, with Reason{SummaryObject, func,
   /// "recursion"}.
   llvm::DenseMap<mlir::Operation *, const Reason *> recursive;
@@ -471,6 +518,11 @@ private:
   // Query caches, filled lazily; the graph does not change after run().
   mutable bool queryIndexBuilt = false;
   mutable llvm::DenseMap<mlir::Operation *, const TUCallSite *> callSiteOf;
+  /// The synthetic sites a model added on a call op (see
+  /// ModelContext::addIndirectCall).
+  mutable llvm::DenseMap<mlir::Operation *,
+                         llvm::SmallVector<const TUCallSite *, 1>>
+      syntheticSitesOf;
   mutable llvm::DenseMap<mlir::StringAttr, const TUFunction *> functionByName;
   mutable llvm::DenseMap<mlir::StringAttr, Node *> symbolNodeOf;
   mutable llvm::DenseMap<mlir::Operation *,

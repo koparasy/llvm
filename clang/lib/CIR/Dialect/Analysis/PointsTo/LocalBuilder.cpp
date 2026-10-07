@@ -1377,9 +1377,18 @@ void LocalBuilder::dispatchCall(size_t index, CIRCallOpInterface call) {
   if (models)
     if (const PointsToModel *model = models->lookup(call, callee, name)) {
       ModelContext ctx(*fg, dataLayout, deferredEffects);
+      SmallVector<CallSiteRecord, 0> extraCalls;
+      ctx.setLaunchSink(&fg->launches);
+      ctx.setCallSink(&extraCalls);
       model->apply(site, ctx);
       site.kind = CallKind::Modelled;
       site.modelled = model->name();
+      // The calls the model makes: indirect, so decided after the walk (or
+      // by the interprocedural phase), like the ones the body spells.
+      for (CallSiteRecord &extra : extraCalls) {
+        fg->callSites.push_back(std::move(extra));
+        indirectCalls.push_back(fg->callSites.size() - 1);
+      }
       return;
     }
   if (callee && !callee.isDeclaration()) {
@@ -1829,7 +1838,84 @@ struct TransferApplier {
     return unifySlots(record.dst, record.src) || changed;
   }
 
-  bool apply() {
+  /// Copy the ghost links in the range: a copy of an object's bytes is the
+  /// same object to a model (a SYCL handle copied by memcpy refers to the
+  /// same storage). A ghost of one side at offset k of the range is set at
+  /// k on the other side, for every k an array side allows. A collapsed side
+  /// holds its ghosts at every offset: each ghost the other side has, at any
+  /// offset, is unified with the collapsed side's ghost of that field. (A
+  /// ghost the other side lacks stays missing, which a client must read as
+  /// unknown.) Too many offsets, and the ghost targets of both sides become
+  /// External: what they describe is unknown from now on.
+  bool applyGhosts() {
+    Cell dst = record.dst.resolve(), src = record.src.resolve();
+    Node *dstNode = dst.getRawNode(), *srcNode = src.getRawNode();
+    if (!dstNode->getNumGhostLinks() && !srcNode->getNumGhostLinks())
+      return false;
+    int64_t length = static_cast<int64_t>(
+        std::min<uint64_t>(record.length, std::numeric_limits<int64_t>::max()));
+    bool changed = false;
+    auto relate = [&](Cell at, GhostField field, Cell target) {
+      std::optional<Cell> have = graph.lookupGhostLink(at, field);
+      if (have && have->resolve() == target.resolve())
+        return;
+      graph.setGhostLink(at, field, target, reason());
+      changed = true;
+    };
+    bool dstCollapsed = dstNode->isCollapsed();
+    bool srcCollapsed = srcNode->isCollapsed();
+    if (dstCollapsed || srcCollapsed) {
+      Cell collapsed = dstCollapsed ? dst : src;
+      Cell other = dstCollapsed ? src : dst;
+      for (const GhostLink &ghost : other.getRawNode()->getGhostLinks())
+        relate(collapsed, ghost.field, ghost.target);
+      if (dstCollapsed && srcCollapsed)
+        for (const GhostLink &ghost : srcNode->getGhostLinks())
+          relate(dst, ghost.field, ghost.target);
+      return changed;
+    }
+    // The offsets k in [0, length) at which a ghost at `offset` on the node
+    // of `at` sits, relative to `at`.
+    SmallVector<std::tuple<int64_t, GhostField, Cell, bool>, 8> moves;
+    auto collect = [&](Cell at, bool toDst) {
+      const Node *node = at.getRawNode();
+      std::optional<uint64_t> elem = node->getArrayElemSize();
+      for (const GhostLink &ghost : node->getGhostLinks()) {
+        int64_t k = ghost.offset - at.getRawOffset();
+        if (!elem) {
+          if (k >= 0 && k < length)
+            moves.emplace_back(k, ghost.field, ghost.target, toDst);
+          continue;
+        }
+        int64_t e = static_cast<int64_t>(*elem);
+        for (k = ((k % e) + e) % e; k < length; k += e) {
+          moves.emplace_back(k, ghost.field, ghost.target, toDst);
+          if (moves.size() > kMaxTransferSlots)
+            return false;
+        }
+      }
+      return true;
+    };
+    if (!collect(src, /*toDst=*/true) || !collect(dst, /*toDst=*/false)) {
+      const Reason *external = graph.makeReason(
+          Reason::Kind::EscapedTo, record.op,
+          "ghost link copied by a byte copy that cannot be placed");
+      for (Node *node : {dstNode, srcNode})
+        for (const GhostLink &ghost : node->getGhostLinks())
+          if (!ghost.target.getNode()->hasFlags(NodeFlags::External)) {
+            graph.markReachable(ghost.target, NodeFlags::External, external);
+            changed = true;
+          }
+      return changed;
+    }
+    for (auto [k, field, target, toDst] : moves)
+      relate(shift(toDst ? record.dst : record.src, k), field, target);
+    return changed;
+  }
+
+  bool apply() { return applyLinks() | applyGhosts(); }
+
+  bool applyLinks() {
     Cell dst = record.dst.resolve(), src = record.src.resolve();
     int64_t length = static_cast<int64_t>(
         std::min<uint64_t>(record.length, std::numeric_limits<int64_t>::max()));

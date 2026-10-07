@@ -1,0 +1,1348 @@
+// RUN: cir-opt %s -split-input-file \
+// RUN:   -pass-pipeline="builtin.module(test-print-kernel-bindings)" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=LEGACY
+// RUN: cir-opt %s -split-input-file -cir-points-to-verify \
+// RUN:   -pass-pipeline="builtin.module(test-cir-points-to{mode=ci sycl=1 print-graphs=0})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=PT
+
+// The cases of sycl-accessor-buffer-identity.cir, run through both the
+// legacy KernelBindingTable trace (LEGACY, the same verdicts as there) and
+// the points-to SYCL models (PT): same `$storage` ghost node (or host
+// memory, or pointer target) = the same memory; distinct and complete =
+// distinct. The inputs are that test's, plus the roles CIRGen gives the
+// launch glue, the USM allocation and getDeviceKernelInfo (untagged there,
+// so the legacy output does not change), and a body for std::vector::data,
+// which points-to analyses rather than models. The first eleven cases are
+// identity cases: ten agree, one is a context-insensitivity mismatch
+// (DISTINCT HOST MEMORY). The last four are policy cases (local accessor,
+// nested accessor, pointer in a struct, two launches): they agree too.
+
+// -----
+// DISTINCT: three local buffers, each accessed once.
+// buffer(range) buffers own fresh storage, so the three accessors are pairwise
+// no-alias; the accessors are built both ways (constructor and get_access).
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%ba, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bb = cir.alloca "bb" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%bb, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bc = cir.alloca "bc" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%bc, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @buffer_get_access(%xb, %bb, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xc = cir.alloca "xc" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xc, %bc, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f2 = cir.get_member %lam[2] {name = "C"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f2, %xc) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}, %arg4: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "C", init_arg = 0 : i32, kind = "accessor", path = ["C"]}}, %arg5: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "C", init_arg = 1 : i32, kind = "accessor", path = ["C"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY: no-alias A B C
+// LEGACY: no-alias-note A: buffer 'ba'
+// LEGACY: no-alias-note B: buffer 'bb'
+// LEGACY: no-alias-note C: buffer 'bc'
+// Agree.
+// PT-LABEL: === launches
+// PT: field A accessor storage=[[A:n[0-9]+]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage=[[B:n[0-9]+]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field C accessor storage=[[C:n[0-9]+]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: no-alias A B C
+
+// -----
+// DISTINCT HOST MEMORY: buffers over three distinct std::vectors.
+// A buffer over host memory is identified by the allocation it points into;
+// distinct vectors own distinct storage.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %va = cir.alloca "va" align(8) : !cir.ptr<!rec_vec>
+      %va.data = cir.call @vector_data(%va) : (!cir.ptr<!rec_vec>) -> !cir.ptr<!f32>
+      %vb = cir.alloca "vb" align(8) : !cir.ptr<!rec_vec>
+      %vb.data = cir.call @vector_data(%vb) : (!cir.ptr<!rec_vec>) -> !cir.ptr<!f32>
+      %vc = cir.alloca "vc" align(8) : !cir.ptr<!rec_vec>
+      %vc.data = cir.call @vector_data(%vc) : (!cir.ptr<!rec_vec>) -> !cir.ptr<!f32>
+      %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_host_ptr(%ba, %va.data, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %bb = cir.alloca "bb" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_host_ptr(%bb, %vb.data, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %bc = cir.alloca "bc" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_host_ptr(%bc, %vc.data, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %bb, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xc = cir.alloca "xc" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xc, %bc, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f2 = cir.get_member %lam[2] {name = "C"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f2, %xc) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}, %arg4: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "C", init_arg = 0 : i32, kind = "accessor", path = ["C"]}}, %arg5: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "C", init_arg = 1 : i32, kind = "accessor", path = ["C"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY: no-alias A B C
+// LEGACY: no-alias-note A: buffer 'ba' over std::vector 'va'
+// MISMATCH, explained: std::vector::data is analysed (its role is not
+// modelled) and context-insensitively, so its one formal binds the three
+// vectors: their storages are one node. Legacy reads each call's own operand.
+// Context-sensitive cloning (T17) separates them.
+// PT-LABEL: === launches
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H:n[0-9]+]]+0 [Mod|Ref] complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H]]+0
+// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H]]+0
+// PT-NEXT: same A B
+// PT-NEXT: same A C
+// PT-NEXT: same B C
+// PT-NEXT: no-alias{{$}}
+
+// -----
+// SAME BUFFER: two accessors on one buffer.
+// Accessing a buffer twice from one kernel is allowed; the two accessors alias,
+// so neither is no-alias, and the third, though distinct, is kept only by
+// itself.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%ba, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bc = cir.alloca "bc" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%bc, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xc = cir.alloca "xc" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xc, %bc, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f2 = cir.get_member %lam[2] {name = "C"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f2, %xc) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}, %arg4: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "C", init_arg = 0 : i32, kind = "accessor", path = ["C"]}}, %arg5: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "C", init_arg = 1 : i32, kind = "accessor", path = ["C"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY: no-alias C
+// LEGACY: no-alias-note A: 'A' and 'B' use the same memory, buffer 'ba'
+// LEGACY: no-alias-note B: 'B' and 'A' use the same memory, buffer 'ba'
+// Agree.
+// PT-LABEL: === launches
+// PT: field A accessor storage=[[A:n[0-9]+]]+0
+// PT-NEXT: field B accessor storage=[[A]]+0
+// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: same A B
+// PT-NEXT: no-alias C
+
+// -----
+// BUFFER COPY: b2 = b1 shares b1's storage.
+// Buffers have reference semantics; a copy is the same memory.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %b1 = cir.alloca "b1" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%b1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %b2 = cir.alloca "b2" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_copy(%b2, %b1) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %b1, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %b2, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY-NOT: no-alias A
+// LEGACY: no-alias-note A: 'A' and 'B' use the same memory, buffer 'b1'
+// LEGACY: no-alias-note B:
+// Agree.
+// PT-LABEL: === launches
+// PT: field A accessor storage=[[A:n[0-9]+]]+0
+// PT-NEXT: field B accessor storage=[[A]]+0
+// PT-NEXT: same A B
+// PT-NEXT: no-alias{{$}}
+
+// -----
+// SUB-BUFFER: two sub-buffers of one parent.
+// A sub-buffer is identified by its parent (ranges are not compared).
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %p = cir.alloca "p" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%p, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %s1 = cir.alloca "s1" align(8) : !cir.ptr<!rec_buf>
+      %s1.off = cir.const #cir.int<0> : !u64i
+      cir.call @buffer_sub(%s1, %p, %s1.off, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) -> ()
+      %s2 = cir.alloca "s2" align(8) : !cir.ptr<!rec_buf>
+      %s2.off = cir.const #cir.int<0> : !u64i
+      cir.call @buffer_sub(%s2, %p, %s2.off, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %s1, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %s2, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY-NOT: no-alias A
+// LEGACY: no-alias-note A: 'A' and 'B' use the same memory, buffer 'p'
+// Agree.
+// PT-LABEL: === launches
+// PT: field A accessor storage=[[A:n[0-9]+]]+0
+// PT-NEXT: field B accessor storage=[[A]]+0
+// PT-NEXT: same A B
+// PT-NEXT: no-alias{{$}}
+
+// -----
+// REINTERPRET: a reinterpreted buffer is its source.
+//
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %b1 = cir.alloca "b1" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%b1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %b2 = cir.alloca "b2" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_reinterpret(%b2, %b1) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %b1, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %b2, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY-NOT: no-alias A
+// LEGACY: no-alias-note A: 'A' and 'B' use the same memory, buffer 'b1'
+// Agree.
+// PT-LABEL: === launches
+// PT: field A accessor storage=[[A:n[0-9]+]]+0
+// PT-NEXT: field B accessor storage=[[A]]+0
+// PT-NEXT: same A B
+// PT-NEXT: no-alias{{$}}
+
+// -----
+// PARAMETER: a buffer reached through a function parameter is unknown.
+// It may be the same buffer as the local one; neither is no-alias.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %b1 = cir.alloca "b1" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%b1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %b1, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %param, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY-NOT: no-alias A
+// LEGACY: no-alias-note A: 'B' may alias it: the buffer is a function parameter
+// LEGACY: no-alias-note B: the buffer is a function parameter
+// Agree.
+// PT-LABEL: === launches
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Incomplete|Ref] origins=0 host=none unknown (storage made by no model)
+// PT-NEXT: no-alias{{$}}
+
+// -----
+// OVERLAPPING HOST MEMORY: two buffers over one vector.
+// Buffers over the same allocation share an identity; an offset into it has
+// unknown provenance.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %v = cir.alloca "v" align(8) : !cir.ptr<!rec_vec>
+      %v.data = cir.call @vector_data(%v) : (!cir.ptr<!rec_vec>) -> !cir.ptr<!f32>
+      %c16 = cir.const #cir.int<16> : !s32i
+      %v.mid = cir.ptr_stride %v.data, %c16 : (!cir.ptr<!f32>, !s32i) -> !cir.ptr<!f32>
+      %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_host_ptr(%ba, %v.data, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %bb = cir.alloca "bb" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_host_ptr(%bb, %v.data, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %bc = cir.alloca "bc" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_host_ptr(%bc, %v.mid, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %bb, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xc = cir.alloca "xc" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xc, %bc, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f2 = cir.get_member %lam[2] {name = "C"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f2, %xc) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}, %arg4: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "C", init_arg = 0 : i32, kind = "accessor", path = ["C"]}}, %arg5: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "C", init_arg = 1 : i32, kind = "accessor", path = ["C"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY-NOT: no-alias A
+// LEGACY: no-alias-note A: 'A' and 'B' use the same memory, buffer 'ba' over std::vector 'v'
+// LEGACY: no-alias-note C: the host pointer of buffer 'bc' has unknown provenance
+// Agree (not no-alias). Points-to: v.mid is a constant stride into the same vector
+// storage node, so C is the same memory; legacy: unknown provenance.
+// PT-LABEL: === launches
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H:n[0-9]+]]+0
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H]]+0
+// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[H]]+0
+// PT-NEXT: same A B
+// PT-NEXT: same A C
+// PT-NEXT: same B C
+// PT-NEXT: no-alias{{$}}
+
+// -----
+// MIXED: an accessor and a USM pointer.
+// A buffer's storage and a distinct USM allocation are distinct; a buffer over
+// the same USM allocation is not.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc, data !cir.ptr<!f32>}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %usm = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPv() : () -> !cir.ptr<!f32>
+      %usm2 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPv() : () -> !cir.ptr<!f32>
+      %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%ba, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bb = cir.alloca "bb" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_host_ptr(%bb, %usm2, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %bb, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f2 = cir.get_member %lam[2] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %usm, %f2 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}, %arg4: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY: no-alias A B P
+// LEGACY: no-alias-note B: buffer 'bb' over a USM allocation
+// LEGACY: no-alias-note P: a USM allocation
+// Agree.
+// PT-LABEL: === launches
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[U2:n[0-9]+]]+0 [Heap|Summary|Mod|Ref|HasUSM] complete
+// PT-NEXT: field P pointer target=[[U1:n[0-9]+]]+0 [Heap|Summary|Ref|HasUSM] complete
+// PT-NEXT: no-alias A B P
+
+// -----
+// USM HOST POINTER: a buffer over the USM allocation the kernel also captures.
+//
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !cir.ptr<!f32>}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %usm = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPv() : () -> !cir.ptr<!f32>
+      %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_host_ptr(%ba, %usm, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %usm, %f1 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY-NOT: no-alias A
+// LEGACY: no-alias-note A: 'A' and 'P' use the same memory, buffer 'ba' over a USM allocation
+// Agree.
+// PT-LABEL: === launches
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[U:n[0-9]+]]+0
+// PT-NEXT: field P pointer target=[[U]]+0
+// PT-NEXT: same A P
+// PT-NEXT: no-alias{{$}}
+
+// -----
+// ASSIGNED: a buffer assigned after construction is unknown.
+//
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %b1 = cir.alloca "b1" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%b1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %b2 = cir.alloca "b2" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%b2, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %asg = cir.call @buffer_assign(%b2, %b1) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf>
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %b1, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %b2, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY-NOT: no-alias A
+// LEGACY: no-alias-note B: buffer 'b2' is not constructed exactly once
+// Agree (not no-alias). Points-to: the assignment unifies b2's storage with b1's;
+// legacy: b2 is not constructed exactly once.
+// PT-LABEL: === launches
+// PT: field A accessor storage=[[A:n[0-9]+]]+0 [Ghost|Summary|Ref] origins=2 host=none complete
+// PT-NEXT: field B accessor storage=[[A]]+0
+// PT-NEXT: same A B
+// PT-NEXT: no-alias{{$}}
+
+// -----
+// LOCAL ACCESSOR: work-group local memory is not a candidate.
+// The local_accessor pointer (address space 3) neither gets nor blocks noalias.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%ba, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bb = cir.alloca "bb" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%bb, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %bb, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}, %arg4: !cir.ptr<!f32, target_address_space(3)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "L", init_arg = 0 : i32, kind = "local_accessor", path = ["L"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY: no-alias A B
+// LEGACY-NOT: no-alias-note L
+// Policy case; agree.
+// PT-LABEL: === launches
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field L local accessor
+// PT-NEXT: no-alias A B
+
+// -----
+// NESTED: an accessor inside a captured struct blocks noalias.
+// It cannot be stamped and is not proven distinct, so no field is no-alias.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%ba, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bb = cir.alloca "bb" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%bb, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %bb, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}, %arg4: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "S", init_arg = 0 : i32, kind = "accessor", path = ["S", "acc"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY-NOT: no-alias A
+// LEGACY: no-alias-note A: captured 'S' holds a nested accessor
+// LEGACY: no-alias-blocked: captured 'S' holds a nested accessor
+// Policy case; agree.
+// PT-LABEL: === launches
+// PT: field S.acc not in closure
+// PT-NEXT: blocked: captured 'S' holds a nested accessor
+// PT-NEXT: no-alias{{$}}
+
+// -----
+// POINTER IN STRUCT: a captured struct holding a pointer blocks noalias.
+//
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+!rec_ps = !cir.struct<"ps" {data !cir.ptr<!f32>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %u1 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPv() : () -> !cir.ptr<!f32>
+      %u2 = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPv() : () -> !cir.ptr<!f32>
+      %f0 = cir.get_member %lam[0] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %u1, %f0 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %f1 = cir.get_member %lam[1] {name = "Q"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %u2, %f1 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}, %arg1: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "Q", kind = "pointer", path = ["Q"]}}, %arg2: !cir.ptr<!rec_ps> {cir.sycl_kernel_param = {field = "S", kind = "std_layout", path = ["S"]}, llvm.byval = !rec_ps}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY-NOT: no-alias P
+// LEGACY: no-alias-note P: captured struct 'S' holds a pointer
+// Policy case; agree.
+// PT-LABEL: === launches
+// PT: field P pointer target={{n[0-9]+}}+0 [Heap|Summary|Ref|HasUSM] complete
+// PT-NEXT: field Q pointer target={{n[0-9]+}}+0 [Heap|Summary|Ref|HasUSM] complete
+// PT-NEXT: blocked: captured struct 'S' holds a pointer
+// PT-NEXT: no-alias{{$}}
+
+// -----
+// TWO LAUNCHES: distinct at one launch, the same buffer at the other.
+// The verdict must hold at every launch of the kernel.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv() -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) func_info<#cir.cxx_ctor<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> func_info<#cir.cxx_assign<!rec_buf, copy>> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) func_info<#cir.cxx_ctor<!rec_acc, copy>> attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %param: !cir.ptr<!rec_buf>) {
+      %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%ba, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bb = cir.alloca "bb" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%bb, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %xa = cir.alloca "xa" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xa, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %xb = cir.alloca "xb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xb, %bb, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %lam2 = cir.alloca "lam2" align(8) : !cir.ptr<!rec_lam>
+      %g0 = cir.get_member %lam2[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%g0, %xa) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %g1 = cir.get_member %lam2[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%g1, %xb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr2 = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr2, %lam2) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base2 = cir.base_class_addr nonnull %hkr2 [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki2 = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base2, %dki2) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      %ya = cir.alloca "ya" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%ya, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %yb = cir.alloca "yb" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%yb, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f0, %ya) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%f1, %yb) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}) cc(spir_kernel) {
+      cir.return
+    }
+  }
+}
+// LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// LEGACY-NOT: no-alias A
+// LEGACY: no-alias-note A: 'A' and 'B' use the same memory, buffer 'ba'
+// Policy case; agree.
+// PT-LABEL: === launches
+// PT: launch @main launch.direct_impl kernels={_ZTSZ4mainEUlvE_}
+// PT: no-alias A B
+// PT: launch @main launch.direct_impl kernels={_ZTSZ4mainEUlvE_}
+// PT: same A B
+// PT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}

@@ -20,7 +20,14 @@
 //
 // The first model whose matches() accepts the call is applied. A call to a
 // declaration that no model accepts gets the unknown-call rule (see
-// LocalBuilder).
+// LocalBuilder). A call to a function with a body is bound to the body
+// (PointsToAnalysis) unless a model that replacesDefinition() accepts it:
+// the call site is then modelled instead, and the body is not analysed for
+// that call. A body reached only through such calls is not analysed at all.
+//
+// A registry may have a fallback registry (setFallback), asked when none of
+// its own models applies: a plug-in registry (the SYCL models) in front of
+// the generic one.
 //
 // Trust rule (plan D1): a model may only rely on what a standard guarantees
 // (the C standard, the C++ standard, the SYCL specification). Each model
@@ -113,6 +120,38 @@ public:
     deferred.push_back({kind, cell, flags, why});
   }
 
+  /// The unknown-call rule (LocalBuilder): what the pointer arguments reach
+  /// escapes (Mod, Ref, deferred), the result is unknown, and the site
+  /// clobbers the globals. The sound fallback of a model whose operands are
+  /// not the shape it expects.
+  void applyUnknownCall(CallSiteRecord &site, const Reason *why);
+
+  /// Record a kernel launch, if this context collects them; the cells are
+  /// those of this graph.
+  void recordLaunch(LaunchRecord launch) {
+    if (launches)
+      launches->push_back(std::move(launch));
+  }
+
+  /// Whether addIndirectCall can add calls in this context.
+  bool canAddCalls() const { return extraCalls != nullptr; }
+
+  /// Add a call the modelled function makes, through the function pointer
+  /// that \p callee points to, with the pointer arguments \p args (empty
+  /// cells for non-pointers): a synthetic indirect call site on \p site's op
+  /// that the analysis resolves and binds like any other. Requires
+  /// canAddCalls().
+  void addIndirectCall(const CallSiteRecord &site, Cell callee,
+                       llvm::ArrayRef<std::optional<Cell>> args);
+
+  /// Collect launches into \p out and synthetic calls into \p calls.
+  void setLaunchSink(llvm::SmallVectorImpl<LaunchRecord> *out) {
+    launches = out;
+  }
+  void setCallSink(llvm::SmallVectorImpl<CallSiteRecord> *calls) {
+    extraCalls = calls;
+  }
+
   /// Record a copy of \p length bytes (std::nullopt: unknown) from \p src to
   /// \p dst, like cir.libc.memcpy (see recordMemTransfer).
   void addMemTransfer(const CallSiteRecord &site, Cell dst, Cell src,
@@ -125,6 +164,8 @@ private:
   const mlir::DataLayout &dataLayout;
   llvm::SmallVectorImpl<DeferredEffect> &deferred;
   llvm::SmallVectorImpl<MemTransferRecord> &memTransfers;
+  llvm::SmallVectorImpl<LaunchRecord> *launches = nullptr;
+  llvm::SmallVectorImpl<CallSiteRecord> *extraCalls = nullptr;
 };
 
 /// A library model.
@@ -146,6 +187,11 @@ public:
 
   /// A short name, printed on the call site (`model=<name>`).
   virtual llvm::StringRef name() const = 0;
+
+  /// Whether the model also applies to a callee with a body, in place of
+  /// binding the call to the body. False by default: a model applies to
+  /// declarations only.
+  virtual bool replacesDefinition() const { return false; }
 
   /// The section of the standard the model relies on.
   virtual llvm::StringRef specCitation() const = 0;
@@ -170,9 +216,15 @@ public:
   /// took, after the predicate models registered before it.
   const PointsToModel *addPredicateModel(std::unique_ptr<PointsToModel> model);
 
+  /// Ask \p registry when none of this registry's models applies.
+  void setFallback(const PointsToModelRegistry *registry) {
+    fallback = registry;
+  }
+
   /// The model for \p call (null for a synthetic site) to the function named
   /// \p calleeName, which is \p calleeOrNull in the module; null if none
-  /// applies.
+  /// applies. A callee with a body only gets a model that
+  /// replacesDefinition().
   const PointsToModel *lookup(cir::CIRCallOpInterface call,
                               cir::FuncOp calleeOrNull,
                               llvm::StringRef calleeName) const;
@@ -187,6 +239,7 @@ private:
   llvm::StringMap<llvm::SmallVector<const PointsToModel *, 1>> byRole;
   llvm::StringMap<llvm::SmallVector<const PointsToModel *, 1>> bySymbol;
   llvm::SmallVector<const PointsToModel *, 2> predicates;
+  const PointsToModelRegistry *fallback = nullptr;
 };
 
 /// Register the generic C and C++ models: allocators, deallocators, the C

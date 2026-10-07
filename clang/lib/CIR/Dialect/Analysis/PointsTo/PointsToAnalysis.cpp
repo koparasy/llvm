@@ -49,6 +49,12 @@ PointsToAnalysis::PointsToAnalysis(ModuleOp module,
                                    const PointsToModelRegistry *models,
                                    PointsToAnalysisOptions options)
     : module(module), models(models), options(options) {
+  if (this->options.extraModels) {
+    ownedModels = std::make_unique<PointsToModelRegistry>();
+    this->options.extraModels(*ownedModels);
+    ownedModels->setFallback(models);
+    this->models = ownedModels.get();
+  }
   run();
 }
 
@@ -145,10 +151,14 @@ Node *PointsToAnalysis::getSymbolNode(FlatSymbolRefAttr sym) const {
   return nullptr;
 }
 
-/// Whether \p func is analysed: it has a body and sits directly in \p module.
-static bool isAnalysed(cir::FuncOp func, ModuleOp module) {
+/// Whether \p func has a body and sits directly in \p module.
+static bool hasBodyIn(cir::FuncOp func, ModuleOp module) {
   return func && !func.isDeclaration() &&
          func->getParentOp() == module.getOperation();
+}
+
+bool PointsToAnalysis::isAnalysed(cir::FuncOp func) const {
+  return hasBodyIn(func, module) && !skipped.contains(func.getOperation());
 }
 
 //===----------------------------------------------------------------------===//
@@ -166,6 +176,7 @@ void PointsToAnalysis::run() {
       reasons.make(Reason::Kind::UnhandledOp, nullptr, "value not analysed");
   globals = std::make_unique<GlobalNodes>(*graph, *dataLayout, symbols, module);
 
+  computeReplacedCalls();
   computeVisibleCallers();
 
   // Call-graph SCCs in post-order: callees before their callers. The
@@ -182,18 +193,19 @@ void PointsToAnalysis::run() {
           continue;
         auto func =
             dyn_cast<cir::FuncOp>(node->getCallableRegion()->getParentOp());
-        if (isAnalysed(func, module) && seen.insert(func).second)
+        if (isAnalysed(func) && seen.insert(func).second)
           order.push_back(func);
       }
   }
   for (auto func : module.getOps<cir::FuncOp>())
-    if (isAnalysed(func, module) && seen.insert(func).second)
+    if (isAnalysed(func) && seen.insert(func).second)
       order.push_back(func);
 
   llvm::TimeRecord localStart = llvm::TimeRecord::getCurrentTime(true);
   for (cir::FuncOp func : order) {
-    bool complete =
-        options.assumeClosedTU || visibleCallers.contains(func.getOperation());
+    bool complete = (options.assumeClosedTU ||
+                     visibleCallers.contains(func.getOperation())) &&
+                    !unboundCallers.contains(func.getOperation());
     buildLocal(func, complete);
   }
   // A global another TU can name may hand the functions in its initializer
@@ -293,6 +305,89 @@ void PointsToAnalysis::run() {
   stats.totalSeconds = total.getWallTime();
 }
 
+void PointsToAnalysis::computeReplacedCalls() {
+  if (!models)
+    return;
+  // The calls a model takes in place of the callee's body: the same lookup
+  // the local phase makes (LocalBuilder::dispatchCall), so the two agree.
+  for (auto func : module.getOps<cir::FuncOp>()) {
+    if (!hasBodyIn(func, module))
+      continue;
+    func.walk([&](CIRCallOpInterface call) {
+      if (call.isIndirect())
+        return;
+      auto calleeSym = call->getAttrOfType<FlatSymbolRefAttr>("callee");
+      if (!calleeSym)
+        return;
+      auto callee =
+          symbols.lookupNearestSymbolFrom<cir::FuncOp>(call, calleeSym);
+      if (!callee || callee.isDeclaration())
+        return;
+      if (models->lookup(call, callee, calleeSym.getValue()))
+        replacedCalls.insert(call);
+    });
+  }
+  stats.numReplacedCalls = replacedCalls.size();
+  if (replacedCalls.empty())
+    return;
+
+  // SOUNDNESS: a skipped body is never looked at, so each of its uses must
+  // be a call whose effect some model gives instead (D1: the model describes
+  // the function for any caller), or a call from a body that is itself
+  // skipped. Any other use (an address taken, a global initializer, a call
+  // bound to the body) keeps it analysed. The callees of a skipped body lose
+  // a caller that is not bound to them (unboundCallers below).
+  llvm::DenseMap<StringAttr, SmallVector<Operation *, 2>> usesOf;
+  llvm::DenseSet<StringAttr> otherUses;
+  std::optional<SymbolTable::UseRange> uses =
+      SymbolTable::getSymbolUses(&module.getBodyRegion());
+  if (!uses)
+    return;
+  for (const SymbolTable::SymbolUse &use : *uses) {
+    StringAttr name = use.getSymbolRef().getRootReference();
+    auto call = dyn_cast<CIRCallOpInterface>(use.getUser());
+    auto callee =
+        call ? call->getAttrOfType<FlatSymbolRefAttr>("callee") : nullptr;
+    if (call && !call.isIndirect() && callee && callee.getAttr() == name)
+      usesOf[name].push_back(call);
+    else
+      otherUses.insert(name);
+  }
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (auto func : module.getOps<cir::FuncOp>()) {
+      if (!hasBodyIn(func, module) || skipped.contains(func) ||
+          otherUses.contains(func.getSymNameAttr()))
+        continue;
+      auto it = usesOf.find(func.getSymNameAttr());
+      if (it == usesOf.end() || it->second.empty())
+        continue;
+      if (llvm::all_of(it->second, [&](Operation *call) {
+            return replacedCalls.contains(call) ||
+                   skipped.contains(call->getParentOfType<cir::FuncOp>());
+          })) {
+        skipped.insert(func);
+        changed = true;
+      }
+    }
+  }
+  stats.numSkippedFunctions = skipped.size();
+
+  for (Operation *call : replacedCalls) {
+    auto sym = call->getAttrOfType<FlatSymbolRefAttr>("callee");
+    if (auto callee = symbols.lookupNearestSymbolFrom<cir::FuncOp>(call, sym))
+      unboundCallers.insert(callee);
+  }
+  for (Operation *func : skipped)
+    cast<cir::FuncOp>(func).walk([&](CIRCallOpInterface call) {
+      if (auto sym = call->getAttrOfType<FlatSymbolRefAttr>("callee"))
+        if (auto callee =
+                symbols.lookupNearestSymbolFrom<cir::FuncOp>(call, sym))
+          unboundCallers.insert(callee);
+    });
+}
+
 void PointsToAnalysis::computeVisibleCallers() {
   // SOUNDNESS: a function may have callers we don't see unless it has local
   // linkage (no other TU names it) and every use of its symbol is a direct
@@ -311,18 +406,20 @@ void PointsToAnalysis::computeVisibleCallers() {
     bool direct = false;
     if (auto call = dyn_cast<CIRCallOpInterface>(user)) {
       auto callee = call->getAttrOfType<FlatSymbolRefAttr>("callee");
-      direct = !call.isIndirect() && callee && callee.getAttr() == name;
+      // A call a model replaces is not bound to the body.
+      direct = !call.isIndirect() && callee && callee.getAttr() == name &&
+               !replacedCalls.contains(call);
     } else if (isa<cir::DeleteArrayOp>(user)) {
       // The element destructor and operator delete: synthetic call sites.
       direct = true;
     }
     if (direct)
-      direct = isAnalysed(user->getParentOfType<cir::FuncOp>(), module);
+      direct = isAnalysed(user->getParentOfType<cir::FuncOp>());
     if (!direct)
       otherUses.insert(name);
   }
   for (auto func : module.getOps<cir::FuncOp>()) {
-    if (!isAnalysed(func, module) || !cir::isLocalLinkage(func.getLinkage()))
+    if (!isAnalysed(func) || !cir::isLocalLinkage(func.getLinkage()))
       continue;
     // Run at program start or exit, by code we don't see.
     if (func->hasAttr("global_ctor_priority") ||
@@ -397,6 +494,12 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
   for (const MemTransferRecord &record : fg->memTransfers)
     memTransfers.push_back(
         {record.op, map(record.dst), map(record.src), record.length});
+  for (const LaunchRecord &local : fg->launches) {
+    LaunchRecord launch = local;
+    launch.closure = mapOpt(local.closure);
+    launch.geometry = mapOpt(local.geometry);
+    launches.push_back(std::move(launch));
+  }
 
   // One node per global symbol: the TU's, with its initializer read once.
   // The local copies are unified into it at the cell the symbol's storage
@@ -426,7 +529,7 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
     case CallKind::Defined: {
       auto callee = symbols.lookupNearestSymbolFrom<cir::FuncOp>(local.call,
                                                                  local.callee);
-      if (isAnalysed(callee, module)) {
+      if (isAnalysed(callee)) {
         call.resolution = CallResolution::Direct;
         call.callee = callee;
         break;
@@ -797,6 +900,11 @@ bool PointsToAnalysis::markEscapedFunctions() {
         if (visited.insert(next).second)
           worklist.push_back(next);
       }
+      for (const GhostLink &ghost : node->getGhostLinks()) {
+        const Node *next = ghost.target.getNode();
+        if (visited.insert(next).second)
+          worklist.push_back(next);
+      }
     }
   }
   if (causes.empty())
@@ -1038,7 +1146,8 @@ void PointsToAnalysis::markSummaries() {
   //    call site in a loop, or a caller that may itself run more than once.
   //    The heap objects of the activations all outlive them. The
   //    context-sensitive phase refines this per call path.
-  // Global, function and ghost origins stand for one object each.
+  // Global and function origins stand for one object each; ghost origins are
+  // treated like heap ones.
   //
   // A stack object of a non-recursive function stays a singleton even if
   // the function is called twice from straight-line code: the two
@@ -1135,7 +1244,10 @@ void PointsToAnalysis::markSummaries() {
                           origins[origins.size() > 1 ? 1 : 0].site,
                           "merged origins");
     const Origin &origin = origins.front();
-    bool heap = origin.kind == Origin::Kind::HeapCall;
+    // A ghost object (a model's, such as a SYCL buffer's storage) is made at
+    // its call site like a heap object, and outlives the activation too.
+    bool heap = origin.kind == Origin::Kind::HeapCall ||
+                origin.kind == Origin::Kind::GhostSite;
     if (!origin.site || (!heap && origin.kind != Origin::Kind::Alloca))
       return nullptr;
     if (heap && loops.isInLoop(origin.site))

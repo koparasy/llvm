@@ -106,6 +106,28 @@ void ModelContext::setResultUnknown(const CallSiteRecord &site,
         graph.addFlags(slot.second, flags, why);
 }
 
+void ModelContext::applyUnknownCall(CallSiteRecord &site, const Reason *why) {
+  // SOUNDNESS: the same rule as LocalBuilder::applyUnknownCall.
+  forEachPointerArg(site, [&](Cell cell) {
+    defer(DeferredEffect::Kind::Reachable, cell,
+          NodeFlags::External | NodeFlags::Mod | NodeFlags::Ref, why);
+  });
+  setResultUnknown(site, NodeFlags::External | NodeFlags::Incomplete, why);
+  site.clobbersGlobals = true;
+}
+
+void ModelContext::addIndirectCall(const CallSiteRecord &site, Cell callee,
+                                   ArrayRef<std::optional<Cell>> args) {
+  assert(extraCalls && "addIndirectCall without a call sink");
+  CallSiteRecord call;
+  call.call = site.call;
+  call.synthetic = true;
+  call.calleePtr = callee;
+  call.args.assign(args.begin(), args.end());
+  call.kind = CallKind::IndirectDeferred;
+  extraCalls->push_back(std::move(call));
+}
+
 //===----------------------------------------------------------------------===//
 // Registry
 //===----------------------------------------------------------------------===//
@@ -145,24 +167,28 @@ PointsToModelRegistry::addPredicateModel(std::unique_ptr<PointsToModel> model) {
 const PointsToModel *PointsToModelRegistry::lookup(CIRCallOpInterface call,
                                                    cir::FuncOp callee,
                                                    StringRef calleeName) const {
+  bool defined = callee && !callee.isDeclaration();
+  auto accepts = [&](const PointsToModel *m) {
+    return (!defined || m->replacesDefinition()) && m->matches(call, callee);
+  };
   if (callee)
     if (auto role = callee->getAttrOfType<StringAttr>(
             CIRDialect::getSYCLHostAPIAttrName())) {
       auto it = byRole.find(role.getValue());
       if (it != byRole.end())
         for (const PointsToModel *m : it->second)
-          if (m->matches(call, callee))
+          if (accepts(m))
             return m;
     }
   auto it = bySymbol.find(calleeName);
   if (it != bySymbol.end())
     for (const PointsToModel *m : it->second)
-      if (m->matches(call, callee))
+      if (accepts(m))
         return m;
   for (const PointsToModel *m : predicates)
-    if (m->matches(call, callee))
+    if (accepts(m))
       return m;
-  return nullptr;
+  return fallback ? fallback->lookup(call, callee, calleeName) : nullptr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -208,6 +234,11 @@ public:
 
   StringRef name() const override { return modelName; }
   StringRef specCitation() const override { return citation; }
+  /// A C library function defined with external linkage is the library's
+  /// (C17 7.1.3p2): the model describes the body.
+  bool replacesDefinition() const override {
+    return accept == Accept::LibraryDefinitions;
+  }
 
 private:
   StringRef modelName;

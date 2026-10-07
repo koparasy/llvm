@@ -2,6 +2,7 @@ add_clang_library(MLIRCIROffloadOpt
   KernelBindingTable.cpp
   KernelCloning.cpp
   SYCLKernelParams.cpp
+  SYCLPointsToModels.cpp
   DeadKernelElimination.cpp
   KernelArgConstantPropagation.cpp
   LaunchBoundsPropagation.cpp
@@ -17,6 +18,7 @@ add_clang_library(MLIRCIROffloadOpt
 
   LINK_LIBS PUBLIC
   MLIRCIR
+  MLIRCIRAnalysis
   MLIRCIRTransforms
   MLIRIR
   MLIRPass

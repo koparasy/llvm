@@ -13,7 +13,8 @@
 // use-points-to=1 builds the points-to analysis (PointsToAnalysis, with the
 // generic library models) of the module that holds the operation and
 // registers CIRPointsToAliasAnalysis after CIRBasicAliasAnalysis.
-// closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU.
+// closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU, and sycl=1 adds
+// the SYCL host API models (registerSYCLPointsToModels).
 // points-to-only=1 prints the answers of the points-to analysis alone.
 // explain=1 follows each MayAlias line with "  why: <explainAlias>".
 //
@@ -38,6 +39,7 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/Timer.h"
@@ -56,13 +58,15 @@ struct PointsToHolder {
   PointsToModelRegistry registry;
   std::unique_ptr<PointsToAnalysis> analysis;
 
-  PointsToHolder(Operation *op, bool closedTU) {
+  PointsToHolder(Operation *op, bool closedTU, bool sycl = false) {
     registerGenericModels(registry);
     auto module = dyn_cast<ModuleOp>(op);
     if (!module)
       module = op->getParentOfType<ModuleOp>();
     PointsToAnalysisOptions options;
     options.assumeClosedTU = closedTU;
+    if (sycl)
+      options.extraModels = cir::registerSYCLPointsToModels;
     analysis = std::make_unique<PointsToAnalysis>(module, &registry, options);
   }
 };
@@ -120,6 +124,12 @@ struct PointsToOptions : public PassWrapper<Derived, OperationPass<>> {
   PointsToOptions(const PointsToOptions &other)
       : PassWrapper<Derived, OperationPass<>>(other) {}
 
+  // The points-to analysis makes CIR types even on an input without CIR ops
+  // (the empty first chunk of a split input).
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<cir::CIRDialect>();
+  }
+
   Pass::Option<bool> usePointsTo{
       *this, "use-points-to",
       llvm::cl::desc("Register the points-to alias analysis last"),
@@ -127,6 +137,9 @@ struct PointsToOptions : public PassWrapper<Derived, OperationPass<>> {
   Pass::Option<bool> closedTU{
       *this, "closed-tu",
       llvm::cl::desc("Points-to: assume every caller is in the module"),
+      llvm::cl::init(false)};
+  Pass::Option<bool> syclModels{
+      *this, "sycl", llvm::cl::desc("Points-to: add the SYCL host API models"),
       llvm::cl::init(false)};
   Pass::Option<bool> pointsToOnly{
       *this, "points-to-only",
@@ -159,7 +172,7 @@ struct TestCIRAliasAnalysisPass
       runAliasAnalysisOnOperation(getOperation(), aliasAnalysis);
       return;
     }
-    PointsToHolder holder(getOperation(), closedTU);
+    PointsToHolder holder(getOperation(), this->closedTU, this->syclModels);
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);
@@ -202,7 +215,7 @@ struct TestCIRAliasAnalysisModRefPass
       runAliasAnalysisOnOperation(getOperation(), aliasAnalysis);
       return;
     }
-    PointsToHolder holder(getOperation(), closedTU);
+    PointsToHolder holder(getOperation(), this->closedTU, this->syclModels);
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);

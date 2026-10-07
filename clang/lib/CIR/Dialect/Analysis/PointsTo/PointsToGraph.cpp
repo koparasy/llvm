@@ -34,6 +34,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Debug.h"
@@ -43,6 +44,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 
 using namespace llvm;
 using namespace cir::pointsto;
@@ -289,6 +291,41 @@ const Reason *ReasonTable::make(Reason::Kind kind, mlir::Operation *op,
 }
 
 //===----------------------------------------------------------------------===//
+// GhostField
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// The process-wide table of ghost field names. Id 0 is the null field.
+struct GhostFieldTable {
+  std::mutex mutex;
+  llvm::StringMap<uint32_t> ids;
+  std::vector<StringRef> names{StringRef()};
+};
+} // namespace
+
+static GhostFieldTable &getGhostFieldTable() {
+  static GhostFieldTable table;
+  return table;
+}
+
+GhostField GhostField::get(StringRef name) {
+  assert(!name.empty() && "a ghost field needs a name");
+  GhostFieldTable &table = getGhostFieldTable();
+  std::lock_guard<std::mutex> lock(table.mutex);
+  auto [it, inserted] =
+      table.ids.try_emplace(name, static_cast<uint32_t>(table.names.size()));
+  if (inserted)
+    table.names.push_back(it->getKey());
+  return GhostField(it->second);
+}
+
+StringRef GhostField::getName() const {
+  GhostFieldTable &table = getGhostFieldTable();
+  std::lock_guard<std::mutex> lock(table.mutex);
+  return id < table.names.size() ? table.names[id] : StringRef();
+}
+
+//===----------------------------------------------------------------------===//
 // Cell and Node
 //===----------------------------------------------------------------------===//
 
@@ -334,6 +371,14 @@ SmallVector<std::pair<int64_t, Cell>, 4> Node::getLinks() const {
   result.reserve(links.size());
   for (const auto &[off, target] : links)
     result.emplace_back(off, target.resolve());
+  return result;
+}
+
+SmallVector<GhostLink, 2> Node::getGhostLinks() const {
+  SmallVector<GhostLink, 2> result;
+  result.reserve(ghosts.size());
+  for (const GhostLink &ghost : ghosts)
+    result.push_back({ghost.offset, ghost.field, ghost.target.resolve()});
   return result;
 }
 
@@ -468,6 +513,11 @@ size_t Graph::markReachable(Cell from, NodeFlags flags, const Reason *why,
       if (target && visited.insert(target).second)
         worklist.push_back(target);
     }
+    for (const GhostLink &ghost : node->ghosts) {
+      Node *target = ghost.target.getNode();
+      if (target && visited.insert(target).second)
+        worklist.push_back(target);
+    }
   }
   return visited.size();
 }
@@ -568,6 +618,72 @@ void Graph::setLink(Cell from, Cell to, const Reason *why) {
 }
 
 //===----------------------------------------------------------------------===//
+// Graph: ghost links
+//===----------------------------------------------------------------------===//
+
+static auto findGhost(SmallVectorImpl<GhostLink> &ghosts, int64_t offset,
+                      GhostField field) {
+  return llvm::lower_bound(
+      ghosts, std::make_pair(offset, field.getId()),
+      [](const GhostLink &g, const std::pair<int64_t, uint32_t> &key) {
+        return std::make_pair(g.offset, g.field.getId()) < key;
+      });
+}
+
+void Graph::insertGhost(Node *node, int64_t offset, GhostField field,
+                        Cell target, Worklist &worklist) {
+  offset = normalizeOffset(node, offset);
+  auto *it = findGhost(node->ghosts, offset, field);
+  if (it != node->ghosts.end() && it->offset == offset && it->field == field) {
+    worklist.emplace_back(it->target, target);
+    return;
+  }
+  node->ghosts.insert(it, {offset, field, target});
+}
+
+void Graph::renormalizeGhosts(Node *node, Worklist &worklist) {
+  if (node->ghosts.empty())
+    return;
+  auto old = std::move(node->ghosts);
+  node->ghosts.clear();
+  for (const GhostLink &ghost : old)
+    insertGhost(node, ghost.offset, ghost.field, ghost.target, worklist);
+}
+
+Cell Graph::getGhostLink(Cell from, GhostField field, const Reason *why) {
+  if (std::optional<Cell> existing = lookupGhostLink(from, field))
+    return *existing;
+  Cell src = from.resolve();
+  assert(src && field && "getGhostLink on an empty cell or field");
+  Cell target(newNode(), 0);
+  Worklist worklist;
+  insertGhost(src.getRawNode(), src.getRawOffset(), field, target, worklist);
+  runWorklist(worklist, why);
+  return target.resolve();
+}
+
+std::optional<Cell> Graph::lookupGhostLink(Cell from, GhostField field) const {
+  Cell src = from.resolve();
+  if (!src || !field)
+    return std::nullopt;
+  auto &ghosts = src.getRawNode()->ghosts;
+  auto *it = findGhost(ghosts, src.getRawOffset(), field);
+  if (it == ghosts.end() || it->offset != src.getRawOffset() ||
+      it->field != field)
+    return std::nullopt;
+  return it->target.resolve();
+}
+
+void Graph::setGhostLink(Cell from, GhostField field, Cell to,
+                         const Reason *why) {
+  Cell src = from.resolve();
+  assert(src && to && field && "setGhostLink on an empty cell or field");
+  Worklist worklist;
+  insertGhost(src.getRawNode(), src.getRawOffset(), field, to, worklist);
+  runWorklist(worklist, why);
+}
+
+//===----------------------------------------------------------------------===//
 // Graph: unification, collapse, arrays
 //===----------------------------------------------------------------------===//
 
@@ -618,11 +734,13 @@ void Graph::merge(Node *survivor, Node *merged, int64_t delta,
   // Move the state out of the merged node and forward it. From here on every
   // cell on `merged` resolves to `survivor`.
   auto mergedLinks = std::move(merged->links);
+  auto mergedGhosts = std::move(merged->ghosts);
   auto mergedOrigins = std::move(merged->origins);
   auto mergedReasons = std::move(merged->reasons);
   NodeFlags mergedFlags = merged->flags;
   uint64_t mergedSize = merged->size;
   merged->links.clear();
+  merged->ghosts.clear();
   merged->origins.clear();
   merged->reasons.clear();
   merged->flags = NodeFlags::None;
@@ -652,6 +770,9 @@ void Graph::merge(Node *survivor, Node *merged, int64_t delta,
 
   for (const auto &[off, target] : mergedLinks)
     insertLink(survivor, off + delta, target, worklist);
+  for (const GhostLink &ghost : mergedGhosts)
+    insertGhost(survivor, ghost.offset + delta, ghost.field, ghost.target,
+                worklist);
   collapseIfMisaligned(survivor, why, worklist);
 }
 
@@ -662,6 +783,7 @@ void Graph::collapseImpl(Node *node, const Reason *why, Worklist &worklist) {
   node->flags |= NodeFlags::Collapsed;
   recordReason(node, NodeFlags::Collapsed, why);
   node->arrayElemSize.reset();
+  renormalizeGhosts(node, worklist);
   if (node->links.empty())
     return;
   // Every slot is the slot at 0 now: unify all targets into the first one.
@@ -697,6 +819,7 @@ void Graph::markArrayImpl(Node *node, uint64_t elemSize, const Reason *why,
   node->links.clear();
   for (const auto &[off, target] : oldLinks)
     insertLink(node, off, target, worklist);
+  renormalizeGhosts(node, worklist);
   collapseIfMisaligned(node, why, worklist);
 }
 
@@ -754,9 +877,12 @@ CloneMap Graph::cloneInto(Graph &dst, ArrayRef<Cell> roots,
   // link order deterministically.
   for (Cell root : roots)
     visit(root);
-  for (size_t i = 0; i < order.size(); ++i)
+  for (size_t i = 0; i < order.size(); ++i) {
     for (const auto &link : order[i]->links)
       visit(link.second);
+    for (const GhostLink &ghost : order[i]->ghosts)
+      visit(ghost.target);
+  }
 
   // The copies have the same collapse and array state as their sources, so
   // the (already normalized and sorted) links carry over unchanged.
@@ -767,6 +893,12 @@ CloneMap Graph::cloneInto(Graph &dst, ArrayRef<Cell> roots,
       copy->links.emplace_back(
           off,
           Cell(result.nodeMap[t.getRawNode()].getRawNode(), t.getRawOffset()));
+    }
+    for (const GhostLink &ghost : src->ghosts) {
+      Cell t = ghost.target.resolve();
+      copy->ghosts.push_back({ghost.offset, ghost.field,
+                              Cell(result.nodeMap[t.getRawNode()].getRawNode(),
+                                   t.getRawOffset())});
     }
   }
   return result;
@@ -886,6 +1018,17 @@ void Graph::print(raw_ostream &os) const {
         },
         ", ");
     os << '}';
+    if (!node->ghosts.empty()) {
+      os << " ghost={";
+      llvm::interleave(
+          node->ghosts, os,
+          [&](const GhostLink &ghost) {
+            os << ghost.offset << ':' << ghost.field.getName() << "->";
+            printCell(os, ghost.target);
+          },
+          ", ");
+      os << '}';
+    }
     if (!node->reasons.empty()) {
       os << " reasons={";
       llvm::interleave(
@@ -917,8 +1060,9 @@ bool Graph::verify(raw_ostream *errs) const {
 
   for (const Node *node : allNodes) {
     if (node->isForwarded()) {
-      if (!node->links.empty() || !node->origins.empty() ||
-          !node->reasons.empty() || node->flags != NodeFlags::None)
+      if (!node->links.empty() || !node->ghosts.empty() ||
+          !node->origins.empty() || !node->reasons.empty() ||
+          node->flags != NodeFlags::None)
         fail(node, "forwarded node still holds state");
       // A cycle in the forwarding chain would make resolve() loop.
       const Node *n = node;
@@ -943,6 +1087,21 @@ bool Graph::verify(raw_ostream *errs) const {
     }
     if (isMisaligned(node))
       fail(node, "misaligned links on a non-collapsed node");
+    const auto &ghosts = node->ghosts;
+    for (size_t i = 0; i < ghosts.size(); ++i) {
+      if (!ghosts[i].field)
+        fail(node, "ghost link without a field");
+      if (!ghosts[i].target)
+        fail(node, "null ghost link target");
+      else if (ghosts[i].target.getNode()->isForwarded())
+        fail(node, "ghost link resolves to a forwarded node");
+      if (i &&
+          std::make_pair(ghosts[i - 1].offset, ghosts[i - 1].field.getId()) >=
+              std::make_pair(ghosts[i].offset, ghosts[i].field.getId()))
+        fail(node, "ghost links not sorted and unique");
+      if (normalizeOffset(node, ghosts[i].offset) != ghosts[i].offset)
+        fail(node, "ghost link offset not normalized");
+    }
     if (node->isCollapsed()) {
       if (links.size() > 1 || (links.size() == 1 && links[0].first != 0))
         fail(node, "collapsed node has a link at a non-zero offset");

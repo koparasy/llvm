@@ -48,6 +48,33 @@
 //                             | indirect-unresolved (<Kind>, "<detail>")
 //                               [bound={@f, ...}]
 //
+// sycl=1 adds the SYCL host API models (OffloadOpt's
+// registerSYCLPointsToModels, through PointsToAnalysisOptions::extraModels)
+// and, in ci mode, prints the kernel launches they record, even with
+// print-graphs=0:
+//
+//   === launches
+//   launch @<func> <model> kernels={<name>, ...} closure=<cell>
+//       geometry=<cell>
+//     kernel <name>[ (no device function)]
+//       field <path> accessor storage=<cell> [<flags>] origins=<n>
+//           host=<cell or none> <complete | unknown (<why>)>
+//       field <path> pointer target=<cell> [<flags>] <complete | ...>
+//       field <path> <not in closure | local accessor>
+//       blocked: <why>
+//       same <a> <b>            for each pair with the same identity
+//       no-alias <field> ...    the fields distinct from every other one
+//   kernel <name>: no-alias <field> ...   over every launch of the kernel
+//
+// The identity of an accessor field is the `$storage` ghost node of the
+// accessor in the closure and the `$host` memory of that storage; of a
+// pointer field, the object it points to. Two identities are the same if
+// their nodes are; distinct if both are complete (no External, Incomplete or
+// UnknownObj, and a storage made by a model) and their nodes and host memory
+// differ; unknown otherwise. A captured struct that holds a pointer, or an
+// accessor inside a captured struct, blocks the kernel (as
+// KernelBindingTable does).
+//
 // closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU and
 // max-indirect-rounds=<n> PointsToAnalysisOptions::maxIndirectRounds.
 // print-graphs=0 leaves out everything but the statistics, which end with one
@@ -63,7 +90,10 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -99,6 +129,10 @@ struct TestCIRPointsToPass
       llvm::cl::desc("local: the local graph of each function; ci: the "
                      "context-insensitive interprocedural analysis"),
       llvm::cl::init("local")};
+  Option<bool> syclModels{*this, "sycl",
+                          llvm::cl::desc("Add the SYCL host API models and, in "
+                                         "ci mode, print the kernel launches"),
+                          llvm::cl::init(false)};
   Option<bool> closedTU{*this, "closed-tu",
                         llvm::cl::desc("In ci mode, assume every caller of "
                                        "every function is in the module"),
@@ -122,6 +156,8 @@ struct TestCIRPointsToPass
   void runOnOperation() override;
   void runLocal();
   void runCI();
+  void printLaunches(raw_ostream &os, ModuleOp module,
+                     const PointsToAnalysis &analysis);
 };
 
 void printCell(raw_ostream &os, StringRef name, std::optional<Cell> cell,
@@ -230,6 +266,8 @@ void TestCIRPointsToPass::runCI() {
   PointsToAnalysisOptions options;
   options.assumeClosedTU = closedTU;
   options.maxIndirectRounds = maxIndirectRounds;
+  if (syclModels)
+    options.extraModels = cir::registerSYCLPointsToModels;
   bool anyFailed = false;
 
   SmallVector<ModuleOp> modules;
@@ -314,6 +352,9 @@ void TestCIRPointsToPass::runCI() {
       }
     }
 
+    if (syclModels)
+      printLaunches(os, module, analysis);
+
     if (!printStats)
       continue;
     const PointsToAnalysisStats &stats = analysis.getStats();
@@ -362,6 +403,11 @@ void TestCIRPointsToPass::runCI() {
        << "indirect calls over the round budget: " << stats.numIndirectBudget
        << "\n"
        << "clobbering calls: " << stats.numClobberingCalls << "\n"
+       << "calls a model replaced: " << stats.numReplacedCalls << "\n"
+       << "functions skipped (only replaced calls): "
+       << stats.numSkippedFunctions << "\n"
+       << "kernel launches recorded: " << analysis.getLaunches().size()
+       << "\n"
        << "copy closure settled: " << (stats.transfersSettled ? "yes" : "no")
        << "\n"
        << "local phase time (wall, s): " << stats.localSeconds << "\n"
@@ -455,6 +501,242 @@ void TestCIRPointsToPass::runCI() {
     signalPassFailure();
 }
 
+namespace {
+/// The memory identity of one closure field (see the file comment).
+struct FieldIdentity {
+  std::string path;
+  enum Kind { Storage, Pointer, Skipped } kind = Skipped;
+  const Node *node = nullptr; // the storage, or the pointer's target
+  const Node *host = nullptr; // the storage's host memory
+  bool complete = false;
+  std::string why;
+};
+
+enum class Verdict { Same, Distinct, Unknown };
+} // namespace
+
+static bool isCompleteNode(const Node *node) {
+  return node && !hasAny(node->getFlags(), NodeFlags::External |
+                                               NodeFlags::Incomplete |
+                                               NodeFlags::UnknownObj);
+}
+
+/// One reason a node is not complete, for the field lines.
+static std::string incompleteWhy(const Node *node) {
+  if (!node)
+    return "no node";
+  for (NodeFlags flag :
+       {NodeFlags::External, NodeFlags::Incomplete, NodeFlags::UnknownObj})
+    if (node->hasFlags(flag)) {
+      std::string out = getFlagName(flag).str();
+      if (const Reason *why = node->getReason(flag))
+        if (const Reason *root = getRootReason(why))
+          out += ": " + formatReason(root) + " at " + formatReasonSite(root);
+      return out;
+    }
+  return "complete";
+}
+
+static Verdict compareIdentities(const FieldIdentity &a,
+                                 const FieldIdentity &b) {
+  if (a.kind == FieldIdentity::Skipped || b.kind == FieldIdentity::Skipped)
+    return Verdict::Distinct; // Not a candidate: never blocks a pair.
+  if (!a.node || !b.node)
+    return Verdict::Unknown;
+  if (a.node == b.node)
+    return Verdict::Same;
+  if (!a.complete || !b.complete)
+    return Verdict::Unknown;
+  // The memory the device may access through each field: an accessor's host
+  // memory, else its fresh storage; a pointer's target.
+  const Node *ma = a.kind == FieldIdentity::Storage && a.host ? a.host : a.node;
+  const Node *mb = b.kind == FieldIdentity::Storage && b.host ? b.host : b.node;
+  return ma == mb ? Verdict::Same : Verdict::Distinct;
+}
+
+void TestCIRPointsToPass::printLaunches(raw_ostream &os, ModuleOp module,
+                                        const PointsToAnalysis &analysis) {
+  if (analysis.getLaunches().empty())
+    return;
+  os << "=== launches\n";
+  const Graph &graph = analysis.getGraph();
+  mlir::DataLayout layout(module);
+  // The no-alias fields of each kernel, ANDed over its launches.
+  llvm::MapVector<StringAttr, std::optional<llvm::SmallVector<std::string>>>
+      perKernel;
+  for (const LaunchRecord &launch : analysis.getLaunches()) {
+    auto func = launch.call->getParentOfType<cir::FuncOp>();
+    os << "launch @" << (func ? func.getSymName() : StringRef("?")) << " "
+       << launch.model << " kernels={";
+    llvm::interleaveComma(launch.kernelNames, os,
+                          [&](StringAttr name) { os << name.getValue(); });
+    os << "} closure=";
+    Graph::printCell(os, launch.closure ? *launch.closure : Cell());
+    os << " geometry=";
+    Graph::printCell(os, launch.geometry ? *launch.geometry : Cell());
+    os << "\n";
+    for (StringAttr name : launch.kernelNames) {
+      cir::FuncOp kernel;
+      getOperation()->walk([&](cir::FuncOp f) {
+        if (f.getSymName() == name.getValue() && !f.isDeclaration() &&
+            f.getNumArguments() && cir::getSYCLKernelParam(f, 0))
+          kernel = f;
+      });
+      os << "  kernel " << name.getValue();
+      if (!kernel) {
+        os << " (no device function)\n";
+        perKernel[name] = llvm::SmallVector<std::string>();
+        continue;
+      }
+      os << "\n";
+      SmallVector<FieldIdentity> fields;
+      std::string blocked;
+      for (unsigned i = 0, e = kernel.getNumArguments(); i != e; ++i) {
+        std::optional<cir::SYCLKernelParam> param =
+            cir::getSYCLKernelParam(kernel, i);
+        if (!param)
+          continue;
+        Type argType = kernel.getArgumentTypes()[i];
+        std::string path;
+        for (Attribute elem : param->path)
+          path += (path.empty() ? "" : ".") +
+                  cast<StringAttr>(elem).getValue().str();
+        if (param->kind == "std_layout") {
+          Type held = argType;
+          if (auto byval = kernel.getArgAttrOfType<TypeAttr>(i, "llvm.byval"))
+            held = byval.getValue();
+          if (!getPointerSlotOffsets(held, layout).empty() && blocked.empty())
+            blocked = "captured struct '" + path + "' holds a pointer";
+          continue;
+        }
+        if (param->kind == "local_accessor") {
+          if (param->accessorPart == "ptr")
+            os << "    field " << path << " local accessor\n";
+          continue;
+        }
+        bool isAccessor = param->kind == "accessor";
+        if (!isAccessor && param->kind != "pointer")
+          continue;
+        if (isAccessor && param->accessorPart != "ptr")
+          continue;
+        if (isAccessor && !param->isTopLevel() && blocked.empty())
+          blocked = "captured '" + param->field.str() +
+                    "' holds a nested accessor";
+        FieldIdentity field;
+        field.path = path;
+        auto ptrTy = dyn_cast<cir::PointerType>(argType);
+        auto as = ptrTy ? dyn_cast_if_present<cir::TargetAddressSpaceAttr>(
+                              ptrTy.getAddrSpace())
+                        : nullptr;
+        os << "    field " << path << " ";
+        if (as && as.getValue() == 3) {
+          os << "local accessor\n";
+          continue;
+        }
+        std::optional<int64_t> offset;
+        if (launch.closure && launch.closureType)
+          offset = cir::getSYCLClosureFieldOffset(module, launch.closureType,
+                                                  param->path, layout);
+        if (!offset) {
+          os << "not in closure\n";
+          field.kind = FieldIdentity::Pointer;
+          field.why = "not in closure";
+          fields.push_back(field);
+          continue;
+        }
+        Cell at(launch.closure->getNode(), launch.closure->getOffset() + *offset);
+        if (isAccessor) {
+          field.kind = FieldIdentity::Storage;
+          std::optional<Cell> storage =
+              graph.lookupGhostLink(at, cir::getSYCLStorageField());
+          os << "accessor storage=";
+          Graph::printCell(os, storage ? *storage : Cell());
+          if (storage) {
+            field.node = storage->getNode();
+            os << " [" << toString(field.node->getFlags()) << "] origins="
+               << field.node->getOrigins().size();
+            std::optional<Cell> host =
+                graph.lookupGhostLink(*storage, cir::getSYCLHostField());
+            os << " host=";
+            if (host) {
+              field.host = host->getNode();
+              Graph::printCell(os, *host);
+              os << " [" << toString(field.host->getFlags()) << "]";
+            } else {
+              os << "none";
+            }
+            field.complete = isCompleteNode(field.node) &&
+                             !field.node->getOrigins().empty() &&
+                             (!field.host || isCompleteNode(field.host));
+            if (!field.complete)
+              field.why = field.node->getOrigins().empty()
+                              ? std::string("storage made by no model")
+                              : incompleteWhy(isCompleteNode(field.node)
+                                                  ? field.host
+                                                  : field.node);
+          } else {
+            field.why = "no storage";
+          }
+        } else {
+          field.kind = FieldIdentity::Pointer;
+          std::optional<Cell> target = graph.lookupLink(at);
+          os << "pointer target=";
+          Graph::printCell(os, target ? *target : Cell());
+          if (target) {
+            field.node = target->getNode();
+            os << " [" << toString(field.node->getFlags()) << "]";
+            field.complete = isCompleteNode(field.node);
+            if (!field.complete)
+              field.why = incompleteWhy(field.node);
+          } else {
+            field.why = "nothing stored";
+          }
+        }
+        os << (field.complete ? " complete" : " unknown (" + field.why + ")")
+           << "\n";
+        fields.push_back(field);
+      }
+      if (!blocked.empty())
+        os << "    blocked: " << blocked << "\n";
+      SmallVector<std::string> noAlias;
+      for (size_t a = 0; a < fields.size(); ++a) {
+        bool distinct = blocked.empty() && fields[a].complete;
+        for (size_t b = 0; b < fields.size(); ++b) {
+          if (a == b)
+            continue;
+          Verdict v = compareIdentities(fields[a], fields[b]);
+          if (v == Verdict::Same && a < b)
+            os << "    same " << fields[a].path << " " << fields[b].path
+               << "\n";
+          distinct &= v == Verdict::Distinct;
+        }
+        if (distinct)
+          noAlias.push_back(fields[a].path);
+      }
+      os << "    no-alias";
+      for (const std::string &f : noAlias)
+        os << " " << f;
+      os << "\n";
+      auto &all = perKernel[name];
+      if (!all) {
+        all = noAlias;
+      } else {
+        llvm::SmallVector<std::string> kept;
+        for (const std::string &f : *all)
+          if (llvm::is_contained(noAlias, f))
+            kept.push_back(f);
+        all = kept;
+      }
+    }
+  }
+  for (auto &[name, fields] : perKernel) {
+    os << "kernel " << name.getValue() << ": no-alias";
+    for (const std::string &f : *fields)
+      os << " " << f;
+    os << "\n";
+  }
+}
+
 void TestCIRPointsToPass::runLocal() {
   raw_ostream &os = llvm::outs();
   SymbolTableCollection symbols;
@@ -465,6 +747,13 @@ void TestCIRPointsToPass::runLocal() {
   PointsToModelRegistry registry;
   if (useModels)
     registerGenericModels(registry);
+  PointsToModelRegistry syclRegistry;
+  const PointsToModelRegistry *models = &registry;
+  if (syclModels) {
+    cir::registerSYCLPointsToModels(syclRegistry);
+    syclRegistry.setFallback(&registry);
+    models = &syclRegistry;
+  }
   llvm::TimeRecord buildTime;
   bool anyFailed = false;
 
@@ -472,7 +761,7 @@ void TestCIRPointsToPass::runLocal() {
     if (func.isDeclaration())
       return;
     llvm::TimeRecord start = llvm::TimeRecord::getCurrentTime(true);
-    LocalBuilder builder(func, &symbols, /*reasons=*/nullptr, &registry);
+    LocalBuilder builder(func, &symbols, /*reasons=*/nullptr, models);
     std::unique_ptr<FunctionGraph> fg = builder.build();
     llvm::TimeRecord end = llvm::TimeRecord::getCurrentTime(false);
     end -= start;

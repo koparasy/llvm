@@ -1,0 +1,476 @@
+// RUN: cir-opt %s -split-input-file -cir-points-to-verify \
+// RUN:   -pass-pipeline="builtin.module(test-cir-points-to{mode=ci sycl=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s
+// RUN: cir-opt %s -split-input-file -cir-points-to-verify \
+// RUN:   -pass-pipeline="builtin.module(test-cir-points-to{mode=ci sycl=1 closed-tu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=CLOSED
+
+// The SYCL host API models of the points-to analysis (SYCLPointsToModels):
+// buffer and accessor storage as `$storage` ghost links, the host memory a
+// buffer may use as `$host`, USM allocations, the command group a queue
+// submission runs, and the kernel launches, keyed on the `cir.sycl_host_api`
+// roles CIRGen tags the host API with. The launch section prints, per closure
+// field of each launched kernel, the storage (accessor) or object (pointer)
+// it refers to; same node = same memory, distinct and complete = distinct.
+
+// -----
+// ROLES: one row of the role table each. Three buffer(range) buffers have
+// three storages (A, B, C); a copy (D), a sub-buffer (E), a reinterpret (F)
+// and an assignment (G = H) share their source's; buffer.other (O) and
+// accessor.other (P) storage is External; an accessor assignment (Q) shares
+// its source's. buffer(hostData) storage has `$host`: the vector's storage
+// (V, through the analysed std::vector::data), or a USM allocation (W, the
+// same object as the USM pointer U). get_access returns its accessor through
+// sret (B). The launch model replaces handler::parallel_for's body, which
+// would hand the closure to the runtime: the closure stays complete. The
+// kernel name comes from the kernel.info marker the replaced body calls.
+
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!void = !cir.void
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_handler = !cir.struct<class "sycl::_V1::handler" {data !cir.ptr<!s8i>}>
+!rec_vec = !cir.struct<class "std::vector<float>" {data !cir.ptr<!f32>, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_lam2 = !cir.struct<"lam2" {data !rec_acc, data !rec_acc, data !rec_acc, data !cir.ptr<!f32>}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc, data !rec_acc, data !rec_acc, data !rec_acc, data !rec_acc, data !rec_acc, data !rec_acc, data !rec_acc, data !rec_acc, data !rec_acc, data !rec_acc, data !rec_acc, data !cir.ptr<!f32>}>
+
+module {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTS1K" : !cir.array<!s8i x 6>, trailing_zeros> : !cir.array<!s8i x 7>
+    cir.global "private" constant cir_private @".str2" = #cir.const_array<"_ZTS2K2" : !cir.array<!s8i x 7>, trailing_zeros> : !cir.array<!s8i x 8>
+    cir.global "private" constant internal @kinfo2 = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str2"> : !cir.ptr<!s8i>, #cir.int<7> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @kinfo = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<6> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_other(!cir.ptr<!rec_buf>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "buffer.other", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.sub", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_reinterpret(!cir.ptr<!rec_buf> {llvm.sret = !rec_buf}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.reinterpret", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_assign(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf> attributes {cir.sycl_host_api = "buffer.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_access(!cir.ptr<!rec_acc> {llvm.sret = !rec_acc}, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) attributes {cir.sycl_host_api = "buffer.get_access", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_copy(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) attributes {cir.sycl_host_api = "accessor.copy", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_assign(!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> !cir.ptr<!rec_acc> attributes {cir.sycl_host_api = "accessor.assign", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @accessor_other(!cir.ptr<!rec_acc>) attributes {cir.sycl_host_api = "accessor.other", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @malloc_device(!u64i) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @usm_free(!cir.ptr<!f32>) attributes {cir.sycl_host_api = "usm.free", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @runtime_launch(!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>)
+    // std::vector::data is analysed: the host pointer is the vector's storage.
+    cir.func internal @vector_data(%vec: !cir.ptr<!rec_vec>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32} {
+      %start = cir.get_member %vec[0] {name = "_M_start"} : !cir.ptr<!rec_vec> -> !cir.ptr<!cir.ptr<!f32>>
+      %data = cir.load %start : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.return %data : !cir.ptr<!f32>
+    }
+    cir.func internal @kernel_info() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @kinfo : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @store_lambda(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) {
+      %info = cir.call @kernel_info() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+    // handler::parallel_for: replaced by the launch model. Its body would
+    // hand the closure to the runtime; it is not analysed.
+    cir.func internal @parallel_for(%h: !cir.ptr<!rec_handler>, %r: !cir.ptr<!rec_range>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 1 : i32} {
+      cir.call @store_lambda(%h, %k) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+      cir.call @runtime_launch(%h, %k) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+      cir.return
+    }
+    cir.func internal @kernel_info2() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @kinfo2 : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @parallel_for2(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam2>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+      %info = cir.call @kernel_info2() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+    cir.func @main(%h: !cir.ptr<!rec_handler>, %r: !cir.ptr<!rec_range>, %n: !u64i, %ip: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf> {test.ptr = "ba"}
+      cir.call @buffer_alloc(%ba, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bb = cir.alloca "bb" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%bb, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bc = cir.alloca "bc" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%bc, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bd = cir.alloca "bd" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_copy(%bd, %ba) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> ()
+      %be = cir.alloca "be" align(8) : !cir.ptr<!rec_buf>
+      %zero = cir.const #cir.int<0> : !u64i
+      cir.call @buffer_sub(%be, %bb, %zero, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !u64i, !cir.ptr<!rec_range>) -> ()
+      %bf = cir.alloca "bf" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_reinterpret(%bf, %bc) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> ()
+      %bg = cir.alloca "bg" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%bg, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %bh = cir.alloca "bh" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%bh, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %asg = cir.call @buffer_assign(%bg, %bh) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> !cir.ptr<!rec_buf>
+      %bo = cir.alloca "bo" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_other(%bo, %ip) : (!cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+      %v = cir.alloca "v" align(8) : !cir.ptr<!rec_vec>
+      %vd = cir.call @vector_data(%v) {test.ptr = "vd"} : (!cir.ptr<!rec_vec>) -> !cir.ptr<!f32>
+      %bv = cir.alloca "bv" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_host_ptr(%bv, %vd, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %u = cir.call @malloc_device(%n) {test.ptr = "u"} : (!u64i) -> !cir.ptr<!f32>
+      %bw = cir.alloca "bw" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_host_ptr(%bw, %u, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      // Accessors, into the closure fields.
+      %fA = cir.get_member %lam[0] {name = "A"} {test.ptr = "fA"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%fA, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %fB = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @buffer_get_access(%fB, %bb, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %xc = cir.alloca "xc" align(8) : !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%xc, %bc, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %fC = cir.get_member %lam[2] {name = "C"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%fC, %xc) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %fD = cir.get_member %lam[3] {name = "D"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%fD, %bd, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %fE = cir.get_member %lam[4] {name = "E"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%fE, %be, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %fF = cir.get_member %lam[5] {name = "F"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%fF, %bf, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %fG = cir.get_member %lam[6] {name = "G"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%fG, %bg, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %fH = cir.get_member %lam[7] {name = "H"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%fH, %bh, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %fO = cir.get_member %lam[8] {name = "O"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%fO, %bo, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %fP = cir.get_member %lam[9] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_other(%fP) : (!cir.ptr<!rec_acc>) -> ()
+      %fQ = cir.get_member %lam[10] {name = "Q"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      %qa = cir.call @accessor_assign(%fQ, %fA) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> !cir.ptr<!rec_acc>
+      %fV = cir.get_member %lam[11] {name = "V"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%fV, %bv, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %fW = cir.get_member %lam[12] {name = "W"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_from_buffer(%fW, %bw, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+      %fU = cir.get_member %lam[13] {name = "U"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %u, %fU : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @parallel_for(%h, %r, %lam) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_range>, !cir.ptr<!rec_lam>) -> ()
+      // A second kernel over the distinct storages only.
+      %lam2 = cir.alloca "lam2" align(8) : !cir.ptr<!rec_lam2>
+      %gA = cir.get_member %lam2[0] {name = "A"} : !cir.ptr<!rec_lam2> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%gA, %fA) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %gB = cir.get_member %lam2[1] {name = "B"} : !cir.ptr<!rec_lam2> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%gB, %fB) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %gV = cir.get_member %lam2[2] {name = "V"} : !cir.ptr<!rec_lam2> -> !cir.ptr<!rec_acc>
+      cir.call @accessor_copy(%gV, %fV) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_acc>) -> ()
+      %gU = cir.get_member %lam2[3] {name = "U"} : !cir.ptr<!rec_lam2> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %u, %gU : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @parallel_for2(%h, %lam2) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam2>) -> ()
+      cir.call @usm_free(%u) : (!cir.ptr<!f32>) -> ()
+      cir.return
+    }
+    cir.func @_ZTS2K2(%a: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}},
+                      %b: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}},
+                      %v: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "V", init_arg = 0 : i32, kind = "accessor", path = ["V"]}},
+                      %u: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "U", kind = "pointer", path = ["U"]}}) cc(spir_kernel) {
+      cir.return
+    }
+    cir.func @_ZTS1K(%a: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}},
+                     %ar: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}},
+                     %b: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}},
+                     %c: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "C", init_arg = 0 : i32, kind = "accessor", path = ["C"]}},
+                     %d: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "D", init_arg = 0 : i32, kind = "accessor", path = ["D"]}},
+                     %e: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "E", init_arg = 0 : i32, kind = "accessor", path = ["E"]}},
+                     %f: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "F", init_arg = 0 : i32, kind = "accessor", path = ["F"]}},
+                     %g: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "G", init_arg = 0 : i32, kind = "accessor", path = ["G"]}},
+                     %hh: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "H", init_arg = 0 : i32, kind = "accessor", path = ["H"]}},
+                     %o: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "O", init_arg = 0 : i32, kind = "accessor", path = ["O"]}},
+                     %p: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "P", init_arg = 0 : i32, kind = "accessor", path = ["P"]}},
+                     %q: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "Q", init_arg = 0 : i32, kind = "accessor", path = ["Q"]}},
+                     %v: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "V", init_arg = 0 : i32, kind = "accessor", path = ["V"]}},
+                     %w: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "W", init_arg = 0 : i32, kind = "accessor", path = ["W"]}},
+                     %u: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "U", kind = "pointer", path = ["U"]}}) cc(spir_kernel) {
+      cir.return
+    }
+}
+
+// CHECK-LABEL: === TU graph
+// The closure: one $storage ghost link per accessor field, apart from the
+// pointer slots (the impl pointers point to runtime objects).
+// CHECK: [Stack|Mod|Ref] size=216 origins={stack(cir.alloca 'lam'{{.*}} ghost={0:$storage->[[A:n[0-9]+]]+0, 16:$storage->[[B:n[0-9]+]]+0, 32:$storage->[[C:n[0-9]+]]+0, 48:$storage->[[A]]+0, 64:$storage->[[B]]+0, 80:$storage->[[C]]+0, 96:$storage->[[G:n[0-9]+]]+0, 112:$storage->[[G]]+0,
+// CHECK: [[A]] [Ghost|Summary|Ref] size=0 origins={ghost(cir.call
+// CHECK: @vector_data return -> [[VEC:n[0-9]+]]+0
+// CHECK-LABEL: === calls
+// CHECK: @main cir.call @buffer_reinterpret -> model buffer.reinterpret
+// CHECK: @main cir.call @vector_data -> direct @vector_data
+// CHECK: @main cir.call @malloc_device -> model usm.alloc
+// CHECK: @main cir.call @buffer_get_access -> model buffer.get_access
+// CHECK: @main cir.call @parallel_for -> model handler.kernel
+// CHECK: @main cir.call @usm_free -> model usm.free
+// CHECK-LABEL: === launches
+// CHECK-NEXT: launch @main handler.kernel kernels={_ZTS1K} closure=[[LAM:n[0-9]+]]+0 geometry=[[R:n[0-9]+]]+0
+// CHECK-NEXT:   kernel _ZTS1K
+// CHECK-NEXT:     field A accessor storage=[[A]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field B accessor storage=[[B]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field C accessor storage=[[C]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field D accessor storage=[[A]]+0
+// CHECK-NEXT:     field E accessor storage=[[B]]+0
+// CHECK-NEXT:     field F accessor storage=[[C]]+0
+// CHECK-NEXT:     field G accessor storage=[[G]]+0 [Ghost|Summary|Ref] origins=2 host=none complete
+// CHECK-NEXT:     field H accessor storage=[[G]]+0
+// CHECK-NEXT:     field O accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none unknown (External: UnmodelledRole, "buffer.other: storage not known"
+// CHECK-NEXT:     field P accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none unknown (External: UnmodelledRole, "accessor.other: storage not known"
+// CHECK-NEXT:     field Q accessor storage=[[A]]+0
+// CHECK-NEXT:     field V accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[VEC]]+0 [Mod|Ref] complete
+// CHECK-NEXT:     field W accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=[[USM:n[0-9]+]]+0 [Heap|Summary|Mod|Ref|HasUSM] complete
+// CHECK-NEXT:     field U pointer target=[[USM]]+0 [Heap|Summary|Mod|Ref|HasUSM] complete
+// CHECK-NEXT:     same A D
+// CHECK-NEXT:     same A Q
+// CHECK-NEXT:     same B E
+// CHECK-NEXT:     same C F
+// CHECK-NEXT:     same D Q
+// CHECK-NEXT:     same G H
+// CHECK-NEXT:     same W U
+// CHECK-NEXT:     no-alias{{$}}
+// CHECK-NEXT: launch @main handler.kernel kernels={_ZTS2K2} closure={{n[0-9]+}}+0 geometry=null
+// CHECK-NEXT:   kernel _ZTS2K2
+// CHECK:          no-alias A B V U
+// CHECK-NEXT: kernel _ZTS1K: no-alias{{$}}
+// CHECK-NEXT: kernel _ZTS2K2: no-alias A B V U
+
+// -----
+// SUBMIT: queue::submit's body is analysed; it builds the cgfo and hands it
+// to the runtime entry point (queue.submit_impl), which the model turns into
+// a synchronous call of the cgfo's invoker with the CGF object and a fresh
+// handler. The invoker is resolved through the cgfo constructor's store and
+// binds the CGF's operator(), whose launch is recorded. Open, the invoker's
+// address is taken, so its formals (and the captured buffers) are
+// incomplete; in a closed TU the two storages are distinct.
+
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!void = !cir.void
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_handler = !cir.struct<class "sycl::_V1::handler" {data !cir.ptr<!s8i>}>
+!rec_queue = !cir.struct<class "sycl::_V1::queue" {data !cir.ptr<!s8i>}>
+!rec_event = !cir.struct<class "sycl::_V1::event" {data !cir.ptr<!s8i>}>
+!rec_cgfo = !cir.struct<class "sycl::_V1::detail::type_erased_cgfo_ty" {data !cir.ptr<!void>, data !cir.ptr<!cir.func<(!cir.ptr<!void>, !cir.ptr<!rec_handler>)>>}>
+!rec_cgf = !cir.struct<"cgf" {data !cir.ptr<!rec_buf>, data !cir.ptr<!rec_buf>}>
+!rec_klam = !cir.struct<"klam" {data !rec_acc, data !rec_acc}>
+
+module {
+  cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTS2KS" : !cir.array<!s8i x 7>, trailing_zeros> : !cir.array<!s8i x 8>
+  cir.global "private" constant internal @kinfo = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<7> : !u64i}> : !rec_sv}> : !rec_ctki
+  cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+  // The runtime entry point the analysed queue::submit hands the cgfo to.
+  cir.func private @submit_with_event_impl(!cir.ptr<!rec_event> {llvm.sret = !rec_event}, !cir.ptr<!rec_queue>, !cir.ptr<!rec_cgfo>) attributes {cir.sycl_host_api = "queue.submit_impl", cir.sycl_host_api_arg = 0 : i32}
+  cir.func internal @kernel_info() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+    %0 = cir.get_global @kinfo : !cir.ptr<!rec_ctki>
+    %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+    cir.return %1 : !cir.ptr<!s8i>
+  }
+  cir.func internal @parallel_for(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_klam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+    %info = cir.call @kernel_info() : () -> !cir.ptr<!s8i>
+    cir.return
+  }
+  // The command-group function object: [&](handler &h) { ... }.
+  cir.func internal @cgf_call(%this: !cir.ptr<!rec_cgf>, %h: !cir.ptr<!rec_handler>) {
+    %k = cir.alloca "k" align(8) : !cir.ptr<!rec_klam>
+    %pa = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_cgf> -> !cir.ptr<!cir.ptr<!rec_buf>>
+    %a = cir.load %pa : !cir.ptr<!cir.ptr<!rec_buf>>, !cir.ptr<!rec_buf>
+    %pb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_cgf> -> !cir.ptr<!cir.ptr<!rec_buf>>
+    %b = cir.load %pb : !cir.ptr<!cir.ptr<!rec_buf>>, !cir.ptr<!rec_buf>
+    %fA = cir.get_member %k[0] {name = "A"} : !cir.ptr<!rec_klam> -> !cir.ptr<!rec_acc>
+    cir.call @accessor_from_buffer(%fA, %a, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+    %fB = cir.get_member %k[1] {name = "B"} : !cir.ptr<!rec_klam> -> !cir.ptr<!rec_acc>
+    cir.call @accessor_from_buffer(%fB, %b, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+    cir.call @parallel_for(%h, %k) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_klam>) -> ()
+    cir.return
+  }
+  // type_erased_cgfo_ty::invoker<F>::call: what the runtime calls back.
+  cir.func internal @invoker_call(%obj: !cir.ptr<!void>, %h: !cir.ptr<!rec_handler>) {
+    %f = cir.cast bitcast %obj : !cir.ptr<!void> -> !cir.ptr<!rec_cgf>
+    cir.call @cgf_call(%f, %h) : (!cir.ptr<!rec_cgf>, !cir.ptr<!rec_handler>) -> ()
+    cir.return
+  }
+  cir.func internal @cgfo_ctor(%this: !cir.ptr<!rec_cgfo>, %f: !cir.ptr<!rec_cgf>) attributes {cir.sycl_host_api = "cgfo.ctor", cir.sycl_host_api_arg = 0 : i32} {
+    %po = cir.get_member %this[0] {name = "object"} : !cir.ptr<!rec_cgfo> -> !cir.ptr<!cir.ptr<!void>>
+    %o = cir.cast bitcast %f : !cir.ptr<!rec_cgf> -> !cir.ptr<!void>
+    cir.store %o, %po : !cir.ptr<!void>, !cir.ptr<!cir.ptr<!void>>
+    %pi = cir.get_member %this[1] {name = "invoker_f"} : !cir.ptr<!rec_cgfo> -> !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!void>, !cir.ptr<!rec_handler>)>>>
+    %i = cir.get_global @invoker_call : !cir.ptr<!cir.func<(!cir.ptr<!void>, !cir.ptr<!rec_handler>)>>
+    cir.store %i, %pi : !cir.ptr<!cir.func<(!cir.ptr<!void>, !cir.ptr<!rec_handler>)>>, !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!void>, !cir.ptr<!rec_handler>)>>>
+    cir.return
+  }
+  // queue::submit: analysed.
+  cir.func internal @submit(%ev: !cir.ptr<!rec_event>, %q: !cir.ptr<!rec_queue>, %cgf: !cir.ptr<!rec_cgf>) attributes {cir.sycl_host_api = "queue.submit", cir.sycl_host_api_arg = 0 : i32} {
+    %cgfo = cir.alloca "cgfo" align(8) : !cir.ptr<!rec_cgfo>
+    cir.call @cgfo_ctor(%cgfo, %cgf) : (!cir.ptr<!rec_cgfo>, !cir.ptr<!rec_cgf>) -> ()
+    cir.call @submit_with_event_impl(%ev, %q, %cgfo) : (!cir.ptr<!rec_event>, !cir.ptr<!rec_queue>, !cir.ptr<!rec_cgfo>) -> ()
+    cir.return
+  }
+  cir.func @main(%q: !cir.ptr<!rec_queue>, %r: !cir.ptr<!rec_range>) {
+    %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_alloc(%ba, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+    %bb = cir.alloca "bb" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_alloc(%bb, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+    %cgf = cir.alloca "cgf" align(8) : !cir.ptr<!rec_cgf>
+    %ca = cir.get_member %cgf[0] {name = "a"} : !cir.ptr<!rec_cgf> -> !cir.ptr<!cir.ptr<!rec_buf>>
+    cir.store %ba, %ca : !cir.ptr<!rec_buf>, !cir.ptr<!cir.ptr<!rec_buf>>
+    %cb = cir.get_member %cgf[1] {name = "b"} : !cir.ptr<!rec_cgf> -> !cir.ptr<!cir.ptr<!rec_buf>>
+    cir.store %bb, %cb : !cir.ptr<!rec_buf>, !cir.ptr<!cir.ptr<!rec_buf>>
+    %ev = cir.alloca "ev" align(8) : !cir.ptr<!rec_event>
+    cir.call @submit(%ev, %q, %cgf) : (!cir.ptr<!rec_event>, !cir.ptr<!rec_queue>, !cir.ptr<!rec_cgf>) -> ()
+    cir.return
+  }
+  cir.func @_ZTS2KS(%a: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}},
+                    %b: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}) cc(spir_kernel) {
+    cir.return
+  }
+}
+
+// CHECK-LABEL: === @cgf_call formals=complete
+// CHECK: === @invoker_call formals=incomplete
+// CHECK-LABEL: === calls
+// CHECK: @cgf_call cir.call @parallel_for -> model handler.kernel
+// CHECK: @invoker_call cir.call @cgf_call -> direct @cgf_call
+// CHECK: @submit cir.call @cgfo_ctor -> direct @cgfo_ctor
+// CHECK: @submit cir.call @submit_with_event_impl -> model queue.submit_impl
+// CHECK: @submit cir.call synthetic -> indirect -> {@invoker_call}
+// CHECK-LABEL: === launches
+// CHECK-NEXT: launch @cgf_call handler.kernel kernels={_ZTS2KS}
+// CHECK-NEXT:   kernel _ZTS2KS
+// CHECK-NEXT:     field A accessor storage={{n[0-9]+}}+0 [Ghost|Incomplete|Summary|Ref] origins=1 host=none unknown (Incomplete: UnknownCaller, "formal #0" at cir.func {{.*}} @invoker_call)
+// CHECK: kernel _ZTS2KS: no-alias{{$}}
+
+// CLOSED-LABEL: === @invoker_call formals=complete
+// CLOSED-LABEL: === calls
+// CLOSED: @submit cir.call synthetic -> indirect -> {@invoker_call}
+// CLOSED-LABEL: === launches
+// CLOSED-NEXT: launch @cgf_call handler.kernel kernels={_ZTS2KS}
+// CLOSED-NEXT:   kernel _ZTS2KS
+// CLOSED-NEXT:     field A accessor storage=[[SA:n[0-9]+]]+0 [Ghost|Ref] origins=1 host=none complete
+// CLOSED-NEXT:     field B accessor storage=[[SB:n[0-9]+]]+0 [Ghost|Ref] origins=1 host=none complete
+// CLOSED-NEXT:     no-alias A B
+
+// -----
+// REPLACED DEFINITIONS: a call a model replaces is not bound to the callee's
+// body. @ctor is reached only through such calls, so it is not analysed (nor
+// @inner, which only @ctor calls, and whose runtime call would have made
+// the buffer escape). @helper keeps a caller that is not bound to it (@ctor),
+// so its formals are incomplete even in a closed TU. @ctor2's address is also
+// taken, so it is analysed, with incomplete formals.
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s32i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+
+module {
+  cir.global external @g = #cir.ptr<null> : !cir.ptr<!s32i>
+  cir.func private @runtime(!cir.ptr<!rec_buf>)
+  // Called by a replaced body and by main: analysed, but one caller is not
+  // bound to it, so its formals are incomplete even in a closed TU.
+  cir.func internal @helper(%p: !cir.ptr<!rec_buf>) {
+    cir.return
+  }
+  // Called only by a replaced body: not analysed.
+  cir.func internal @inner(%p: !cir.ptr<!rec_buf>) {
+    cir.call @runtime(%p) : (!cir.ptr<!rec_buf>) -> ()
+    cir.return
+  }
+  // Only reached through calls the buffer.alloc model replaces: skipped.
+  cir.func internal @ctor(%this: !cir.ptr<!rec_buf>, %r: !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32} {
+    cir.call @helper(%this) : (!cir.ptr<!rec_buf>) -> ()
+    cir.call @inner(%this) : (!cir.ptr<!rec_buf>) -> ()
+    cir.return
+  }
+  // A replaced call and an address taken: analysed, formals incomplete.
+  cir.func internal @ctor2(%this: !cir.ptr<!rec_buf>, %r: !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32} {
+    cir.call @runtime(%this) : (!cir.ptr<!rec_buf>) -> ()
+    cir.return
+  }
+  cir.global internal @fp = #cir.global_view<@ctor2> : !cir.ptr<!cir.func<(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>)>>
+  cir.func @main(%r: !cir.ptr<!rec_range>) {
+    %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf> {test.ptr = "b"}
+    cir.call @ctor(%b, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+    %c = cir.alloca "c" align(8) : !cir.ptr<!rec_buf> {test.ptr = "c"}
+    cir.call @ctor2(%c, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+    %d = cir.alloca "d" align(8) : !cir.ptr<!rec_buf> {test.ptr = "d"}
+    cir.call @helper(%d) : (!cir.ptr<!rec_buf>) -> ()
+    cir.return
+  }
+}
+
+// CHECK-LABEL: === TU graph
+// CHECK-NOT: === @ctor
+// CHECK-NOT: === @inner
+// CHECK: === @helper formals=incomplete
+// CHECK-NOT: === @ctor formals
+// CHECK: === @ctor2 formals=incomplete
+// CHECK: @main b -> {{n[0-9]+}}+0 complete
+// CHECK-LABEL: === calls
+// CHECK: @main cir.call @ctor -> model buffer.alloc
+// CHECK: @main cir.call @ctor2 -> model buffer.alloc
+// CHECK: @main cir.call @helper -> direct @helper
+
+// CLOSED-LABEL: === TU graph
+// CLOSED-NOT: === @ctor
+// CLOSED: === @helper formals=incomplete
+// CLOSED-NOT: === @ctor formals
+// CLOSED: === @ctor2 formals=incomplete
+// CLOSED: === @main formals=complete
+
+// -----
+// DIRECT LAUNCHES: detail::submit_kernel_direct (launch.direct) and the
+// queue::parallel_for shortcut (queue.kernel, with an sret event). The
+// closure is the last pointer operand to a non-SYCL record; the geometry an
+// nd_range passed by address (a range passed by value has no cell). The
+// USM allocations the closure holds are only read: no escape. The event the
+// runtime fills holds runtime pointers.
+
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_ndrange = !cir.struct<class "sycl::_V1::nd_range<1>" {data !rec_range, data !rec_range}>
+!rec_queue = !cir.struct<class "sycl::_V1::queue" {data !cir.ptr<!s8i>}>
+!rec_event = !cir.struct<class "sycl::_V1::event" {data !cir.ptr<!s8i>}>
+!rec_loc = !cir.struct<class "sycl::_V1::detail::code_location" {data !cir.ptr<!s8i>}>
+!rec_lam = !cir.struct<"lam" {data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+
+module {
+  cir.func private @malloc_shared(!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+  // detail::submit_kernel_direct_parallel_for(queue, nd_range, kernel, loc).
+  cir.func private @submit_kernel_direct(!cir.ptr<!rec_queue>, !cir.ptr<!rec_ndrange>, !cir.ptr<!rec_lam>, !cir.ptr<!rec_loc>) attributes {cir.sycl_host_api = "launch.direct", cir.sycl_host_api_arg = 2 : i32}
+  // queue::parallel_for(range, kernel) returning an event.
+  cir.func private @queue_parallel_for(!cir.ptr<!rec_event> {llvm.sret = !rec_event}, !cir.ptr<!rec_queue>, !u64i, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "queue.kernel", cir.sycl_host_api_arg = 1 : i32}
+  cir.func @main(%q: !cir.ptr<!rec_queue>, %nd: !cir.ptr<!rec_ndrange>, %loc: !cir.ptr<!rec_loc>, %n: !u64i) {
+    %x = cir.call @malloc_shared(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+    %y = cir.call @malloc_shared(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+    %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+    %fx = cir.get_member %lam[0] {name = "X"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+    cir.store %x, %fx : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+    %fy = cir.get_member %lam[1] {name = "Y"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+    cir.store %y, %fy : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+    cir.call @submit_kernel_direct(%q, %nd, %lam, %loc) : (!cir.ptr<!rec_queue>, !cir.ptr<!rec_ndrange>, !cir.ptr<!rec_lam>, !cir.ptr<!rec_loc>) -> ()
+    %ev = cir.alloca "ev" align(8) : !cir.ptr<!rec_event>
+    cir.call @queue_parallel_for(%ev, %q, %n, %lam) : (!cir.ptr<!rec_event>, !cir.ptr<!rec_queue>, !u64i, !cir.ptr<!rec_lam>) -> ()
+    cir.return
+  }
+}
+
+// CHECK-LABEL: === TU graph
+// CHECK: [[X:n[0-9]+]] [Heap|Summary|Ref|HasUSM] size=0 origins={heap(cir.call
+// CHECK: [[Y:n[0-9]+]] [Heap|Summary|Ref|HasUSM] size=0 origins={heap(cir.call
+// CHECK: [[LAM:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'lam'{{.*}} links={0->[[X]]+0, 8->[[Y]]+0}
+// CHECK: [Stack|Mod] size=8 origins={stack(cir.alloca 'ev'{{.*}} links={0->[[RT:n[0-9]+]]+0}
+// CHECK: [[RT]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: EscapedTo({{.*}}"kept by the SYCL runtime")
+// CHECK-LABEL: === launches
+// CHECK-NEXT: launch @main launch.direct kernels={} closure=[[LAM]]+0 geometry={{n[0-9]+}}+0
+// CHECK-NEXT: launch @main queue.kernel kernels={} closure=[[LAM]]+0 geometry=null

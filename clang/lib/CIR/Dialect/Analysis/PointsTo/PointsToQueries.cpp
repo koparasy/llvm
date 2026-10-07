@@ -521,9 +521,12 @@ void PointsToAnalysis::buildQueryIndex() const {
   queryIndexBuilt = true;
   for (const std::unique_ptr<TUFunction> &fn : functions) {
     functionByName[cir::FuncOp(fn->func).getSymNameAttr()] = fn.get();
-    for (const TUCallSite &site : fn->callSites)
+    for (const TUCallSite &site : fn->callSites) {
       if (!site.site.synthetic)
         callSiteOf[site.site.call] = &site;
+      else if (isa<CIRCallOpInterface>(site.site.call))
+        syntheticSitesOf[site.site.call].push_back(&site);
+    }
   }
   for (auto [sym, node] : globals->getSymbolNodes())
     symbolNodeOf[sym.getAttr()] = node;
@@ -594,35 +597,46 @@ PointsToAnalysis::getCallReach(const TUCallSite &call) const {
   slot = std::make_unique<llvm::DenseSet<const Node *>>();
   llvm::DenseSet<const Node *> &reach = *slot;
 
-  SmallVector<Cell, 8> roots;
-  const CallSiteRecord &site = call.site;
-  for (const std::optional<Cell> &arg : site.args)
-    if (arg)
-      roots.push_back(*arg);
-  for (const auto &[index, slots] : site.aggregateArgs)
-    for (auto [off, cell] : slots)
-      if (cell)
-        roots.push_back(cell);
-  // The result: the callee may write a fresh object and return it.
-  if (site.result)
-    roots.push_back(*site.result);
-  if (site.resultSlots)
-    for (auto [off, cell] : *site.resultSlots)
-      if (cell)
-        roots.push_back(cell);
+  // The call's own site and the calls a model makes on its behalf (a
+  // synthetic site on the same op): all of them run during the call.
+  buildQueryIndex();
+  SmallVector<const TUCallSite *, 2> sites{&call};
+  auto extra = syntheticSitesOf.find(call.site.call);
+  if (extra != syntheticSitesOf.end())
+    llvm::append_range(sites, extra->second);
 
-  // The globals the callee may name.
-  bool allGlobals = site.clobbersGlobals ||
-                    call.resolution == CallResolution::Unknown ||
-                    call.resolution == CallResolution::IndirectUnresolved;
-  if (!allGlobals) {
+  SmallVector<Cell, 8> roots;
+  bool allGlobals = false;
+  for (const TUCallSite *one : sites) {
+    const CallSiteRecord &site = one->site;
+    for (const std::optional<Cell> &arg : site.args)
+      if (arg)
+        roots.push_back(*arg);
+    for (const auto &[index, slots] : site.aggregateArgs)
+      for (auto [off, cell] : slots)
+        if (cell)
+          roots.push_back(cell);
+    // The result: the callee may write a fresh object and return it.
+    if (site.result)
+      roots.push_back(*site.result);
+    if (site.resultSlots)
+      for (auto [off, cell] : *site.resultSlots)
+        if (cell)
+          roots.push_back(cell);
+
+    // The globals the callee may name.
+    allGlobals |= site.clobbersGlobals ||
+                  one->resolution == CallResolution::Unknown ||
+                  one->resolution == CallResolution::IndirectUnresolved;
+    if (allGlobals)
+      continue;
     llvm::DenseSet<const TUFunction *> visited;
-    if (call.resolution == CallResolution::Direct) {
+    if (one->resolution == CallResolution::Direct) {
       if (const TUFunction *callee =
-              functionMap.lookup(cir::FuncOp(call.callee).getOperation()))
+              functionMap.lookup(cir::FuncOp(one->callee).getOperation()))
         allGlobals = !collectNamedSymbols(*callee, visited, roots);
-    } else if (call.resolution == CallResolution::Indirect) {
-      for (FlatSymbolRefAttr target : call.targets)
+    } else if (one->resolution == CallResolution::Indirect) {
+      for (FlatSymbolRefAttr target : one->targets)
         if (const TUFunction *callee = lookupFunction(target.getAttr()))
           if (!collectNamedSymbols(*callee, visited, roots)) {
             allGlobals = true;
@@ -644,6 +658,9 @@ PointsToAnalysis::getCallReach(const TUCallSite &call) const {
     const Node *node = worklist.pop_back_val();
     for (auto [off, target] : node->getLinks())
       if (const Node *next = target.getNode(); reach.insert(next).second)
+        worklist.push_back(next);
+    for (const GhostLink &ghost : node->getGhostLinks())
+      if (const Node *next = ghost.target.getNode(); reach.insert(next).second)
         worklist.push_back(next);
   }
   return reach;
@@ -667,6 +684,11 @@ ModRefResult PointsToAnalysis::getCallModRef(Operation *call,
   // accesses (status propagation spreads External, not Mod), so they don't
   // refine the answer either.
   if (isUnknownReachable(node))
+    return ModRefResult::getModAndRef();
+  // SOUNDNESS: a USM allocation is also accessed by device code, which runs
+  // asynchronously and is synchronized with by calls (a wait, an event, the
+  // next command) whose arguments need not reach the allocation.
+  if (node->hasFlags(NodeFlags::HasUSM))
     return ModRefResult::getModAndRef();
   // SOUNDNESS: a call (and everything it calls) reaches an existing object
   // only through a pointer: one it is passed, one it loads from memory it

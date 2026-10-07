@@ -81,8 +81,11 @@ LogicalResult Verifier::run() {
   cir::FuncOp func = fg.getFunction();
 
   llvm::DenseMap<Operation *, unsigned> records;
+  // Synthetic sites (cir.delete_array, or a call a model makes on behalf of a
+  // modelled call) come on top of the call's own record.
   for (const CallSiteRecord &site : fg.callSites)
-    ++records[site.call];
+    if (!site.synthetic)
+      ++records[site.call];
 
   func.walk([&](Block *block) {
     for (BlockArgument arg : block->getArguments())
@@ -187,6 +190,14 @@ cir::pointsto::verifyPointsToAnalysis(const PointsToAnalysis &analysis) {
           os << nodeName(node) << " is " << getFlagName(flag) << " but "
              << nodeName(target.getNode()) << ", which it links to at " << off
              << ", is not\n";
+          ok = false;
+        }
+      for (const GhostLink &ghost : node->getGhostLinks())
+        if (!ghost.target.getNode()->hasFlags(flag)) {
+          os << nodeName(node) << " is " << getFlagName(flag) << " but "
+             << nodeName(ghost.target.getNode()) << ", which its ghost link "
+             << ghost.field.getName() << " at " << ghost.offset
+             << " targets, is not\n";
           ok = false;
         }
     }

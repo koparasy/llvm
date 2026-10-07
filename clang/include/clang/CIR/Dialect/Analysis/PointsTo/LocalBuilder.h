@@ -186,6 +186,25 @@ struct CallSiteRecord {
   std::optional<AggregateSlots> resultSlots;
 };
 
+/// A kernel launch a model recorded (the SYCL plug-in's launch sinks): what
+/// the launched kernel receives. The interprocedural phase maps the cells
+/// into the TU graph (PointsToAnalysis::getLaunches).
+struct LaunchRecord {
+  /// The launching call.
+  mlir::Operation *call = nullptr;
+  /// The model that recorded it.
+  llvm::StringRef model;
+  /// The device kernels the call may launch, by symbol; empty if the model
+  /// could not tell.
+  llvm::SmallVector<mlir::StringAttr, 2> kernelNames;
+  /// The kernel function object (closure) the kernel receives a copy of, if
+  /// the model found it, and its type (the record a pointer to it points to).
+  std::optional<Cell> closure;
+  mlir::Type closureType;
+  /// The launch geometry object (range or nd_range), if passed by address.
+  std::optional<Cell> geometry;
+};
+
 /// An effect on what a pointer reaches that the local phase applies after
 /// the walk (and after closeMemTransfers), once every link of the function
 /// is known: flow-insensitively, what is stored into a node after a call is
@@ -259,10 +278,13 @@ public:
   /// The slots of what the function returns, if it returns an aggregate that
   /// holds pointers.
   std::optional<AggregateSlots> returnSlots;
-  /// The calls in the body, in walk order.
+  /// The calls in the body, in walk order. A synthetic site (a call a model
+  /// makes on behalf of the call it models) follows its call's record.
   llvm::SmallVector<CallSiteRecord, 4> callSites;
   /// The copies, in walk order.
   llvm::SmallVector<MemTransferRecord, 0> memTransfers;
+  /// The kernel launches the models recorded, in walk order.
+  llvm::SmallVector<LaunchRecord, 0> launches;
   /// The node of each global and function symbol the graph names (its
   /// storage starts at the cell), sorted by symbol name. The
   /// interprocedural phase unifies the copies of one symbol across graphs.

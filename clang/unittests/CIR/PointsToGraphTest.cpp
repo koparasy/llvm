@@ -894,4 +894,152 @@ TEST(PointsToGraphTest, VerifyAnalysisInvariants) {
   }
 }
 
+//===----------------------------------------------------------------------===//
+// 12. Named ghost links.
+//===----------------------------------------------------------------------===//
+
+TEST(PointsToGraphTest, GhostFieldsAreInterned) {
+  GhostField a = GhostField::get("$test.a");
+  GhostField b = GhostField::get("$test.b");
+  EXPECT_TRUE(a);
+  EXPECT_FALSE(GhostField());
+  EXPECT_NE(a, b);
+  EXPECT_EQ(a, GhostField::get("$test.a"));
+  EXPECT_EQ(a.getName(), "$test.a");
+  EXPECT_EQ(GhostField().getName(), "");
+}
+
+TEST(PointsToGraphTest, GhostLinksMergeOnUnify) {
+  Graph g;
+  GhostField storage = GhostField::get("$storage");
+  GhostField host = GhostField::get("$host");
+  Node *a = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Node *b = g.makeNode(stackOrigin(1), NodeFlags::Stack);
+  Node *s1 = g.makeNode(NodeFlags::Ghost);
+  Node *s2 = g.makeNode(NodeFlags::Ghost);
+  Node *h = g.makeNode();
+  g.setGhostLink(Cell(a, 16), storage, Cell(s1));
+  g.setGhostLink(Cell(b, 0), storage, Cell(s2));
+  g.setGhostLink(Cell(b, 0), host, Cell(h));
+  // Different offsets and fields stay apart.
+  EXPECT_FALSE(g.lookupGhostLink(Cell(a, 0), storage));
+  EXPECT_FALSE(g.lookupGhostLink(Cell(a, 16), host));
+  EXPECT_VERIFIED(g);
+
+  // b's object sits at a+16: its $storage collides with a's and unifies.
+  g.unify(Cell(a, 16), Cell(b, 0));
+  EXPECT_TRUE(sameCell(Cell(s1), Cell(s2)));
+  EXPECT_TRUE(sameCell(*g.lookupGhostLink(Cell(a, 16), host), Cell(h)));
+  EXPECT_EQ(Cell(a).getNode()->getNumGhostLinks(), 2u);
+  EXPECT_EQ(Cell(a).getNode()->getNumLinks(), 0u);
+  EXPECT_VERIFIED(g);
+
+  // getGhostLink creates on demand, then reads the same target.
+  Cell made = g.getGhostLink(Cell(a, 32), storage);
+  EXPECT_TRUE(sameCell(made, g.getGhostLink(Cell(a, 32), storage)));
+  EXPECT_FALSE(sameCell(made, Cell(s1)));
+  // setGhostLink on an existing ghost unifies the targets.
+  Node *s3 = g.makeNode(NodeFlags::Ghost);
+  g.setGhostLink(Cell(a, 32), storage, Cell(s3));
+  EXPECT_TRUE(sameCell(made, Cell(s3)));
+  EXPECT_VERIFIED(g);
+}
+
+TEST(PointsToGraphTest, GhostLinksIndependentOfLinkShape) {
+  Graph g;
+  GhostField storage = GhostField::get("$storage");
+  GhostField host = GhostField::get("$host");
+
+  // A ghost at a pointer slot's offset neither collides with the link nor
+  // makes the node misaligned.
+  Node *n = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Node *t = g.makeNode();
+  Node *s = g.makeNode(NodeFlags::Ghost);
+  g.setLink(Cell(n, 0), Cell(t));
+  g.setGhostLink(Cell(n, 0), storage, Cell(s));
+  g.setGhostLink(Cell(n, 4), host, Cell(g.makeNode()));
+  EXPECT_FALSE(Cell(n).getNode()->isCollapsed());
+  EXPECT_TRUE(sameCell(*g.lookupLink(Cell(n, 0)), Cell(t)));
+  EXPECT_FALSE(sameCell(Cell(t), Cell(s)));
+  EXPECT_VERIFIED(g);
+
+  // An array of handles: ghosts are taken modulo the element size, so the
+  // elements share one ghost per field, apart from the real links.
+  Node *arr = g.makeNode(stackOrigin(1), NodeFlags::Stack);
+  Node *e0 = g.makeNode(NodeFlags::Ghost);
+  Node *e1 = g.makeNode(NodeFlags::Ghost);
+  Node *p = g.makeNode();
+  g.setGhostLink(Cell(arr, 0), storage, Cell(e0));
+  g.setGhostLink(Cell(arr, 16), storage, Cell(e1));
+  g.setLink(Cell(arr, 8), Cell(p));
+  EXPECT_FALSE(sameCell(Cell(e0), Cell(e1)));
+  g.markArray(arr, 16);
+  EXPECT_TRUE(sameCell(Cell(e0), Cell(e1)));
+  EXPECT_FALSE(sameCell(Cell(e0), Cell(p)));
+  EXPECT_TRUE(sameCell(*g.lookupGhostLink(Cell(arr, 32), storage), Cell(e0)));
+  EXPECT_FALSE(Cell(arr).getNode()->isCollapsed());
+  EXPECT_VERIFIED(g);
+
+  // Collapse moves every ghost to offset 0: one per field, real links apart.
+  Node *c = g.makeNode(stackOrigin(2), NodeFlags::Stack);
+  Node *c0 = g.makeNode(NodeFlags::Ghost);
+  Node *c1 = g.makeNode(NodeFlags::Ghost);
+  Node *ch = g.makeNode();
+  Node *cl = g.makeNode();
+  g.setGhostLink(Cell(c, 0), storage, Cell(c0));
+  g.setGhostLink(Cell(c, 24), storage, Cell(c1));
+  g.setGhostLink(Cell(c, 24), host, Cell(ch));
+  g.setLink(Cell(c, 8), Cell(cl));
+  g.collapse(c);
+  EXPECT_TRUE(sameCell(Cell(c0), Cell(c1)));
+  EXPECT_FALSE(sameCell(Cell(c0), Cell(ch)));
+  EXPECT_FALSE(sameCell(Cell(c0), Cell(cl)));
+  EXPECT_FALSE(sameCell(Cell(ch), Cell(cl)));
+  EXPECT_EQ(Cell(c).getNode()->getNumGhostLinks(), 2u);
+  EXPECT_TRUE(sameCell(*g.lookupGhostLink(Cell(c, 40), host), Cell(ch)));
+  EXPECT_VERIFIED(g);
+}
+
+TEST(PointsToGraphTest, GhostLinksCloneAndPropagate) {
+  Graph g;
+  GhostField storage = GhostField::get("$storage");
+  GhostField host = GhostField::get("$host");
+  Node *buf = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Node *st = g.makeNode(Origin{Origin::Kind::GhostSite}, NodeFlags::Ghost);
+  Node *mem = g.makeNode(stackOrigin(1), NodeFlags::Stack);
+  g.setGhostLink(Cell(buf, 8), storage, Cell(st));
+  g.setGhostLink(Cell(st), host, Cell(mem));
+  // A cycle through a ghost link.
+  g.setLink(Cell(mem), Cell(buf));
+
+  Graph dst;
+  CloneMap map = g.cloneInto(dst, {Cell(buf)});
+  EXPECT_EQ(map.size(), 3u);
+  Cell cbuf = map.lookup(buf);
+  std::optional<Cell> cst =
+      dst.lookupGhostLink(Cell(cbuf.getNode(), 8), storage);
+  ASSERT_TRUE(cst);
+  EXPECT_TRUE(sameCell(*cst, map.lookup(st)));
+  std::optional<Cell> cmem = dst.lookupGhostLink(*cst, host);
+  ASSERT_TRUE(cmem);
+  EXPECT_TRUE(sameCell(*cmem, map.lookup(mem)));
+  EXPECT_TRUE(sameCell(*dst.lookupLink(*cmem), cbuf));
+  EXPECT_VERIFIED(dst);
+
+  // Escape follows ghost links: what a ghost refers to is unknown once the
+  // handle escapes.
+  EXPECT_EQ(g.markReachable(Cell(buf), NodeFlags::External), 3u);
+  EXPECT_TRUE(Cell(st).getNode()->hasFlags(NodeFlags::External));
+  EXPECT_TRUE(Cell(mem).getNode()->hasFlags(NodeFlags::External));
+
+  // Printing.
+  Graph p;
+  Node *h = p.makeNode(NodeFlags::Stack);
+  Node *s = p.makeNode(NodeFlags::Ghost);
+  p.setGhostLink(Cell(h, 16), storage, Cell(s));
+  EXPECT_EQ(printed(p), "n0 [Stack] size=0 origins={} links={} "
+                        "ghost={16:$storage->n1+0}\n"
+                        "n1 [Ghost] size=0 origins={} links={}\n");
+}
+
 } // namespace
