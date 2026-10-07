@@ -1,0 +1,78 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=PT
+// RUN: cir-opt %s -test-cir-alias-analysis='use-points-to=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=COMB
+
+// Escapes and alias answers. Code we don't see may make a pointer to any
+// object whose address it got, but never to one whose address never
+// escaped.
+
+!s32i = !cir.int<s, 32>
+!rec_S = !cir.struct<"S" {data !s32i, data !s32i}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @ext_pp(!cir.ptr<!cir.ptr<!s32i>>)
+cir.func private @ext(!cir.ptr<!s32i>)
+
+// q is loaded from pp after @ext_pp had pp: it may be any pointer @ext_pp
+// stored there. x never escaped, so q is not &x: NoAlias, which the local
+// analyses can't tell (q comes from a load). y was passed to @ext, so @ext_pp
+// may have stored &y: MayAlias, and the explanation names both escapes.
+// PT-LABEL: Testing : "escape"
+// PT-NEXT:  x#0 <-> y#0: NoAlias
+// PT-NEXT:  x#0 <-> q#0: NoAlias
+// PT-NEXT:  y#0 <-> q#0: MayAlias
+// PT-NEXT:    why: a: an escaped pointer passed to @ext (alias-escape.cir:{{[0-9]+}}); b: reachable from an escaped pointer passed to @ext_pp (alias-escape.cir:{{[0-9]+}})
+// COMB-LABEL: Testing : "escape"
+// COMB-NEXT:  x#0 <-> y#0: NoAlias
+// COMB-NEXT:  x#0 <-> q#0: NoAlias
+// COMB-NEXT:  y#0 <-> q#0: MayAlias
+cir.func @escape() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i> {test.ptr = "x"}
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i> {test.ptr = "y"}
+  %pp = cir.alloca "pp" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @ext(%y) : (!cir.ptr<!s32i>) -> ()
+  cir.call @ext_pp(%pp) : (!cir.ptr<!cir.ptr<!s32i>>) -> ()
+  %q = cir.load %pp : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "q"}
+  cir.return
+}
+
+// Offsets on a node unknown code reaches say nothing. @formals may be called
+// from other TUs, so its parameters are Incomplete. Storing &p->b and r into
+// one slot unifies r with the cell of p->b, offset 4, but a caller may call
+// formals(s, &s->a): pa and r may alias although their cells are at 0 and 4.
+// For the same reason points-to alone gives up on pa and pb; that they are
+// two members of one base is CIRBasicAliasAnalysis's to see (COMB).
+// PT-LABEL: Testing : "formals"
+// PT:       pa#0 <-> pb#0: MayAlias
+// PT:       pa#0 <-> func.region0#1: MayAlias
+// PT-NEXT:    why: a, b: same node, which may refer to unknown memory: parameter #0 of @formals, which may have callers that are not analysed (alias-escape.cir:{{[0-9]+}})
+// COMB-LABEL: Testing : "formals"
+// COMB:       pa#0 <-> pb#0: NoAlias
+// COMB:       pa#0 <-> func.region0#1: MayAlias
+cir.func @formals(%p: !cir.ptr<!rec_S>, %r: !cir.ptr<!s32i>)
+    attributes {test.ptr = "func"} {
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %pa = cir.get_member %p[0] {name = "a"} {test.ptr = "pa"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  %pb = cir.get_member %p[1] {name = "b"} {test.ptr = "pb"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  cir.store %pb, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %r, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+// The parameters of an internal function whose every caller is visible are
+// complete: @pair is only called with two distinct locals, so a and b don't
+// alias. The local analyses see two unrelated parameters.
+// PT-LABEL: Testing : "pair"
+// PT-NEXT:  func.region0#0 <-> func.region0#1: NoAlias
+// COMB-LABEL: Testing : "pair"
+// COMB-NEXT:  func.region0#0 <-> func.region0#1: NoAlias
+cir.func internal @pair(%a: !cir.ptr<!s32i>, %b: !cir.ptr<!s32i>)
+    attributes {test.ptr = "func"} {
+  cir.return
+}
+cir.func @pair_caller() {
+  %u = cir.alloca "u" align(4) : !cir.ptr<!s32i>
+  %v = cir.alloca "v" align(4) : !cir.ptr<!s32i>
+  cir.call @pair(%u, %v) : (!cir.ptr<!s32i>, !cir.ptr<!s32i>) -> ()
+  cir.return
+}
+}

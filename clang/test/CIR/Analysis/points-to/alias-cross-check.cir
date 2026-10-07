@@ -1,0 +1,89 @@
+// Soundness cross-check of the points-to alias answers: the alias test pass,
+// with use-points-to=1, asserts on every pair of `test.ptr` values that
+// CIRBasicAliasAnalysis and the points-to analysis never give two different
+// answers that are both not MayAlias (in particular never NoAlias against
+// MustAlias). Run it over every points-to test, open and closed-tu; the
+// alias-analysis*.cir tests in the parent directory run it in their own RUN
+// lines. A failure is an assertion in the pass, so only the exit status is
+// checked. When adding a points-to test, add it here.
+//
+// RUN: cir-opt %S/aggregate-values.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/aggregate-values.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/alias-basic.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/alias-basic.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/alias-escape.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/alias-escape.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/alias-ipo.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/alias-ipo.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/array-cap.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/array-cap.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/copy.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/copy.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/escape-call.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/escape-call.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/escape-global.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/escape-global.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/escape-ptr-to-int.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/escape-ptr-to-int.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/escape-return.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/escape-return.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/globals.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/globals.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/indirect-cap.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/indirect-cap.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/indirect.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/indirect.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-args.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-args.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-globals.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-globals.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-member.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-member.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-memcpy.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-memcpy.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-recursion.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-recursion.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-return.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-return.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-sret.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-sret.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-visibility.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-ci-visibility.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-aggregate.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-aggregate.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-alloca-load-store.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-alloca-load-store.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-arrays.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-arrays.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-calls.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-calls.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-collapse.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-collapse.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-fields.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-fields.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-merge.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-merge.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/memcpy.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/memcpy.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-alloc.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-alloc.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-array-ctor.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-array-ctor.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-libc.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-libc.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-memory-effects.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-memory-effects.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-unknown.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-unknown.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/modref.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/modref.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/summary.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/summary.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/unhandled-op.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/unhandled-op.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/virtual.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/virtual.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/virtual-shared-ptr.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/virtual-shared-ptr.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/vtable-ops.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/vtable-ops.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null

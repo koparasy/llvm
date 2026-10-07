@@ -1,0 +1,191 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=PT
+// RUN: cir-opt %s -test-cir-alias-analysis='use-points-to=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=COMB
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis))' --mlir-disable-threading -o /dev/null 2>&1 | FileCheck %s --check-prefix=BASIC
+// RUN: cir-opt %s -test-cir-points-to-alias-sample='pairs=50 seed=1' -o /dev/null | FileCheck %s --check-prefix=SAMPLE
+
+// The random-pair sampler (used on gemm) prints one row per analysis and
+// counts the pairs on which CIRBasicAliasAnalysis and points-to disagree.
+// SAMPLE:      === points-to alias sample: 50 pairs, seed 1
+// SAMPLE:      analysis NoAlias MayAlias Must Partial ns/query
+// SAMPLE-NEXT: CIRBasicAA
+// SAMPLE-NEXT: points-to
+// SAMPLE-NEXT: default
+// SAMPLE-NEXT: combined
+// SAMPLE-NEXT: points-to refines a CIRBasicAA MayAlias: {{[0-9]+}}, CIRBasicAA refines a points-to MayAlias: {{[0-9]+}}, contradictions: 0 (with the default chain: 0)
+
+// Alias queries answered from the points-to graph. The PT run: the points-to
+// analysis alone (with explanations of its MayAlias answers); COMB, the
+// chain LocalAliasAnalysis, CIRBasicAliasAnalysis, CIRPointsToAliasAnalysis
+// (the first answer that is not MayAlias wins); BASIC, the chain without
+// points-to, for comparison.
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_S = !cir.struct<"S" {data !s32i, data !s32i}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @malloc(!u64i) -> !cir.ptr<!void>
+
+// Locals: two allocas are two objects. A pointer loaded back from a slot that
+// only ever held &x is &x: x is a singleton (one origin, not a Summary,
+// complete), so the same offset is MustAlias. CIRBasicAliasAnalysis can't see
+// through the load.
+// PT-LABEL: Testing : "locals"
+// PT-NEXT:  x#0 <-> y#0: NoAlias
+// PT-NEXT:  x#0 <-> p#0: MustAlias
+// PT-NEXT:  y#0 <-> p#0: NoAlias
+// COMB-LABEL: Testing : "locals"
+// COMB-NEXT:  x#0 <-> y#0: NoAlias
+// COMB-NEXT:  x#0 <-> p#0: MustAlias
+// COMB-NEXT:  y#0 <-> p#0: NoAlias
+// BASIC-LABEL: Testing : "locals"
+// BASIC-NEXT:  x#0 <-> y#0: NoAlias
+// BASIC-NEXT:  x#0 <-> p#0: MayAlias
+// BASIC-NEXT:  y#0 <-> p#0: MayAlias
+cir.func @locals() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i> {test.ptr = "x"}
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i> {test.ptr = "y"}
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %p = cir.load %slot : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "p"}
+  cir.return
+}
+
+// Fields: the byte ranges of the members, also through a pointer reloaded
+// from memory (m1 is a member of %t, which is %s).
+// PT-LABEL: Testing : "fields"
+// PT-NEXT:  s#0 <-> m0#0: MustAlias
+// PT-NEXT:  s#0 <-> m1#0: PartialAlias
+// PT-NEXT:  m0#0 <-> m1#0: NoAlias
+// COMB-LABEL: Testing : "fields"
+// COMB-NEXT:  s#0 <-> m0#0: MustAlias
+// COMB-NEXT:  s#0 <-> m1#0: PartialAlias
+// COMB-NEXT:  m0#0 <-> m1#0: NoAlias
+// BASIC-LABEL: Testing : "fields"
+// BASIC-NEXT:  s#0 <-> m0#0: MustAlias
+// BASIC-NEXT:  s#0 <-> m1#0: MayAlias
+// BASIC-NEXT:  m0#0 <-> m1#0: MayAlias
+cir.func @fields() {
+  %s = cir.alloca "s" align(4) : !cir.ptr<!rec_S> {test.ptr = "s"}
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!rec_S>>
+  cir.store %s, %slot : !cir.ptr<!rec_S>, !cir.ptr<!cir.ptr<!rec_S>>
+  %t = cir.load %slot : !cir.ptr<!cir.ptr<!rec_S>>, !cir.ptr<!rec_S>
+  %m0 = cir.get_member %s[0] {name = "a"} {test.ptr = "m0"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  %m1 = cir.get_member %t[1] {name = "b"} {test.ptr = "m1"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// Arrays: the dynamic ptr_stride makes the node an array of 8-byte S
+// elements. Field a and field b of an element are disjoint in every element
+// (and two different elements are disjoint), but a of element %i and a of
+// element 0 may be the same.
+// PT-LABEL: Testing : "arrays"
+// PT-NEXT:  ea#0 <-> eb#0: NoAlias
+// PT-NEXT:  ea#0 <-> da#0: MayAlias
+// PT-NEXT:    why: a, b: same node (an array of 8-byte elements; the accesses may overlap in one element)
+// PT-NEXT:  eb#0 <-> da#0: NoAlias
+// BASIC-LABEL: Testing : "arrays"
+// BASIC-NEXT:  ea#0 <-> eb#0: MayAlias
+// BASIC-NEXT:  ea#0 <-> da#0: MayAlias
+// BASIC-NEXT:  eb#0 <-> da#0: MayAlias
+cir.func @arrays(%i: !s32i) {
+  %arr = cir.alloca "arr" align(4) : !cir.ptr<!cir.array<!rec_S x 4>>
+  %d = cir.cast array_to_ptrdecay %arr : !cir.ptr<!cir.array<!rec_S x 4>> -> !cir.ptr<!rec_S>
+  %e = cir.ptr_stride %d, %i : (!cir.ptr<!rec_S>, !s32i) -> !cir.ptr<!rec_S>
+  %ea = cir.get_member %e[0] {name = "a"} {test.ptr = "ea"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  %eb = cir.get_member %e[1] {name = "b"} {test.ptr = "eb"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  %da = cir.get_member %d[0] {name = "a"} {test.ptr = "da"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// Collapsed: the select unifies s.a with s.b, so the node keeps no offsets
+// and points-to says MayAlias. CIRBasicAliasAnalysis still sees two constant
+// offsets of one alloca and answers first.
+// PT-LABEL: Testing : "collapsed"
+// PT-NEXT:  m0#0 <-> m1#0: MayAlias
+// PT-NEXT:    why: a, b: same node (collapsed: an object merged with others at `cir.select` (alias-basic.cir:{{[0-9]+}}))
+// COMB-LABEL: Testing : "collapsed"
+// COMB-NEXT:  m0#0 <-> m1#0: NoAlias
+cir.func @collapsed(%c: !cir.bool) {
+  %s = cir.alloca "s" align(4) : !cir.ptr<!rec_S>
+  %m0 = cir.get_member %s[0] {name = "a"} {test.ptr = "m0"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  %m1 = cir.get_member %s[1] {name = "b"} {test.ptr = "m1"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  %sel = cir.select if %c then %m0 else %m1 : (!cir.bool, !cir.ptr<!s32i>, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// A null pointer points to no object.
+// PT-LABEL: Testing : "null"
+// PT-NEXT:  x#0 <-> n#0: NoAlias
+cir.func @null() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i> {test.ptr = "x"}
+  %n = cir.const #cir.ptr<null> : !cir.ptr<!s32i> {test.ptr = "n"}
+  cir.return
+}
+
+// MustAlias needs a singleton. Here the slot holds &x or &y, so x and y share
+// one node with two origins (a Summary): p may be &y, MayAlias. The
+// explanation counts the objects merged into the node (N17).
+// PT-LABEL: Testing : "merged"
+// PT-NEXT:  x#0 <-> p#0: MayAlias
+// PT-NEXT:    why: a, b: same node at the same offset, which may stand for several objects: an object with several origins (alias-basic.cir:{{[0-9]+}}) [2 objects merged into one node, e.g. stack 'x' (alias-basic.cir:{{[0-9]+}}) and stack 'y' (alias-basic.cir:{{[0-9]+}})]
+// COMB-LABEL: Testing : "merged"
+// COMB-NEXT:  x#0 <-> p#0: MayAlias
+cir.func @merged() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i> {test.ptr = "x"}
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %p = cir.load %slot : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "p"}
+  cir.return
+}
+
+// A heap object allocated in a loop is a Summary with one origin: q is the
+// object of some earlier iteration, p the current one.
+// PT-LABEL: Testing : "in_loop"
+// PT-NEXT:  p#0 <-> q#0: MayAlias
+// PT-NEXT:    why: a, b: same node at the same offset, which may stand for several objects: an object allocated in a loop (alias-basic.cir:{{[0-9]+}})
+cir.func @in_loop() {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!void>>
+  cir.while {
+    %c = cir.const #cir.bool<true> : !cir.bool
+    cir.condition(%c)
+  } do {
+    %p = cir.call @malloc(%c4) {test.ptr = "p"} : (!u64i) -> !cir.ptr<!void>
+    cir.store %p, %slot : !cir.ptr<!void>, !cir.ptr<!cir.ptr<!void>>
+    cir.yield
+  }
+  %q = cir.load %slot : !cir.ptr<!cir.ptr<!void>>, !cir.ptr<!void> {test.ptr = "q"}
+  cir.return
+}
+
+// A heap object allocated once per call. @heap_once is external: it may be
+// called any number of times from other TUs, and the objects of all those
+// calls may be live at once, so the node is a Summary. Under closed-tu
+// nothing calls it more than once (it has no caller here), so the object is
+// a singleton and p, q MustAlias. An access through a void pointer has an
+// unknown size, and points-to then answers MustAlias for no pair.
+// PT-LABEL: Testing : "heap_once"
+// PT-NEXT:  p#0 <-> q#0: MayAlias
+// PT-NEXT:    why: a, b: same node at the same offset, which may stand for several objects: an object allocated in a function that may run several times (alias-basic.cir:{{[0-9]+}})
+// CLOSED-LABEL: Testing : "heap_once"
+// CLOSED-NEXT:  p#0 <-> q#0: MustAlias
+// CLOSED-NEXT:  p#0 <-> vq#0: MayAlias
+// CLOSED-NEXT:  q#0 <-> vq#0: MayAlias
+// BASIC-LABEL: Testing : "heap_once"
+// BASIC-NEXT:  p#0 <-> q#0: MayAlias
+cir.func @heap_once() {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %raw = cir.call @malloc(%c4) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i> {test.ptr = "p"}
+  cir.store %p, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %q = cir.load %slot : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "q"}
+  %vq = cir.cast bitcast %q : !cir.ptr<!s32i> -> !cir.ptr<!void> {test.ptr = "vq"}
+  cir.return
+}
+}

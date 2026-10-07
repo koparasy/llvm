@@ -1,7 +1,13 @@
 // Use --mlir-disable-threading so that the AA queries are serialized
 // as well as their diagnostic output.
 // RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis))' \
-// RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s
+// RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s --check-prefixes=CHECK,OPEN
+// The same with the points-to analysis registered last; with closed-tu the
+// answers that change are explained at each test (CLOSED).
+// RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis{use-points-to=1}))' \
+// RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s --check-prefixes=CHECK,OPEN
+// RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis{use-points-to=1 closed-tu=1}))' \
+// RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s --check-prefixes=CHECK,CLOSED
 
 // -----
 
@@ -38,9 +44,13 @@ cir.func @three_distinct_allocas() {
 
 // Function arguments have unknown provenance — they may alias each other.
 // test.ptr goes on the cir.func op; args are addressed as func.region0#N.
+// Under closed-tu every caller of the function is in the module, and there is
+// none here, so the points-to analysis sees no object either argument may
+// point to: NoAlias, vacuously.
 
 // CHECK-LABEL: Testing : "ptr_args_may_alias"
-// CHECK-DAG: func.region0#0 <-> func.region0#1: MayAlias
+// OPEN-DAG: func.region0#0 <-> func.region0#1: MayAlias
+// CLOSED-DAG: func.region0#0 <-> func.region0#1: NoAlias
 
 !s32i = !cir.int<s, 32>
 cir.func @ptr_args_may_alias(%p: !cir.ptr<!s32i>, %q: !cir.ptr<!s32i>)

@@ -18,6 +18,9 @@
 #include "mlir/Analysis/AliasAnalysis.h"
 
 namespace cir {
+namespace pointsto {
+class PointsToAnalysis;
+} // namespace pointsto
 
 /// Register all CIR alias analysis implementations with `aa`, which answers
 /// queries about values within `op`. Pass the same operation `aa` was created
@@ -30,7 +33,12 @@ namespace cir {
 ///   mlir::AliasAnalysis aa(funcOp);
 ///   cir::registerCIRAliasAnalyses(aa, funcOp);
 ///
-void registerCIRAliasAnalyses(mlir::AliasAnalysis &aa, mlir::Operation *op);
+/// With \p pointsTo, a finished points-to analysis of the module that holds
+/// `op`, CIRPointsToAliasAnalysis is registered last, after
+/// CIRBasicAliasAnalysis; \p pointsTo must outlive `aa`.
+void registerCIRAliasAnalyses(
+    mlir::AliasAnalysis &aa, mlir::Operation *op,
+    const pointsto::PointsToAnalysis *pointsTo = nullptr);
 
 } // namespace cir
 

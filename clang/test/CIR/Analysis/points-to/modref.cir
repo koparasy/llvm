@@ -1,0 +1,68 @@
+// RUN: cir-opt %s -test-cir-alias-analysis-modref='points-to-only=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=PT
+// RUN: cir-opt %s -test-cir-alias-analysis-modref='use-points-to=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=COMB
+// RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis-modref))' --mlir-disable-threading -o /dev/null 2>&1 | FileCheck %s --check-prefix=BASIC
+
+// Mod/ref of calls from points-to. A call reaches an existing object only
+// through its arguments, its result and the globals it (or a callee) names.
+// An object no unknown code can reach and no such path leads to is
+// NoModRef. Otherwise the node's Mod and Ref flags, set by every access of
+// the analysed code (context-insensitively), refine ModRef.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @use(!cir.ptr<!s32i>)
+cir.func private @strlen(!cir.ptr<!s8i>) -> !u64i
+cir.global constant internal @str = #cir.const_array<"hi\00" : !cir.array<!s8i x 3>> : !cir.array<!s8i x 3>
+
+cir.func internal @touch(%p: !cir.ptr<!s32i>) {
+  %one = cir.const #cir.int<1> : !s32i
+  cir.store %one, %p : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+
+// - @use (unknown) receives y: ModRef on y; x never escaped and is not
+//   passed: NoModRef.
+// - @touch (defined, internal) stores to what it is passed: Mod on t (only
+//   ever written), NoModRef on x.
+// - strlen (a read-only library model) on the constant string: Ref, since
+//   nothing ever writes it.
+// PT-LABEL: Testing : "calls"
+// PT-DAG:  use_call -> x#0: NoModRef
+// PT-DAG:  use_call -> y#0: ModRef
+// PT-DAG:  touch_call -> x#0: NoModRef
+// PT-DAG:  touch_call -> t#0: Mod
+// PT-DAG:  strlen_call -> s#0: Ref
+// PT-DAG:  strlen_call -> x#0: NoModRef
+// PT-DAG:  load_x -> x#0: Ref
+// PT-DAG:  load_x -> y#0: NoModRef
+// PT-DAG:  store_x -> x#0: Mod
+// PT-DAG:  store_x -> t#0: NoModRef
+// COMB-LABEL: Testing : "calls"
+// COMB-DAG:  use_call -> x#0: NoModRef
+// COMB-DAG:  use_call -> y#0: ModRef
+// COMB-DAG:  touch_call -> x#0: NoModRef
+// COMB-DAG:  touch_call -> t#0: Mod
+// COMB-DAG:  strlen_call -> s#0: Ref
+// BASIC-LABEL: Testing : "calls"
+// BASIC-DAG:  use_call -> x#0: ModRef
+// BASIC-DAG:  touch_call -> x#0: ModRef
+// BASIC-DAG:  touch_call -> t#0: ModRef
+// BASIC-DAG:  strlen_call -> s#0: ModRef
+cir.func @calls() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i> {test.ptr = "x"}
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i> {test.ptr = "y"}
+  %t = cir.alloca "t" align(4) : !cir.ptr<!s32i> {test.ptr = "t"}
+  %g = cir.get_global @str : !cir.ptr<!cir.array<!s8i x 3>>
+  %s = cir.cast array_to_ptrdecay %g : !cir.ptr<!cir.array<!s8i x 3>> -> !cir.ptr<!s8i> {test.ptr = "s"}
+  %zero = cir.const #cir.int<0> : !s32i
+  cir.store %zero, %x {test.ptr = "store_x"} : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.ptr = "load_x"}
+  cir.call @use(%y) {test.ptr = "use_call"} : (!cir.ptr<!s32i>) -> ()
+  cir.call @touch(%t) {test.ptr = "touch_call"} : (!cir.ptr<!s32i>) -> ()
+  %n = cir.call @strlen(%s) {test.ptr = "strlen_call"} : (!cir.ptr<!s8i>) -> !u64i
+  cir.return
+}
+}

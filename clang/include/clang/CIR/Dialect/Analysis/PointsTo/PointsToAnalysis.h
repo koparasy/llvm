@@ -61,6 +61,10 @@
 //     "merged origins"}. Alias queries never answer MustAlias for such a
 //     node.
 //
+// Queries (PointsToQueries.cpp) run on the finished graph: alias, getModRef
+// and explainAlias. CIRPointsToAliasAnalysis wraps them as an
+// mlir::AliasAnalysis implementation.
+//
 // Formals: a function's formals start Incomplete (Reason UnknownCaller)
 // unless all of its callers are visible: it has internal or private linkage
 // and every use of its symbol is a direct call from a function this
@@ -73,12 +77,14 @@
 #ifndef CLANG_CIR_DIALECT_ANALYSIS_POINTSTO_POINTSTOANALYSIS_H
 #define CLANG_CIR_DIALECT_ANALYSIS_POINTSTO_POINTSTOANALYSIS_H
 
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/LocalBuilder.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToGraph.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
@@ -176,6 +182,60 @@ struct ObjectSet {
 ///  - a complete empty set: "pointer refers to no object".
 std::string explain(const ObjectSet &set);
 
+/// The rule of PointsToAnalysis::alias that decided a query, for
+/// explanations and statistics. See PointsToQueries.cpp for each rule's
+/// soundness argument.
+enum class AliasRule : uint8_t {
+  /// The same SSA value: MustAlias.
+  SameValue,
+  /// One side is a null pointer, which points to no object: NoAlias.
+  NullPointer,
+  /// Both sides are null, or derived from null: MayAlias.
+  BothNull,
+  /// A value the analysis has no cell for (a function without a body, or
+  /// one in another module): MayAlias.
+  NotAnalysed,
+  /// Different nodes, neither reachable by unknown code: NoAlias.
+  DistinctObjects,
+  /// Different nodes; one may refer to unknown memory, but the other's
+  /// object never escaped and came from no unknown code: NoAlias.
+  UnescapedObject,
+  /// Different nodes, both may refer to unknown memory: MayAlias.
+  BothUnknown,
+  /// The same node, which unknown code can reach: its offsets say nothing
+  /// about where a pointer that code made points. MayAlias.
+  SameNodeUnknown,
+  /// The same collapsed node: MayAlias.
+  Collapsed,
+  /// The same array node, each access within one element at disjoint
+  /// element-relative ranges: NoAlias.
+  ArrayDisjoint,
+  /// The same array node otherwise: MayAlias.
+  ArrayMayOverlap,
+  /// The same node at disjoint byte ranges: NoAlias.
+  DisjointRanges,
+  /// The same singleton node at the same offset: MustAlias.
+  SameAddress,
+  /// The same offset of a node that is not a singleton (a Summary, several
+  /// or no origins): MayAlias.
+  SameOffsetNotSingleton,
+  /// The same node, an access size is unknown and the ranges are not
+  /// provably disjoint: MayAlias.
+  UnknownSize,
+  /// Overlapping ranges at different offsets of a singleton: PartialAlias.
+  PartialOverlap,
+  /// Overlapping ranges of a node that is not a singleton: MayAlias.
+  OverlapNotSingleton,
+};
+
+llvm::StringRef getAliasRuleName(AliasRule rule);
+
+/// An alias answer and the rule that gave it.
+struct AliasAnswer {
+  mlir::AliasResult result;
+  AliasRule rule;
+};
+
 /// Counters of one run, for statistics and tests.
 struct PointsToAnalysisStats {
   size_t numFunctions = 0;
@@ -233,6 +293,45 @@ public:
   /// without a link holds nothing seen, which is all it may hold only if
   /// its node is complete.
   ObjectSet objectsAt(Cell cell) const;
+
+  /// An access size that reaches to the end of the object.
+  static constexpr uint64_t kUnknownSize = ~uint64_t(0);
+
+  /// Whether accesses of \p sizeA bytes at \p a and of \p sizeB bytes at
+  /// \p b may overlap. A size of std::nullopt is the size of the pointee
+  /// type (kUnknownSize if it has none), kUnknownSize reaches to the end of
+  /// the object. Values of a function this analysis does not walk give
+  /// MayAlias. The rules and their soundness arguments are in
+  /// PointsToQueries.cpp.
+  mlir::AliasResult alias(mlir::Value a, mlir::Value b,
+                          std::optional<uint64_t> sizeA = std::nullopt,
+                          std::optional<uint64_t> sizeB = std::nullopt) const;
+  /// The same, with the rule that decided it.
+  AliasAnswer aliasWithRule(mlir::Value a, mlir::Value b,
+                            std::optional<uint64_t> sizeA = std::nullopt,
+                            std::optional<uint64_t> sizeB = std::nullopt) const;
+  /// One line saying why alias(a, b) gives its answer, for remarks. For a
+  /// MayAlias it names what each side may refer to, for example
+  ///   "a: reachable from an escaped pointer passed to @foo (t.cpp:3);
+  ///    b: same node ..."
+  /// A node with several origins also says how many objects were merged
+  /// into it and, if it collapsed, why (not only the first reason it got).
+  std::string explainAlias(mlir::Value a, mlir::Value b,
+                           std::optional<uint64_t> sizeA = std::nullopt,
+                           std::optional<uint64_t> sizeB = std::nullopt) const;
+
+  /// Whether \p op may read (Ref) or write (Mod) the memory \p location
+  /// points to, an access of its pointee type:
+  ///  - a load, store, copy, memcpy-family op or atomic: from alias() of
+  ///    its address operands with \p location;
+  ///  - a call: NoModRef if the object of \p location is complete (neither
+  ///    External, Incomplete nor UnknownObj) and is not reachable from the
+  ///    call's pointer arguments, its result, or a global the callee may
+  ///    name; otherwise Ref if no code ever writes the node, Mod if none
+  ///    ever reads it, and ModRef if both (context-insensitive, so coarse);
+  ///  - any other op: NoModRef if it has no memory effect but allocation,
+  ///    ModRef otherwise.
+  mlir::ModRefResult getModRef(mlir::Operation *op, mlir::Value location) const;
 
   mlir::ModuleOp getModule() const { return module; }
   Graph &getGraph() { return *graph; }
@@ -301,6 +400,32 @@ private:
   /// (see the comment in the .cpp file).
   void markSummaries();
 
+  // Queries (PointsToQueries.cpp).
+  uint64_t getAccessSize(mlir::Value ptr, std::optional<uint64_t> size) const;
+  AliasAnswer aliasCells(Cell a, Cell b, uint64_t sizeA, uint64_t sizeB) const;
+  std::string explainAnswer(const AliasAnswer &answer, mlir::Value a,
+                            mlir::Value b) const;
+  mlir::ModRefResult getAccessModRef(mlir::Value addr,
+                                     std::optional<uint64_t> size, bool mod,
+                                     bool ref, mlir::Value location) const;
+  mlir::ModRefResult getCallModRef(mlir::Operation *call,
+                                   mlir::Value location) const;
+  const TUCallSite *findCallSite(mlir::Operation *call) const;
+  /// The nodes a call may access: those reachable from its pointer
+  /// arguments, its result and the globals its callees may name.
+  const llvm::DenseSet<const Node *> &
+  getCallReach(const TUCallSite &call) const;
+  /// Add to \p out the symbol nodes \p fn and its callees, transitively, may
+  /// name. Returns false if one of them may call code we don't see, which
+  /// may name any global.
+  bool collectNamedSymbols(const TUFunction &fn,
+                           llvm::DenseSet<const TUFunction *> &visited,
+                           llvm::SmallVectorImpl<Cell> &out) const;
+  /// Fill the caches below the first time a query needs them.
+  void buildQueryIndex() const;
+  const TUFunction *lookupFunction(mlir::StringAttr name) const;
+  Node *lookupSymbolNode(mlir::StringAttr name) const;
+
   mlir::ModuleOp module;
   const PointsToModelRegistry *models;
   PointsToAnalysisOptions options;
@@ -326,6 +451,15 @@ private:
   llvm::StringMap<unsigned> unhandledOps;
   PointsToAnalysisStats stats;
   bool verifyErrors = false;
+
+  // Query caches, filled lazily; the graph does not change after run().
+  mutable bool queryIndexBuilt = false;
+  mutable llvm::DenseMap<mlir::Operation *, const TUCallSite *> callSiteOf;
+  mutable llvm::DenseMap<mlir::StringAttr, const TUFunction *> functionByName;
+  mutable llvm::DenseMap<mlir::StringAttr, Node *> symbolNodeOf;
+  mutable llvm::DenseMap<mlir::Operation *,
+                         std::unique_ptr<llvm::DenseSet<const Node *>>>
+      callReach;
 };
 
 } // namespace cir::pointsto

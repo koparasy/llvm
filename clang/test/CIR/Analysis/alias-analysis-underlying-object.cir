@@ -1,7 +1,13 @@
 // Use --mlir-disable-threading so that the AA queries are serialized
 // as well as their diagnostic output.
 // RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis))' \
-// RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s
+// RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s --check-prefixes=CHECK,BASIC
+// The same with the points-to analysis registered last (PT); the answers
+// that change are explained at each test.
+// RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis{use-points-to=1}))' \
+// RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s --check-prefixes=CHECK,PT
+// RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis{use-points-to=1 closed-tu=1}))' \
+// RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s --check-prefixes=CHECK,PT
 
 // -----
 
@@ -419,12 +425,17 @@ cir.func @complex_parts_distinct_allocas() {
 
 // -----
 
+// The points-to analysis takes an unknown size to reach to the end of the
+// object: vp's access starts at offset 4, where m0's access [0, 4) ends, so
+// the two are disjoint whatever vp's size.
+
 // CHECK-LABEL: Testing : "unknown_access_size"
 // CHECK-DAG: s#0 <-> m0#0: MustAlias
 // CHECK-DAG: s#0 <-> m1#0: PartialAlias
 // CHECK-DAG: m0#0 <-> m1#0: NoAlias
 // CHECK-DAG: s#0 <-> vp#0: MayAlias
-// CHECK-DAG: m0#0 <-> vp#0: MayAlias
+// BASIC-DAG: m0#0 <-> vp#0: MayAlias
+// PT-DAG: m0#0 <-> vp#0: NoAlias
 // CHECK-DAG: m1#0 <-> vp#0: MustAlias
 
 !s32i = !cir.int<s, 32>

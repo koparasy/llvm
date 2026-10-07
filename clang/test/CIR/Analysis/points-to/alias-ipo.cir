@@ -1,0 +1,78 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=PT
+// RUN: cir-opt %s -test-cir-alias-analysis='use-points-to=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=COMB
+
+// Interprocedural alias answers under the context-insensitive analysis (the
+// T08 cases, ipo-ci-member.cir and ipo-ci-return.cir).
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_Obj = !cir.struct<"Obj" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+
+// Two factories, two allocation sites: obj.a and obj.b point to two
+// different heap nodes, neither reachable by unknown code, so the pointers
+// read back in @read don't alias. The local analyses only see two loads.
+cir.func internal @make() -> !cir.ptr<!s32i> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @make2() -> !cir.ptr<!s32i> {
+  %c8 = cir.const #cir.int<8> : !u64i
+  %raw = cir.call @_Znwm(%c8) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @init(%this: !cir.ptr<!rec_Obj>) {
+  %a = cir.call @make() : () -> !cir.ptr<!s32i>
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.call @make2() : () -> !cir.ptr<!s32i>
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+// PT-LABEL: Testing : "read"
+// PT-NEXT:  a#0 <-> b#0: NoAlias
+// COMB-LABEL: Testing : "read"
+// COMB-NEXT:  a#0 <-> b#0: NoAlias
+cir.func internal @read(%this: !cir.ptr<!rec_Obj>) {
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a = cir.load %ma : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "a"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.load %mb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "b"}
+  cir.return
+}
+cir.func @main() {
+  %obj = cir.alloca "obj" align(8) : !cir.ptr<!rec_Obj>
+  cir.call @init(%obj) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.call @read(%obj) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+
+// One factory called twice: the context-insensitive analysis binds both
+// calls to the one return cell of @make3, so x and y share its heap node, a
+// Summary ("several callers"): MayAlias, although they are two objects at
+// run time. Cloning the callee per call site (T17) makes them two nodes and
+// this NoAlias.
+// PT-LABEL: Testing : "use_twice"
+// PT-NEXT:  x#0 <-> y#0: MayAlias
+// PT-NEXT:    why: a, b: same node at the same offset, which may stand for several objects: an object allocated in a function that may run several times (alias-ipo.cir:{{[0-9]+}})
+// COMB-LABEL: Testing : "use_twice"
+// COMB-NEXT:  x#0 <-> y#0: MayAlias
+cir.func internal @make3() -> !cir.ptr<!s32i> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func @use_twice() {
+  %x = cir.call @make3() {test.ptr = "x"} : () -> !cir.ptr<!s32i>
+  %y = cir.call @make3() {test.ptr = "y"} : () -> !cir.ptr<!s32i>
+  cir.return
+}
+}

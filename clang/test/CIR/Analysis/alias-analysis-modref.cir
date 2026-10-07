@@ -2,6 +2,11 @@
 // as well as their diagnostic output.
 // RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis-modref))' \
 // RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s
+// The same with the points-to analysis registered last: no answer changes.
+// RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis-modref{use-points-to=1}))' \
+// RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s
+// RUN: cir-opt %s -pass-pipeline='builtin.module(cir.func(test-cir-alias-analysis-modref{use-points-to=1 closed-tu=1}))' \
+// RUN:   -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s
 
 // -----
 
