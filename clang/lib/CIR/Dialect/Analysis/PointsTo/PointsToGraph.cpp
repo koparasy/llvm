@@ -284,7 +284,8 @@ void Graph::addFlags(Cell cell, NodeFlags flags, const Reason *why) {
   }
 }
 
-size_t Graph::markReachable(Cell from, NodeFlags flags, const Reason *why) {
+size_t Graph::markReachable(Cell from, NodeFlags flags, const Reason *why,
+                            bool stopAtFlagged) {
   assert(!hasAny(flags, NodeFlags::Collapsed) &&
          "markReachable must not collapse nodes");
   Node *root = from.getNode();
@@ -296,11 +297,18 @@ size_t Graph::markReachable(Cell from, NodeFlags flags, const Reason *why) {
   visited.insert(root);
   while (!worklist.empty()) {
     Node *node = worklist.pop_back_val();
+    // Already flagged: whatever it reaches is the job of the call made for
+    // it.
+    if (stopAtFlagged && node != root && node->hasFlags(flags))
+      continue;
     const Reason *r = why;
     if (node != root && why) {
       if (!derived)
         derived = makeReason(why->kind, why->op,
-                             "reachable from an escaped pointer", why);
+                             flags == NodeFlags::Incomplete
+                                 ? "reachable from an incomplete node"
+                                 : "reachable from an escaped pointer",
+                             why);
       r = derived;
     }
     addFlags(Cell(node), flags, r);
@@ -497,6 +505,7 @@ void Graph::merge(Node *survivor, Node *merged, int64_t delta,
 }
 
 void Graph::collapseImpl(Node *node, const Reason *why, Worklist &worklist) {
+
   if (node->isCollapsed())
     return;
   node->flags |= NodeFlags::Collapsed;

@@ -1,0 +1,53 @@
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CLOSED
+
+// A formal starts Incomplete (UnknownCaller) unless every caller of the
+// function is visible: @inner is internal and only called directly, so its
+// formal is complete. @ext has external linkage: callers in other TUs may
+// pass anything. @taken is internal, but its address is taken, so an
+// indirect caller we don't resolve may call it. With closed-tu=1 every
+// function counts as having only visible callers.
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[A1:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a1' {{.*}})} links={}{{$}}
+// CHECK-DAG: [[A2:n[0-9]+]] [Stack|Incomplete] size=4 origins={stack(cir.alloca 'a2' {{.*}})} links={} reasons={Incomplete: UnknownCaller(cir.func {{.*}}, "formal #0")}
+// CHECK-DAG: [[A3:n[0-9]+]] [Stack|Incomplete] size=4 origins={stack(cir.alloca 'a3' {{.*}})} links={} reasons={Incomplete: UnknownCaller(cir.func {{.*}}, "formal #0")}
+// CHECK-LABEL: === @inner formals=complete
+// CHECK-NEXT: @inner formal #0 -> [[A1]]+0
+// CHECK-LABEL: === @ext formals=incomplete
+// CHECK-NEXT: @ext formal #0 -> [[A2]]+0
+// CHECK-LABEL: === @taken formals=incomplete
+// CHECK-NEXT: @taken formal #0 -> [[A3]]+0
+
+// CLOSED-LABEL: === TU graph
+// CLOSED-DAG: {{n[0-9]+}} [Stack] size=4 origins={stack(cir.alloca 'a1' {{.*}})} links={}{{$}}
+// CLOSED-DAG: {{n[0-9]+}} [Stack] size=4 origins={stack(cir.alloca 'a2' {{.*}})} links={}{{$}}
+// CLOSED-DAG: {{n[0-9]+}} [Stack] size=4 origins={stack(cir.alloca 'a3' {{.*}})} links={}{{$}}
+// CLOSED: === @inner formals=complete
+// CLOSED: === @ext formals=complete
+// CLOSED: === @taken formals=complete
+
+!s32i = !cir.int<s, 32>
+!fnty = !cir.func<(!cir.ptr<!s32i>)>
+
+module {
+cir.global "private" internal @fp = #cir.global_view<@taken> : !cir.ptr<!fnty>
+cir.func internal @inner(%p: !cir.ptr<!s32i>) {
+  cir.return
+}
+cir.func @ext(%p: !cir.ptr<!s32i>) {
+  cir.return
+}
+cir.func internal @taken(%p: !cir.ptr<!s32i>) {
+  cir.return
+}
+cir.func @outer() {
+  %a1 = cir.alloca "a1" align(4) : !cir.ptr<!s32i>
+  %a2 = cir.alloca "a2" align(4) : !cir.ptr<!s32i>
+  %a3 = cir.alloca "a3" align(4) : !cir.ptr<!s32i>
+  cir.call @inner(%a1) : (!cir.ptr<!s32i>) -> ()
+  cir.call @ext(%a2) : (!cir.ptr<!s32i>) -> ()
+  cir.call @taken(%a3) : (!cir.ptr<!s32i>) -> ()
+  cir.return
+}
+}

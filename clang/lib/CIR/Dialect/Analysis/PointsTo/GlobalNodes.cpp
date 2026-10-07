@@ -221,6 +221,17 @@ Cell GlobalNodes::makeUnknown(const Reason *why) {
   return cell;
 }
 
+SmallVector<std::pair<FlatSymbolRefAttr, Node *>, 0>
+GlobalNodes::getSymbolNodes() const {
+  SmallVector<std::pair<FlatSymbolRefAttr, Node *>, 0> result;
+  for (const auto &[sym, node] : nodes)
+    result.emplace_back(cast<FlatSymbolRefAttr>(sym), node);
+  llvm::sort(result, [](const auto &a, const auto &b) {
+    return a.first.getValue() < b.first.getValue();
+  });
+  return result;
+}
+
 Node *GlobalNodes::getNode(FlatSymbolRefAttr sym) {
   Node *node = makeNode(sym, /*depth=*/0);
   // Read the initializers of the node made and of every global they reach.

@@ -1,0 +1,65 @@
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// obj.a = make(); obj.b = make2(); through a `this` method, read back in
+// another method. The two factories have their own allocation sites, so the
+// members point to two distinct Heap nodes, and the object links them at
+// offsets 0 and 8.
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[H1:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: [[H2:n[0-9]+]] [Heap] size=8 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: [[OBJ:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'obj' {{.*}})} links={0->[[H1]]+0, 8->[[H2]]+0}
+// CHECK-LABEL: === @init formals=complete
+// CHECK-NEXT: @init formal #0 -> [[OBJ]]+0
+// CHECK-LABEL: === @read formals=complete
+// CHECK-NEXT: @read formal #0 -> [[OBJ]]+0
+// CHECK-NEXT: @read a -> [[H1]]+0
+// CHECK-NEXT: @read b -> [[H2]]+0
+// CHECK-LABEL: === @main
+// CHECK-NEXT: @main obj -> [[OBJ]]+0
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_Obj = !cir.struct<"Obj" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func internal @make() -> !cir.ptr<!s32i> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @make2() -> !cir.ptr<!s32i> {
+  %c8 = cir.const #cir.int<8> : !u64i
+  %raw = cir.call @_Znwm(%c8) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @init(%this: !cir.ptr<!rec_Obj>) {
+  %a = cir.call @make() : () -> !cir.ptr<!s32i>
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.call @make2() : () -> !cir.ptr<!s32i>
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+cir.func internal @read(%this: !cir.ptr<!rec_Obj>) {
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a = cir.load %ma : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %a_tag = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.load %mb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %b_tag = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  cir.return
+}
+cir.func @main() {
+  %obj = cir.alloca "obj" align(8) : !cir.ptr<!rec_Obj>
+  %obj_tag = cir.cast bitcast %obj : !cir.ptr<!rec_Obj> -> !cir.ptr<!rec_Obj> {test.ptr = "obj"}
+  cir.call @init(%obj) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.call @read(%obj) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+}

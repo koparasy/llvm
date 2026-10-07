@@ -143,6 +143,11 @@ public:
   /// absolute address or an uninterpretable constant points to.
   Cell makeUnknown(const Reason *why);
 
+  /// The node made for each symbol so far (an alias and its aliasee give the
+  /// same node), sorted by symbol name.
+  llvm::SmallVector<std::pair<mlir::FlatSymbolRefAttr, Node *>, 0>
+  getSymbolNodes() const;
+
 private:
   mlir::Operation *lookup(mlir::FlatSymbolRefAttr sym);
   Node *makeNode(mlir::FlatSymbolRefAttr sym, unsigned depth);

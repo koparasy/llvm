@@ -102,14 +102,15 @@ struct MemTransferRecord {
 };
 
 /// Apply the copies \p transfers to \p graph until no link changes (see
-/// MemTransferRecord). A side whose node is collapsed holds its pointers at
-/// every offset: the other side gets that link at each pointer-aligned
-/// offset in the range. A range over arrays with too many offsets to list
-/// (a long or unknown length) makes both sides arrays of one element size
-/// and relates one offset per element class. A copy that fits none of this,
-/// or a closure that does not settle, collapses both nodes and unifies their
-/// links instead, which is sound but coarse.
-void closeMemTransfers(Graph &graph,
+/// MemTransferRecord). Return false if that took too many rounds and every
+/// copy was done field-insensitively instead. A side whose node is collapsed
+/// holds its pointers at every offset: the other side gets that link at each
+/// pointer-aligned offset in the range. A range over arrays with too many
+/// offsets to list (a long or unknown length) makes both sides arrays of one
+/// element size and relates one offset per element class. A copy that fits none
+/// of this, or a closure that does not settle, collapses both nodes and unifies
+/// their links instead, which is sound but coarse.
+bool closeMemTransfers(Graph &graph,
                        llvm::ArrayRef<MemTransferRecord> transfers);
 
 /// Record a memory-to-memory copy of \p length bytes (std::nullopt: unknown)
@@ -252,8 +253,12 @@ public:
   std::optional<AggregateSlots> returnSlots;
   /// The calls in the body, in walk order.
   llvm::SmallVector<CallSiteRecord, 4> callSites;
-  /// The copies of a known length, in walk order.
+  /// The copies, in walk order.
   llvm::SmallVector<MemTransferRecord, 0> memTransfers;
+  /// The node of each global and function symbol the graph names (its
+  /// storage starts at the cell), sorted by symbol name. The
+  /// interprocedural phase unifies the copies of one symbol across graphs.
+  llvm::SmallVector<std::pair<mlir::FlatSymbolRefAttr, Cell>, 0> symbolCells;
 
 private:
   cir::FuncOp func;
@@ -293,6 +298,11 @@ public:
                         ReasonTable *reasons = nullptr,
                         const PointsToModelRegistry *models = nullptr);
   ~LocalBuilder();
+
+  /// Declare that every caller of the function is known and will be bound
+  /// to it by the interprocedural phase: the formals then do not start
+  /// Incomplete. Call before build(). Off by default.
+  void setFormalsComplete(bool complete) { formalsComplete = complete; }
 
   /// Walk the body and return the finished graph. Call once. Under
   /// -cir-points-to-verify the graph is verified before it is returned.
@@ -440,6 +450,7 @@ private:
   /// walk.
   llvm::SmallVector<size_t, 0> indirectCalls;
   bool verifyErrors = false;
+  bool formalsComplete = false;
 };
 
 } // namespace cir::pointsto

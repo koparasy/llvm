@@ -27,9 +27,27 @@
 // pessimistic, the call sites by kind and by model, and the declarations
 // that got the unknown-call rule most often.
 //
+// With mode=ci, the context-insensitive interprocedural analysis
+// (PointsToAnalysis) runs instead, once per module that holds functions with
+// a body, and prints:
+//
+//   === TU graph
+//   <Graph::print of the TU graph>
+//   === @func formals=complete|incomplete
+//   @func formal #<i> -> <cell or slots>
+//   @func return -> <cell or slots>
+//   @func <name> -> <cell or slots>   for each tagged value, as above
+//   === calls
+//   @caller <op> [@callee] -> direct @f | model <name> | unknown
+//                             | indirect-unresolved
+//
+// closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU. print-graphs=0
+// leaves out everything but the statistics.
+//
 //===----------------------------------------------------------------------===//
 
 #include "clang/CIR/Dialect/Analysis/PointsTo/LocalBuilder.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
 #include "mlir/Pass/Pass.h"
@@ -62,8 +80,19 @@ struct TestCIRPointsToPass
   Option<bool> useModels{*this, "models",
                          llvm::cl::desc("Apply the generic library models"),
                          llvm::cl::init(true)};
+  Option<std::string> mode{
+      *this, "mode",
+      llvm::cl::desc("local: the local graph of each function; ci: the "
+                     "context-insensitive interprocedural analysis"),
+      llvm::cl::init("local")};
+  Option<bool> closedTU{*this, "closed-tu",
+                        llvm::cl::desc("In ci mode, assume every caller of "
+                                       "every function is in the module"),
+                        llvm::cl::init(false)};
 
   void runOnOperation() override;
+  void runLocal();
+  void runCI();
 };
 
 void printCell(raw_ostream &os, StringRef name, std::optional<Cell> cell) {
@@ -83,6 +112,176 @@ void printSlots(raw_ostream &os, StringRef name,
 }
 
 void TestCIRPointsToPass::runOnOperation() {
+  if (mode == "ci")
+    return runCI();
+  if (mode != "local") {
+    getOperation()->emitError() << "unknown test-cir-points-to mode '"
+                                << mode << "'";
+    return signalPassFailure();
+  }
+  runLocal();
+}
+
+/// Print the tagged values of \p func with \p prefix before each line.
+template <typename LookupCell, typename LookupSlots>
+static void printTagged(raw_ostream &os, cir::FuncOp func, StringRef prefix,
+                        LookupCell lookupCell, LookupSlots lookupSlots) {
+  func.walk([&](Operation *op) {
+    auto name = op->getAttrOfType<StringAttr>("test.ptr");
+    if (!name)
+      return;
+    std::string label = (prefix + name.getValue()).str();
+    if (op == func.getOperation()) {
+      for (BlockArgument arg : func.getArguments())
+        if (std::optional<Cell> cell = lookupCell(arg))
+          printCell(os, label + ".region0#" + std::to_string(arg.getArgNumber()),
+                    cell);
+      return;
+    }
+    if (op->getNumResults())
+      if (const AggregateSlots *slots = lookupSlots(op->getResult(0))) {
+        printSlots(os, label, *slots);
+        return;
+      }
+    printCell(os, label,
+              op->getNumResults() ? lookupCell(op->getResult(0)) : std::nullopt);
+  });
+}
+
+void TestCIRPointsToPass::runCI() {
+  raw_ostream &os = llvm::outs();
+  PointsToModelRegistry registry;
+  if (useModels)
+    registerGenericModels(registry);
+  PointsToAnalysisOptions options;
+  options.assumeClosedTU = closedTU;
+  bool anyFailed = false;
+
+  SmallVector<ModuleOp> modules;
+  getOperation()->walk([&](ModuleOp module) {
+    if (llvm::any_of(module.getOps<cir::FuncOp>(),
+                     [](cir::FuncOp func) { return !func.isDeclaration(); }))
+      modules.push_back(module);
+  });
+  for (ModuleOp module : modules) {
+    PointsToAnalysis analysis(module, &registry, options);
+    if (analysis.hadVerifyErrors())
+      anyFailed = true;
+    const Graph &graph = analysis.getGraph();
+    if (printGraphs) {
+      os << "=== TU graph\n";
+      graph.print(os);
+      auto lookupCell = [&](Value value) -> std::optional<Cell> {
+        if (Cell cell = analysis.cellOf(value))
+          return cell;
+        return std::nullopt;
+      };
+      auto lookupSlots = [&](Value value) { return analysis.slotsOf(value); };
+      for (auto func : module.getOps<cir::FuncOp>()) {
+        const TUFunction *fn = analysis.getFunction(func);
+        if (!fn)
+          continue;
+        std::string prefix = ("@" + func.getSymName() + " ").str();
+        os << "=== @" << func.getSymName() << " formals="
+           << (fn->formalsComplete ? "complete" : "incomplete") << "\n";
+        for (auto [i, formal] : llvm::enumerate(fn->formals)) {
+          std::string label = prefix + "formal #" + std::to_string(i);
+          if (formal)
+            printCell(os, label, formal);
+          else if (fn->formalSlots[i])
+            printSlots(os, label, *fn->formalSlots[i]);
+        }
+        if (fn->returnCell)
+          printCell(os, prefix + "return", fn->returnCell);
+        if (fn->returnSlots)
+          printSlots(os, prefix + "return", *fn->returnSlots);
+        printTagged(os, func, prefix, lookupCell, lookupSlots);
+      }
+      os << "=== calls\n";
+      for (auto func : module.getOps<cir::FuncOp>()) {
+        const TUFunction *fn = analysis.getFunction(func);
+        if (!fn)
+          continue;
+        for (const TUCallSite &call : fn->callSites) {
+          os << "@" << func.getSymName() << " " << call.site.call->getName();
+          if (call.site.callee)
+            os << " " << call.site.callee;
+          if (call.site.synthetic)
+            os << " synthetic";
+          os << " -> " << getCallResolutionName(call.resolution);
+          if (call.resolution == CallResolution::Direct)
+            os << " @" << cir::FuncOp(call.callee).getSymName();
+          else if (call.resolution == CallResolution::Model)
+            os << " " << call.site.modelled;
+          os << "\n";
+        }
+      }
+    }
+
+    if (!printStats)
+      continue;
+    const PointsToAnalysisStats &stats = analysis.getStats();
+    llvm::StringMap<unsigned> collapseReasons, resolutions;
+    size_t numNodes = 0, numCollapsed = 0, numExternal = 0, numIncomplete = 0;
+    for (const Node *node : graph.nodes()) {
+      ++numNodes;
+      if (node->hasFlags(NodeFlags::External))
+        ++numExternal;
+      if (node->hasFlags(NodeFlags::Incomplete))
+        ++numIncomplete;
+      if (!node->isCollapsed())
+        continue;
+      ++numCollapsed;
+      std::string key = "<no reason>";
+      if (const Reason *why = node->getReason(NodeFlags::Collapsed)) {
+        key = getReasonKindName(why->kind).str() + "(" +
+              (why->op ? why->op->getName().getStringRef().str() : "-");
+        if (!why->detail.empty())
+          key += ", \"" + why->detail.str() + "\"";
+        key += ")";
+      }
+      ++collapseReasons[key];
+    }
+    for (const auto &fn : analysis.getFunctions())
+      for (const TUCallSite &call : fn->callSites)
+        ++resolutions[getCallResolutionName(call.resolution)];
+    os << "--- ci stats\n"
+       << "functions: " << stats.numFunctions << "\n"
+       << "functions with complete formals: " << stats.numCompleteFunctions
+       << "\n"
+       << "local nodes: " << stats.numLocalNodes << "\n"
+       << "TU live nodes: " << numNodes << "\n"
+       << "collapsed nodes: " << numCollapsed << "\n"
+       << "external nodes: " << numExternal << "\n"
+       << "incomplete nodes: " << numIncomplete << "\n"
+       << "direct calls: " << stats.numDirectCalls << "\n"
+       << "bindings unified: " << stats.numBindings << "\n"
+       << "indirect calls unresolved here: " << stats.numIndirectUnresolved
+       << "\n"
+       << "clobbering calls: " << stats.numClobberingCalls << "\n"
+       << "copy closure settled: " << (stats.transfersSettled ? "yes" : "no")
+       << "\n"
+       << "local phase time (wall, s): " << stats.localSeconds << "\n"
+       << "analysis time (wall, s): " << stats.totalSeconds << "\n";
+    auto printMap = [&](StringRef title, const llvm::StringMap<unsigned> &map) {
+      SmallVector<std::pair<unsigned, StringRef>> sorted;
+      for (const auto &entry : map)
+        sorted.emplace_back(entry.getValue(), entry.getKey());
+      llvm::sort(sorted, [](const auto &a, const auto &b) {
+        return a.first != b.first ? a.first > b.first : a.second < b.second;
+      });
+      os << title << ": " << sorted.size() << "\n";
+      for (auto [count, name] : sorted)
+        os << "  " << name << " " << count << "\n";
+    };
+    printMap("call sites by resolution", resolutions);
+    printMap("collapsed nodes by reason", collapseReasons);
+  }
+  if (anyFailed)
+    signalPassFailure();
+}
+
+void TestCIRPointsToPass::runLocal() {
   raw_ostream &os = llvm::outs();
   SymbolTableCollection symbols;
   llvm::StringMap<unsigned> pessimisticOps, unhandledOps, unclassifiedOps,

@@ -1,0 +1,56 @@
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Mutual recursion: @even passes its formal to @odd, @odd passes x to
+// @even. The SCC is bound like any other calls and the analysis ends: the
+// formals of both and the objects a and x are one node. A self-recursive
+// walk over a list unifies each node with the one it links to, so the list
+// is one node that links to itself.
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[AX:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'x' {{.*}}), stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[L:n[0-9]+]] [Stack|Ref] size=8 origins={stack(cir.alloca 'head' {{.*}})} links={0->[[L]]+0}
+// CHECK-LABEL: === @even formals=complete
+// CHECK-NEXT: @even formal #0 -> [[AX]]+0
+// CHECK-LABEL: === @odd formals=complete
+// CHECK-NEXT: @odd formal #0 -> [[AX]]+0
+// CHECK-NEXT: @odd x -> [[AX]]+0
+// CHECK-LABEL: === @walk formals=complete
+// CHECK-NEXT: @walk formal #0 -> [[L]]+0
+// CHECK-LABEL: === @top
+// CHECK-NEXT: @top a -> [[AX]]+0
+// CHECK-NEXT: @top head -> [[L]]+0
+// CHECK-LABEL: === calls
+// CHECK-NEXT: @even cir.call @odd -> direct @odd
+// CHECK-NEXT: @odd cir.call @even -> direct @even
+// CHECK-NEXT: @walk cir.call @walk -> direct @walk
+
+!s32i = !cir.int<s, 32>
+!rec_N = !cir.struct<"N" {data !cir.ptr<!cir.struct<"N">>}>
+
+module {
+cir.func internal @even(%p: !cir.ptr<!s32i>) {
+  cir.call @odd(%p) : (!cir.ptr<!s32i>) -> ()
+  cir.return
+}
+cir.func internal @odd(%p: !cir.ptr<!s32i>) {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %x_tag = cir.cast bitcast %x : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x"}
+  cir.call @even(%x) : (!cir.ptr<!s32i>) -> ()
+  cir.return
+}
+cir.func internal @walk(%n: !cir.ptr<!rec_N>) {
+  %m = cir.get_member %n[0] {name = "next"} : !cir.ptr<!rec_N> -> !cir.ptr<!cir.ptr<!rec_N>>
+  %next = cir.load %m : !cir.ptr<!cir.ptr<!rec_N>>, !cir.ptr<!rec_N>
+  cir.call @walk(%next) : (!cir.ptr<!rec_N>) -> ()
+  cir.return
+}
+cir.func @top() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %a_tag = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  cir.call @even(%a) : (!cir.ptr<!s32i>) -> ()
+  %head = cir.alloca "head" align(8) : !cir.ptr<!rec_N>
+  %head_tag = cir.cast bitcast %head : !cir.ptr<!rec_N> -> !cir.ptr<!rec_N> {test.ptr = "head"}
+  cir.call @walk(%head) : (!cir.ptr<!rec_N>) -> ()
+  cir.return
+}
+}

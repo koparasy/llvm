@@ -359,7 +359,14 @@ public:
   /// set, so cycles and long chains are fine. \p flags must not contain
   /// Collapsed (collapsing would rewrite the links being walked). Returns the
   /// number of nodes visited.
-  size_t markReachable(Cell from, NodeFlags flags, const Reason *why = nullptr);
+  ///
+  /// With \p stopAtFlagged the walk does not go past a node other than the
+  /// one of \p from that already has all of \p flags: propagating a flag from
+  /// every node that has it, one call per node, is then linear overall. When
+  /// \p flags is exactly Incomplete the derived reason reads "reachable from
+  /// an incomplete node" instead.
+  size_t markReachable(Cell from, NodeFlags flags, const Reason *why = nullptr,
+                       bool stopAtFlagged = false);
 
   /// Add \p origin to the node of \p cell unless it is already there.
   void addOrigin(Cell cell, const Origin &origin);

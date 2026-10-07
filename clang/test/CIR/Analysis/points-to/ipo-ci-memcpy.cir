@@ -1,0 +1,54 @@
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// A memcpy in a callee over a struct the caller passes. In @copy's local
+// graph the formals hold no links, so the copy relates nothing there. Once
+// the call binds them to dst and src, the copy closure runs again on the TU
+// graph and gives dst the links of src: both members loaded back from dst
+// point to what was stored into src.
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A:n[0-9]+]]+0, 8->[[B:n[0-9]+]]+0}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0, 8->[[B]]+0}
+// CHECK-DAG: [[A]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-LABEL: === @copy formals=complete
+// CHECK-NEXT: @copy formal #0 -> [[DST]]+0
+// CHECK-NEXT: @copy formal #1 -> [[SRC]]+0
+// CHECK-LABEL: === @main
+// CHECK-DAG: @main dst.f0 -> [[A]]+0
+// CHECK-DAG: @main dst.f1 -> [[B]]+0
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_S = !cir.struct<"S" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func internal @copy(%d: !cir.ptr<!rec_S>, %s: !cir.ptr<!rec_S>) {
+  %dv = cir.cast bitcast %d : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %sv = cir.cast bitcast %s : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %len = cir.const #cir.int<16> : !u64i
+  cir.libc.memcpy %len bytes from %sv to %dv : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  cir.return
+}
+cir.func @main() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %a_tag = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %b_tag = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_S>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
+  %s0 = cir.get_member %src[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %s0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %s1 = cir.get_member %src[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %s1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @copy(%dst, %src) : (!cir.ptr<!rec_S>, !cir.ptr<!rec_S>) -> ()
+  %d0 = cir.get_member %dst[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %l0 = cir.load %d0 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %l0_tag = cir.cast bitcast %l0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "dst.f0"}
+  %d1 = cir.get_member %dst[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %l1 = cir.load %d1 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %l1_tag = cir.cast bitcast %l1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "dst.f1"}
+  cir.return
+}
+}

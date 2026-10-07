@@ -1,0 +1,51 @@
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Context-insensitive binding: every caller of @f shares its formal, so the
+// objects @caller1 and @caller2 pass it, a and b, become one node. That is
+// the expected imprecision of this analysis; a context-sensitive one keeps
+// them apart. @g has one caller: c stays a node of its own.
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[AB:n[0-9]+]] [Stack|Mod] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[C:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'c' {{.*}})} links={}
+// CHECK-LABEL: === @f formals=complete
+// CHECK-NEXT: @f formal #0 -> [[AB]]+0
+// CHECK-LABEL: === @g formals=complete
+// CHECK-NEXT: @g formal #0 -> [[C]]+0
+// CHECK-LABEL: === @caller1
+// CHECK-DAG: @caller1 a -> [[AB]]+0
+// CHECK-DAG: @caller1 c -> [[C]]+0
+// CHECK-LABEL: === @caller2
+// CHECK-NEXT: @caller2 b -> [[AB]]+0
+// CHECK-LABEL: === calls
+// CHECK-NEXT: @caller1 cir.call @f -> direct @f
+// CHECK-NEXT: @caller1 cir.call @g -> direct @g
+// CHECK-NEXT: @caller2 cir.call @f -> direct @f
+
+!s32i = !cir.int<s, 32>
+
+module {
+cir.func internal @f(%p: !cir.ptr<!s32i>) {
+  %one = cir.const #cir.int<1> : !s32i
+  cir.store %one, %p : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func internal @g(%p: !cir.ptr<!s32i>) {
+  cir.return
+}
+cir.func @caller1() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %c = cir.alloca "c" align(4) : !cir.ptr<!s32i>
+  %a_tag = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %c_tag = cir.cast bitcast %c : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "c"}
+  cir.call @f(%a) : (!cir.ptr<!s32i>) -> ()
+  cir.call @g(%c) : (!cir.ptr<!s32i>) -> ()
+  cir.return
+}
+cir.func @caller2() {
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %b_tag = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  cir.call @f(%b) : (!cir.ptr<!s32i>) -> ()
+  cir.return
+}
+}

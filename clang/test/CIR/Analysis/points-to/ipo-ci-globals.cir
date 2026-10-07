@@ -1,0 +1,52 @@
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// All functions share one node per global symbol. An unknown call may read
+// or write every non-constant global another TU can name (@gx) and every
+// one whose address escaped (@gs, reachable from @gp): they become External
+// with Mod and Ref, the reason naming the call. @gl is internal and its
+// address does not escape: an unknown call cannot touch it. @gc is a
+// constant: it cannot be written.
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[GL:n[0-9]+]] [Global] size=4 origins={global(@gl)} links={}{{$}}
+// CHECK-DAG: [[GX:n[0-9]+]] [Global|Incomplete|External|Mod|Ref] size=4 origins={global(@gx)} links={} reasons={Incomplete: EscapedTo(cir.global {{.*}}, "global visible to other TUs"), External: EscapedTo(cir.global {{.*}}, "global visible to other TUs"), Mod: EscapedTo(cir.call {{.*}}, "@opaque may access the global"), Ref: EscapedTo(cir.call {{.*}}, "@opaque may access the global")}
+// CHECK-DAG: [[GC:n[0-9]+]] [Global] size=4 origins={global(@gc)} links={}{{$}}
+// CHECK-DAG: [[GP:n[0-9]+]] [Global|Incomplete|External|Mod|Ref] size=8 origins={global(@gp)} links={0->[[GS:n[0-9]+]]+0}
+// CHECK-DAG: [[GS]] [Global|Incomplete|External|Mod|Ref] size=4 origins={global(@gs)} links={} reasons={Incomplete: EscapedTo(cir.global {{.*}}, "reachable from an incomplete node") <- EscapedTo(cir.global {{.*}}, "global visible to other TUs"), External: EscapedTo(cir.global {{.*}}, "reachable from an escaped pointer") <- EscapedTo(cir.global {{.*}}, "global visible to other TUs"), Mod: EscapedTo(cir.call {{.*}}, "@opaque may access the global")
+// CHECK-LABEL: === @f1
+// CHECK-NEXT: @f1 gl -> [[GL]]+0
+// CHECK-NEXT: @f1 gx -> [[GX]]+0
+// CHECK-NEXT: @f1 gc -> [[GC]]+0
+// CHECK-LABEL: === @f2
+// CHECK-NEXT: @f2 gl -> [[GL]]+0
+// CHECK-NEXT: @f2 gx -> [[GX]]+0
+// CHECK-NEXT: @f2 gp -> [[GP]]+0
+// CHECK-NEXT: @f2 gs -> [[GS]]+0
+// CHECK-LABEL: === calls
+// CHECK-NEXT: @f2 cir.call @opaque -> unknown
+
+!s32i = !cir.int<s, 32>
+
+module {
+cir.global external @gx = #cir.int<0> : !s32i
+cir.global "private" internal @gl = #cir.int<0> : !s32i
+cir.global "private" internal @gs = #cir.int<0> : !s32i
+cir.global external @gp = #cir.global_view<@gs> : !cir.ptr<!s32i>
+cir.global "private" constant internal @gc = #cir.int<3> : !s32i
+cir.func private @opaque()
+cir.func @f1() {
+  %l = cir.get_global @gl : !cir.ptr<!s32i> {test.ptr = "gl"}
+  %x = cir.get_global @gx : !cir.ptr<!s32i> {test.ptr = "gx"}
+  %c = cir.get_global @gc : !cir.ptr<!s32i> {test.ptr = "gc"}
+  cir.return
+}
+cir.func @f2() {
+  %l = cir.get_global @gl : !cir.ptr<!s32i> {test.ptr = "gl"}
+  %x = cir.get_global @gx : !cir.ptr<!s32i> {test.ptr = "gx"}
+  %p = cir.get_global @gp : !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "gp"}
+  %s = cir.load %p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %s_tag = cir.cast bitcast %s : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "gs"}
+  cir.call @opaque() : () -> ()
+  cir.return
+}
+}

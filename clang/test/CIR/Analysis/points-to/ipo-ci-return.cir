@@ -1,0 +1,41 @@
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// A factory `T *make() { return new T; }` called twice. The operator new
+// call site in @make gives one Heap node, and the context-insensitive
+// analysis binds both calls to the one return cell of @make: x and y point
+// to the same node, although they are two objects at run time. Telling them
+// apart needs heap cloning per call path, the motivation for the
+// context-sensitive phase.
+
+// CHECK-LABEL: === TU graph
+// CHECK-NEXT: [[H:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}}ipo-ci-return.cir:{{[0-9]+}}:{{[0-9]+}})} links={}
+// CHECK-NOT: [Heap]
+// CHECK-LABEL: === @make formals=complete
+// CHECK-NEXT: @make return -> [[H]]+0
+// CHECK-LABEL: === @use
+// CHECK-NEXT: @use x -> [[H]]+0
+// CHECK-NEXT: @use y -> [[H]]+0
+// CHECK-LABEL: === calls
+// CHECK-NEXT: @make cir.call @_Znwm -> model operator-new
+// CHECK-NEXT: @use cir.call @make -> direct @make
+// CHECK-NEXT: @use cir.call @make -> direct @make
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_T = !cir.struct<"T" {data !s32i}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func internal @make() -> !cir.ptr<!rec_T> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %t = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!rec_T>
+  cir.return %t : !cir.ptr<!rec_T>
+}
+cir.func @use() {
+  %x = cir.call @make() {test.ptr = "x"} : () -> !cir.ptr<!rec_T>
+  %y = cir.call @make() {test.ptr = "y"} : () -> !cir.ptr<!rec_T>
+  cir.return
+}
+}

@@ -467,7 +467,8 @@ std::unique_ptr<FunctionGraph> LocalBuilder::build() {
   assert(fg && "build() called twice");
   Graph &graph = fg->getGraph();
 
-  // Formals: what a caller passes in is not known yet.
+  // Formals: what a caller passes in is not known yet, unless every caller
+  // is bound to the function later (setFormalsComplete).
   Block &entry = func.getBody().front();
   for (BlockArgument arg : entry.getArguments()) {
     if (!hasPointers(arg.getType())) {
@@ -475,11 +476,14 @@ std::unique_ptr<FunctionGraph> LocalBuilder::build() {
       continue;
     }
     const Reason *why =
-        graph.makeReason(Reason::Kind::UnknownCaller, func,
-                         "formal #" + std::to_string(arg.getArgNumber()));
+        formalsComplete
+            ? nullptr
+            : graph.makeReason(Reason::Kind::UnknownCaller, func,
+                               "formal #" + std::to_string(arg.getArgNumber()));
     auto fresh = [&] {
       Cell cell(graph.makeNode());
-      graph.addFlags(cell, NodeFlags::Incomplete, why);
+      if (why)
+        graph.addFlags(cell, NodeFlags::Incomplete, why);
       return cell;
     };
     if (!isPointerType(arg.getType())) {
@@ -503,6 +507,8 @@ std::unique_ptr<FunctionGraph> LocalBuilder::build() {
   closeMemTransfers(graph, fg->memTransfers);
   applyDeferredEffects();
   resolveIndirectCalls();
+  for (auto [sym, node] : globals->getSymbolNodes())
+    fg->symbolCells.emplace_back(sym, Cell(node));
 
   if (isPointsToVerifyEnabled())
     verifyErrors = failed(verifyFunctionGraph(*fg));
@@ -1732,7 +1738,7 @@ struct TransferApplier {
 };
 } // namespace
 
-void cir::pointsto::closeMemTransfers(Graph &graph,
+bool cir::pointsto::closeMemTransfers(Graph &graph,
                                       ArrayRef<MemTransferRecord> transfers) {
   // Unification is symmetric, so this treats dst and src alike: it only
   // ever adds links and merges targets, which over-approximates the
@@ -1742,10 +1748,11 @@ void cir::pointsto::closeMemTransfers(Graph &graph,
     for (const MemTransferRecord &record : transfers)
       changed |= TransferApplier{graph, record}.apply();
     if (!changed)
-      return;
+      return true;
   }
   for (const MemTransferRecord &record : transfers)
     TransferApplier{graph, record}.smash();
+  return false;
 }
 
 void LocalBuilder::visitReturn(cir::ReturnOp op) {

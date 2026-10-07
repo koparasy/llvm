@@ -1,0 +1,58 @@
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// A struct with a pointer member, returned two ways. Through an sret
+// pointer, the result slot is an argument like any other: @mk stores into
+// its formal, which is the caller's %r, so the member loaded back points to
+// a. By value, the callee's return slots are bound to the call's result
+// slots: the member extracted points to b.
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[R:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'r' {{.*}})} links={0->[[A:n[0-9]+]]+0}
+// CHECK-DAG: [[A]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: {{n[0-9]+}} [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'tmp' {{.*}})} links={0->[[B]]+0}
+// CHECK-LABEL: === @mk formals=complete
+// CHECK-NEXT: @mk formal #0 -> [[R]]+0
+// CHECK-NEXT: @mk formal #1 -> [[A]]+0
+// CHECK-LABEL: === @mkv formals=complete
+// CHECK-NEXT: @mkv formal #0 -> [[B]]+0
+// CHECK-NEXT: @mkv return -> {0: [[B]]+0}
+// CHECK-LABEL: === @use
+// CHECK-DAG: @use sret.p -> [[A]]+0
+// CHECK-DAG: @use byval.p -> [[B]]+0
+// CHECK-LABEL: === calls
+// CHECK-NEXT: @use cir.call @mk -> direct @mk
+// CHECK-NEXT: @use cir.call @mkv -> direct @mkv
+
+!s32i = !cir.int<s, 32>
+!rec_P = !cir.struct<"P" {data !cir.ptr<!s32i>}>
+
+module {
+cir.func internal @mk(%ret: !cir.ptr<!rec_P> {llvm.sret = !rec_P}, %v: !cir.ptr<!s32i>) {
+  %m = cir.get_member %ret[0] {name = "p"} : !cir.ptr<!rec_P> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %v, %m : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+cir.func internal @mkv(%v: !cir.ptr<!s32i>) -> !rec_P {
+  %tmp = cir.alloca "tmp" align(8) : !cir.ptr<!rec_P>
+  %m = cir.get_member %tmp[0] {name = "p"} : !cir.ptr<!rec_P> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %v, %m : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.load %tmp : !cir.ptr<!rec_P>, !rec_P
+  cir.return %r : !rec_P
+}
+cir.func @use() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %r = cir.alloca "r" align(8) : !cir.ptr<!rec_P>
+  %a_tag = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %b_tag = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  cir.call @mk(%r, %a) : (!cir.ptr<!rec_P>, !cir.ptr<!s32i>) -> ()
+  %m = cir.get_member %r[0] {name = "p"} : !cir.ptr<!rec_P> -> !cir.ptr<!cir.ptr<!s32i>>
+  %l = cir.load %m : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %l_tag = cir.cast bitcast %l : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "sret.p"}
+  %s = cir.call @mkv(%b) : (!cir.ptr<!s32i>) -> !rec_P
+  %x = cir.extract_member %s[0] : !rec_P -> !cir.ptr<!s32i>
+  %x_tag = cir.cast bitcast %x : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "byval.p"}
+  cir.return
+}
+}

@@ -581,6 +581,36 @@ TEST(PointsToGraphTest, MarkReachableFollowsLinksAndCycles) {
   EXPECT_EQ(g.markReachable(Cell(), NodeFlags::External, why), 0u);
 }
 
+TEST(PointsToGraphTest, MarkReachableStopsAtFlaggedNodes) {
+  Graph g;
+  Node *a = g.makeNode(NodeFlags::Heap);
+  Node *b = g.makeNode(NodeFlags::Heap);
+  Node *c = g.makeNode(NodeFlags::Heap);
+  Node *d = g.makeNode(NodeFlags::Heap);
+  // a -> b -> c -> d; b already Incomplete.
+  g.setLink(Cell(a), Cell(b));
+  g.setLink(Cell(b), Cell(c));
+  g.setLink(Cell(c), Cell(d));
+  const Reason *first = g.makeReason(Reason::Kind::UnknownCaller, nullptr, "b");
+  g.addFlags(Cell(b), NodeFlags::Incomplete, first);
+  const Reason *why = g.makeReason(Reason::Kind::UnknownCaller, nullptr, "a");
+  g.addFlags(Cell(a), NodeFlags::Incomplete, why);
+
+  // From a: the walk stops at b, which has the flag already.
+  g.markReachable(Cell(a), NodeFlags::Incomplete, why, /*stopAtFlagged=*/true);
+  EXPECT_FALSE(c->hasFlags(NodeFlags::Incomplete));
+  EXPECT_EQ(b->getReason(NodeFlags::Incomplete), first);
+  // From b: its own call reaches c and d, with a reason derived from b's.
+  g.markReachable(Cell(b), NodeFlags::Incomplete,
+                  b->getReason(NodeFlags::Incomplete), /*stopAtFlagged=*/true);
+  for (Node *n : {c, d})
+    EXPECT_TRUE(n->hasFlags(NodeFlags::Incomplete));
+  const Reason *derived = d->getReason(NodeFlags::Incomplete);
+  ASSERT_NE(derived, nullptr);
+  EXPECT_EQ(derived->cause, first);
+  EXPECT_EQ(derived->detail, "reachable from an incomplete node");
+}
+
 //===----------------------------------------------------------------------===//
 // 9. Printing.
 //===----------------------------------------------------------------------===//
