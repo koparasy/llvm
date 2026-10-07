@@ -1,0 +1,55 @@
+// RUN: cir-opt %s -test-cir-points-to -o /dev/null | FileCheck %s
+
+// Loading a record value remembers the targets of the pointer slots inside
+// it; storing the value links the same slots of the destination.
+
+!s32i = !cir.int<s, 32>
+!rec_S = !cir.struct<"S" {data !cir.ptr<!s32i>, data !s32i, data !cir.ptr<!s32i>}>
+!rec_W = !cir.struct<"W" {data !s32i, data !cir.array<!rec_S x 2>}>
+
+// CHECK-LABEL: === @copy_record
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=24 origins={stack(cir.alloca 'src' {{.*}})} links={0->[[A]]+0, 16->[[B]]+0}
+// CHECK-DAG: [[DST:n[0-9]+]] [Stack|Mod] size=24 origins={stack(cir.alloca 'dst' {{.*}})} links={0->[[A]]+0, 16->[[B]]+0}
+cir.func @copy_record() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_S>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
+  %f0 = cir.get_member %src[0] {name = "p"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %f2 = cir.get_member %src[2] {name = "q"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %f2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %v = cir.load %src : !cir.ptr<!rec_S>, !rec_S
+  cir.store %v, %dst : !rec_S, !cir.ptr<!rec_S>
+  cir.return
+}
+
+// Pointer slots nested in an array member: W.s[0].p, W.s[0].q, W.s[1].p and
+// W.s[1].q sit at 8, 24, 32 and 48. The destination slot W.s[1].q already
+// points somewhere, and the copy unifies the two targets. The slots nobody
+// stored to get (empty) target nodes on the load, shared by the copy.
+
+// CHECK-LABEL: === @nested_record
+// CHECK: [[AB:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK: [[SRC:n[0-9]+]] [Stack|Mod|Ref] size=56 origins={stack(cir.alloca 'src' {{.*}})} links={8->[[T0:n[0-9]+]]+0, 24->[[T1:n[0-9]+]]+0, 32->[[T2:n[0-9]+]]+0, 48->[[AB]]+0}
+// CHECK: [[DST:n[0-9]+]] [Stack|Mod] size=56 origins={stack(cir.alloca 'dst' {{.*}})} links={8->[[T0]]+0, 24->[[T1]]+0, 32->[[T2]]+0, 48->[[AB]]+0}
+cir.func @nested_record() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_W>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_W>
+  %arr = cir.get_member %src[1] {name = "s"} : !cir.ptr<!rec_W> -> !cir.ptr<!cir.array<!rec_S x 2>>
+  %one = cir.const #cir.int<1> : !s32i
+  %s1 = cir.get_element %arr[%one : !s32i] : !cir.ptr<!cir.array<!rec_S x 2>> -> !cir.ptr<!rec_S>
+  %q = cir.get_member %s1[2] {name = "q"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %q : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %darr = cir.get_member %dst[1] {name = "s"} : !cir.ptr<!rec_W> -> !cir.ptr<!cir.array<!rec_S x 2>>
+  %d1 = cir.get_element %darr[%one : !s32i] : !cir.ptr<!cir.array<!rec_S x 2>> -> !cir.ptr<!rec_S>
+  %dq = cir.get_member %d1[2] {name = "q"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %dq : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %v = cir.load %src : !cir.ptr<!rec_W>, !rec_W
+  cir.store %v, %dst : !rec_W, !cir.ptr<!rec_W>
+  cir.return
+}

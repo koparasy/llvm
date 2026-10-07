@@ -1,0 +1,107 @@
+// RUN: cir-opt %s -test-cir-points-to -o /dev/null | FileCheck %s
+
+// Constant indices are byte offsets; a dynamic index turns the node into an
+// array of the element size, so offsets are taken modulo it.
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+
+// A constant cir.get_element index is an exact byte offset.
+
+// CHECK-LABEL: === @constant_element
+// CHECK-DAG: [[ARR:n[0-9]+]] [Stack] size=40 origins={stack(cir.alloca 'arr' {{.*}})} links={}
+// CHECK-DAG: decay -> [[ARR]]+0
+// CHECK-DAG: elem2 -> [[ARR]]+8
+cir.func @constant_element() {
+  %arr = cir.alloca "arr" align(4) : !cir.ptr<!cir.array<!s32i x 10>>
+  %d = cir.cast array_to_ptrdecay %arr : !cir.ptr<!cir.array<!s32i x 10>> -> !cir.ptr<!s32i> {test.ptr = "decay"}
+  %two = cir.const #cir.int<2> : !s64i
+  %e2 = cir.get_element %arr[%two : !s64i] : !cir.ptr<!cir.array<!s32i x 10>> -> !cir.ptr<!s32i>
+  %e2_tag = cir.cast bitcast %e2 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "elem2"}
+  cir.return
+}
+
+// Pointer arithmetic is only defined within an array, so a non-zero constant
+// cir.ptr_stride makes the node an array of the element size, and every
+// element is the same cell.
+
+// CHECK-LABEL: === @constant_stride
+// CHECK-DAG: [[ARR:n[0-9]+]] [Stack] size=40 arr=4 origins={stack(cir.alloca 'arr' {{.*}})} links={}
+// CHECK-DAG: stride3 -> [[ARR]]+0
+// CHECK-DAG: back -> [[ARR]]+0
+cir.func @constant_stride() {
+  %arr = cir.alloca "arr" align(4) : !cir.ptr<!cir.array<!s32i x 10>>
+  %d = cir.cast array_to_ptrdecay %arr : !cir.ptr<!cir.array<!s32i x 10>> -> !cir.ptr<!s32i>
+  %three = cir.const #cir.int<3> : !s64i
+  %p3 = cir.ptr_stride %d, %three : (!cir.ptr<!s32i>, !s64i) -> !cir.ptr<!s32i>
+  %p3_tag = cir.cast bitcast %p3 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "stride3"}
+  %m2 = cir.const #cir.int<-2> : !s64i
+  %back = cir.ptr_stride %p3, %m2 : (!cir.ptr<!s32i>, !s64i) -> !cir.ptr<!s32i>
+  %back_tag = cir.cast bitcast %back : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "back"}
+  cir.return
+}
+
+// A pointer incremented in a loop stays field-sensitive at the element size
+// instead of collapsing: the slot holds both p and p+1, which are the same
+// cell on the array node.
+
+// CHECK-LABEL: === @increment_loop
+// CHECK-DAG: [[ARR:n[0-9]+]] [Stack] size=40 arr=4 origins={stack(cir.alloca 'arr' {{.*}})} links={}
+// CHECK-DAG: [[SLOT:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'p' {{.*}})} links={0->[[ARR]]+0}
+// CHECK-NOT: Collapsed
+cir.func @increment_loop() {
+  %arr = cir.alloca "arr" align(4) : !cir.ptr<!cir.array<!s32i x 10>>
+  %slot = cir.alloca "p" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %d = cir.cast array_to_ptrdecay %arr : !cir.ptr<!cir.array<!s32i x 10>> -> !cir.ptr<!s32i>
+  cir.store %d, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %p = cir.load %slot : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %one = cir.const #cir.int<1> : !s64i
+  %next = cir.ptr_stride %p, %one : (!cir.ptr<!s32i>, !s64i) -> !cir.ptr<!s32i>
+  cir.store %next, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+// An array of pointers: constant slots stay separate until a dynamic index
+// smashes the node into an array of 8-byte elements, which merges the slot
+// targets.
+
+// CHECK-LABEL: === @dynamic_index
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[PTRS:n[0-9]+]] [Stack|Mod|Ref] size=32 arr=8 origins={stack(cir.alloca 'ptrs' {{.*}})} links={0->[[A]]+0}
+// CHECK-DAG: slot1 -> [[PTRS]]+0
+// CHECK-DAG: slot2 -> [[PTRS]]+0
+// CHECK-DAG: dyn -> [[PTRS]]+0
+// CHECK-DAG: loaded -> [[A]]+0
+cir.func @dynamic_index(%i: !s64i) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %ptrs = cir.alloca "ptrs" align(8) : !cir.ptr<!cir.array<!cir.ptr<!s32i> x 4>>
+  %one = cir.const #cir.int<1> : !s64i
+  %two = cir.const #cir.int<2> : !s64i
+  %s1 = cir.get_element %ptrs[%one : !s64i] : !cir.ptr<!cir.array<!cir.ptr<!s32i> x 4>> -> !cir.ptr<!cir.ptr<!s32i>>
+  %s1_tag = cir.cast bitcast %s1 : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "slot1"}
+  %s2 = cir.get_element %ptrs[%two : !s64i] : !cir.ptr<!cir.array<!cir.ptr<!s32i> x 4>> -> !cir.ptr<!cir.ptr<!s32i>>
+  %s2_tag = cir.cast bitcast %s2 : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "slot2"}
+  cir.store %a, %s1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %s2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %si = cir.get_element %ptrs[%i : !s64i] : !cir.ptr<!cir.array<!cir.ptr<!s32i> x 4>> -> !cir.ptr<!cir.ptr<!s32i>>
+  %si_tag = cir.cast bitcast %si : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "dyn"}
+  %l = cir.load %si : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "loaded"}
+  cir.return
+}
+
+// A dynamic cir.ptr_stride on a formal: the formal's node becomes an array of
+// the element size.
+
+// CHECK-LABEL: === @dynamic_stride
+// CHECK-DAG: [[F:n[0-9]+]] [Incomplete] size=0 arr=4 origins={} links={} reasons={Incomplete: UnknownCaller({{.*}})}
+// CHECK-DAG: p_i -> [[F]]+0
+// CHECK-DAG: p_i_1 -> [[F]]+0
+cir.func @dynamic_stride(%p: !cir.ptr<!s32i>, %i: !s64i) {
+  %pi = cir.ptr_stride %p, %i : (!cir.ptr<!s32i>, !s64i) -> !cir.ptr<!s32i>
+  %pi_tag = cir.cast bitcast %pi : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p_i"}
+  %one = cir.const #cir.int<1> : !s64i
+  %pi1 = cir.ptr_stride %pi, %one : (!cir.ptr<!s32i>, !s64i) -> !cir.ptr<!s32i>
+  %pi1_tag = cir.cast bitcast %pi1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p_i_1"}
+  cir.return
+}

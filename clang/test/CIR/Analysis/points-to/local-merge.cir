@@ -1,0 +1,87 @@
+// RUN: cir-opt %s -test-cir-points-to -o /dev/null | FileCheck %s
+
+// Merged pointers unify: cir.select, cir.ternary, cir.scope results, ops in
+// cir.if regions, and block arguments after CFG flattening.
+
+!s32i = !cir.int<s, 32>
+
+// CHECK-LABEL: === @select
+// CHECK: [[AB:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-NOT: cir.alloca 'b'
+// CHECK-DAG: a -> [[AB]]+0
+// CHECK-DAG: b -> [[AB]]+0
+// CHECK-DAG: sel -> [[AB]]+0
+// CHECK-DAG: sel_null -> [[AB]]+0
+cir.func @select(%c: !cir.bool) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i> {test.ptr = "a"}
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i> {test.ptr = "b"}
+  %s = cir.select if %c then %a else %b : (!cir.bool, !cir.ptr<!s32i>, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  %s_tag = cir.cast bitcast %s : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "sel"}
+  %null = cir.const #cir.ptr<null> : !cir.ptr<!s32i>
+  %sn = cir.select if %c then %s else %null : (!cir.bool, !cir.ptr<!s32i>, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  %sn_tag = cir.cast bitcast %sn : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "sel_null"}
+  cir.return
+}
+
+// CHECK-LABEL: === @ternary
+// CHECK-DAG: a -> [[AB:n[0-9]+]]+0
+// CHECK-DAG: b -> [[AB]]+0
+// CHECK-DAG: t -> [[AB]]+0
+cir.func @ternary(%c: !cir.bool) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i> {test.ptr = "a"}
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i> {test.ptr = "b"}
+  %t = cir.ternary(%c, true {
+    cir.yield %a : !cir.ptr<!s32i>
+  }, false {
+    cir.yield %b : !cir.ptr<!s32i>
+  }) : (!cir.bool) -> !cir.ptr<!s32i>
+  %t_tag = cir.cast bitcast %t : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "t"}
+  cir.return
+}
+
+// A pointer yielded out of a cir.scope, and a store inside a cir.if: cir.if
+// has no results, so its regions are just walked.
+
+// CHECK-LABEL: === @scope_and_if
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[SLOT:n[0-9]+]] [Stack|Mod] size=8 origins={stack(cir.alloca 'slot' {{.*}})} links={0->[[A]]+0}
+// CHECK-DAG: scoped -> [[A]]+0
+cir.func @scope_and_if(%c: !cir.bool) {
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.scope {
+    %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+    cir.yield %a : !cir.ptr<!s32i>
+  } : !cir.ptr<!s32i>
+  %r_tag = cir.cast bitcast %r : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "scoped"}
+  cir.if %c {
+    cir.store %r, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  }
+  cir.return
+}
+
+// After flattening, the block argument of the join block unifies the
+// incoming pointers, including one that is used before its block is reached
+// in the walk.
+
+// CHECK-LABEL: === @block_args
+// CHECK-DAG: a -> [[ABC:n[0-9]+]]+0
+// CHECK-DAG: b -> [[ABC]]+0
+// CHECK-DAG: c -> [[ABC]]+0
+// CHECK-DAG: phi -> [[ABC]]+0
+// CHECK-DAG: return -> [[ABC]]+0
+cir.func @block_args(%c: !cir.bool) -> !cir.ptr<!s32i> {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i> {test.ptr = "a"}
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i> {test.ptr = "b"}
+  cir.brcond %c ^bb1(%a : !cir.ptr<!s32i>), ^bb2
+^bb1(%p: !cir.ptr<!s32i>):
+  %p_tag = cir.cast bitcast %p : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "phi"}
+  cir.return %p : !cir.ptr<!s32i>
+^bb3:
+  cir.br ^bb1(%x : !cir.ptr<!s32i>)
+^bb2:
+  %c2 = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i>
+  cir.br ^bb4
+^bb4:
+  %x = cir.alloca "c" align(4) : !cir.ptr<!s32i> {test.ptr = "c"}
+  cir.brcond %c ^bb3, ^bb1(%c2 : !cir.ptr<!s32i>)
+}

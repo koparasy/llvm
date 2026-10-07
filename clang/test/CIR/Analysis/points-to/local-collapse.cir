@@ -1,0 +1,70 @@
+// RUN: cir-opt %s -test-cir-points-to -o /dev/null | FileCheck %s
+
+// Ops that lose the offset collapse the node; integer/pointer casts mark
+// nodes External.
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!rec_S = !cir.struct<"S" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+// cir.ptr_mask: the node of s collapses and its two slot targets merge.
+
+// CHECK-LABEL: === @ptr_mask
+// CHECK-DAG: [[AB:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[S:n[0-9]+]] [Stack|Collapsed|Mod] size=16 origins={stack(cir.alloca 's' {{.*}})} links={0->[[AB]]+0} reasons={Collapsed: CollapsedAt(cir.ptr_mask {{.*}}, "unknown offset")}
+// CHECK-DAG: masked -> [[S]]+0
+cir.func @ptr_mask() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %s = cir.alloca "s" align(8) : !cir.ptr<!rec_S>
+  %f0 = cir.get_member %s[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %f1 = cir.get_member %s[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %f1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %raw = cir.cast bitcast %s : !cir.ptr<!rec_S> -> !cir.ptr<!u8i>
+  %mask = cir.const #cir.int<-16> : !s64i
+  %m = cir.ptr_mask %raw, %mask : (!cir.ptr<!u8i>, !s64i) -> !cir.ptr<!u8i> {test.ptr = "masked"}
+  cir.return
+}
+
+// int_to_ptr makes a fresh unknown object; ptr_to_int lets the address of x
+// escape.
+
+// CHECK-LABEL: === @int_casts
+// CHECK-DAG: [[X:n[0-9]+]] [Stack|External] size=4 origins={stack(cir.alloca 'x' {{.*}})} links={} reasons={External: EscapedTo(cir.cast {{.*}}, "address escaped as an integer")}
+// CHECK-DAG: [[U:n[0-9]+]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: EscapedTo(cir.cast {{.*}}, "pointer made from an integer"), External: EscapedTo(cir.cast {{.*}}, "pointer made from an integer")}
+// CHECK-DAG: forged -> [[U]]+0
+cir.func @int_casts(%i: !s64i) {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %xi = cir.cast ptr_to_int %x : !cir.ptr<!s32i> -> !s64i
+  %p = cir.cast int_to_ptr %i : !s64i -> !cir.ptr<!s32i> {test.ptr = "forged"}
+  cir.return
+}
+
+// cir.get_runtime_member applies a data-member pointer, an offset unknown
+// here.
+
+!rec_T = !cir.struct<"T" {data !s32i, data !s32i}>
+// CHECK-LABEL: === @runtime_member
+// CHECK-DAG: [[T:n[0-9]+]] [Stack|Collapsed] size=8 origins={stack(cir.alloca 't' {{.*}})} links={} reasons={Collapsed: CollapsedAt(cir.get_runtime_member {{.*}}, "unknown offset")}
+// CHECK-DAG: member -> [[T]]+0
+cir.func @runtime_member(%m: !cir.data_member<!s32i in !rec_T>) {
+  %t = cir.alloca "t" align(4) : !cir.ptr<!rec_T>
+  %f = cir.get_runtime_member %t[%m : !cir.data_member<!s32i in !rec_T>] : !cir.ptr<!rec_T> -> !cir.ptr<!s32i>
+  %f_tag = cir.cast bitcast %f : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "member"}
+  cir.return
+}
+
+// cir.dyn_cast may land anywhere in the complete object.
+
+!rec_Base = !cir.struct<"Base" {data !cir.ptr<!s32i>}>
+!rec_Derived = !cir.struct<"Derived" {data !rec_Base, data !s32i}>
+// CHECK-LABEL: === @dyn_cast
+// CHECK-DAG: [[O:n[0-9]+]] [Incomplete|Collapsed] size=0 origins={} links={} reasons={Incomplete: UnknownCaller({{.*}}), Collapsed: CollapsedAt(cir.dyn_cast {{.*}}, "unknown offset")}
+// CHECK-DAG: casted -> [[O]]+0
+cir.func @dyn_cast(%b: !cir.ptr<!rec_Base>) {
+  %d = cir.dyn_cast ptr %b : !cir.ptr<!rec_Base> -> !cir.ptr<!rec_Derived> #cir.dyn_cast_info<src_rtti = #cir.global_view<@_ZTI4Base> : !cir.ptr<!u8i>, dest_rtti = #cir.global_view<@_ZTI7Derived> : !cir.ptr<!u8i>, runtime_func = @__dynamic_cast, bad_cast_func = @__cxa_bad_cast, offset_hint = #cir.int<0> : !s64i>
+  %d_tag = cir.cast bitcast %d : !cir.ptr<!rec_Derived> -> !cir.ptr<!rec_Derived> {test.ptr = "casted"}
+  cir.return
+}

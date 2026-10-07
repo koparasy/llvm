@@ -1,0 +1,97 @@
+// RUN: cir-opt %s -test-cir-points-to -o /dev/null | FileCheck %s
+
+// Field addresses are byte offsets into one node: get_member, nested members,
+// base and derived class addresses and complex parts. get_member takes no
+// trailing attribute dictionary, so its results are tagged through a bitcast.
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!rec_S = !cir.struct<"S" {data !s32i, data !s32i, data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_O = !cir.struct<"O" {data !s32i, data !rec_S}>
+!rec_B = !cir.struct<"B" {data !s64i}>
+!rec_D = !cir.struct<"D" {data !s64i, data !rec_B}>
+
+// &s.x, &s.y, &s.p and &s.q are distinct offsets of the node of s; pointers
+// stored through &s.p and &s.q become links at 8 and 16.
+
+// CHECK-LABEL: === @members
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[S:n[0-9]+]] [Stack|Mod] size=24 origins={stack(cir.alloca 's' {{.*}})} links={8->[[A]]+0, 16->[[B]]+0}
+// CHECK-DAG: x -> [[S]]+0
+// CHECK-DAG: y -> [[S]]+4
+// CHECK-DAG: p -> [[S]]+8
+// CHECK-DAG: q -> [[S]]+16
+cir.func @members() {
+  %s = cir.alloca "s" align(8) : !cir.ptr<!rec_S>
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %x = cir.get_member %s[0] {name = "x"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  %x_tag = cir.cast bitcast %x : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x"}
+  %y = cir.get_member %s[1] {name = "y"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  %y_tag = cir.cast bitcast %y : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "y"}
+  %p = cir.get_member %s[2] {name = "p"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %p_tag = cir.cast bitcast %p : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "p"}
+  %q = cir.get_member %s[3] {name = "q"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %q_tag = cir.cast bitcast %q : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "q"}
+  cir.store %a, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %q : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+// A member of a nested record: O.s sits at 8 (S is 8-aligned), O.s.y at 12.
+
+// CHECK-LABEL: === @nested
+// CHECK-DAG: [[O:n[0-9]+]] [Stack] size=32 origins={stack(cir.alloca 'o' {{.*}})} links={}
+// CHECK-DAG: o.s -> [[O]]+8
+// CHECK-DAG: o.s.y -> [[O]]+12
+// CHECK-DAG: o.s.q -> [[O]]+24
+cir.func @nested() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_O>
+  %s = cir.get_member %o[1] {name = "s"} : !cir.ptr<!rec_O> -> !cir.ptr<!rec_S>
+  %s_tag = cir.cast bitcast %s : !cir.ptr<!rec_S> -> !cir.ptr<!rec_S> {test.ptr = "o.s"}
+  %y = cir.get_member %s[1] {name = "y"} : !cir.ptr<!rec_S> -> !cir.ptr<!s32i>
+  %y_tag = cir.cast bitcast %y : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "o.s.y"}
+  %q = cir.get_member %s[3] {name = "q"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %q_tag = cir.cast bitcast %q : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "o.s.q"}
+  cir.return
+}
+
+// The B base of a D sits 8 bytes in; derived_class_addr goes back.
+
+// CHECK-LABEL: === @class_addr
+// CHECK-DAG: [[D:n[0-9]+]] [Stack] size=16 origins={stack(cir.alloca 'd' {{.*}})} links={}
+// CHECK-DAG: base -> [[D]]+8
+// CHECK-DAG: derived -> [[D]]+0
+cir.func @class_addr() {
+  %d = cir.alloca "d" align(8) : !cir.ptr<!rec_D>
+  %base = cir.base_class_addr nonnull %d [8] : !cir.ptr<!rec_D> -> !cir.ptr<!rec_B> {test.ptr = "base"}
+  %derived = cir.derived_class_addr nonnull %base [8] : !cir.ptr<!rec_B> -> !cir.ptr<!rec_D> {test.ptr = "derived"}
+  cir.return
+}
+
+// The imaginary part of a complex double is 8 bytes in.
+
+// CHECK-LABEL: === @complex
+// CHECK-DAG: [[C:n[0-9]+]] [Stack] size=16 origins={stack(cir.alloca 'c' {{.*}})} links={}
+// CHECK-DAG: real -> [[C]]+0
+// CHECK-DAG: imag -> [[C]]+8
+cir.func @complex() {
+  %c = cir.alloca "c" align(8) : !cir.ptr<!cir.complex<!cir.double>>
+  %re = cir.complex.real_ptr %c : !cir.ptr<!cir.complex<!cir.double>> -> !cir.ptr<!cir.double> {test.ptr = "real"}
+  %im = cir.complex.imag_ptr %c : !cir.ptr<!cir.complex<!cir.double>> -> !cir.ptr<!cir.double> {test.ptr = "imag"}
+  cir.return
+}
+
+// A bitcast from a !cir.vptr keeps the address (decomposePointer only looks
+// through casts from a !cir.ptr).
+
+// CHECK-LABEL: === @vptr_bitcast
+// CHECK-DAG: [[SLOT:n[0-9]+]] [Stack|Ref] size=8 origins={stack(cir.alloca 'slot' {{.*}})} links={0->[[VT:n[0-9]+]]+0}
+// CHECK-DAG: vtable -> [[VT]]+0
+cir.func @vptr_bitcast() {
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.vptr>
+  %vp = cir.load %slot : !cir.ptr<!cir.vptr>, !cir.vptr
+  %p = cir.cast bitcast %vp : !cir.vptr -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "vtable"}
+  cir.return
+}

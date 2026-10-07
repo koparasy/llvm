@@ -1,0 +1,67 @@
+// RUN: cir-opt %s -test-cir-points-to -o /dev/null | FileCheck %s
+
+// Calls are only recorded: the cells of their pointer arguments, of the
+// callee pointer of an indirect call, and a fresh node for a pointer result.
+// cir.get_global gives one node per symbol.
+
+!s32i = !cir.int<s, 32>
+
+module {
+cir.global external @g = #cir.int<0> : !s32i
+cir.func private @take(!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+cir.func private @may_throw(!cir.ptr<!s32i>)
+
+// CHECK-LABEL: === @direct
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[G:n[0-9]+]] [Global] size=4 arr=4 origins={global(@g)} links={}
+// CHECK-DAG: [[R:n[0-9]+]] [] size=0 origins={} links={}
+// CHECK-DAG: [[R2:n[0-9]+]] [] size=0 origins={} links={}
+// CHECK:     call cir.call @take args={0: [[A]]+0, 2: [[G]]+0} result=[[R]]+0
+// CHECK-NEXT: call cir.call @take args={0: [[G]]+0, 2: null} result=[[R2]]+0
+// CHECK-DAG: g1 -> [[G]]+0
+// CHECK-DAG: g2 -> [[G]]+0
+// CHECK-DAG: res -> [[R]]+0
+cir.func @direct(%n: !s32i) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %g1 = cir.get_global @g : !cir.ptr<!s32i> {test.ptr = "g1"}
+  %g2 = cir.get_global @g : !cir.ptr<!s32i> {test.ptr = "g2"}
+  %r = cir.call @take(%a, %n, %g1) : (!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  %r_tag = cir.cast bitcast %r : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "res"}
+  %one = cir.const #cir.int<1> : !s32i
+  %g4 = cir.ptr_stride %g2, %one : (!cir.ptr<!s32i>, !s32i) -> !cir.ptr<!s32i>
+  %null = cir.const #cir.ptr<null> : !cir.ptr<!s32i>
+  %r2 = cir.call @take(%g4, %n, %null) : (!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// An indirect call through a pointer to @take loaded from a slot: the callee
+// cell is the Function node of @take.
+
+// CHECK-LABEL: === @indirect
+// CHECK-DAG: [[F:n[0-9]+]] [Function] size=0 origins={func(@take)} links={}
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK:     call cir.call callee=[[F]]+0 args={0: [[A]]+0, 2: [[A]]+0} result={{n[0-9]+}}+0
+cir.func @indirect(%n: !s32i) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>>>>
+  %f = cir.get_global @take : !cir.ptr<!cir.func<(!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>>>
+  cir.store %f, %slot : !cir.ptr<!cir.func<(!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>>>, !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>>>>
+  %fp = cir.load %slot : !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>>>>, !cir.ptr<!cir.func<(!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>>>
+  %r = cir.call %fp(%a, %n, %a) : (!cir.ptr<!cir.func<(!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>>>, !cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  cir.return
+}
+
+// A flattened cir.try_call is recorded like a call.
+
+// CHECK-LABEL: === @try_call
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK:     call cir.try_call @may_throw args={0: [[A]]+0} result=null
+cir.func @try_call() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  cir.try_call @may_throw(%a) ^bb1, ^bb2 : (!cir.ptr<!s32i>) -> ()
+^bb1:
+  cir.return
+^bb2:
+  cir.return
+}
+}

@@ -1,0 +1,108 @@
+// RUN: cir-opt %s -test-cir-points-to -o /dev/null | FileCheck %s
+
+// Allocas, loads and stores of pointers and scalars, formals and the return
+// cell.
+
+!s32i = !cir.int<s, 32>
+
+// p = &a; q = &b; *pp = p; r = *pp: r and p point to the same cell, a and b
+// are distinct nodes, and pp's slot links to a.
+
+// CHECK-LABEL: === @load_store
+// CHECK-DAG: [[A:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[PP:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'pp' {{.*}})} links={0->[[A]]+0}
+// CHECK-DAG: p -> [[A]]+0
+// CHECK-DAG: q -> [[B]]+0
+// CHECK-DAG: pp -> [[PP]]+0
+// CHECK-DAG: r -> [[A]]+0
+cir.func @load_store() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %pp = cir.alloca "pp" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %p = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p"}
+  %q = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "q"}
+  %pp2 = cir.cast bitcast %pp : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "pp"}
+  cir.store %p, %pp : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.load %pp : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "r"}
+  cir.return
+}
+
+// Two pointers stored into one slot: their targets unify.
+
+// CHECK-LABEL: === @two_stores
+// CHECK: [[AB:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK: [[SLOT:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'slot' {{.*}})} links={0->[[AB]]+0}
+// CHECK-DAG: a -> [[AB]]+0
+// CHECK-DAG: b -> [[AB]]+0
+// CHECK-DAG: r -> [[AB]]+0
+cir.func @two_stores() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i> {test.ptr = "a"}
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i> {test.ptr = "b"}
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.load %slot : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "r"}
+  cir.return
+}
+
+// Scalar loads and stores only set Ref and Mod. Storing null adds no link.
+
+// CHECK-LABEL: === @scalars_and_null
+// CHECK-DAG: [[X:n[0-9]+]] [Stack|Mod] size=4 origins={stack(cir.alloca 'x' {{.*}})} links={}
+// CHECK-DAG: [[Y:n[0-9]+]] [Stack|Ref] size=4 origins={stack(cir.alloca 'y' {{.*}})} links={}
+// CHECK-DAG: [[P:n[0-9]+]] [Stack|Mod] size=8 origins={stack(cir.alloca 'p' {{.*}})} links={}
+// CHECK-DAG: null -> null
+cir.func @scalars_and_null() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %p = cir.alloca "p" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %c = cir.const #cir.int<1> : !s32i
+  cir.store %c, %x : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %y : !cir.ptr<!s32i>, !s32i
+  %null = cir.const #cir.ptr<null> : !cir.ptr<!s32i> {test.ptr = "null"}
+  cir.store %null, %p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+// Formals get one Incomplete node each. Loading through a formal creates a
+// target node, and both returns unify it with the first formal.
+
+// CHECK-LABEL: === @formals_and_return
+// CHECK: [[F0:n[0-9]+]] [Incomplete] size=0 origins={} links={} reasons={Incomplete: UnknownCaller(cir.func {{.*}}, "formal #0")}
+// CHECK: [[F2:n[0-9]+]] [Incomplete|Ref] size=8 origins={} links={0->[[F0]]+0} reasons={Incomplete: UnknownCaller(cir.func {{.*}}, "formal #2")}
+// CHECK-NEXT: formal #0 -> [[F0]]+0
+// CHECK-NEXT: formal #2 -> [[F2]]+0
+// CHECK-NEXT: return -> [[F0]]+0
+// CHECK-DAG: args.region0#0 -> [[F0]]+0
+// CHECK-DAG: loaded -> [[F0]]+0
+cir.func @formals_and_return(%p: !cir.ptr<!s32i>, %n: !s32i, %pp: !cir.ptr<!cir.ptr<!s32i>>, %c: !cir.bool) -> !cir.ptr<!s32i>
+    attributes {test.ptr = "args"} {
+  cir.brcond %c ^bb1, ^bb2
+^bb1:
+  cir.return %p : !cir.ptr<!s32i>
+^bb2:
+  %l = cir.load %pp : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "loaded"}
+  cir.return %l : !cir.ptr<!s32i>
+}
+
+// An atomic exchange of a pointer is a store of the new value plus a load of
+// the old one; atomic arithmetic on an integer is Mod and Ref only.
+
+// CHECK-LABEL: === @atomics
+// CHECK-DAG: [[AB:n[0-9]+]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
+// CHECK-DAG: [[SLOT:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 'slot' {{.*}})} links={0->[[AB]]+0}
+// CHECK-DAG: [[I:n[0-9]+]] [Stack|Mod|Ref] size=4 origins={stack(cir.alloca 'i' {{.*}})} links={}
+// CHECK-DAG: old -> [[AB]]+0
+cir.func @atomics() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %i = cir.alloca "i" align(4) : !cir.ptr<!s32i>
+  %slot = cir.alloca "slot" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %slot : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %old = cir.atomic.xchg seq_cst syncscope(system) %slot, %b : (!cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  %old_tag = cir.cast bitcast %old : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "old"}
+  %one = cir.const #cir.int<1> : !s32i
+  %f = cir.atomic.fetch add seq_cst syncscope(system) %i, %one : (!cir.ptr<!s32i>, !s32i) -> !s32i
+  cir.return
+}
