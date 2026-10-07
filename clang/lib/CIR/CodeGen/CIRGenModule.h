@@ -686,6 +686,11 @@ public:
   void emitOpenCLKernelArgMetadata(cir::FuncOp func,
                                    const clang::FunctionDecl *fd);
 
+  /// The role of a SYCL host buffer/accessor API function for the offload
+  /// combine's buffer identity analysis, or empty.
+  static llvm::StringRef getSYCLHostAPIRole(const clang::FunctionDecl *fd,
+                                            unsigned &argIndex);
+
   /// Record which SYCL kernel parameters are accessor base pointers, for the
   /// kernel_arg_runtime_aligned/kernel_arg_exclusive_ptr metadata.
   void emitSYCLKernelArgAccessorMetadata(cir::FuncOp func,

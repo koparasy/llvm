@@ -3864,6 +3864,104 @@ void CIRGenModule::emitSYCLKernelArgAccessorMetadata(
                 mlir::DenseBoolArrayAttr::get(&getMLIRContext(), accessorPtrs));
 }
 
+/// Whether `rd` is the class `name` declared directly in namespace `ns`
+/// (looking through inline namespaces such as sycl::_V1).
+static bool isClassInNamespace(const CXXRecordDecl *rd, llvm::StringRef ns,
+                               llvm::StringRef name) {
+  if (!rd || !rd->getIdentifier() || rd->getName() != name)
+    return false;
+  const DeclContext *dc = rd->getDeclContext();
+  while (const auto *nd = dyn_cast<NamespaceDecl>(dc)) {
+    if (!nd->isInline())
+      return nd->getIdentifier() && nd->getName() == ns &&
+             nd->getDeclContext()->getRedeclContext()->isTranslationUnit();
+    dc = nd->getDeclContext();
+  }
+  return false;
+}
+
+/// The record a parameter type names, through references.
+static const CXXRecordDecl *paramRecord(QualType type) {
+  return type.getNonReferenceType()->getAsCXXRecordDecl();
+}
+
+/// The role of a SYCL host API function the offload combine traces buffer
+/// and accessor identity through (see KernelBindingTable), or empty. On the
+/// host the SYCL classes carry no sycl_type attribute, so they are recognized
+/// by their declarations:
+///   buffer.alloc        buffer(range, ...): fresh storage
+///   buffer.host_ptr     buffer(T *hostData, range, ...): may use hostData
+///   buffer.copy         buffer copy/move constructor: same storage
+///   buffer.sub          buffer(buffer &parent, id, range): parent's storage
+///   buffer.other        any other buffer constructor
+///   buffer.reinterpret  buffer::reinterpret: the source's storage
+///   buffer.assign       buffer::operator=
+///   buffer.get_access   buffer::get_access(handler &, ...): a device accessor
+///   accessor.from_buffer  accessor(buffer &, ...)
+///   accessor.copy       accessor copy/move constructor
+///   accessor.assign     accessor::operator=
+///   accessor.other      any other accessor constructor
+///   vector.data         std::vector::data
+/// `argIndex` receives the source-level parameter index (not counting `this`)
+/// of the buffer, accessor or host pointer the role reads, where it has one.
+llvm::StringRef CIRGenModule::getSYCLHostAPIRole(const FunctionDecl *fd,
+                                                 unsigned &argIndex) {
+  const auto *md = dyn_cast<CXXMethodDecl>(fd);
+  if (!md)
+    return {};
+  const CXXRecordDecl *rd = md->getParent();
+  const auto *ctor = dyn_cast<CXXConstructorDecl>(md);
+  bool isAssign = md->getOverloadedOperator() == OO_Equal;
+
+  if (isClassInNamespace(rd, "std", "vector"))
+    return md->getIdentifier() && md->getName() == "data" ? "vector.data" : "";
+
+  if (isClassInNamespace(rd, "sycl", "buffer")) {
+    if (ctor) {
+      if (ctor->isCopyOrMoveConstructor())
+        return "buffer.copy";
+      if (ctor->getNumParams() == 0)
+        return "buffer.other";
+      QualType first = ctor->getParamDecl(0)->getType();
+      if (first->isPointerType())
+        return "buffer.host_ptr";
+      const CXXRecordDecl *firstRec = paramRecord(first);
+      if (isClassInNamespace(firstRec, "sycl", "range"))
+        return "buffer.alloc";
+      if (firstRec && firstRec->getCanonicalDecl() == rd->getCanonicalDecl())
+        return "buffer.sub";
+      return "buffer.other";
+    }
+    if (isAssign)
+      return "buffer.assign";
+    if (md->getIdentifier() && md->getName() == "reinterpret")
+      return "buffer.reinterpret";
+    if (md->getIdentifier() && md->getName() == "get_access" &&
+        md->getNumParams() >= 1 &&
+        isClassInNamespace(paramRecord(md->getParamDecl(0)->getType()), "sycl",
+                           "handler"))
+      return "buffer.get_access";
+    return {};
+  }
+
+  if (isClassInNamespace(rd, "sycl", "accessor")) {
+    if (ctor) {
+      if (ctor->isCopyOrMoveConstructor())
+        return "accessor.copy";
+      for (const ParmVarDecl *param : ctor->parameters())
+        if (isClassInNamespace(paramRecord(param->getType()), "sycl",
+                               "buffer")) {
+          argIndex = param->getFunctionScopeIndex();
+          return "accessor.from_buffer";
+        }
+      return "accessor.other";
+    }
+    if (isAssign)
+      return "accessor.assign";
+  }
+  return {};
+}
+
 cir::FuncOp CIRGenModule::getOrCreateCIRFunction(
     StringRef mangledName, mlir::Type funcType, GlobalDecl gd, bool forVTable,
     bool dontDefer, bool isThunk, ForDefinition_t isForDefinition,
@@ -3943,6 +4041,17 @@ cir::FuncOp CIRGenModule::getOrCreateCIRFunction(
   cir::FuncOp funcOp = createCIRFunction(
       invalidLoc ? theModule->getLoc() : getLoc(funcDecl->getSourceRange()),
       mangledName, mlir::cast<cir::FuncType>(funcType), funcDecl);
+
+  if (getLangOpts().SYCLIsHost && funcDecl) {
+    unsigned argIndex = 0;
+    llvm::StringRef role = getSYCLHostAPIRole(funcDecl, argIndex);
+    if (!role.empty()) {
+      funcOp->setAttr(cir::CIRDialect::getSYCLHostAPIAttrName(),
+                      builder.getStringAttr(role));
+      funcOp->setAttr(cir::CIRDialect::getSYCLHostAPIArgAttrName(),
+                      builder.getI32IntegerAttr(argIndex));
+    }
+  }
 
   if (funcDecl && funcDecl->hasAttr<AnnotateAttr>())
     deferredAnnotations[mangledName] = funcDecl;
