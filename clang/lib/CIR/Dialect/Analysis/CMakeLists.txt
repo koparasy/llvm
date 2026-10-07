@@ -2,6 +2,7 @@ add_clang_library(MLIRCIRAnalysis
   CIRAliasAnalysis.cpp
   CIRBasicAliasAnalysis.cpp
   CIRPointerDecomposition.cpp
+  PointsTo/PointsToGraph.cpp
 
   LINK_LIBS PUBLIC
   MLIRCIR
