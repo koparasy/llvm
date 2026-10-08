@@ -405,22 +405,25 @@ def OffloadStampReqdWorkGroupSize
 
 def OffloadInferKernelParamNoAlias
     : Pass<"cir-offload-infer-kernel-param-noalias", "mlir::ModuleOp"> {
-  let summary = "Infer llvm.noalias on SYCL kernel params from distinct USM allocs";
+  let summary = "Infer llvm.noalias on SYCL kernel params from distinct memory";
   let description = [{
     Runs over a `cir.offload.container`. A SYCL device kernel pointer parameter
-    is bound to a closure capture field. When, at every visible launch site,
-    that field's captured pointer is backed by a USM allocation
-    (malloc_device / malloc_shared / malloc_host) provably distinct from every
-    other captured pointer of the same closure, the parameter cannot alias the
-    others and is stamped `llvm.noalias`, using the host<->device correspondence
-    and closure-allocation analysis from `KernelBindingTable`.
+    -- a captured USM pointer, or the `ptr` part of a captured accessor -- is
+    bound to a closure capture field (`cir.sycl_kernel_param`). When, at every
+    visible launch site, that field is backed by memory (a USM allocation, a
+    buffer's storage) provably distinct from every other candidate field of
+    the same closure, the parameter cannot alias the others and is stamped
+    `llvm.noalias`, using the host<->device correspondence and the host facts
+    of `KernelBindingTable` (legacy trace or SYCLHostFacts, `host-facts`).
 
-    Only TU-local/optimizable bindings (every launch visible) are touched, and
-    the shared device kernel is annotated in place -- never cloned. A parameter
-    whose source is not a distinct allocation (pointer arithmetic, a shared
-    base, an opaque value, a buffer/accessor) is left conservatively untouched,
-    as is a parameter that already carries `llvm.noalias`. The LLVM `noalias`
-    param attribute is emitted from this arg attribute later, at LLVM lowering.
+    A TU-local/optimizable binding (every launch visible) is annotated in
+    place. A kernel visible to other TUs is specialized by clone: this TU's
+    launches are redirected to a copy, and only the copy is annotated. A
+    parameter that already carries `llvm.noalias` is left alone, as are an
+    accessor's range/offset parameters and its `readonly`. Each candidate
+    parameter gets one `kernel-param-noalias:` remark with the decision and
+    its reason. The LLVM `noalias` param attribute is emitted from this arg
+    attribute later, at LLVM lowering.
   }];
   let constructor = "mlir::createOffloadInferKernelParamNoAliasPass()";
   let dependentDialects = ["cir::CIRDialect"];

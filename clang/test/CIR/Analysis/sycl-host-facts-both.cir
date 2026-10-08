@@ -7,7 +7,7 @@
 // RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=0 host-facts-subobjects=0' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
 // RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias \
-// RUN:   2>&1 | FileCheck %s --check-prefix=PASS-LEGACY
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=PASS-LEGACY
 // RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=1 subobjects=0})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
 // RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both bu=1 subobjects=0})" \
@@ -163,10 +163,17 @@ module attributes {cir.offload.container} {
 // PASS-BOTH: remark: host-facts-disagreements: 4 of 4 candidate fields (closed-tu, ci)
 // PASS-BOTH-NOT: llvm.noalias
 
-// InferKernelParamNoAlias stamps only USM pointer parameters; the accessor
-// verdicts have no consumer yet.
+// With host-facts=ipo both accessor pointer parameters and both USM pointer
+// parameters are stamped (the accessor ranges are not), one remark each.
+// PASS-IPO: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (accessor 'A'): noalias (a buffer (ghost {{n[0-9]+}}))
+// PASS-IPO: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 2 (accessor 'B'): noalias (a buffer (ghost {{n[0-9]+}}))
+// PASS-IPO: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 4 (pointer 'P'): noalias (a USM allocation ({{.*}}))
+// PASS-IPO: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 5 (pointer 'Q'): noalias (a USM allocation ({{.*}}))
 // PASS-IPO-NOT: remark
-// PASS-IPO: cir.func @_ZTSZ4mainEUlvE_({{.*}}field = "P", kind = "pointer", path = ["P"]}, llvm.noalias}, {{.*}}field = "Q", kind = "pointer", path = ["Q"]}, llvm.noalias})
+// PASS-IPO: cir.func @_ZTSZ4mainEUlvE_({{.*}}field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}, llvm.noalias}, %arg1: {{[^%]*}}path = ["A"]}}, {{.*}}field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}, llvm.noalias}, %arg3: {{[^%]*}}path = ["B"]}}, {{.*}}field = "P", kind = "pointer", path = ["P"]}, llvm.noalias}, {{.*}}field = "Q", kind = "pointer", path = ["Q"]}, llvm.noalias})
 
-// PASS-LEGACY-NOT: remark
-// PASS-LEGACY-NOT: llvm.noalias
+// PASS-LEGACY-NOT: ): noalias
+// PASS-LEGACY: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (accessor 'A'): not stamped (the buffer is a function parameter)
+// PASS-LEGACY-COUNT-2: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg {{[0-9]}} ({{.*}}): not stamped
+// PASS-LEGACY: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 5 (pointer 'Q'): not stamped (pointer 'Q' is not a visible USM allocation)
+// PASS-LEGACY-NOT: ): noalias

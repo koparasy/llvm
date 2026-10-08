@@ -58,6 +58,14 @@ std::optional<SYCLKernelParam> getSYCLKernelParam(cir::FuncOp kernel,
 llvm::StringRef getSYCLCapturedField(cir::FuncOp kernel, unsigned argNo,
                                      bool wantPointer);
 
+/// The closure field whose global memory a SYCL kernel argument points to, as
+/// a noalias candidate: a captured pointer copied in whole, or the `ptr` part
+/// of an accessor held directly by the closure (`isAccessor` tells which).
+/// Empty for any other argument (a range or offset of an accessor, a
+/// local_accessor, a scalar, a member nested in a captured struct, ...).
+llvm::StringRef getSYCLNoAliasField(cir::FuncOp kernel, unsigned argNo,
+                                    bool &isAccessor);
+
 /// The alloca of the kernel's local closure object, or null.
 mlir::Value getSYCLKernelObject(cir::FuncOp kernel);
 

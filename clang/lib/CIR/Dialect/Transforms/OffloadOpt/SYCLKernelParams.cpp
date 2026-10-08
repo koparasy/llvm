@@ -44,6 +44,17 @@ llvm::StringRef cir::getSYCLCapturedField(cir::FuncOp kernel, unsigned argNo,
   return param->field;
 }
 
+llvm::StringRef cir::getSYCLNoAliasField(cir::FuncOp kernel, unsigned argNo,
+                                         bool &isAccessor) {
+  std::optional<SYCLKernelParam> param = getSYCLKernelParam(kernel, argNo);
+  if (!param || !param->isTopLevel())
+    return {};
+  isAccessor = param->kind == "accessor";
+  if (isAccessor ? param->accessorPart != "ptr" : param->kind != "pointer")
+    return {};
+  return param->field;
+}
+
 mlir::Value cir::getSYCLKernelObject(cir::FuncOp kernel) {
   mlir::Value result;
   kernel.walk([&](cir::AllocaOp alloca) {

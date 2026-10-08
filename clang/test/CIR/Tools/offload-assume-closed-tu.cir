@@ -41,8 +41,9 @@
 
 // CI: host-facts-disagreements: 4 of 4 candidate fields (closed-tu, ci, subobjects)
 
-// ipo stamps the two USM pointer parameters under closed-tu only.
-// IPO: cir.func @_ZTSZ4mainEUlvE_({{.*}}field = "P", kind = "pointer", path = ["P"]}, llvm.noalias}, {{.*}}field = "Q", kind = "pointer", path = ["Q"]}, llvm.noalias})
+// ipo stamps the two accessor pointer and two USM pointer parameters under
+// closed-tu only.
+// IPO: cir.func @_ZTSZ4mainEUlvE_({{.*}}field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}, llvm.noalias}, {{.*}}field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}, llvm.noalias}, {{.*}}field = "P", kind = "pointer", path = ["P"]}, llvm.noalias}, {{.*}}field = "Q", kind = "pointer", path = ["Q"]}, llvm.noalias})
 // IPO-OPEN-NOT: llvm.noalias
 
 //--- host.cir
