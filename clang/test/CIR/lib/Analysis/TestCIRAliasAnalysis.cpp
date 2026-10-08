@@ -13,6 +13,7 @@
 // use-points-to=1 builds the points-to analysis (PointsToAnalysis, with the
 // generic library models) of the module that holds the operation and
 // registers CIRPointsToAliasAnalysis after CIRBasicAliasAnalysis.
+// mode=bu runs the bottom-up mode (PointsToMode::BU).
 // closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU, and sycl=1 adds
 // the SYCL plug-in (addSYCLPointsToPlugin: the host API models and the
 // device-write rule).
@@ -59,13 +60,16 @@ struct PointsToHolder {
   PointsToModelRegistry registry;
   std::unique_ptr<PointsToAnalysis> analysis;
 
-  PointsToHolder(Operation *op, bool closedTU, bool sycl = false) {
+  PointsToHolder(Operation *op, bool closedTU, bool sycl = false,
+                 bool bottomUp = false) {
     registerGenericModels(registry);
     auto module = dyn_cast<ModuleOp>(op);
     if (!module)
       module = op->getParentOfType<ModuleOp>();
     PointsToAnalysisOptions options;
     options.assumeClosedTU = closedTU;
+    if (bottomUp)
+      options.mode = PointsToMode::BU;
     if (sycl)
       cir::addSYCLPointsToPlugin(options);
     analysis = std::make_unique<PointsToAnalysis>(module, &registry, options);
@@ -139,6 +143,10 @@ struct PointsToOptions : public PassWrapper<Derived, OperationPass<>> {
       *this, "closed-tu",
       llvm::cl::desc("Points-to: assume every caller is in the module"),
       llvm::cl::init(false)};
+  Pass::Option<std::string> ptMode{
+      *this, "mode",
+      llvm::cl::desc("Points-to: ci (context-insensitive) or bu (bottom-up)"),
+      llvm::cl::init("ci")};
   Pass::Option<bool> syclModels{
       *this, "sycl", llvm::cl::desc("Points-to: add the SYCL host API models"),
       llvm::cl::init(false)};
@@ -173,7 +181,8 @@ struct TestCIRAliasAnalysisPass
       runAliasAnalysisOnOperation(getOperation(), aliasAnalysis);
       return;
     }
-    PointsToHolder holder(getOperation(), this->closedTU, this->syclModels);
+    PointsToHolder holder(getOperation(), this->closedTU, this->syclModels,
+                          this->ptMode == "bu");
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);
@@ -216,7 +225,8 @@ struct TestCIRAliasAnalysisModRefPass
       runAliasAnalysisOnOperation(getOperation(), aliasAnalysis);
       return;
     }
-    PointsToHolder holder(getOperation(), this->closedTU, this->syclModels);
+    PointsToHolder holder(getOperation(), this->closedTU, this->syclModels,
+                          this->ptMode == "bu");
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);
@@ -265,6 +275,10 @@ struct TestCIRPointsToAliasSamplePass
       *this, "closed-tu",
       llvm::cl::desc("Points-to: assume every caller is in the module"),
       llvm::cl::init(false)};
+  Option<std::string> ptMode{
+      *this, "mode",
+      llvm::cl::desc("Points-to: ci (context-insensitive) or bu (bottom-up)"),
+      llvm::cl::init("ci")};
   Option<std::string> showRule{
       *this, "show-rule",
       llvm::cl::desc("Print the first pairs (show=<n>) a points-to rule "
@@ -305,7 +319,7 @@ void TestCIRPointsToAliasSamplePass::runOnOperation() {
   }
 
   llvm::TimeRecord start = llvm::TimeRecord::getCurrentTime(true);
-  PointsToHolder holder(target, closedTU);
+  PointsToHolder holder(target, closedTU, /*sycl=*/false, ptMode == "bu");
   llvm::TimeRecord built = llvm::TimeRecord::getCurrentTime(false);
   built -= start;
   const PointsToAnalysis &pt = *holder.analysis;
@@ -402,7 +416,8 @@ void TestCIRPointsToAliasSamplePass::runOnOperation() {
           [&](Value a, Value b) { return combinedAA.alias(a, b); });
 
   os << "=== points-to alias sample: " << pairs.size() << " pairs, seed "
-     << seed << (closedTU ? ", closed-tu" : "") << "\n";
+     << seed << (closedTU ? ", closed-tu" : "")
+     << (ptMode == "bu" ? ", bu" : "") << "\n";
   os << "functions sampled: " << perFunction.size()
      << ", pointer values: " << all.size() << "\n";
   os << llvm::format("points-to analysis: %.1f ms\n",

@@ -1,0 +1,57 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 print-stats=1 max-clone-nodes=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 print-stats=1 max-total-clone-nodes=2' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=TOTAL
+
+// The clone budgets. With max-clone-nodes=1 the first copy of @make's graph
+// into @f would exceed it: the call is bound to @make's own graph instead,
+// context-insensitively (Reason Budget), and the two graphs become one, so
+// the other two calls are bound to it too (an SCC-like binding, MergedAt).
+// a, b and c are make's one node, as in CI. With max-total-clone-nodes=2 two
+// copies are made and the third call falls back.
+
+// CHECK-LABEL: === @f formals=complete
+// CHECK-NEXT: @f a -> [[N:n[0-9]+]]+0 complete
+// CHECK-NEXT: @f b -> [[N]]+0 complete
+// CHECK-NEXT: @f c -> [[N]]+0 complete
+// CHECK-LABEL: === calls
+// CHECK: @f cir.call @make -> direct @make [merged (Budget, "@make: the copy would exceed the clone budget")]
+// CHECK-NEXT: @f cir.call @make -> direct @make [merged (MergedAt, "@make")]
+// CHECK-NEXT: @f cir.call @make -> direct @make [merged (MergedAt, "@make")]
+// CHECK-LABEL: --- bu stats
+// CHECK: copies of callee graphs: 0
+// CHECK: bindings over budget: 1
+
+// TOTAL-LABEL: === @f formals=complete
+// TOTAL-NEXT: @f a -> [[A:n[0-9]+]]+0 complete
+// TOTAL-NEXT: @f b -> [[B:n[0-9]+]]+0 complete
+// TOTAL-NEXT: @f c -> [[C:n[0-9]+]]+0 complete
+// TOTAL-LABEL: === calls
+// TOTAL: @f cir.call @make -> direct @make [clone #{{[0-9]+}}]
+// TOTAL-NEXT: @f cir.call @make -> direct @make [clone #{{[0-9]+}}]
+// TOTAL-NEXT: @f cir.call @make -> direct @make [merged (Budget, "@make: the copy would exceed the clone budget")]
+// TOTAL-LABEL: --- bu stats
+// TOTAL: copies of callee graphs: 2
+// TOTAL: copied nodes: 2
+// TOTAL: bindings over budget: 1
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func internal @make() -> !cir.ptr<!s32i> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func @f() {
+  %a0 = cir.call @make() : () -> !cir.ptr<!s32i>
+  %a = cir.cast bitcast %a0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %b0 = cir.call @make() : () -> !cir.ptr<!s32i>
+  %b = cir.cast bitcast %b0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  %c0 = cir.call @make() : () -> !cir.ptr<!s32i>
+  %c = cir.cast bitcast %c0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "c"}
+  cir.return
+}
+}

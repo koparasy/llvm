@@ -37,6 +37,7 @@
 //
 // Options:
 //   closed-tu=1               PointsToAnalysisOptions::assumeClosedTU
+//   mode=bu                   the bottom-up mode (PointsToMode::BU)
 //   max-pairs-per-func=<n>    as above
 //   seed=<s>                  the sampling seed
 //   table=<path>              write the side table: one line per check,
@@ -170,6 +171,10 @@ struct TestCIRPointsToInstrumentPass
       *this, "closed-tu",
       llvm::cl::desc("Points-to: assume every caller is in the module"),
       llvm::cl::init(false)};
+  Option<std::string> ptMode{
+      *this, "mode",
+      llvm::cl::desc("Points-to: ci (context-insensitive) or bu (bottom-up)"),
+      llvm::cl::init("ci")};
   Option<unsigned> maxPairs{
       *this, "max-pairs-per-func",
       llvm::cl::desc("The most pairs checked per function (0 = all)"),
@@ -264,6 +269,8 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
   registerGenericModels(registry);
   PointsToAnalysisOptions options;
   options.assumeClosedTU = closedTU;
+  if (ptMode == "bu")
+    options.mode = PointsToMode::BU;
   PointsToAnalysis pt(module, &registry, options);
   DataLayout dataLayout(module);
 

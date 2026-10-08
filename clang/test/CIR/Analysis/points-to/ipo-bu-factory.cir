@@ -1,0 +1,144 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 contexts=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CI
+
+// Heap cloning (T17). One operator new in @make, called from three sites in
+// @f, and from three sites in @g through eight wrappers (@w8 -> ... -> @w1 ->
+// @make). Context-insensitively the six results are the one node of the
+// allocation site. Bottom-up, each call site gets its own copy of the
+// callee's graph, so each result is its own heap node, whose origin carries
+// its calling context (#ctx, printed in === contexts): the call in @f, or
+// the call in @g followed by the eight calls of the wrappers.
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[A:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}})#[[CA:[0-9]+]]} links={}
+// CHECK-DAG: [[B:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}})#[[CB:[0-9]+]]} links={}
+// CHECK-DAG: [[C:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}})#[[CC:[0-9]+]]} links={}
+// CHECK-DAG: [[D:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}})#[[CD:[0-9]+]]} links={}
+// CHECK-DAG: [[E:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}})#[[CE:[0-9]+]]} links={}
+// CHECK-DAG: [[H:n[0-9]+]] [Heap] size=4 origins={heap(cir.call {{.*}})#[[CH:[0-9]+]]} links={}
+// pointsTo(value, callPath): @w1's result in the context of @w2's call to it,
+// and of @w3's call to @w2 too, are the copies in @w2's and @w3's graphs.
+// CHECK-LABEL: === @w1 formals=complete
+// CHECK-NEXT: @w1 return -> [[P0:n[0-9]+]]+0
+// CHECK-NEXT: @w1 p1 -> [[P0]]+0 complete
+// CHECK-NEXT: @w1 p1 in [cir.call {{.*}}] -> [[P1:n[0-9]+]]+0 complete
+// CHECK-NEXT: @w1 p1 in [cir.call {{.*}}, cir.call {{.*}}] -> [[P2:n[0-9]+]]+0 complete
+// CHECK-LABEL: === @w2 formals=complete
+// CHECK-NEXT: @w2 return -> [[P1]]+0
+// CHECK-LABEL: === @w3 formals=complete
+// CHECK-NEXT: @w3 return -> [[P2]]+0
+// CHECK-LABEL: === @f formals=complete
+// CHECK-NEXT: @f a -> [[A]]+0 complete
+// CHECK-NEXT: @f b -> [[B]]+0 complete
+// CHECK-NEXT: @f c -> [[C]]+0 complete
+// CHECK-LABEL: === @g formals=complete
+// CHECK-NEXT: @g d -> [[D]]+0 complete
+// CHECK-NEXT: @g e -> [[E]]+0 complete
+// CHECK-NEXT: @g h -> [[H]]+0 complete
+// CHECK-LABEL: === calls
+// CHECK: @f cir.call @make -> direct @make [clone #[[CA]]]
+// CHECK-NEXT: @f cir.call @make -> direct @make [clone #[[CB]]]
+// CHECK-NEXT: @f cir.call @make -> direct @make [clone #[[CC]]]
+// CHECK-NEXT: @g cir.call @w8 -> direct @w8 [clone #[[GD:[0-9]+]]]
+// CHECK-NEXT: @g cir.call @w8 -> direct @w8 [clone #[[GE:[0-9]+]]]
+// CHECK-NEXT: @g cir.call @w8 -> direct @w8 [clone #[[GH:[0-9]+]]]
+// The context of d: the call in @g, then the call of @w8, ..., then @w1's.
+// CHECK-LABEL: === contexts
+// CHECK-DAG: #[[W1:[0-9]+]] = cir.call {{.*}} in @w1{{$}}
+// CHECK-DAG: #[[W2:[0-9]+]] = cir.call {{.*}} in @w2 < #[[W1]]
+// CHECK-DAG: #[[W3:[0-9]+]] = cir.call {{.*}} in @w3 < #[[W2]]
+// CHECK-DAG: #[[W4:[0-9]+]] = cir.call {{.*}} in @w4 < #[[W3]]
+// CHECK-DAG: #[[W5:[0-9]+]] = cir.call {{.*}} in @w5 < #[[W4]]
+// CHECK-DAG: #[[W6:[0-9]+]] = cir.call {{.*}} in @w6 < #[[W5]]
+// CHECK-DAG: #[[W7:[0-9]+]] = cir.call {{.*}} in @w7 < #[[W6]]
+// CHECK-DAG: #[[W8:[0-9]+]] = cir.call {{.*}} in @w8 < #[[W7]]
+// CHECK-DAG: #[[CA]] = cir.call {{.*}} in @f{{$}}
+// CHECK-DAG: #[[CB]] = cir.call {{.*}} in @f{{$}}
+// CHECK-DAG: #[[CC]] = cir.call {{.*}} in @f{{$}}
+// CHECK-DAG: #[[CD]] = cir.call {{.*}} in @g < #[[W8]]
+// CHECK-DAG: #[[CE]] = cir.call {{.*}} in @g < #[[W8]]
+// CHECK-DAG: #[[CH]] = cir.call {{.*}} in @g < #[[W8]]
+
+// BU-LABEL: Testing : "f"
+// BU-NEXT: a#0 <-> b#0: NoAlias
+// BU-NEXT: a#0 <-> c#0: NoAlias
+// BU-NEXT: b#0 <-> c#0: NoAlias
+// BU-LABEL: Testing : "g"
+// BU-NEXT: d#0 <-> e#0: NoAlias
+// BU-NEXT: d#0 <-> h#0: NoAlias
+// BU-NEXT: e#0 <-> h#0: NoAlias
+
+// CI-LABEL: Testing : "f"
+// CI-NEXT: a#0 <-> b#0: MayAlias
+// CI-NEXT: a#0 <-> c#0: MayAlias
+// CI-NEXT: b#0 <-> c#0: MayAlias
+// CI-LABEL: Testing : "g"
+// CI-NEXT: d#0 <-> e#0: MayAlias
+// CI-NEXT: d#0 <-> h#0: MayAlias
+// CI-NEXT: e#0 <-> h#0: MayAlias
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func internal @make() -> !cir.ptr<!s32i> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @w1() -> !cir.ptr<!s32i> {
+  %p = cir.call @make() : () -> !cir.ptr<!s32i>
+  %p1 = cir.cast bitcast %p : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p1"}
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @w2() -> !cir.ptr<!s32i> {
+  %p = cir.call @w1() : () -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @w3() -> !cir.ptr<!s32i> {
+  %p = cir.call @w2() : () -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @w4() -> !cir.ptr<!s32i> {
+  %p = cir.call @w3() : () -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @w5() -> !cir.ptr<!s32i> {
+  %p = cir.call @w4() : () -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @w6() -> !cir.ptr<!s32i> {
+  %p = cir.call @w5() : () -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @w7() -> !cir.ptr<!s32i> {
+  %p = cir.call @w6() : () -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @w8() -> !cir.ptr<!s32i> {
+  %p = cir.call @w7() : () -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func @f() {
+  %a0 = cir.call @make() : () -> !cir.ptr<!s32i>
+  %a = cir.cast bitcast %a0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %b0 = cir.call @make() : () -> !cir.ptr<!s32i>
+  %b = cir.cast bitcast %b0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  %c0 = cir.call @make() : () -> !cir.ptr<!s32i>
+  %c = cir.cast bitcast %c0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "c"}
+  cir.return
+}
+cir.func @g() {
+  %d0 = cir.call @w8() : () -> !cir.ptr<!s32i>
+  %d = cir.cast bitcast %d0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "d"}
+  %e0 = cir.call @w8() : () -> !cir.ptr<!s32i>
+  %e = cir.cast bitcast %e0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "e"}
+  %h0 = cir.call @w8() : () -> !cir.ptr<!s32i>
+  %h = cir.cast bitcast %h0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "h"}
+  cir.return
+}
+}

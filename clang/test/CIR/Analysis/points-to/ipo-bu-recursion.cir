@@ -1,0 +1,93 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 print-stats=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=BUALIAS
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CIALIAS
+
+// Recursion in the bottom-up phase. The SCC {@even, @odd} has one graph,
+// its calls to each other bound to it context-insensitively (as in CI): the
+// heap object of @even and the formals are one node, a summary (recursion).
+// The two calls from @main copy that graph twice; both pass x, so both
+// copies merge with x: a and b are one node (the SCC merged its contexts, and
+// @main's two contexts meet in x). The self-recursive @push links each new
+// node to the previous head: one self-linked summary node per list, and the
+// two lists of @main, two copies of @push's graph, stay apart.
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: {{n[0-9]+}} [Heap|Summary] size=4 origins={heap(cir.call {{.*}})} links={} reasons={Summary: SummaryObject({{.*}}, "recursion") <- SummaryObject(cir.func {{.*}}, "recursion")}
+// CHECK-DAG: [[AB:n[0-9]+]] [Stack|Heap|Summary] size=4 origins={stack(cir.alloca 'x' {{.*}}), heap(cir.call {{.*}})#[[CA:[0-9]+]], heap(cir.call {{.*}})#[[CB:[0-9]+]]} links={}
+// CHECK-DAG: [[L1:n[0-9]+]] [Heap|Summary|Mod|Ref] size=8 origins={heap(cir.call {{.*}})#{{[0-9]+}}} links={0->[[L1]]+0} reasons={Summary: SummaryObject({{.*}}, "recursion") <- {{.*}}}
+// CHECK-DAG: [[L2:n[0-9]+]] [Heap|Summary|Mod] size=8 origins={heap(cir.call {{.*}})#{{[0-9]+}}} links={0->[[L2]]+0} reasons={Summary: SummaryObject({{.*}}, "recursion") <- {{.*}}}
+// CHECK-LABEL: === @main formals=complete
+// CHECK-NEXT: @main a -> [[AB]]+0 complete
+// CHECK-NEXT: @main b -> [[AB]]+0 complete
+// CHECK-NEXT: @main h1 -> [[L1]]+0 complete
+// CHECK-NEXT: @main h2 -> [[L2]]+0 complete
+// CHECK-NEXT: @main n1 -> [[L1]]+0 complete
+// CHECK-LABEL: === calls
+// CHECK: @even cir.call @odd -> direct @odd [merged (MergedAt, "@odd")]
+// CHECK: @odd cir.call @even -> direct @even [merged (MergedAt, "@even")]
+// CHECK: @push cir.call @push -> direct @push [merged (MergedAt, "@push")]
+// CHECK: @main cir.call @even -> direct @even [clone #[[CA]]]
+// CHECK-NEXT: @main cir.call @even -> direct @even [clone #[[CB]]]
+// CHECK-NEXT: @main cir.call @push -> direct @push [clone #{{[0-9]+}}]
+// CHECK-NEXT: @main cir.call @push -> direct @push [clone #{{[0-9]+}}]
+// CHECK-LABEL: --- bu stats
+// CHECK: copies of callee graphs: 4
+// CHECK: bindings inside an SCC: 3
+// CHECK: recursive functions: 3
+
+// BUALIAS-LABEL: Testing : "main"
+// BUALIAS: a#0 <-> b#0: MayAlias
+// BUALIAS: h1#0 <-> h2#0: NoAlias
+// BUALIAS: h1#0 <-> n1#0: MayAlias
+// CIALIAS-LABEL: Testing : "main"
+// CIALIAS: h1#0 <-> h2#0: MayAlias
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_N = !cir.struct<"N" {data !cir.ptr<!cir.struct<"N">>}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func internal @even(%p: !cir.ptr<!s32i>) -> !cir.ptr<!s32i> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %q = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  %r = cir.call @odd(%q) : (!cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  cir.return %r : !cir.ptr<!s32i>
+}
+cir.func internal @odd(%p: !cir.ptr<!s32i>) -> !cir.ptr<!s32i> {
+  %r = cir.call @even(%p) : (!cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @push(%l: !cir.ptr<!cir.ptr<!rec_N>>) {
+  %c8 = cir.const #cir.int<8> : !u64i
+  %raw = cir.call @_Znwm(%c8) : (!u64i) -> !cir.ptr<!void>
+  %node = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!rec_N>
+  %head = cir.load %l : !cir.ptr<!cir.ptr<!rec_N>>, !cir.ptr<!rec_N>
+  %m = cir.get_member %node[0] {name = "next"} : !cir.ptr<!rec_N> -> !cir.ptr<!cir.ptr<!rec_N>>
+  cir.store %head, %m : !cir.ptr<!rec_N>, !cir.ptr<!cir.ptr<!rec_N>>
+  cir.store %node, %l : !cir.ptr<!rec_N>, !cir.ptr<!cir.ptr<!rec_N>>
+  cir.call @push(%l) : (!cir.ptr<!cir.ptr<!rec_N>>) -> ()
+  cir.return
+}
+cir.func @main() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %a0 = cir.call @even(%x) : (!cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  %a = cir.cast bitcast %a0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %b0 = cir.call @even(%x) : (!cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  %b = cir.cast bitcast %b0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  %l1 = cir.alloca "l1" align(8) : !cir.ptr<!cir.ptr<!rec_N>>
+  %l2 = cir.alloca "l2" align(8) : !cir.ptr<!cir.ptr<!rec_N>>
+  cir.call @push(%l1) : (!cir.ptr<!cir.ptr<!rec_N>>) -> ()
+  cir.call @push(%l2) : (!cir.ptr<!cir.ptr<!rec_N>>) -> ()
+  %h1 = cir.load %l1 : !cir.ptr<!cir.ptr<!rec_N>>, !cir.ptr<!rec_N>
+  %h1_tag = cir.cast bitcast %h1 : !cir.ptr<!rec_N> -> !cir.ptr<!rec_N> {test.ptr = "h1"}
+  %h2 = cir.load %l2 : !cir.ptr<!cir.ptr<!rec_N>>, !cir.ptr<!rec_N>
+  %h2_tag = cir.cast bitcast %h2 : !cir.ptr<!rec_N> -> !cir.ptr<!rec_N> {test.ptr = "h2"}
+  %m1 = cir.get_member %h1[0] {name = "next"} : !cir.ptr<!rec_N> -> !cir.ptr<!cir.ptr<!rec_N>>
+  %n1 = cir.load %m1 : !cir.ptr<!cir.ptr<!rec_N>>, !cir.ptr<!rec_N>
+  %n1_tag = cir.cast bitcast %n1 : !cir.ptr<!rec_N> -> !cir.ptr<!rec_N> {test.ptr = "n1"}
+  cir.return
+}
+}

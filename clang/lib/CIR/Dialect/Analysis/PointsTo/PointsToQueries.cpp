@@ -68,6 +68,8 @@ StringRef cir::pointsto::getAliasRuleName(AliasRule rule) {
     return "partial-overlap";
   case AliasRule::OverlapNotSingleton:
     return "overlap-not-singleton";
+  case AliasRule::DifferentFunctions:
+    return "different-functions";
   }
   llvm_unreachable("unknown alias rule");
 }
@@ -99,6 +101,13 @@ static bool isDerivedFromNull(Value value, const DataLayout &dataLayout) {
   return decomposed.base && isNullPointerConstant(decomposed.base);
 }
 
+/// The function \p value belongs to, or null.
+static Operation *getFunctionOf(Value value) {
+  Region *region = value.getParentRegion();
+  return region ? region->getParentOfType<cir::FuncOp>().getOperation()
+                : nullptr;
+}
+
 uint64_t PointsToAnalysis::getAccessSize(Value ptr,
                                          std::optional<uint64_t> size) const {
   if (size)
@@ -128,6 +137,11 @@ PointsToAnalysis::aliasWithRule(Value a, Value b, std::optional<uint64_t> sizeA,
   // LocalAliasAnalysis and CIRBasicAliasAnalysis follow too).
   if (a == b)
     return {AliasResult::MustAlias, AliasRule::SameValue};
+  // BU: each function has its own graph, and a node of one stands for
+  // objects in that function's activations only. A copy of a callee's
+  // object and the callee's own node for it are two nodes.
+  if (options.mode == PointsToMode::BU && getFunctionOf(a) != getFunctionOf(b))
+    return {AliasResult::MayAlias, AliasRule::DifferentFunctions};
 
   ObjectSet setA = pointsTo(a);
   ObjectSet setB = pointsTo(b);
@@ -403,6 +417,8 @@ std::string PointsToAnalysis::explainAnswer(const AliasAnswer &answer, Value a,
     return sameNode(", an access size is unknown");
   case AliasRule::PartialOverlap:
     return "a, b: overlapping ranges of one object";
+  case AliasRule::DifferentFunctions:
+    return "a, b: values of two functions, whose graphs are apart";
   }
   llvm_unreachable("unknown alias rule");
 }
@@ -434,6 +450,11 @@ static std::optional<uint64_t> getConstantLength(Value length) {
 
 ModRefResult PointsToAnalysis::getModRef(Operation *op, Value location) const {
   using MRR = ModRefResult;
+  // BU: an op and a location of two functions are in two graphs.
+  if (options.mode == PointsToMode::BU &&
+      op->getParentOfType<cir::FuncOp>().getOperation() !=
+          getFunctionOf(location))
+    return MRR::getModAndRef();
   auto access = [&](Value addr, std::optional<uint64_t> size, bool mod,
                     bool ref) {
     return getAccessModRef(addr, size, mod, ref, location);

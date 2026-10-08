@@ -434,6 +434,9 @@ def OffloadInferKernelParamNoAlias
            /*default=*/"false",
            "Under ipo/both, assume the module holds every caller of every "
            "function (PointsToAnalysisOptions::assumeClosedTU).">,
+    Option<"hostFactsBottomUp", "host-facts-bu", "bool", /*default=*/"false",
+           "Under ipo/both, run the points-to analysis bottom-up "
+           "(PointsToMode::BU).">,
     Option<"hostFactsCensus", "host-facts-census", "bool", /*default=*/"false",
            "Under both, also emit one host-facts remark per candidate field "
            "with both verdicts.">,

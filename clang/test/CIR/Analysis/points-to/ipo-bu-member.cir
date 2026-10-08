@@ -1,0 +1,108 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CI
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 print-stats=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=STATS
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 contexts=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CTX
+
+// obj.a = make(); obj.b = make(); with ONE factory (the T7 shape; compare
+// ipo-ci-member.cir, which has two). Context-insensitively both members point
+// to make's one heap node: MayAlias. Bottom-up, the two calls in @init get
+// two copies of make's graph, two heap nodes: NoAlias, in @init and in
+// @read, which reads them back through `this`.
+//
+// @read's own graph sees two empty nodes behind this->a and this->b. They are
+// NoAlias only because in every context @read is copied into, the two
+// copies of them are distinct nodes. @read2 has the same body, but its
+// caller stores ONE pointer into both members (@init2): the copy of @read2 in
+// @main unifies the two, and the projection of that copy back into @read2's
+// own graph (projectClones) merges them there too: MayAlias.
+
+// BU-LABEL: Testing : "init"
+// BU-NEXT: a#0 <-> b#0: NoAlias
+// BU-LABEL: Testing : "read"
+// BU-NEXT: ra#0 <-> rb#0: NoAlias
+// BU-LABEL: Testing : "read2"
+// BU-NEXT: ra2#0 <-> rb2#0: MayAlias
+// BU-NEXT: why: a, b: same node at the same offset, which has no known origin
+
+// CI-LABEL: Testing : "init"
+// CI-NEXT: a#0 <-> b#0: MayAlias
+// CI-LABEL: Testing : "read"
+// CI-NEXT: ra#0 <-> rb#0: MayAlias
+// CI-LABEL: Testing : "read2"
+// CI-NEXT: ra2#0 <-> rb2#0: MayAlias
+
+// pointsTo(value, callPath): what @init stored and what @read loads are the
+// same nodes of @main's graph, in the contexts of @main's calls.
+// CTX-LABEL: === @init formals=complete
+// CTX: @init a in [cir.call {{.*}}] -> [[A:n[0-9]+]]+0 complete
+// CTX: @init b in [cir.call {{.*}}] -> [[B:n[0-9]+]]+0 complete
+// CTX-LABEL: === @read formals=complete
+// CTX: @read ra in [cir.call {{.*}}] -> [[A]]+0 complete
+// CTX: @read rb in [cir.call {{.*}}] -> [[B]]+0 complete
+// CTX-LABEL: === @read2 formals=complete
+// CTX: @read2 ra2 in [cir.call {{.*}}] -> [[AB:n[0-9]+]]+0 complete
+// CTX: @read2 rb2 in [cir.call {{.*}}] -> [[AB]]+0 complete
+
+// STATS-LABEL: --- bu stats
+// STATS: source merges projected: 1
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_Obj = !cir.struct<"Obj" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func internal @make() -> !cir.ptr<!s32i> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @init(%this: !cir.ptr<!rec_Obj>) {
+  %a = cir.call @make() : () -> !cir.ptr<!s32i>
+  %a_tag = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.call @make() : () -> !cir.ptr<!s32i>
+  %b_tag = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+cir.func internal @init2(%this: !cir.ptr<!rec_Obj>) {
+  %p = cir.call @make() : () -> !cir.ptr<!s32i>
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %p, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %p, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+cir.func internal @read(%this: !cir.ptr<!rec_Obj>) {
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a = cir.load %ma : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %a_tag = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "ra"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.load %mb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %b_tag = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "rb"}
+  cir.return
+}
+cir.func internal @read2(%this: !cir.ptr<!rec_Obj>) {
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a = cir.load %ma : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %a_tag = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "ra2"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.load %mb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %b_tag = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "rb2"}
+  cir.return
+}
+cir.func @main() {
+  %obj = cir.alloca "obj" align(8) : !cir.ptr<!rec_Obj>
+  %obj2 = cir.alloca "obj2" align(8) : !cir.ptr<!rec_Obj>
+  cir.call @init(%obj) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.call @read(%obj) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.call @init2(%obj2) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.call @read2(%obj2) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+}

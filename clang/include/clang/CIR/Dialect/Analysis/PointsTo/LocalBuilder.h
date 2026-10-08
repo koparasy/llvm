@@ -209,6 +209,11 @@ struct LaunchRecord {
   mlir::Type closureType;
   /// The launch geometry object (range or nd_range), if passed by address.
   std::optional<Cell> geometry;
+  /// The bottom-up phase: for a record cloned into a caller's graph, the
+  /// calls from that caller down to the function holding `call` (a
+  /// CallPathTable id, outermost call first). 0 for the record of the
+  /// launching function itself.
+  uint32_t ctx = 0;
 };
 
 /// An effect on what a pointer reaches that the local phase applies after

@@ -42,6 +42,11 @@ struct PrintKernelBindingsPass
                      "is in the module"),
       llvm::cl::init(false)};
 
+  Option<bool> bottomUp{
+      *this, "bu",
+      llvm::cl::desc("Under ipo/both, run the points-to analysis bottom-up"),
+      llvm::cl::init(false)};
+
   StringRef getArgument() const final { return "test-print-kernel-bindings"; }
   StringRef getDescription() const final {
     return "Print the host<->device kernel bindings of an offload container.";
@@ -64,6 +69,7 @@ struct PrintKernelBindingsPass
     cir::HostFactsOptions options;
     options.mode = *mode;
     options.assumeClosedTU = closedTU;
+    options.bottomUp = bottomUp;
     cir::KernelBindingTable(getOperation(), options).print(llvm::errs());
   }
 };

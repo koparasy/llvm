@@ -71,6 +71,7 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
     cir::HostFactsOptions options;
     options.mode = *mode;
     options.assumeClosedTU = hostFactsClosedTU;
+    options.bottomUp = hostFactsBottomUp;
     ownTable.emplace(container, options);
   }
   cir::KernelBindingTable &table =
@@ -97,7 +98,8 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
     mlir::emitRemark(container.getLoc())
         << "host-facts-disagreements: " << disagreements << " of "
         << table.getHostFactsComparisons().size() << " candidate fields ("
-        << (hostFactsClosedTU ? "closed-tu" : "open") << ")";
+        << (hostFactsClosedTU ? "closed-tu" : "open")
+        << (hostFactsBottomUp ? ", bu" : "") << ")";
   }
   mlir::MLIRContext *ctx = &getContext();
   llvm::StringRef noAliasName = mlir::LLVM::LLVMDialect::getNoAliasAttrName();

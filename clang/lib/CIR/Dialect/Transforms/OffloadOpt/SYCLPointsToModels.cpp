@@ -1232,7 +1232,9 @@ void cir::registerSYCLPointsToModels(PointsToModelRegistry &registry) {
 bool cir::applySYCLDeviceWrites(PointsToAnalysis &analysis) {
   Graph &graph = analysis.getGraph();
   bool changed = false;
-  for (const LaunchRecord &launch : analysis.getLaunches()) {
+  // Every record, in every calling context (BU: the copies in the callers'
+  // graphs stand for the same launch there).
+  for (const LaunchRecord &launch : analysis.getAllLaunches()) {
     if (!launch.closure)
       continue; // The launch got the unknown-call rule.
     Node *closure = launch.closure->getNode();

@@ -546,6 +546,83 @@ TEST(PointsToGraphTest, CloneReachableWithCycles) {
   EXPECT_VERIFIED(src);
 }
 
+TEST(PointsToGraphTest, CloneIntoSelfWithSharedNodesAndContexts) {
+  // The bottom-up phase copies a callee's part of one graph into the same
+  // graph: shared nodes (what globals reach) map to themselves and are not
+  // walked, and each copied origin gets a new calling context.
+  Graph g;
+  g.enableSharedTracking();
+  Node *global = g.makeNode(NodeFlags::Global);
+  Node *gtarget = g.makeNode(NodeFlags::Heap);
+  g.setLink(Cell(global, 0), Cell(gtarget));
+  g.markShared(Cell(global));
+  g.flushShared();
+  EXPECT_TRUE(g.isShared(global));
+  EXPECT_TRUE(g.isShared(gtarget));
+
+  Node *formal = g.makeNode();
+  Node *heap = g.makeNode(stackOrigin(0), NodeFlags::Heap);
+  g.setLink(Cell(formal, 0), Cell(heap));
+  g.setLink(Cell(formal, 8), Cell(global));
+  EXPECT_FALSE(g.isShared(formal));
+  EXPECT_FALSE(g.isShared(heap));
+
+  CloneOptions options;
+  auto isShared = [&](const Node *node) { return g.isShared(node); };
+  auto rewrite = [](Origin &origin) { origin.ctx = 7; };
+  options.isShared = isShared;
+  options.rewriteOrigin = rewrite;
+  CloneMap map = g.cloneInto(g, {Cell(formal)}, NodeFlags::All, options);
+  EXPECT_VERIFIED(g);
+  // formal, heap, and global as a self-entry; gtarget is not walked.
+  EXPECT_EQ(map.size(), 3u);
+  EXPECT_EQ(map.lookup(global).getNode(), global);
+  EXPECT_FALSE(map.lookup(gtarget));
+  Node *formal2 = map.lookup(formal).getNode();
+  Node *heap2 = map.lookup(heap).getNode();
+  ASSERT_TRUE(formal2 && heap2);
+  EXPECT_NE(heap2, heap);
+  ASSERT_EQ(heap2->getOrigins().size(), 1u);
+  EXPECT_EQ(heap2->getOrigins()[0].ctx, 7u);
+  EXPECT_EQ(heap->getOrigins()[0].ctx, 0u);
+  EXPECT_TRUE(sameCell(*g.lookupLink(Cell(formal2, 8)), Cell(global)));
+  EXPECT_TRUE(sameCell(*g.lookupLink(Cell(formal2, 0)), Cell(heap2)));
+}
+
+TEST(PointsToGraphTest, SharedTrackingFollowsLinksAndMerges) {
+  Graph g;
+  g.enableSharedTracking();
+  Node *global = g.makeNode(NodeFlags::Global);
+  g.markShared(Cell(global));
+  g.flushShared();
+  // A link added to a shared node shares its target.
+  Node *a = g.makeNode(NodeFlags::Heap);
+  Node *b = g.makeNode(NodeFlags::Heap);
+  g.setLink(Cell(a, 0), Cell(b));
+  g.setLink(Cell(global, 0), Cell(a));
+  g.flushShared();
+  EXPECT_TRUE(g.isShared(a));
+  EXPECT_TRUE(g.isShared(b));
+  // A node merged with a shared one makes the survivor shared, with all its
+  // links, whichever node survives.
+  Node *c = g.makeNode(NodeFlags::Heap);
+  Node *d = g.makeNode(NodeFlags::Heap);
+  g.setLink(Cell(c, 0), Cell(d));
+  EXPECT_FALSE(g.isShared(c));
+  g.unify(Cell(c, 8), Cell(b, 0));
+  g.flushShared();
+  EXPECT_TRUE(g.isShared(c));
+  EXPECT_TRUE(g.isShared(d));
+  Node *e = g.makeNode(NodeFlags::Heap);
+  Node *f = g.makeNode(NodeFlags::Heap);
+  g.setLink(Cell(e, 0), Cell(f));
+  g.unify(Cell(b, 0), Cell(e, 16)); // e survives
+  g.flushShared();
+  EXPECT_TRUE(g.isShared(e));
+  EXPECT_TRUE(g.isShared(f));
+  EXPECT_VERIFIED(g);
+}
+
 //===----------------------------------------------------------------------===//
 // markReachable
 //===----------------------------------------------------------------------===//

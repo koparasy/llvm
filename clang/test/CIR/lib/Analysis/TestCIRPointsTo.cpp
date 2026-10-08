@@ -71,6 +71,25 @@
 // (getSYCLNoAliasCandidates), by name; their identities and verdicts are
 // SYCLHostFacts::identityOfClosureField and noAliasFields.
 //
+// mode=bu runs the bottom-up mode (PointsToMode::BU) and prints the same,
+// with the calls annotated by how each body was bound:
+//
+//   ... [clone #<ctx>] | [merged (<Kind>, "<detail>")]
+//       | [fallback (<Kind>, "<detail>")]
+//
+// then the call sites each function's graph inherited from copies, and the
+// calling contexts:
+//
+//   === inherited calls
+//   @<graph> <op> in @<func> path=#<ctx> -> <resolution as above>
+//   === contexts
+//   #<id> = <op> <file:line> in @<func> [< #<parent>]
+//
+// The stats then start with "--- bu stats" and add the copy counters.
+// contexts=1 also prints each tagged value of a function in the contexts of
+// the calls that copied its graph (see printInContexts).
+// max-clone-nodes=<n> and max-total-clone-nodes=<n> set the budgets.
+//
 // closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU and
 // max-indirect-rounds=<n> PointsToAnalysisOptions::maxIndirectRounds.
 // print-graphs=0 leaves out everything but the statistics, which end with one
@@ -150,6 +169,20 @@ struct TestCIRPointsToPass
       llvm::cl::desc("In ci mode, the rounds of indirect-call resolution "
                      "that may bind new targets"),
       llvm::cl::init(PointsToAnalysisOptions().maxIndirectRounds)};
+  Option<bool> printContexts{
+      *this, "contexts",
+      llvm::cl::desc("In bu mode, also print each tagged pointer value in the "
+                     "calling contexts of one and two calls "
+                     "(PointsToAnalysis::pointsTo(value, callPath))"),
+      llvm::cl::init(false)};
+  Option<unsigned> maxCloneNodes{
+      *this, "max-clone-nodes",
+      llvm::cl::desc("In bu mode, the most nodes of one function's graph"),
+      llvm::cl::init(PointsToAnalysisOptions().maxCloneNodes)};
+  Option<unsigned> maxTotalCloneNodes{
+      *this, "max-total-clone-nodes",
+      llvm::cl::desc("In bu mode, the most nodes of all copies"),
+      llvm::cl::init(PointsToAnalysisOptions().maxTotalCloneNodes)};
 
   void runOnOperation() override;
   void runLocal();
@@ -215,8 +248,91 @@ const Reason *rootReason(const Reason *why) {
   return why;
 }
 
+/// BU: each tagged pointer value of \p func as seen through the copies of
+/// its graph at one call and at two calls:
+///   @func <name> in [<call> file:line, ...] -> <cell>, ... complete|incomplete
+void printInContexts(raw_ostream &os, const PointsToAnalysis &analysis,
+                     cir::FuncOp func, const TUFunction &fn) {
+  auto where = [](Operation *call) {
+    std::string out = call->getName().getStringRef().str();
+    if (auto loc = dyn_cast<FileLineColLoc>(call->getLoc()))
+      out += " " + llvm::sys::path::filename(loc.getFilename().getValue())
+                       .str() +
+             ":" + std::to_string(loc.getLine());
+    return out;
+  };
+  // The paths: the calls whose copy of fn's graph sits in the caller's own
+  // graph, and one more call above each.
+  SmallVector<SmallVector<Operation *, 2>, 4> paths;
+  const CallPathTable &table = analysis.getCallPaths();
+  for (const auto &clone : analysis.getClones()) {
+    if (clone->callee != &fn || table.getPath(clone->ctx).size() != 1)
+      continue;
+    paths.push_back({clone->call});
+    for (const auto &outer : analysis.getClones())
+      if (outer->callee == clone->caller &&
+          table.getPath(outer->ctx).size() == 1)
+        paths.push_back({outer->call, clone->call});
+  }
+  func.walk([&](Operation *op) {
+    auto name = op->getAttrOfType<StringAttr>("test.ptr");
+    if (!name || op == func.getOperation() || op->getNumResults() != 1 ||
+        !isPointerValueType(op->getResult(0).getType()))
+      return;
+    for (ArrayRef<Operation *> path : paths) {
+      ObjectSet set = analysis.pointsTo(op->getResult(0), path);
+      os << "@" << func.getSymName() << " " << name.getValue() << " in [";
+      llvm::interleaveComma(path, os,
+                            [&](Operation *call) { os << where(call); });
+      os << "] ->";
+      for (Cell cell : set.cells) {
+        os << " ";
+        Graph::printCell(os, cell);
+      }
+      os << (set.complete ? " complete" : " incomplete") << "\n";
+    }
+  });
+}
+
+/// " -> <resolution>" of \p call, then (BU) how each body was bound.
+void printResolution(raw_ostream &os, const PointsToAnalysis &analysis,
+                     const TUCallSite &call) {
+  os << " -> " << getCallResolutionName(call.resolution);
+  if (call.resolution == CallResolution::Direct)
+    os << " @" << cir::FuncOp(call.callee).getSymName();
+  else if (call.resolution == CallResolution::Model)
+    os << " " << call.site.modelled;
+  else if (call.resolution == CallResolution::Indirect)
+    os << " -> " << formatTargets(call);
+  else if (call.resolution == CallResolution::IndirectUnresolved) {
+    if (call.unresolvedWhy)
+      os << " (" << formatReason(call.unresolvedWhy) << ")";
+    if (!call.targets.empty())
+      os << " bound=" << formatTargets(call);
+  }
+  if (analysis.getMode() != PointsToMode::BU)
+    return;
+  if (call.fallback) {
+    os << " [fallback (" << formatReason(call.notClonedWhy) << ")]";
+    return;
+  }
+  for (const TUCallSite::Binding &binding : call.bindings) {
+    os << " [";
+    if (call.resolution != CallResolution::Direct)
+      os << "@" << cir::FuncOp(binding.callee).getSymName() << " ";
+    if (binding.clone >= 0)
+      os << "clone #" << analysis.getClones()[binding.clone]->ctx;
+    else
+      os << "merged ("
+         << (call.notClonedWhy ? formatReason(call.notClonedWhy)
+                               : std::string("-"))
+         << ")";
+    os << "]";
+  }
+}
+
 void TestCIRPointsToPass::runOnOperation() {
-  if (mode == "ci")
+  if (mode == "ci" || mode == "bu")
     return runCI();
   if (mode != "local") {
     getOperation()->emitError() << "unknown test-cir-points-to mode '"
@@ -264,6 +380,12 @@ void TestCIRPointsToPass::runCI() {
   PointsToAnalysisOptions options;
   options.assumeClosedTU = closedTU;
   options.maxIndirectRounds = maxIndirectRounds;
+  bool bottomUp = mode == "bu";
+  if (bottomUp) {
+    options.mode = PointsToMode::BU;
+    options.maxCloneNodes = maxCloneNodes;
+    options.maxTotalCloneNodes = maxTotalCloneNodes;
+  }
   if (syclModels)
     cir::addSYCLPointsToPlugin(options);
   bool anyFailed = false;
@@ -320,6 +442,8 @@ void TestCIRPointsToPass::runCI() {
           return out;
         };
         printTagged(os, func, prefix, lookupCell, lookupSlots, suffix);
+        if (bottomUp && printContexts)
+          printInContexts(os, analysis, func, *fn);
       }
       os << "=== calls\n";
       for (auto func : module.getOps<cir::FuncOp>()) {
@@ -332,19 +456,37 @@ void TestCIRPointsToPass::runCI() {
             os << " " << call.site.callee;
           if (call.site.synthetic)
             os << " synthetic";
-          os << " -> " << getCallResolutionName(call.resolution);
-          if (call.resolution == CallResolution::Direct)
-            os << " @" << cir::FuncOp(call.callee).getSymName();
-          else if (call.resolution == CallResolution::Model)
-            os << " " << call.site.modelled;
-          else if (call.resolution == CallResolution::Indirect)
-            os << " -> " << formatTargets(call);
-          else if (call.resolution == CallResolution::IndirectUnresolved) {
-            if (call.unresolvedWhy)
-              os << " (" << formatReason(call.unresolvedWhy) << ")";
-            if (!call.targets.empty())
-              os << " bound=" << formatTargets(call);
+          printResolution(os, analysis, call);
+          os << "\n";
+        }
+      }
+      if (bottomUp) {
+        os << "=== inherited calls\n";
+        for (auto func : module.getOps<cir::FuncOp>()) {
+          const TUFunction *fn = analysis.getFunction(func);
+          if (!fn)
+            continue;
+          for (const auto &call : fn->inheritedCalls) {
+            os << "@" << func.getSymName() << " "
+               << call->site.call->getName() << " in @"
+               << call->site.call->getParentOfType<cir::FuncOp>().getSymName()
+               << " prefix=#" << call->prefix;
+            printResolution(os, analysis, *call);
+            os << "\n";
           }
+        }
+        os << "=== contexts\n";
+        const CallPathTable &paths = analysis.getCallPaths();
+        for (uint32_t id = 1; id <= paths.size(); ++id) {
+          Operation *call = paths.getCall(id);
+          os << "#" << id << " = " << call->getName();
+          if (auto loc = dyn_cast<FileLineColLoc>(call->getLoc()))
+            os << " " << llvm::sys::path::filename(loc.getFilename().getValue())
+               << ":" << loc.getLine();
+          if (auto f = call->getParentOfType<cir::FuncOp>())
+            os << " in @" << f.getSymName();
+          if (uint32_t parent = paths.getParent(id))
+            os << " < #" << parent;
           os << "\n";
         }
       }
@@ -380,7 +522,7 @@ void TestCIRPointsToPass::runCI() {
     for (const auto &fn : analysis.getFunctions())
       for (const TUCallSite &call : fn->callSites)
         ++resolutions[getCallResolutionName(call.resolution)];
-    os << "--- ci stats\n"
+    os << "--- " << getPointsToModeName(options.mode) << " stats\n"
        << "functions: " << stats.numFunctions << "\n"
        << "functions with complete formals: " << stats.numCompleteFunctions
        << "\n"
@@ -410,6 +552,26 @@ void TestCIRPointsToPass::runCI() {
        << "\n"
        << "local phase time (wall, s): " << stats.localSeconds << "\n"
        << "analysis time (wall, s): " << stats.totalSeconds << "\n";
+    if (bottomUp) {
+      std::string largest = "-";
+      if (auto f = dyn_cast_if_present<cir::FuncOp>(stats.largestGraph))
+        largest = ("@" + f.getSymName()).str();
+      os << "copies of callee graphs: " << stats.numClones << "\n"
+         << "copied nodes: " << stats.numClonedNodes << "\n"
+         << "largest graph (nodes): " << stats.maxGraphNodes << " " << largest
+         << "\n"
+         << "calling contexts: " << stats.numCallPaths << "\n"
+         << "inherited call sites: " << stats.numInheritedCalls << "\n"
+         << "bindings inside an SCC: " << stats.numSCCBindings << "\n"
+         << "bindings through a cycle: " << stats.numCycleBindings << "\n"
+         << "bindings over budget: " << stats.numBudgetBindings << "\n"
+         << "calls to a callee still being analysed: "
+         << stats.numCycleFallbacks << "\n"
+         << "flags projected to sources: " << stats.numProjectedFlags << "\n"
+         << "source merges projected: " << stats.numPullBackMerges << "\n"
+         << "launch records (all contexts): " << stats.numLaunchInstances
+         << "\n";
+    }
     auto printMap = [&](StringRef title, const llvm::StringMap<unsigned> &map,
                         size_t limit = ~size_t(0)) {
       SmallVector<std::pair<unsigned, StringRef>> sorted;
@@ -513,7 +675,15 @@ void TestCIRPointsToPass::printLaunches(raw_ostream &os, ModuleOp module,
   for (const LaunchRecord &launch : analysis.getLaunches()) {
     auto func = launch.call->getParentOfType<cir::FuncOp>();
     os << "launch @" << (func ? func.getSymName() : StringRef("?")) << " "
-       << launch.model << " kernels={";
+       << launch.model;
+    // BU: a copy in a caller's graph.
+    if (launch.ctx) {
+      Operation *outer = analysis.getCallPaths().getPath(launch.ctx).front();
+      auto graph = outer->getParentOfType<cir::FuncOp>();
+      os << " in-graph-of=@" << (graph ? graph.getSymName() : StringRef("?"))
+         << " ctx=#" << launch.ctx;
+    }
+    os << " kernels={";
     llvm::interleaveComma(launch.kernelNames, os,
                           [&](StringAttr name) { os << name.getValue(); });
     os << "} closure=";

@@ -8,6 +8,21 @@
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
 // RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-LEGACY
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both bu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN-BU
+// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=1' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
+//
+// Bottom-up (bu=1, T17): the same verdicts. Under closed-TU the launch record
+// in @run's graph is replaced by its copy in @main's graph (every caller of
+// @run copied its graph), where the storages and the USM objects are the ones
+// @setup's copy made. Open, @run may have callers we don't see, its own record
+// is used, and there the objects behind `this` have no allocation site.
+// OPEN-BU: host-facts A: legacy=not stamped ({{.*}}) ipo=not stamped (accessor 'A': {{n[0-9]+}} has no allocation site the analysis sees)
+// OPEN-BU: host-facts P: legacy=not stamped ({{.*}}) ipo=not stamped (pointer 'P': {{n[0-9]+}} has no allocation site the analysis sees)
+// OPEN-BU: host-facts-disagreements: 0 of 4 candidate fields
 
 // --cir-offload-host-facts=both: the legacy and the points-to (SYCLHostFacts)
 // noalias verdicts of every candidate field, the legacy one used. Here they

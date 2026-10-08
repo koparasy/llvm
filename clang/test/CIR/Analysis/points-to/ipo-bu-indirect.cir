@@ -1,0 +1,112 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to=mode=bu -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=OPEN
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=BUALIAS
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CIALIAS
+
+// A virtual call resolved during the bottom-up phase (virtual.cir's shape,
+// both overrides returning this->p). In @call_f's own graph the callee
+// pointer, loaded from the vptr of its formal, points to nothing seen: the
+// call is pending. Each copy of @call_f's graph in @main inherits the call
+// site (=== inherited calls); there the vptr is the one the constructor
+// stored, so each copy calls exactly one override, whose graph is then
+// copied into @main too. r1 is &x and r2 is &y. Context-insensitively the
+// two objects meet in @call_f's formal, the call has both targets and r1,
+// r2 are one node.
+//
+// @call_f's own call stays without a target: at the end it gets the
+// unknown-call rule ("no target seen") in @call_f's own graph only.
+
+// CHECK-LABEL: === @main formals=complete
+// CHECK-NEXT: @main r1 -> [[X:n[0-9]+]]+0 complete
+// CHECK-NEXT: @main r2 -> [[Y:n[0-9]+]]+0 complete
+// CHECK-NEXT: @main x -> [[X]]+0 complete
+// CHECK-NEXT: @main y -> [[Y]]+0 complete
+// CHECK-LABEL: === calls
+// CHECK-NEXT: @call_f cir.call -> indirect-unresolved (IndirectUnresolved, "no target seen")
+// CHECK-LABEL: === inherited calls
+// CHECK-NEXT: @main cir.call in @call_f prefix=#[[C1:[0-9]+]] -> indirect -> {@_ZN2D11fEv} [@_ZN2D11fEv clone #[[T1:[0-9]+]]]
+// CHECK-NEXT: @main cir.call in @call_f prefix=#[[C2:[0-9]+]] -> indirect -> {@_ZN2D21fEv} [@_ZN2D21fEv clone #[[T2:[0-9]+]]]
+// CHECK-LABEL: === contexts
+// CHECK-DAG: #[[C1]] = cir.call {{.*}}:{{[0-9]+}} in @main{{$}}
+// CHECK-DAG: #[[CF:[0-9]+]] = cir.call {{.*}} in @call_f{{$}}
+// CHECK-DAG: #[[T1]] = cir.call {{.*}} in @main < #[[CF]]
+// CHECK-DAG: #[[T2]] = cir.call {{.*}} in @main < #[[CF]]
+
+// The overrides' own formals are Incomplete without closed-tu (their address
+// is in a vtable), but the copies in @main bind them to @main's objects:
+// resolved all the same (unlike virtual.cir's OPEN run).
+// OPEN-LABEL: === inherited calls
+// OPEN-NEXT: @main cir.call in @call_f prefix=#{{[0-9]+}} -> indirect -> {@_ZN2D11fEv} [@_ZN2D11fEv clone #{{[0-9]+}}]
+// OPEN-NEXT: @main cir.call in @call_f prefix=#{{[0-9]+}} -> indirect -> {@_ZN2D21fEv} [@_ZN2D21fEv clone #{{[0-9]+}}]
+
+// BUALIAS-LABEL: Testing : "main"
+// BUALIAS-NEXT: r1#0 <-> r2#0: NoAlias
+// BUALIAS-NEXT: r1#0 <-> x#0: MustAlias
+// BUALIAS-NEXT: r2#0 <-> x#0: NoAlias
+// CIALIAS-LABEL: Testing : "main"
+// CIALIAS-NEXT: r1#0 <-> r2#0: MayAlias
+
+!s32i = !cir.int<s, 32>
+!u8i = !cir.int<u, 8>
+!rec_B = !cir.struct<"B" {data !cir.vptr, data !cir.ptr<!s32i>}>
+!rec_vt = !cir.struct<{data !cir.array<!cir.ptr<!u8i> x 3>}>
+!fty = !cir.func<(!cir.ptr<!rec_B>) -> !cir.ptr<!s32i>>
+
+
+
+module {
+cir.global "private" constant internal @_ZTV2D1 = #cir.vtable<{#cir.const_array<[#cir.ptr<null> : !cir.ptr<!u8i>, #cir.ptr<null> : !cir.ptr<!u8i>, #cir.global_view<@_ZN2D11fEv> : !cir.ptr<!u8i>]> : !cir.array<!cir.ptr<!u8i> x 3>}> : !rec_vt
+cir.global "private" constant internal @_ZTV2D2 = #cir.vtable<{#cir.const_array<[#cir.ptr<null> : !cir.ptr<!u8i>, #cir.ptr<null> : !cir.ptr<!u8i>, #cir.global_view<@_ZN2D21fEv> : !cir.ptr<!u8i>]> : !cir.array<!cir.ptr<!u8i> x 3>}> : !rec_vt
+
+cir.func internal @_ZN2D11fEv(%this: !cir.ptr<!rec_B>) -> !cir.ptr<!s32i> {
+  %m = cir.get_member %this[1] {name = "p"} : !cir.ptr<!rec_B> -> !cir.ptr<!cir.ptr<!s32i>>
+  %p = cir.load %m : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @_ZN2D21fEv(%this: !cir.ptr<!rec_B>) -> !cir.ptr<!s32i> {
+  %m = cir.get_member %this[1] {name = "p"} : !cir.ptr<!rec_B> -> !cir.ptr<!cir.ptr<!s32i>>
+  %p = cir.load %m : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+cir.func internal @_ZN2D1C1Ev(%this: !cir.ptr<!rec_B>) {
+  %vp = cir.vtable.address_point(@_ZTV2D1, address_point = <index = 0, offset = 2>) : !cir.vptr
+  %slot = cir.vtable.get_vptr %this : !cir.ptr<!rec_B> -> !cir.ptr<!cir.vptr>
+  cir.store %vp, %slot : !cir.vptr, !cir.ptr<!cir.vptr>
+  cir.return
+}
+cir.func internal @_ZN2D2C1Ev(%this: !cir.ptr<!rec_B>) {
+  %vp = cir.vtable.address_point(@_ZTV2D2, address_point = <index = 0, offset = 2>) : !cir.vptr
+  %slot = cir.vtable.get_vptr %this : !cir.ptr<!rec_B> -> !cir.ptr<!cir.vptr>
+  cir.store %vp, %slot : !cir.vptr, !cir.ptr<!cir.vptr>
+  cir.return
+}
+cir.func internal @call_f(%obj: !cir.ptr<!rec_B>) -> !cir.ptr<!s32i> {
+  %vslot = cir.vtable.get_vptr %obj : !cir.ptr<!rec_B> -> !cir.ptr<!cir.vptr>
+  %vp = cir.load %vslot : !cir.ptr<!cir.vptr>, !cir.vptr
+  %vp_tag = cir.cast bitcast %vp : !cir.vptr -> !cir.ptr<!u8i> {test.ptr = "vptr"}
+  %fa = cir.vtable.get_virtual_fn_addr %vp[0] {test.ptr = "slot"} : !cir.vptr -> !cir.ptr<!cir.ptr<!fty>>
+  %ti = cir.vtable.get_type_info %vp {test.ptr = "rtti"} : !cir.vptr -> !cir.ptr<!cir.ptr<!u8i>>
+  %f = cir.load %fa : !cir.ptr<!cir.ptr<!fty>>, !cir.ptr<!fty>
+  %r = cir.call %f(%obj) : (!cir.ptr<!fty>, !cir.ptr<!rec_B>) -> !cir.ptr<!s32i>
+  cir.return %r : !cir.ptr<!s32i>
+}
+cir.func @main() {
+  %d1 = cir.alloca "d1" align(8) : !cir.ptr<!rec_B>
+  %d2 = cir.alloca "d2" align(8) : !cir.ptr<!rec_B>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  cir.call @_ZN2D1C1Ev(%d1) : (!cir.ptr<!rec_B>) -> ()
+  cir.call @_ZN2D2C1Ev(%d2) : (!cir.ptr<!rec_B>) -> ()
+  %p1 = cir.get_member %d1[1] {name = "p"} : !cir.ptr<!rec_B> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %p1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %p2 = cir.get_member %d2[1] {name = "p"} : !cir.ptr<!rec_B> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %p2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %r1 = cir.call @call_f(%d1) : (!cir.ptr<!rec_B>) -> !cir.ptr<!s32i>
+  %r1_tag = cir.cast bitcast %r1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "r1"}
+  %r2 = cir.call @call_f(%d2) : (!cir.ptr<!rec_B>) -> !cir.ptr<!s32i>
+  %r2_tag = cir.cast bitcast %r2 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "r2"}
+  %x_tag = cir.cast bitcast %x : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x"}
+  %y_tag = cir.cast bitcast %y : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "y"}
+  cir.return
+}
+}

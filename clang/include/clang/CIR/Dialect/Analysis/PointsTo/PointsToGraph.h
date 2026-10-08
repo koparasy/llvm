@@ -55,6 +55,7 @@
 #include "llvm/ADT/BitmaskEnum.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Allocator.h"
@@ -374,6 +375,8 @@ private:
   llvm::SmallVector<Origin, 1> origins;
   /// First reason per status bit, sorted by bit.
   llvm::SmallVector<std::pair<NodeFlags, const Reason *>, 0> reasons;
+  /// Reachable from a node Graph::markShared was given (see there).
+  bool shared = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -394,9 +397,26 @@ public:
 
   size_t size() const { return nodeMap.size(); }
 
+  /// Every (source node, copy) pair, the source as it was when it was
+  /// cloned (resolve it before use; it may have been merged since). A node
+  /// CloneOptions::isShared kept maps to itself.
+  const llvm::DenseMap<const Node *, Cell> &entries() const { return nodeMap; }
+
 private:
   friend class Graph;
   llvm::DenseMap<const Node *, Cell> nodeMap;
+};
+
+/// How Graph::cloneInto treats some nodes (both optional).
+struct CloneOptions {
+  /// A node for which this returns true is not copied: it maps to itself,
+  /// and the walk does not go past it. Only valid when cloning into the
+  /// source graph (the bottom-up phase's globals graph, whose nodes every
+  /// function's graph shares).
+  llvm::function_ref<bool(const Node *)> isShared;
+  /// Called on every origin of every copy: the hook that gives a cloned
+  /// object its calling context (Origin::ctx).
+  llvm::function_ref<void(Origin &)> rewriteOrigin;
 };
 
 //===----------------------------------------------------------------------===//
@@ -516,7 +536,23 @@ public:
   /// is shared with this graph. Links and ghost links, including cycles, are
   /// reproduced.
   CloneMap cloneInto(Graph &dst, llvm::ArrayRef<Cell> roots,
-                     NodeFlags keepMask = NodeFlags::All) const;
+                     NodeFlags keepMask = NodeFlags::All,
+                     const CloneOptions &options = {}) const;
+
+  /// Shared nodes (the bottom-up phase): a node is shared when it is
+  /// reachable from a node passed to markShared, through links and ghost
+  /// links, as the graph is now. Off unless enabled; then the graph keeps
+  /// track as links are added and nodes merge, and flushShared brings
+  /// isShared up to date.
+  void enableSharedTracking() { trackShared = true; }
+  /// Make the node of \p cell, and what it reaches, shared (after the next
+  /// flushShared).
+  void markShared(Cell cell);
+  /// Mark everything the shared nodes reach as shared.
+  void flushShared();
+  /// Whether the node of \p node (resolved) is shared, as of the last
+  /// flushShared.
+  bool isShared(const Node *node) const;
 
   /// The live (not forwarded) nodes, in creation order.
   auto nodes() const {
@@ -574,6 +610,11 @@ private:
   static void recordReason(Node *node, NodeFlags bit, const Reason *why);
 
   unsigned pointerSize;
+  bool trackShared = false;
+  /// Cells whose nodes are to become shared at the next flushShared: the
+  /// targets of links added to shared nodes, and the survivors of merges
+  /// with a shared node.
+  std::vector<Cell> sharedFrontier;
   std::unique_ptr<ReasonTable> ownedReasons;
   ReasonTable *reasonTable;
   llvm::SpecificBumpPtrAllocator<Node> nodeAllocator;

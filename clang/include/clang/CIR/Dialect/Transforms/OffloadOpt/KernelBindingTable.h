@@ -175,6 +175,10 @@ struct HostFactsOptions {
   // in the module (PointsToAnalysisOptions::assumeClosedTU). Off by default
   // (plan D2); -cir-offload-assume-closed-tu (T18) will map onto it.
   bool assumeClosedTU = false;
+  // The points-to analysis runs in its bottom-up mode (PointsToMode::BU):
+  // the launch records of a function its callers copied are read in the
+  // callers' graphs.
+  bool bottomUp = false;
 };
 
 // Which closure fields of a SYCL kernel are candidates for llvm.noalias, read

@@ -62,6 +62,22 @@
 //     "merged origins"}. Alias queries never answer MustAlias for such a
 //     node.
 //
+// Bottom-up mode (PointsToAnalysisOptions::mode = BU, see
+// PointsToBottomUp.cpp for the rules and their soundness argument): instead
+// of sharing a callee's formals among its callers, every call site gets its
+// own copy of the callee's graph (heap cloning), built in call-graph SCC
+// post-order: an allocation site gives one node per acyclic calling context
+// (Origin::ctx, a CallPathTable id). All the per-function graphs live in the
+// one Graph, apart from each other except for the nodes reachable from
+// globals, which every function shares (the globals graph). Inside a
+// recursive SCC, and past the clone budgets, calls are bound as above
+// (context-insensitively). The fixpoint of step 5 then runs over all of
+// them, and also projects what each copy learnt in its caller's context
+// (status flags, and which of its nodes the caller merged) back into the
+// graph it was copied from, so that each function's own graph stays sound
+// for all of its callers. Queries about a value of a function answer from
+// that function's graph; values of two different functions are MayAlias.
+//
 // Queries (PointsToQueries.cpp) run on the finished graph: alias, getModRef
 // and explainAlias. CIRPointsToAliasAnalysis wraps them as an
 // mlir::AliasAnalysis implementation.
@@ -99,12 +115,14 @@
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace llvm {
 class raw_ostream;
@@ -116,7 +134,25 @@ class GlobalNodes;
 class PointsToModelRegistry;
 class PointsToAnalysis;
 
+/// How calls to functions with a body are bound (see the file comment).
+enum class PointsToMode : uint8_t {
+  /// Context-insensitive: every caller shares the callee's formals.
+  CI,
+  /// Bottom-up cloning: every call site gets its own copy of the callee's
+  /// graph.
+  BU,
+};
+
+llvm::StringRef getPointsToModeName(PointsToMode mode);
+
 struct PointsToAnalysisOptions {
+  PointsToMode mode = PointsToMode::CI;
+  /// BU: the most nodes a function's graph may have (its own and the copies
+  /// of its callees' graphs); a call whose copy would exceed it is bound to
+  /// the callee's own graph instead (Reason Budget).
+  size_t maxCloneNodes = 50000;
+  /// BU: the most nodes all the copies together may have.
+  size_t maxTotalCloneNodes = 2000000;
   /// Treat every function as if all of its callers were in the module: no
   /// formal starts Incomplete. Tests set it; the -cir-offload-assume-closed-tu
   /// flag maps onto it later.
@@ -172,6 +208,60 @@ struct TUCallSite {
   llvm::SmallVector<mlir::FlatSymbolRefAttr, 2> targets;
   /// Why an indirect call is CallResolution::IndirectUnresolved.
   const Reason *unresolvedWhy = nullptr;
+
+  // BU mode only.
+  /// A body the call was bound to: the direct callee, or a target with a
+  /// body. `clone` indexes PointsToAnalysis::getClones(), or is -1 for a
+  /// binding to the callee's own graph (context-insensitive: a call inside
+  /// a recursive SCC, a cycle, or over budget). `pairs` are the cells
+  /// unified (actual or result, callee side).
+  struct Binding {
+    cir::FuncOp callee;
+    int clone = -1;
+    llvm::SmallVector<std::pair<Cell, Cell>, 4> pairs;
+  };
+  llvm::SmallVector<Binding, 1> bindings;
+  /// Why a body was bound without a copy (Reason Budget, or MergedAt for a
+  /// call in a recursive SCC or a cycle), or, with `fallback`, why the
+  /// direct call got the unknown-call rule instead: its callee was still
+  /// being analysed (a cycle through an indirect call).
+  const Reason *notClonedWhy = nullptr;
+  bool fallback = false;
+  /// For a site a function's graph got from the copy of a callee's graph:
+  /// the calls from that function down to the one holding `site.call`,
+  /// outermost first, as a CallPathTable id; 0 for the function's own
+  /// sites. The site's calling context is that path followed by
+  /// `site.call`.
+  uint32_t prefix = 0;
+  /// The functions copied along that path (a target among them is a cycle).
+  llvm::SmallVector<mlir::Operation *, 2> pathFuncs;
+  /// The leading entries of `targets` bound in the graph the site was
+  /// copied from (and so in the copy too).
+  unsigned numInheritedTargets = 0;
+};
+
+/// The calling contexts of the bottom-up mode: an id stands for a call
+/// followed by the context of the callee (its parent id), so that a path
+/// reads from the outermost call inwards. 0 is the empty path.
+class CallPathTable {
+public:
+  CallPathTable() : entries{{nullptr, 0}} {}
+  /// The id of \p call followed by \p parent, interned.
+  uint32_t intern(mlir::Operation *call, uint32_t parent);
+  /// The id of \p call followed by \p parent if it exists.
+  std::optional<uint32_t> lookup(mlir::Operation *call, uint32_t parent) const;
+  /// The id of \p prefix followed by \p path (both ids).
+  uint32_t concat(uint32_t prefix, uint32_t path);
+  mlir::Operation *getCall(uint32_t id) const { return entries[id].first; }
+  uint32_t getParent(uint32_t id) const { return entries[id].second; }
+  /// The calls of \p id, outermost first.
+  llvm::SmallVector<mlir::Operation *, 4> getPath(uint32_t id) const;
+  /// The number of non-empty paths.
+  size_t size() const { return entries.size() - 1; }
+
+private:
+  std::vector<std::pair<mlir::Operation *, uint32_t>> entries;
+  llvm::DenseMap<std::pair<mlir::Operation *, uint32_t>, uint32_t> ids;
 };
 
 /// The roots of one function in the TU graph.
@@ -189,6 +279,28 @@ struct TUFunction {
   std::optional<Cell> returnCell;
   std::optional<AggregateSlots> returnSlots;
   llvm::SmallVector<TUCallSite, 4> callSites;
+  /// BU mode: the indirect call sites this function's graph got from the
+  /// copies of its callees' graphs (see TUCallSite::prefix). They are
+  /// resolved in this graph, where the callee pointer may point to more
+  /// than in the callee's own graph.
+  std::vector<std::unique_ptr<TUCallSite>> inheritedCalls;
+  /// BU mode: the call-graph SCC of the function (its graph's index).
+  unsigned scc = 0;
+};
+
+/// BU mode: one copy of a function's graph into a caller's graph, at a call.
+struct TUClone {
+  /// The function whose graph got the copy (the one holding the call, or
+  /// the function that inherited the call site).
+  const TUFunction *caller;
+  /// The function whose graph was copied.
+  const TUFunction *callee;
+  mlir::Operation *call;
+  /// The calling context of the copy (CallPathTable id): the calls from
+  /// `caller` down to `call`.
+  uint32_t ctx;
+  /// The callee's nodes (as they were when copied) to the copies.
+  CloneMap map;
 };
 
 /// What a pointer may point to (PointsToAnalysis::pointsTo) or a memory cell
@@ -256,6 +368,9 @@ enum class AliasRule : uint8_t {
   PartialOverlap,
   /// Overlapping ranges of a node that is not a singleton: MayAlias.
   OverlapNotSingleton,
+  /// BU mode: values of two different functions, whose graphs are apart:
+  /// MayAlias.
+  DifferentFunctions,
 };
 
 llvm::StringRef getAliasRuleName(AliasRule rule);
@@ -273,6 +388,31 @@ struct PointsToAnalysisStats {
   /// unified for them.
   size_t numDirectCalls = 0;
   size_t numBindings = 0;
+  // BU mode.
+  /// The copies of callee graphs, the nodes they copied, the calling
+  /// contexts, the call sites inherited from copies, and the largest graph
+  /// of one function (its nodes, own and copied).
+  size_t numClones = 0;
+  size_t numClonedNodes = 0;
+  size_t numCallPaths = 0;
+  size_t numInheritedCalls = 0;
+  size_t maxGraphNodes = 0;
+  mlir::Operation *largestGraph = nullptr;
+  /// Bindings to a callee's own graph: inside a recursive SCC, through a
+  /// cycle, and over a clone budget; and calls that got the unknown-call
+  /// rule because their callee was still being analysed.
+  size_t numSCCBindings = 0;
+  size_t numCycleBindings = 0;
+  size_t numBudgetBindings = 0;
+  size_t numCycleFallbacks = 0;
+  /// What the projection from copies to their sources added: flags, and
+  /// the merges of source nodes that a caller's context merged.
+  size_t numProjectedFlags = 0;
+  size_t numPullBackMerges = 0;
+  /// The kernel launch records of all contexts, and those that stand for
+  /// every execution of a launch (getLaunches).
+  size_t numLaunchInstances = 0;
+
   /// Indirect calls by final resolution, the targets with a body bound for
   /// them, the rounds that bound a target, and the calls that ran out of
   /// rounds.
@@ -327,6 +467,16 @@ public:
   /// a complete empty set; a value the analysis has no cell for (not a
   /// pointer, or not in an analysed function) an incomplete empty set.
   ObjectSet pointsTo(mlir::Value value) const;
+  /// BU mode: what \p value, a value of the function that the last call of
+  /// \p callPath calls, may point to in that context, as a cell of the
+  /// graph of the function holding the first call: callPath[0] is a call in
+  /// that function, callPath[i] a call in the callee of callPath[i - 1].
+  /// The cells are those of the copies made along the path. If the path was
+  /// not copied (a call bound context-insensitively, over budget, or not a
+  /// call of these functions), the set of pointsTo(value), which holds for
+  /// every context. CI mode, or an empty path: pointsTo(value).
+  ObjectSet pointsTo(mlir::Value value,
+                     llvm::ArrayRef<mlir::Operation *> callPath) const;
   /// What the pointer slot at \p cell may hold: its link target. A slot
   /// without a link holds nothing seen, which is all it may hold only if
   /// its node is complete.
@@ -397,8 +547,25 @@ public:
   bool isRecursive(cir::FuncOp func) const;
 
   /// The kernel launches the models recorded, their cells in the TU graph,
-  /// in function processing order.
-  llvm::ArrayRef<LaunchRecord> getLaunches() const { return launches; }
+  /// in function processing order. BU mode: the records that together stand
+  /// for every execution of each launch: a record in the graph of a
+  /// function every caller of which copied it is replaced by its copies in
+  /// the callers' graphs (LaunchRecord::ctx), up to a function that has
+  /// unknown callers, no callers, or one bound context-insensitively.
+  llvm::ArrayRef<LaunchRecord> getLaunches() const {
+    return options.mode == PointsToMode::BU ? coveringLaunches : launches;
+  }
+  /// Every launch record: CI mode, getLaunches(); BU mode, also the copies
+  /// in every caller's graph and the records they replace. A rule about
+  /// what a launch does to its graph (the SYCL device-write rule) applies
+  /// to all of them.
+  llvm::ArrayRef<LaunchRecord> getAllLaunches() const { return launches; }
+
+  PointsToMode getMode() const { return options.mode; }
+  /// BU mode: the calling contexts (Origin::ctx, LaunchRecord::ctx).
+  const CallPathTable &getCallPaths() const { return callPaths; }
+  /// BU mode: every copy of a callee's graph, in the order they were made.
+  llvm::ArrayRef<std::unique_ptr<TUClone>> getClones() const { return clones; }
 
   /// Whether \p func has a body but is not analysed, because every use of it
   /// is a call that a model replaces (see PointsToModel::replacesDefinition)
@@ -425,6 +592,69 @@ private:
 
   void run();
   void buildLocal(cir::FuncOp func, bool formalsComplete);
+  /// The fixpoint of step 5 (see the file comment).
+  void runFixpoint();
+  /// Make Incomplete the formals and the return cell of \p fn, as the local
+  /// phase does for a function with callers we don't see.
+  void markUnknownCallers(TUFunction &fn);
+
+  // Bottom-up mode (PointsToBottomUp.cpp).
+  /// The graph of one call-graph SCC: its functions' own nodes and the
+  /// copies of their callees' graphs. Graphs bound context-insensitively to
+  /// each other (over budget, a cycle) are merged into one (union-find).
+  struct Partition {
+    enum class State : uint8_t { NotStarted, InProgress, Done };
+    State state = State::NotStarted;
+    unsigned parent = 0;
+    /// The SCC's functions, and whether it is recursive.
+    llvm::SmallVector<cir::FuncOp, 1> funcs;
+    bool cyclic = false;
+    /// The analysed functions whose nodes are in the graph.
+    llvm::SmallVector<TUFunction *, 1> members;
+    /// The indirect call sites of the graph, own and inherited, with the
+    /// function holding each: what a copy of the graph inherits.
+    std::vector<std::pair<TUCallSite *, TUFunction *>> calls;
+    /// Indices into `launches` and `memTransfers` of the graph's records.
+    std::vector<unsigned> launches;
+    std::vector<unsigned> transfers;
+    /// The nodes made for the graph: the local graphs and the copies.
+    size_t nodes = 0;
+  };
+  enum class BindResult : uint8_t { Bound, Fallback };
+  void runBottomUp(llvm::ArrayRef<llvm::SmallVector<cir::FuncOp, 1>> sccs,
+                   llvm::ArrayRef<bool> cyclic);
+  void processSCC(unsigned scc);
+  unsigned findPartition(unsigned scc);
+  void mergePartitions(unsigned into, unsigned from);
+  /// Bind \p call of \p owner's graph to the body of \p callee: a copy,
+  /// or the callee's own graph (see PointsToBottomUp.cpp). Fallback if the
+  /// callee is still being analysed: nothing was done.
+  BindResult bindBottomUp(TUCallSite &call, TUFunction &owner,
+                          cir::FuncOp callee);
+  void cloneCallee(TUCallSite &call, TUFunction &owner, TUFunction &callee);
+  /// Bind \p call to \p callee's own cells mapped by \p map, recording the
+  /// pairs in a new TUCallSite::Binding.
+  void bindMapped(TUCallSite &call, const TUFunction &callee, int clone,
+                  llvm::function_ref<Cell(Cell)> map, const Reason *why);
+  /// One round of indirect-call resolution over \p calls (each with the
+  /// function whose graph holds it); see resolveIndirectCalls.
+  bool resolveIndirectRound(
+      llvm::ArrayRef<std::pair<TUCallSite *, TUFunction *>> calls,
+      bool finalize, bool overBudget, bool &bound);
+  /// Every call site with the function whose graph holds it: the own sites
+  /// and (BU) the inherited ones.
+  llvm::SmallVector<std::pair<TUCallSite *, TUFunction *>, 0> allCallSites();
+  /// Close the copies of \p scc's graph (N8).
+  bool closePartition(unsigned scc);
+  /// Project what the copies learnt in their callers' graphs back into the
+  /// graphs they were copied from. Returns whether it changed anything.
+  bool projectClones();
+  /// The records of getLaunches() in BU mode.
+  void computeCoveringLaunches();
+  /// The function whose graph holds \p launch.
+  const TUFunction *getLaunchOwner(const LaunchRecord &launch) const;
+  /// BU mode: the SCC of each analysed function.
+  llvm::DenseMap<mlir::Operation *, unsigned> sccOf;
   /// Whether \p func has a body directly in the module and is not skipped.
   bool isAnalysed(cir::FuncOp func) const;
   /// Find the calls a model replaces, the functions skipped because of them,
@@ -446,7 +676,8 @@ private:
   /// Give \p call the effect of its target \p target, which has no body
   /// here: a model, or the unknown-call rule.
   void applyDeclarationTarget(TUCallSite &call, mlir::FlatSymbolRefAttr target,
-                              cir::FuncOp calleeOrNull);
+                              cir::FuncOp calleeOrNull,
+                              TUFunction *owner = nullptr);
   void applyUnknownCall(TUCallSite &call, const Reason *why);
   void propagateStatus();
   bool clobberGlobals();
@@ -516,6 +747,16 @@ private:
   /// never complete, closed TU or not.
   llvm::DenseSet<mlir::Operation *> unboundCallers;
   llvm::SmallVector<LaunchRecord, 0> launches;
+  /// BU mode: getLaunches().
+  llvm::SmallVector<LaunchRecord, 0> coveringLaunches;
+  CallPathTable callPaths;
+  std::vector<std::unique_ptr<TUClone>> clones;
+  std::vector<Partition> partitions;
+  /// The functions some direct call of which got the unknown-call rule
+  /// because they were still being analysed: their formals are never
+  /// complete.
+  llvm::DenseSet<mlir::Operation *> fallbackCallees;
+  size_t numIndirectRoundsBU = 0;
   /// The functions in a recursive SCC, with Reason{SummaryObject, func,
   /// "recursion"}.
   llvm::DenseMap<mlir::Operation *, const Reason *> recursive;

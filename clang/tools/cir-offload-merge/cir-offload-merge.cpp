@@ -104,6 +104,12 @@ llvm::cl::opt<bool> HostFactsClosedTU(
     llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, assume every "
                    "caller of every host function is in this TU"),
     llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
+// Temporary: the bottom-up points-to mode (T17), until it is the default.
+llvm::cl::opt<bool> HostFactsBottomUp(
+    "cir-offload-host-facts-bu",
+    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, run the points-to "
+                   "analysis bottom-up (context-sensitive)"),
+    llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
 llvm::cl::opt<bool> HostFactsCensus(
     "cir-offload-host-facts-census",
     llvm::cl::desc("Under --cir-offload-host-facts=both, also remark both "
@@ -447,10 +453,13 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   {
     std::unique_ptr<mlir::Pass> noAlias =
         mlir::createOffloadInferKernelParamNoAliasPass();
-    if (HostFacts != "legacy" || HostFactsClosedTU || HostFactsCensus) {
+    if (HostFacts != "legacy" || HostFactsClosedTU || HostFactsCensus ||
+        HostFactsBottomUp) {
       std::string options = "host-facts=" + HostFacts;
       if (HostFactsClosedTU)
         options += " host-facts-closed-tu=true";
+      if (HostFactsBottomUp)
+        options += " host-facts-bu=true";
       if (HostFactsCensus)
         options += " host-facts-census=true";
       if (mlir::failed(noAlias->initializeOptions(

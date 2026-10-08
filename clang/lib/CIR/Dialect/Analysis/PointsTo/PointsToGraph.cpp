@@ -555,6 +555,8 @@ static auto findLink(SmallVectorImpl<std::pair<int64_t, Cell>> &links,
 void Graph::insertLink(Node *node, int64_t offset, Cell target,
                        Worklist &worklist) {
   offset = normalizeOffset(node, offset);
+  if (node->shared)
+    sharedFrontier.push_back(target);
   auto *it = findLink(node->links, offset);
   if (it != node->links.end() && it->first == offset) {
     // The slot already points somewhere: both targets are the same cell now.
@@ -635,6 +637,8 @@ static auto findGhost(SmallVectorImpl<GhostLink> &ghosts, int64_t offset,
 void Graph::insertGhost(Node *node, int64_t offset, GhostField field,
                         Cell target, Worklist &worklist) {
   offset = normalizeOffset(node, offset);
+  if (node->shared)
+    sharedFrontier.push_back(target);
   auto *it = findGhost(node->ghosts, offset, field);
   if (it != node->ghosts.end() && it->offset == offset && it->field == field) {
     worklist.emplace_back(it->target, target);
@@ -750,6 +754,13 @@ void Graph::merge(Node *survivor, Node *merged, int64_t delta,
   merged->arrayElemSize.reset();
   merged->forward = survivor;
   merged->forwardDelta = delta;
+  // The survivor of a merge with a shared node is shared. It is marked at
+  // the next flushShared, which then walks its links (those it had, and
+  // those inserted below, which insertLink records only for a node already
+  // shared).
+  if (merged->shared && !survivor->shared)
+    sharedFrontier.push_back(Cell(survivor));
+  merged->shared = false;
 
   // Collapsed is applied by collapseImpl below, which also moves the links.
   survivor->flags |= mergedFlags & ~NodeFlags::Collapsed;
@@ -837,8 +848,35 @@ void Graph::markArray(Node *node, uint64_t elemSize, const Reason *why) {
 // Graph: cloning
 //===----------------------------------------------------------------------===//
 
-CloneMap Graph::cloneInto(Graph &dst, ArrayRef<Cell> roots,
-                          NodeFlags keepMask) const {
+void Graph::markShared(Cell cell) {
+  assert(trackShared && "markShared without shared tracking");
+  if (cell)
+    sharedFrontier.push_back(cell);
+}
+
+void Graph::flushShared() {
+  while (!sharedFrontier.empty()) {
+    Node *node = sharedFrontier.back().getNode();
+    sharedFrontier.pop_back();
+    if (!node || node->shared)
+      continue;
+    node->shared = true;
+    for (const auto &link : node->links)
+      sharedFrontier.push_back(link.second);
+    for (const GhostLink &ghost : node->ghosts)
+      sharedFrontier.push_back(ghost.target);
+  }
+}
+
+bool Graph::isShared(const Node *node) const {
+  const Node *live = Cell(const_cast<Node *>(node)).getNode();
+  return live && live->shared;
+}
+
+CloneMap Graph::cloneInto(Graph &dst, ArrayRef<Cell> roots, NodeFlags keepMask,
+                          const CloneOptions &options) const {
+  assert((!options.isShared || &dst == this) &&
+         "shared nodes map to themselves only within one graph");
   // Collapsed describes the shape of the links; it is always kept.
   keepMask |= NodeFlags::Collapsed;
   bool sharedReasons = &dst.getReasonTable() == reasonTable;
@@ -863,11 +901,18 @@ CloneMap Graph::cloneInto(Graph &dst, ArrayRef<Cell> roots,
     Node *src = cell.getNode();
     if (!src || result.nodeMap.count(src))
       return;
+    if (options.isShared && options.isShared(src)) {
+      result.nodeMap[src] = Cell(src, 0);
+      return;
+    }
     Node *copy = dst.newNode();
     copy->flags = src->flags & keepMask;
     copy->size = src->size;
     copy->arrayElemSize = src->arrayElemSize;
     copy->origins = src->origins;
+    if (options.rewriteOrigin)
+      for (Origin &origin : copy->origins)
+        options.rewriteOrigin(origin);
     for (const auto &[bit, r] : src->reasons)
       if (hasAny(keepMask, bit))
         copy->reasons.emplace_back(bit, copyReason(r));

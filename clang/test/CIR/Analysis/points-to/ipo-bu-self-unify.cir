@@ -1,0 +1,67 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CI
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=BUALIAS
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CIALIAS
+
+// N11: the shared_ptr refcount helper __exchange_and_add_dispatch(int*, int)
+// is called with &cb->use_count (+8) and &cb->weak_count (+12) of ONE
+// control block. Context-insensitively its one formal is unified with both
+// cells, a node unified with itself at two offsets: the control block
+// collapses (and in a real TU every control block meets in that formal).
+// Bottom-up each call site binds its own copy of the helper's formal, so the
+// control block keeps its fields.
+
+// CHECK-LABEL: === TU graph
+// CHECK-NOT: Collapsed
+// CHECK: [[CB:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'cb' {{.*}})} links={0->{{n[0-9]+}}+0}
+// CHECK-NOT: Collapsed
+// CHECK-LABEL: === @release formals=complete
+// CHECK-NEXT: @release formal #0 -> [[CB2:n[0-9]+]]+0
+// CHECK-LABEL: === @main
+// CHECK-NEXT: @main cb -> [[CB]]+0 complete
+// CHECK-NEXT: @main use -> [[CB]]+8 complete
+// CHECK-NEXT: @main weak -> [[CB]]+12 complete
+// CHECK-LABEL: === calls
+// CHECK: @release cir.call @_ZN9__gnu_cxx27__exchange_and_add_dispatchEPii -> direct @_ZN9__gnu_cxx27__exchange_and_add_dispatchEPii [clone #{{[0-9]+}}]
+// CHECK-NEXT: @release cir.call @_ZN9__gnu_cxx27__exchange_and_add_dispatchEPii -> direct @_ZN9__gnu_cxx27__exchange_and_add_dispatchEPii [clone #{{[0-9]+}}]
+
+// CI-LABEL: === TU graph
+// CI: [Stack|Collapsed|Mod|Ref] size=16 origins={stack(cir.alloca 'cb' {{.*}})} links={0->{{n[0-9]+}}+0} reasons={Collapsed: MergedAt(cir.call {{.*}}, "@_ZN9__gnu_cxx27__exchange_and_add_dispatchEPii")}
+
+// BUALIAS-LABEL: Testing : "main"
+// BUALIAS: use#0 <-> weak#0: NoAlias
+// CIALIAS-LABEL: Testing : "main"
+// CIALIAS: use#0 <-> weak#0: MayAlias
+
+!s32i = !cir.int<s, 32>
+!rec_CB = !cir.struct<"CB" {data !cir.ptr<!s32i>, data !s32i, data !s32i}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func internal @_ZN9__gnu_cxx27__exchange_and_add_dispatchEPii(%p: !cir.ptr<!s32i>, %v: !s32i) -> !s32i {
+  %old = cir.load %p : !cir.ptr<!s32i>, !s32i
+  %new = cir.add %old, %v : !s32i
+  cir.store %new, %p : !s32i, !cir.ptr<!s32i>
+  cir.return %old : !s32i
+}
+cir.func internal @release(%cb: !cir.ptr<!rec_CB>) {
+  %m1 = cir.const #cir.int<-1> : !s32i
+  %use = cir.get_member %cb[1] {name = "use_count"} : !cir.ptr<!rec_CB> -> !cir.ptr<!s32i>
+  %r1 = cir.call @_ZN9__gnu_cxx27__exchange_and_add_dispatchEPii(%use, %m1) : (!cir.ptr<!s32i>, !s32i) -> !s32i
+  %weak = cir.get_member %cb[2] {name = "weak_count"} : !cir.ptr<!rec_CB> -> !cir.ptr<!s32i>
+  %r2 = cir.call @_ZN9__gnu_cxx27__exchange_and_add_dispatchEPii(%weak, %m1) : (!cir.ptr<!s32i>, !s32i) -> !s32i
+  cir.return
+}
+cir.func @main() {
+  %cb = cir.alloca "cb" align(8) : !cir.ptr<!rec_CB>
+  %cb_tag = cir.cast bitcast %cb : !cir.ptr<!rec_CB> -> !cir.ptr<!rec_CB> {test.ptr = "cb"}
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %mp = cir.get_member %cb[0] {name = "p"} : !cir.ptr<!rec_CB> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %mp : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %use0 = cir.get_member %cb[1] {name = "use_count"} : !cir.ptr<!rec_CB> -> !cir.ptr<!s32i>
+  %use = cir.cast bitcast %use0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "use"}
+  %weak0 = cir.get_member %cb[2] {name = "weak_count"} : !cir.ptr<!rec_CB> -> !cir.ptr<!s32i>
+  %weak = cir.cast bitcast %weak0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "weak"}
+  cir.call @release(%cb) : (!cir.ptr<!rec_CB>) -> ()
+  cir.return
+}
+}

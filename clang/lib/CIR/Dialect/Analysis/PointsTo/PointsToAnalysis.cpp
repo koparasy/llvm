@@ -19,6 +19,7 @@
 #include "clang/CIR/Interfaces/CIROpInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SCCIterator.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -43,6 +44,16 @@ StringRef cir::pointsto::getCallResolutionName(CallResolution resolution) {
     return "indirect-unresolved";
   }
   llvm_unreachable("unknown call resolution");
+}
+
+StringRef cir::pointsto::getPointsToModeName(PointsToMode mode) {
+  switch (mode) {
+  case PointsToMode::CI:
+    return "ci";
+  case PointsToMode::BU:
+    return "bu";
+  }
+  llvm_unreachable("unknown points-to mode");
 }
 
 PointsToAnalysis::PointsToAnalysis(ModuleOp module,
@@ -180,96 +191,91 @@ void PointsToAnalysis::run() {
   computeVisibleCallers();
 
   // Call-graph SCCs in post-order: callees before their callers. The
-  // context-insensitive result does not depend on the order; the
-  // context-sensitive phase that replaces this one will.
-  SmallVector<cir::FuncOp, 0> order;
+  // context-insensitive result does not depend on the order; the bottom-up
+  // one is built in it.
+  SmallVector<SmallVector<cir::FuncOp, 1>, 0> sccs;
+  SmallVector<bool, 0> cyclic;
   llvm::DenseSet<Operation *> seen;
   {
     CallGraph callGraph(module);
     for (auto it = llvm::scc_begin(static_cast<const CallGraph *>(&callGraph));
-         !it.isAtEnd(); ++it)
+         !it.isAtEnd(); ++it) {
+      SmallVector<cir::FuncOp, 1> scc;
       for (CallGraphNode *node : *it) {
         if (node->isExternal())
           continue;
         auto func =
             dyn_cast<cir::FuncOp>(node->getCallableRegion()->getParentOp());
         if (isAnalysed(func) && seen.insert(func).second)
-          order.push_back(func);
+          scc.push_back(func);
       }
+      if (scc.empty())
+        continue;
+      cyclic.push_back(it.hasCycle());
+      sccs.push_back(std::move(scc));
+    }
   }
   for (auto func : module.getOps<cir::FuncOp>())
-    if (isAnalysed(func) && seen.insert(func).second)
-      order.push_back(func);
+    if (isAnalysed(func) && seen.insert(func).second) {
+      cyclic.push_back(false);
+      sccs.push_back({func});
+    }
 
-  llvm::TimeRecord localStart = llvm::TimeRecord::getCurrentTime(true);
-  for (cir::FuncOp func : order) {
-    bool complete = (options.assumeClosedTU ||
-                     visibleCallers.contains(func.getOperation())) &&
-                    !unboundCallers.contains(func.getOperation());
-    buildLocal(func, complete);
-  }
   // A global another TU can name may hand the functions in its initializer
   // to code we don't see even if no function here names it: give it a node,
   // so that markEscapedFunctions sees those functions.
-  for (auto global : module.getOps<cir::GlobalOp>()) {
-    std::optional<Attribute> init = global.getInitialValue();
-    if (!init || cir::isLocalLinkage(global.getLinkage()))
-      continue;
-    bool namesSymbol = false;
-    init->walk([&](FlatSymbolRefAttr) { namesSymbol = true; });
-    if (namesSymbol)
-      globals->getNode(FlatSymbolRefAttr::get(global.getSymNameAttr()));
+  auto addNameableGlobals = [&] {
+    for (auto global : module.getOps<cir::GlobalOp>()) {
+      std::optional<Attribute> init = global.getInitialValue();
+      if (!init || cir::isLocalLinkage(global.getLinkage()))
+        continue;
+      bool namesSymbol = false;
+      init->walk([&](FlatSymbolRefAttr) { namesSymbol = true; });
+      if (!namesSymbol)
+        continue;
+      Node *node =
+          globals->getNode(FlatSymbolRefAttr::get(global.getSymNameAttr()));
+      if (options.mode == PointsToMode::BU)
+        graph->markShared(Cell(node));
+    }
+  };
+
+  llvm::TimeRecord localStart = llvm::TimeRecord::getCurrentTime(true);
+  if (options.mode == PointsToMode::BU) {
+    graph->enableSharedTracking();
+    addNameableGlobals();
+    runBottomUp(sccs, cyclic);
+    llvm::TimeRecord localTime = llvm::TimeRecord::getCurrentTime(false);
+    localTime -= localStart;
+    stats.localSeconds = localTime.getWallTime();
+    stats.numFunctions = functions.size();
+    // The copies made while the graphs were built related their own
+    // copies; the shared nodes may have more links now.
+    stats.transfersSettled = closeMemTransfers(*graph, memTransfers);
+  } else {
+    for (ArrayRef<cir::FuncOp> scc : sccs)
+      for (cir::FuncOp func : scc) {
+        bool complete = (options.assumeClosedTU ||
+                         visibleCallers.contains(func.getOperation())) &&
+                        !unboundCallers.contains(func.getOperation());
+        buildLocal(func, complete);
+      }
+    addNameableGlobals();
+    llvm::TimeRecord localTime = llvm::TimeRecord::getCurrentTime(false);
+    localTime -= localStart;
+    stats.localSeconds = localTime.getWallTime();
+    stats.numFunctions = functions.size();
+
+    // Context-insensitive binding: every caller shares the callee's formals
+    // and return cell. Unification only merges, so one pass is enough.
+    stats.numBindings = bindCalls(/*dryRun=*/false);
+
+    // The bindings added links on both sides of the copies: relate the new
+    // offsets.
+    stats.transfersSettled = closeMemTransfers(*graph, memTransfers);
   }
-  llvm::TimeRecord localTime = llvm::TimeRecord::getCurrentTime(false);
-  localTime -= localStart;
-  stats.localSeconds = localTime.getWallTime();
-  stats.numFunctions = functions.size();
 
-  // Context-insensitive binding: every caller shares the callee's formals
-  // and return cell. Unification only merges, so one pass is enough.
-  stats.numBindings = bindCalls(/*dryRun=*/false);
-
-  // The bindings added links on both sides of the copies: relate the new
-  // offsets.
-  stats.transfersSettled = closeMemTransfers(*graph, memTransfers);
-
-  // Status propagation, global clobbering and indirect-call resolution, to
-  // a fixpoint of all of them (see the file comment):
-  //  - an unknown-call rule adds External flags and clobbers globals;
-  //  - propagation can show more globals to be escaped, which the clobbering
-  //    calls then reach too;
-  //  - binding an indirect target merges nodes, which can give another
-  //    callee node more targets, and adds links the copy closure must relate
-  //    (N8);
-  //  - any of them can make a callee node External or Incomplete, which turns
-  //    a call resolved earlier into an unresolved one;
-  //  - a function whose node turned External, or that is a target of an
-  //    unresolved call, gets Incomplete formals (markEscapedFunctions, N13),
-  //    which propagation then spreads.
-  // The loop stops only after a round in which no rule changed anything, so
-  // the result satisfies every rule. It terminates: every rule only adds
-  // flags or merges nodes, both monotone, and the graph has finitely many
-  // nodes and flags; the nodes a round may create (the unknown results of an
-  // unknown-call rule, the model objects of a declaration target) are made
-  // at most once per (call, target) pair, and a call becomes unresolved at
-  // most once. Binding is bounded too: each round that binds adds at least
-  // one (call, target) pair, of finitely many, and maxIndirectRounds caps
-  // the rounds that may do so.
-  bool changed = true;
-  while (changed) {
-    propagateStatus();
-    changed = clobberGlobals();
-    propagateStatus();
-    bool bound = false;
-    changed |= resolveIndirectCalls(/*finalize=*/false, bound);
-    changed |= markEscapedFunctions();
-    if (options.extraFixpointRule)
-      changed |= options.extraFixpointRule(*this);
-    if (!changed)
-      changed = resolveIndirectCalls(/*finalize=*/true, bound);
-    if (bound)
-      stats.transfersSettled &= closeMemTransfers(*graph, memTransfers);
-  }
+  runFixpoint();
   for (std::unique_ptr<TUFunction> &fn : functions)
     for (TUCallSite &call : fn->callSites) {
       if (call.resolution == CallResolution::Indirect)
@@ -281,6 +287,11 @@ void PointsToAnalysis::run() {
   // The graph is final: no rule merges nodes any more.
   computeRecursion();
   markSummaries();
+  if (options.mode == PointsToMode::BU) {
+    computeCoveringLaunches();
+    stats.numCallPaths = callPaths.size();
+    stats.numLaunchInstances = launches.size();
+  }
 
 #ifndef NDEBUG
   // Unification is monotone: once every call is bound, binding them again
@@ -305,6 +316,97 @@ void PointsToAnalysis::run() {
   llvm::TimeRecord total = llvm::TimeRecord::getCurrentTime(false);
   total -= start;
   stats.totalSeconds = total.getWallTime();
+}
+
+void PointsToAnalysis::markUnknownCallers(TUFunction &fn) {
+  // The same flags and reasons the local phase gives a function whose
+  // formals are not complete (LocalBuilder::build), and the return cell
+  // buildLocal marks.
+  cir::FuncOp func = fn.func;
+  for (auto [i, formal] : llvm::enumerate(fn.formals)) {
+    if (!formal && !fn.formalSlots[i])
+      continue;
+    const Reason *why = graph->makeReason(Reason::Kind::UnknownCaller, func,
+                                          "formal #" + std::to_string(i));
+    if (formal)
+      graph->addFlags(*formal, NodeFlags::Incomplete, why);
+    if (fn.formalSlots[i])
+      for (auto [off, cell] : *fn.formalSlots[i])
+        if (cell)
+          graph->addFlags(cell, NodeFlags::Incomplete, why);
+  }
+  if (!fn.returnCell && !fn.returnSlots)
+    return;
+  const Reason *why = graph->makeReason(Reason::Kind::UnknownCaller, func,
+                                        "returned to an unknown caller");
+  if (fn.returnCell)
+    graph->addFlags(*fn.returnCell, NodeFlags::Incomplete, why);
+  if (fn.returnSlots)
+    for (auto [off, cell] : *fn.returnSlots)
+      if (cell)
+        graph->addFlags(cell, NodeFlags::Incomplete, why);
+}
+
+void PointsToAnalysis::runFixpoint() {
+  if (options.mode == PointsToMode::BU) {
+    // BU: the local graphs were built with complete formals, so that the
+    // copies of a callee's graph do not get the Incomplete of its unknown
+    // callers (each copy has its caller); the function's own graph gets
+    // them now.
+    for (std::unique_ptr<TUFunction> &fn : functions) {
+      if (fallbackCallees.contains(fn->func.getOperation()))
+        fn->formalsComplete = false;
+      if (!fn->formalsComplete)
+        markUnknownCallers(*fn);
+    }
+  }
+
+  // Status propagation, global clobbering and indirect-call resolution, to
+  // a fixpoint of all of them (see the file comment):
+  //  - an unknown-call rule adds External flags and clobbers globals;
+  //  - propagation can show more globals to be escaped, which the clobbering
+  //    calls then reach too;
+  //  - binding an indirect target merges nodes, which can give another
+  //    callee node more targets, and adds links the copy closure must relate
+  //    (N8);
+  //  - any of them can make a callee node External or Incomplete, which turns
+  //    a call resolved earlier into an unresolved one;
+  //  - a function whose node turned External, or that is a target of an
+  //    unresolved call, gets Incomplete formals (markEscapedFunctions, N13),
+  //    which propagation then spreads;
+  //  - BU: what a copy of a callee's graph learnt in its caller's graph is
+  //    projected back into the callee's graph (projectClones), which adds
+  //    flags and merges nodes too.
+  // The loop stops only after a round in which no rule changed anything, so
+  // the result satisfies every rule. It terminates: every rule only adds
+  // flags or merges nodes, both monotone, and the graph has finitely many
+  // nodes and flags; the nodes a round may create (the unknown results of an
+  // unknown-call rule, the model objects of a declaration target) are made
+  // at most once per (call, target) pair, and a call becomes unresolved at
+  // most once. Binding is bounded too: each round that binds adds at least
+  // one (call, target) pair, of finitely many, and maxIndirectRounds caps
+  // the rounds that may do so. (BU: binding a target may copy its graph;
+  // see PointsToBottomUp.cpp for why that is bounded.)
+  bool changed = true;
+  while (changed) {
+    propagateStatus();
+    changed = clobberGlobals();
+    propagateStatus();
+    bool bound = false;
+    changed |= resolveIndirectCalls(/*finalize=*/false, bound);
+    changed |= markEscapedFunctions();
+    if (options.extraFixpointRule)
+      changed |= options.extraFixpointRule(*this);
+    bool projected = false;
+    if (options.mode == PointsToMode::BU) {
+      projected = projectClones();
+      changed |= projected;
+    }
+    if (!changed)
+      changed = resolveIndirectCalls(/*finalize=*/true, bound);
+    if (bound || projected)
+      stats.transfersSettled &= closeMemTransfers(*graph, memTransfers);
+  }
 }
 
 void PointsToAnalysis::computeReplacedCalls() {
@@ -433,8 +535,11 @@ void PointsToAnalysis::computeVisibleCallers() {
 }
 
 void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
+  bool bottomUp = options.mode == PointsToMode::BU;
   LocalBuilder builder(func, &symbols, &reasons, models);
-  builder.setFormalsComplete(formalsComplete);
+  // BU: the formals of the local graph are what each copy of it gets from
+  // its own caller; runFixpoint marks the function's own graph.
+  builder.setFormalsComplete(bottomUp || formalsComplete);
   builder.setDeferIndirectCalls(true);
   std::unique_ptr<FunctionGraph> fg = builder.build();
   if (builder.hadVerifyErrors())
@@ -481,7 +586,7 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
   fn->returnCell = mapOpt(fg->returnCell);
   if (fg->returnSlots)
     fn->returnSlots = mapSlots(*fg->returnSlots);
-  if (!formalsComplete) {
+  if (!formalsComplete && !bottomUp) {
     // What the function returns reaches its unknown callers.
     const Reason *why = graph->makeReason(Reason::Kind::UnknownCaller, func,
                                           "returned to an unknown caller");
@@ -493,13 +598,25 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
           graph->addFlags(cell, NodeFlags::Incomplete, why);
   }
 
-  for (const MemTransferRecord &record : fg->memTransfers)
+  Partition *partition = nullptr;
+  if (bottomUp) {
+    fn->scc = sccOf.lookup(func.getOperation());
+    partition = &partitions[findPartition(fn->scc)];
+    partition->members.push_back(fn.get());
+    partition->nodes += local.getNumLiveNodes();
+  }
+  for (const MemTransferRecord &record : fg->memTransfers) {
+    if (partition)
+      partition->transfers.push_back(memTransfers.size());
     memTransfers.push_back({record.op, map(record.dst), map(record.src),
                             record.length, record.ghosts});
+  }
   for (const LaunchRecord &local : fg->launches) {
     LaunchRecord launch = local;
     launch.closure = mapOpt(local.closure);
     launch.geometry = mapOpt(local.geometry);
+    if (partition)
+      partition->launches.push_back(launches.size());
     launches.push_back(std::move(launch));
   }
 
@@ -511,7 +628,11 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
     if (!symbolWhy)
       symbolWhy = graph->makeReason(Reason::Kind::MergedAt, func,
                                     "one node per global symbol");
-    graph->unify(map(cell), Cell(globals->getNode(sym)), symbolWhy);
+    Node *node = globals->getNode(sym);
+    graph->unify(map(cell), Cell(node), symbolWhy);
+    // BU: the globals graph, which every function's graph shares.
+    if (bottomUp)
+      graph->markShared(Cell(node));
   }
 
   for (const CallSiteRecord &local : fg->callSites) {
@@ -567,8 +688,31 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
   functions.push_back(std::move(fn));
 }
 
+SmallVector<std::pair<TUCallSite *, TUFunction *>, 0>
+PointsToAnalysis::allCallSites() {
+  SmallVector<std::pair<TUCallSite *, TUFunction *>, 0> result;
+  for (std::unique_ptr<TUFunction> &fn : functions) {
+    for (TUCallSite &call : fn->callSites)
+      result.emplace_back(&call, fn.get());
+    for (std::unique_ptr<TUCallSite> &call : fn->inheritedCalls)
+      result.emplace_back(call.get(), fn.get());
+  }
+  return result;
+}
+
 size_t PointsToAnalysis::bindCalls(bool dryRun) {
   size_t count = 0;
+  if (options.mode == PointsToMode::BU) {
+    // The bindings were made while the graphs were built (and in the
+    // fixpoint): check the pairs they recorded.
+    assert(dryRun && "BU binds while it builds the graphs");
+    for (auto [call, owner] : allCallSites())
+      for (const TUCallSite::Binding &binding : call->bindings)
+        for (auto [a, b] : binding.pairs)
+          if (a.resolve() != b.resolve())
+            ++count;
+    return count;
+  }
   for (std::unique_ptr<TUFunction> &fn : functions) {
     for (TUCallSite &call : fn->callSites) {
       if (call.resolution == CallResolution::Direct) {
@@ -662,6 +806,8 @@ namespace {
 /// as it was at the start of the round.
 struct IndirectDecision {
   TUCallSite *call;
+  /// The function whose graph holds the call.
+  TUFunction *owner;
   /// Set: the call is unresolved, for this reason.
   llvm::StringRef unresolved;
   /// The targets the call did not have yet, sorted by name.
@@ -670,64 +816,77 @@ struct IndirectDecision {
 } // namespace
 
 bool PointsToAnalysis::resolveIndirectCalls(bool finalize, bool &bound) {
+  bool binds = false;
+  bool changed = resolveIndirectRound(
+      allCallSites(), finalize,
+      stats.numIndirectRounds >= options.maxIndirectRounds, binds);
+  if (binds) {
+    ++stats.numIndirectRounds;
+    bound = true;
+  }
+  return changed;
+}
+
+bool PointsToAnalysis::resolveIndirectRound(
+    ArrayRef<std::pair<TUCallSite *, TUFunction *>> calls, bool finalize,
+    bool overBudget, bool &bound) {
   // Decide every call on the graph as it is at the start of the round, then
   // apply the decisions: a round then means one step of the chain "binding a
   // target gives another call a target", whatever the order of the calls.
   SmallVector<IndirectDecision, 0> decisions;
-  for (std::unique_ptr<TUFunction> &fn : functions)
-    for (TUCallSite &call : fn->callSites) {
-      if (call.resolution != CallResolution::Indirect)
-        continue;
-      IndirectDecision decision{&call, {}, {}};
-      if (!call.site.calleePtr) {
-        decision.unresolved = "callee is a null pointer";
-        decisions.push_back(std::move(decision));
-        continue;
-      }
-      // SOUNDNESS: the targets are known only if the callee node stands for
-      // nothing but the functions named by its origins: no unknown object,
-      // nothing that code we don't see could have stored (External), and
-      // nothing an unknown caller could have passed in (Incomplete).
-      const Node *callee = call.site.calleePtr->getNode();
-      NodeFlags flags = callee->getFlags();
-      if (hasAny(flags, NodeFlags::UnknownObj))
-        decision.unresolved = "callee may be an unknown object";
-      else if (hasAny(flags, NodeFlags::External))
-        decision.unresolved = "callee node is External";
-      else if (hasAny(flags, NodeFlags::Incomplete))
-        decision.unresolved = "callee node is Incomplete";
-      else if (!llvm::all_of(callee->getOrigins(), [](const Origin &origin) {
-                 return origin.kind == Origin::Kind::FuncSym &&
-                        isa_and_present<FlatSymbolRefAttr>(origin.sym);
-               }))
-        decision.unresolved = "callee may point to something not a function";
-      else if (callee->getOrigins().empty()) {
-        // Nothing seen yet: a later round may store a function there. When
-        // nothing else changes any more, it never will.
-        if (!finalize)
-          continue;
-        decision.unresolved = "no target seen";
-      }
-      if (decision.unresolved.empty()) {
-        for (const Origin &origin : callee->getOrigins()) {
-          auto sym = cast<FlatSymbolRefAttr>(origin.sym);
-          if (!llvm::is_contained(call.targets, sym) &&
-              !llvm::is_contained(decision.newTargets, sym))
-            decision.newTargets.push_back(sym);
-        }
-        if (decision.newTargets.empty())
-          continue;
-        llvm::sort(decision.newTargets,
-                   [](FlatSymbolRefAttr a, FlatSymbolRefAttr b) {
-                     return a.getValue() < b.getValue();
-                   });
-      }
+  for (auto [callPtr, owner] : calls) {
+    TUCallSite &call = *callPtr;
+    if (call.resolution != CallResolution::Indirect)
+      continue;
+    IndirectDecision decision{&call, owner, {}, {}};
+    if (!call.site.calleePtr) {
+      decision.unresolved = "callee is a null pointer";
       decisions.push_back(std::move(decision));
+      continue;
     }
+    // SOUNDNESS: the targets are known only if the callee node stands for
+    // nothing but the functions named by its origins: no unknown object,
+    // nothing that code we don't see could have stored (External), and
+    // nothing an unknown caller could have passed in (Incomplete).
+    const Node *callee = call.site.calleePtr->getNode();
+    NodeFlags flags = callee->getFlags();
+    if (hasAny(flags, NodeFlags::UnknownObj))
+      decision.unresolved = "callee may be an unknown object";
+    else if (hasAny(flags, NodeFlags::External))
+      decision.unresolved = "callee node is External";
+    else if (hasAny(flags, NodeFlags::Incomplete))
+      decision.unresolved = "callee node is Incomplete";
+    else if (!llvm::all_of(callee->getOrigins(), [](const Origin &origin) {
+               return origin.kind == Origin::Kind::FuncSym &&
+                      isa_and_present<FlatSymbolRefAttr>(origin.sym);
+             }))
+      decision.unresolved = "callee may point to something not a function";
+    else if (callee->getOrigins().empty()) {
+      // Nothing seen yet: a later round may store a function there. When
+      // nothing else changes any more, it never will.
+      if (!finalize)
+        continue;
+      decision.unresolved = "no target seen";
+    }
+    if (decision.unresolved.empty()) {
+      for (const Origin &origin : callee->getOrigins()) {
+        auto sym = cast<FlatSymbolRefAttr>(origin.sym);
+        if (!llvm::is_contained(call.targets, sym) &&
+            !llvm::is_contained(decision.newTargets, sym))
+          decision.newTargets.push_back(sym);
+      }
+      if (decision.newTargets.empty())
+        continue;
+      llvm::sort(decision.newTargets,
+                 [](FlatSymbolRefAttr a, FlatSymbolRefAttr b) {
+                   return a.getValue() < b.getValue();
+                 });
+    }
+    decisions.push_back(std::move(decision));
+  }
   if (decisions.empty())
     return false;
 
-  bool overBudget = stats.numIndirectRounds >= options.maxIndirectRounds;
   bool bindsThisRound = false;
   for (IndirectDecision &decision : decisions) {
     TUCallSite &call = *decision.call;
@@ -745,9 +904,20 @@ bool PointsToAnalysis::resolveIndirectCalls(bool finalize, bool &bound) {
       applyUnknownCall(call, call.unresolvedWhy);
       continue;
     }
+    bool fallback = false;
     for (FlatSymbolRefAttr target : decision.newTargets) {
       call.targets.push_back(target);
       auto func = symbols.lookupNearestSymbolFrom<cir::FuncOp>(module, target);
+      if (options.mode == PointsToMode::BU && isAnalysed(func)) {
+        // The target's graph is copied, or the call bound to it (see
+        // PointsToBottomUp.cpp); a target still being analysed is a cycle
+        // that cannot be bound yet.
+        if (bindBottomUp(call, *decision.owner, func) == BindResult::Fallback)
+          fallback = true;
+        ++stats.numIndirectTargetsBound;
+        bindsThisRound = true;
+        continue;
+      }
       if (const TUFunction *callee =
               func ? functionMap.lookup(func.getOperation()) : nullptr) {
         bindCall(call, *callee, /*dryRun=*/false);
@@ -755,22 +925,45 @@ bool PointsToAnalysis::resolveIndirectCalls(bool finalize, bool &bound) {
         bindsThisRound = true;
         continue;
       }
-      applyDeclarationTarget(call, target, func);
+      applyDeclarationTarget(call, target, func, decision.owner);
+    }
+    if (fallback) {
+      // SOUNDNESS: a target whose graph is still being built cannot be
+      // copied (the copy would miss what is added to it later) nor bound to
+      // (its callers would copy it unfinished). The call gets the
+      // unknown-call rule instead, and markEscapedFunctions makes the
+      // formals of its targets Incomplete: the target has a caller that is
+      // not bound to it.
+      ++stats.numCycleFallbacks;
+      call.resolution = CallResolution::IndirectUnresolved;
+      call.unresolvedWhy = graph->makeReason(
+          Reason::Kind::IndirectUnresolved, call.site.call,
+          "a target is still being analysed: recursion through an indirect "
+          "call");
+      applyUnknownCall(call, call.unresolvedWhy);
     }
   }
-  if (bindsThisRound) {
-    ++stats.numIndirectRounds;
+  if (bindsThisRound)
     bound = true;
-  }
   return true;
 }
 
 void PointsToAnalysis::applyDeclarationTarget(TUCallSite &call,
                                               FlatSymbolRefAttr target,
-                                              cir::FuncOp calleeOrNull) {
+                                              cir::FuncOp calleeOrNull,
+                                              TUFunction *owner) {
   // The same effect a direct call to the declaration got in the local phase,
   // on the TU graph.
   auto op = cast<CIRCallOpInterface>(call.site.call);
+  size_t numTransfers = memTransfers.size();
+  llvm::scope_exit noteTransfers([&] {
+    // BU: the copies a model records belong to the graph of the call.
+    if (options.mode != PointsToMode::BU || !owner)
+      return;
+    Partition &partition = partitions[findPartition(owner->scc)];
+    for (size_t i = numTransfers; i < memTransfers.size(); ++i)
+      partition.transfers.push_back(i);
+  });
   if (models)
     if (const PointsToModel *model =
             models->lookup(op, calleeOrNull, target.getValue())) {
@@ -855,8 +1048,9 @@ bool PointsToAnalysis::markEscapedFunctions() {
       consider(sym, node->getReason(NodeFlags::External));
   }
   const Reason *unknownTargetWhy = nullptr;
-  for (std::unique_ptr<TUFunction> &fn : functions)
-    for (TUCallSite &call : fn->callSites) {
+  for (auto [callPtr, owner] : allCallSites()) {
+    TUCallSite &call = *callPtr;
+    {
       if (call.resolution != CallResolution::IndirectUnresolved)
         continue;
       for (FlatSymbolRefAttr target : call.targets)
@@ -877,6 +1071,7 @@ bool PointsToAnalysis::markEscapedFunctions() {
       if (unknownTarget && !unknownTargetWhy)
         unknownTargetWhy = call.unresolvedWhy;
     }
+  }
   if (unknownTargetWhy) {
     // Every node reachable from a global another TU can name.
     llvm::DenseSet<const Node *> visited;
@@ -983,8 +1178,9 @@ bool PointsToAnalysis::clobberGlobals() {
   constexpr NodeFlags clobber =
       NodeFlags::External | NodeFlags::Mod | NodeFlags::Ref;
   bool changed = false;
-  for (std::unique_ptr<TUFunction> &fn : functions)
-    for (TUCallSite &call : fn->callSites) {
+  for (auto [callPtr, owner] : allCallSites()) {
+    TUCallSite &call = *callPtr;
+    {
       if (!call.site.clobbersGlobals)
         continue;
       ++stats.numClobberingCalls;
@@ -1001,6 +1197,7 @@ bool PointsToAnalysis::clobberGlobals() {
         graph->addFlags(cell, clobber, why);
       }
     }
+  }
   return changed;
 }
 
@@ -1067,10 +1264,15 @@ void PointsToAnalysis::computeRecursion() {
   for (auto [i, fn] : llvm::enumerate(functions)) {
     nodes[i].index = i;
     root.callees.push_back(&nodes[i]);
-    for (const TUCallSite &call : fn->callSites)
-      forEachBoundCallee(call, indexOf, symbols, module, [&](unsigned callee) {
-        nodes[i].callees.push_back(&nodes[callee]);
-      });
+  }
+  // BU: a site inherited from a copy calls from the function that holds its
+  // op, not from the one whose graph got it.
+  for (auto [call, owner] : allCallSites()) {
+    unsigned caller = indexOf.lookup(
+        call->site.call->getParentOfType<cir::FuncOp>().getOperation());
+    forEachBoundCallee(*call, indexOf, symbols, module, [&](unsigned callee) {
+      nodes[caller].callees.push_back(&nodes[callee]);
+    });
   }
   for (auto it = llvm::scc_begin(&root); !it.isAtEnd(); ++it) {
     if (!it.hasCycle())
@@ -1175,16 +1377,24 @@ void PointsToAnalysis::markSummaries() {
   SmallVector<unsigned, 0> numCallSites(n, 0);
   SmallVector<Operation *, 0> secondCallSite(n, nullptr);
   SmallVector<SmallVector<std::pair<unsigned, Operation *>, 4>, 0> callees(n);
-  for (auto [i, fn] : llvm::enumerate(functions))
-    for (const TUCallSite &call : fn->callSites)
-      forEachBoundCallee(call, indexOf, symbols, module, [&](unsigned callee) {
-        callees[i].emplace_back(callee, call.site.call);
-        if (++numCallSites[callee] == 2)
-          secondCallSite[callee] = call.site.call;
-        if (!runsMany[callee] && loops.isInLoop(call.site.call))
-          runsMany[callee] = reasons.make(Reason::Kind::SummaryObject,
-                                          call.site.call, "called in a loop");
-      });
+  // One edge per (call op, callee): BU sites inherited from copies repeat
+  // the op of the site they were copied from.
+  llvm::DenseSet<std::pair<Operation *, unsigned>> edges;
+  for (auto [callPtr, owner] : allCallSites()) {
+    const TUCallSite &call = *callPtr;
+    unsigned i = indexOf.lookup(
+        call.site.call->getParentOfType<cir::FuncOp>().getOperation());
+    forEachBoundCallee(call, indexOf, symbols, module, [&](unsigned callee) {
+      if (!edges.insert({call.site.call, callee}).second)
+        return;
+      callees[i].emplace_back(callee, call.site.call);
+      if (++numCallSites[callee] == 2)
+        secondCallSite[callee] = call.site.call;
+      if (!runsMany[callee] && loops.isInLoop(call.site.call))
+        runsMany[callee] = reasons.make(Reason::Kind::SummaryObject,
+                                        call.site.call, "called in a loop");
+    });
+  }
   llvm::DenseSet<StringRef> addressTaken;
   for (auto [sym, node] : globals->getSymbolNodes())
     addressTaken.insert(sym.getValue());
@@ -1229,12 +1439,47 @@ void PointsToAnalysis::markSummaries() {
       continue;
     for (const TUCallSite &call : fn->callSites)
       if (call.resolution == CallResolution::Unknown ||
-          call.resolution == CallResolution::IndirectUnresolved) {
+          call.resolution == CallResolution::IndirectUnresolved ||
+          call.fallback) {
         reentered[i] = reasons.make(Reason::Kind::SummaryObject, call.site.call,
                                     "may be re-entered through unknown code");
         break;
       }
   }
+
+  // BU: a heap object cloned into a calling context (Origin::ctx) is made
+  // once per execution of that path in an activation of the function whose
+  // graph holds it, the one holding the outermost call. It stands for
+  // several live objects only if the path may run more than once in that
+  // activation (a call on it in a loop, or in a recursive function), or if
+  // that function itself runs several times (runsMany, the rule above for
+  // its own heap objects: objects of two activations meet through the
+  // memory that outlives them). Several calling contexts are several nodes,
+  // so "several callers" of the allocating function no longer makes it a
+  // summary. A stack object keeps the rules of its own function: two
+  // activations of it at one call path are not live at the same time
+  // unless it is recursive or re-entered.
+  auto contextSummary = [&](const Origin &origin) -> const Reason * {
+    SmallVector<Operation *, 4> path = callPaths.getPath(origin.ctx);
+    for (Operation *call : path) {
+      if (loops.isInLoop(call))
+        return reasons.make(Reason::Kind::SummaryObject, call,
+                            "called in a loop");
+      auto caller = call->getParentOfType<cir::FuncOp>();
+      if (const Reason *rec =
+              caller ? recursive.lookup(caller.getOperation()) : nullptr)
+        return reasons.make(Reason::Kind::SummaryObject, origin.site,
+                            "recursion", rec);
+    }
+    auto owner = path.front()->getParentOfType<cir::FuncOp>();
+    auto it = owner ? indexOf.find(owner.getOperation()) : indexOf.end();
+    if (it == indexOf.end())
+      return nullptr;
+    if (runsMany[it->second])
+      return reasons.make(Reason::Kind::SummaryObject, origin.site,
+                          "several callers", runsMany[it->second]);
+    return nullptr;
+  };
 
   // The reason \p node is a summary, or null.
   auto summaryReason = [&](const Node *node) -> const Reason * {
@@ -1261,6 +1506,8 @@ void PointsToAnalysis::markSummaries() {
     if (const Reason *rec = recursive.lookup(func.getOperation()))
       return reasons.make(Reason::Kind::SummaryObject, origin.site, "recursion",
                           rec);
+    if (heap && origin.ctx)
+      return contextSummary(origin);
     if (heap && runsMany[it->second])
       return reasons.make(Reason::Kind::SummaryObject, origin.site,
                           "several callers", runsMany[it->second]);
