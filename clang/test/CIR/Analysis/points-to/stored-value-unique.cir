@@ -1,0 +1,75 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Stored values (T22): one store of 1024, then a load of it, gives the
+// constant, complete. A spill slot (a value stored, reloaded and stored
+// again) is read through; a value stored by a narrower-typed store reads as
+// the constant of the load's type when only the signedness differs; an
+// integral cast of a constant folds; a memset of zero reads as zero.
+
+// CHECK-LABEL: === values
+// CHECK-NEXT: x: {#cir.int<1024> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: spilled: {#cir.int<1024> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: unsigned: {#cir.int<4294967295> : !cir.int<u, 32>} defs=0 complete
+// CHECK-NEXT: widened: {#cir.int<1024> : !cir.int<u, 64>} defs=0 complete
+// CHECK-NEXT: zeroed: {#cir.int<0> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: param: {} defs=1 complete
+
+!s32i = !cir.int<s, 32>
+!u32i = !cir.int<u, 32>
+!u8i = !cir.int<u, 8>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+
+module {
+cir.func @unique() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %c = cir.const #cir.int<1024> : !s32i
+  cir.store %c, %x : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "x"}
+  cir.return %v : !s32i
+}
+cir.func @spill() -> !s32i {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %c = cir.const #cir.int<1024> : !s32i
+  cir.store %c, %a : !s32i, !cir.ptr<!s32i>
+  %t = cir.load %a : !cir.ptr<!s32i>, !s32i
+  cir.store %t, %b : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %b : !cir.ptr<!s32i>, !s32i {test.load = "spilled"}
+  cir.return %v : !s32i
+}
+cir.func @signedness() -> !u32i {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %c = cir.const #cir.int<-1> : !s32i
+  cir.store %c, %a : !s32i, !cir.ptr<!s32i>
+  %u = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!u32i>
+  %v = cir.load %u : !cir.ptr<!u32i>, !u32i {test.load = "unsigned"}
+  cir.return %v : !u32i
+}
+cir.func @cast() -> !u64i {
+  %a = cir.alloca "a" align(8) : !cir.ptr<!u64i>
+  %c = cir.const #cir.int<1024> : !s32i
+  %w = cir.cast integral %c : !s32i -> !u64i
+  cir.store %w, %a : !u64i, !cir.ptr<!u64i>
+  %v = cir.load %a : !cir.ptr<!u64i>, !u64i {test.load = "widened"}
+  cir.return %v : !u64i
+}
+cir.func @memset() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %p = cir.cast bitcast %x : !cir.ptr<!s32i> -> !cir.ptr<!void>
+  %b = cir.const #cir.int<0> : !u8i
+  %n = cir.const #cir.int<4> : !u64i
+  cir.libc.memset %n bytes at %p to %b : !cir.ptr<!void>, !u8i, !u64i
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "zeroed"}
+  cir.return %v : !s32i
+}
+// A parameter spilled to its slot: the SSA value (a def), not a constant.
+cir.func @param(%arg: !s32i) -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  cir.store %arg, %x : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "param"}
+  cir.return %v : !s32i
+}
+}

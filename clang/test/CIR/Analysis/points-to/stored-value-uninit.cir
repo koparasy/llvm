@@ -1,0 +1,50 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Stored values (T22), the indeterminate-value rule: an automatic or
+// dynamic object starts with an indeterminate value, and reading one is UB
+// (C++20 [basic.indet]p2; C17 6.7.9p10, and 7.22.3.4p2 for malloc), so a
+// load that no write reaches is complete and empty: no value a UB-free
+// program can read. For the same reason, a store on one path only gives its
+// value alone (the other path's read would be UB), and malloc's storage is
+// indeterminate while calloc's is not (a write of an unknown value here).
+
+// CHECK-LABEL: === values
+// CHECK-NEXT: never: {} defs=0 complete
+// CHECK-NEXT: one.path: {#cir.int<5> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: malloc: {} defs=0 complete
+// CHECK-NEXT: calloc: {} defs=0 incomplete (EscapedTo, "written with an unknown value")
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+
+module {
+cir.func private @malloc(!u64i) -> !cir.ptr<!void>
+cir.func private @calloc(!u64i, !u64i) -> !cir.ptr<!void>
+cir.func @never() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "never"}
+  cir.return %v : !s32i
+}
+cir.func @one_path(%c: !cir.bool) -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  cir.if %c {
+    %five = cir.const #cir.int<5> : !s32i
+    cir.store %five, %x : !s32i, !cir.ptr<!s32i>
+  }
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "one.path"}
+  cir.return %v : !s32i
+}
+cir.func @heap() -> !s32i {
+  %n = cir.const #cir.int<4> : !u64i
+  %one = cir.const #cir.int<1> : !u64i
+  %m = cir.call @malloc(%n) : (!u64i) -> !cir.ptr<!void>
+  %mp = cir.cast bitcast %m : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  %v = cir.load %mp : !cir.ptr<!s32i>, !s32i {test.load = "malloc"}
+  %c = cir.call @calloc(%one, %n) : (!u64i, !u64i) -> !cir.ptr<!void>
+  %cp = cir.cast bitcast %c : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  %w = cir.load %cp : !cir.ptr<!s32i>, !s32i {test.load = "calloc"}
+  cir.return %v : !s32i
+}
+}

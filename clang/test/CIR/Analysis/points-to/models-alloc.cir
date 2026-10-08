@@ -96,12 +96,13 @@ cir.func @do_posix_memalign() {
   cir.return
 }
 
-// strdup: a fresh Heap node; the source string is only read.
+// strdup: a fresh Heap node holding a copy of the string (Mod: a write of a
+// value the stored-value queries don't know); the source is only read.
 // __cxa_allocate_exception: a fresh Heap node too.
 
 // CHECK-LABEL: === @strdup_exception
 // CHECK-DAG: [[S:n[0-9]+]] [Stack|Ref] size=4 origins={stack(cir.alloca 's' {{.*}})} links={}
-// CHECK-DAG: [[D:n[0-9]+]] [Heap] size=0 origins={heap(cir.call {{.*}})} links={}
+// CHECK-DAG: [[D:n[0-9]+]] [Heap|Mod] size=0 origins={heap(cir.call {{.*}})} links={}
 // CHECK-DAG: [[E:n[0-9]+]] [Heap] size=24 origins={heap(cir.call {{.*}})} links={}
 // CHECK-DAG: call cir.call @strdup args={0: [[S]]+0} result=[[D]]+0 kind=modelled model=strdup
 // CHECK-DAG: call cir.call @__cxa_allocate_exception args={} result=[[E]]+0 kind=modelled model=cxa-allocate-exception

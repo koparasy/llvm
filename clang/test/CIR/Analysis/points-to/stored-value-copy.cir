@@ -1,0 +1,101 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Stored values (T22): a copy writes what its source holds at the same
+// offset. cir.copy of a struct, then cir.libc.memcpy of the copy, read a
+// field of the last one: the constant stored into the first (the answer
+// keeps the constants it saw even when it is incomplete). A whole
+// aggregate stored from a load reads through the load's source; a constant
+// aggregate gives its member. A memcpy of an unknown length from a fresh
+// source still reads the source (where it does not reach, the destination
+// stays indeterminate); a copy from an escaped object is incomplete. With
+// subobjects, a write to a member of a member (its own child node) is seen by
+// a read through the whole object's address (pointer-interconvertible).
+
+// CHECK-LABEL: === values
+// CHECK-NEXT: copy.b: {#cir.int<20> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: memcpy.a: {#cir.int<10> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: agg.b: {#cir.int<20> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: const.b: {#cir.int<8> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: dyn.a: {#cir.int<10> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: first.member: {#cir.int<5> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: escaped.a: {#cir.int<10> : !cir.int<s, 32>} defs=0 incomplete (EscapedTo, "@escape")
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_P = !cir.struct<"P" {data !s32i, data !s32i}>
+!rec_O = !cir.struct<"O" {data !rec_P, data !s32i}>
+
+module {
+cir.func private @escape(!cir.ptr<!rec_P>)
+cir.func @copies(%n: !u64i) {
+  %s = cir.alloca "s" align(4) : !cir.ptr<!rec_P>
+  %t = cir.alloca "t" align(4) : !cir.ptr<!rec_P>
+  %u = cir.alloca "u" align(4) : !cir.ptr<!rec_P>
+  %w = cir.alloca "w" align(4) : !cir.ptr<!rec_P>
+  %c10 = cir.const #cir.int<10> : !s32i
+  %c20 = cir.const #cir.int<20> : !s32i
+  %sa = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  %sb = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  cir.store %c10, %sa : !s32i, !cir.ptr<!s32i>
+  cir.store %c20, %sb : !s32i, !cir.ptr<!s32i>
+  cir.copy %s to %t : !cir.ptr<!rec_P>
+  %tb = cir.get_member %t[1] {name = "b"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  %v1 = cir.load %tb : !cir.ptr<!s32i>, !s32i {test.load = "copy.b"}
+  %tv = cir.cast bitcast %t : !cir.ptr<!rec_P> -> !cir.ptr<!void>
+  %uv = cir.cast bitcast %u : !cir.ptr<!rec_P> -> !cir.ptr<!void>
+  %eight = cir.const #cir.int<8> : !u64i
+  cir.libc.memcpy %eight bytes from %tv to %uv : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  %ua = cir.get_member %u[0] {name = "a"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  %v2 = cir.load %ua : !cir.ptr<!s32i>, !s32i {test.load = "memcpy.a"}
+  %agg = cir.load %s : !cir.ptr<!rec_P>, !rec_P
+  cir.store %agg, %w : !rec_P, !cir.ptr<!rec_P>
+  %wb = cir.get_member %w[1] {name = "b"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  %v3 = cir.load %wb : !cir.ptr<!s32i>, !s32i {test.load = "agg.b"}
+  cir.return
+}
+cir.func @constant() -> !s32i {
+  %k = cir.alloca "k" align(4) : !cir.ptr<!rec_P>
+  %c = cir.const #cir.const_record<{#cir.int<7> : !s32i, #cir.int<8> : !s32i}> : !rec_P
+  cir.store %c, %k : !rec_P, !cir.ptr<!rec_P>
+  %kb = cir.get_member %k[1] {name = "b"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  %v = cir.load %kb : !cir.ptr<!s32i>, !s32i {test.load = "const.b"}
+  cir.return %v : !s32i
+}
+cir.func @dynamic(%n: !u64i) -> !s32i {
+  %s = cir.alloca "s" align(4) : !cir.ptr<!rec_P>
+  %d = cir.alloca "d" align(4) : !cir.ptr<!rec_P>
+  %c10 = cir.const #cir.int<10> : !s32i
+  %sa = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  cir.store %c10, %sa : !s32i, !cir.ptr<!s32i>
+  %sv = cir.cast bitcast %s : !cir.ptr<!rec_P> -> !cir.ptr<!void>
+  %dv = cir.cast bitcast %d : !cir.ptr<!rec_P> -> !cir.ptr<!void>
+  cir.libc.memcpy %n bytes from %sv to %dv : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  %da = cir.get_member %d[0] {name = "a"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  %v = cir.load %da : !cir.ptr<!s32i>, !s32i {test.load = "dyn.a"}
+  cir.return %v : !s32i
+}
+cir.func @first_member() -> !s32i {
+  %o = cir.alloca "o" align(4) : !cir.ptr<!rec_O>
+  %in = cir.get_member %o[0] {name = "in"} : !cir.ptr<!rec_O> -> !cir.ptr<!rec_P>
+  %x = cir.get_member %in[0] {name = "a"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  %c5 = cir.const #cir.int<5> : !s32i
+  cir.store %c5, %x : !s32i, !cir.ptr<!s32i>
+  %whole = cir.cast bitcast %o : !cir.ptr<!rec_O> -> !cir.ptr<!s32i>
+  %v = cir.load %whole : !cir.ptr<!s32i>, !s32i {test.load = "first.member"}
+  cir.return %v : !s32i
+}
+cir.func @escaped() -> !s32i {
+  %s = cir.alloca "s" align(4) : !cir.ptr<!rec_P>
+  %d = cir.alloca "d" align(4) : !cir.ptr<!rec_P>
+  %c10 = cir.const #cir.int<10> : !s32i
+  %sa = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  cir.store %c10, %sa : !s32i, !cir.ptr<!s32i>
+  cir.call @escape(%s) : (!cir.ptr<!rec_P>) -> ()
+  cir.copy %s to %d : !cir.ptr<!rec_P>
+  %da = cir.get_member %d[0] {name = "a"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  %v = cir.load %da : !cir.ptr<!s32i>, !s32i {test.load = "escaped.a"}
+  cir.return %v : !s32i
+}
+}

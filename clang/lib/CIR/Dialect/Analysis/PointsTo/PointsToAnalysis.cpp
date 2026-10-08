@@ -13,6 +13,7 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/GlobalNodes.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/StoredValues.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
 #include "clang/CIR/Interfaces/CIRLoopOpInterface.h"
@@ -617,7 +618,12 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
       partition->transfers.push_back(memTransfers.size());
     memTransfers.push_back({record.op, map(record.dst), map(record.src),
                             record.length, record.ghosts});
+    // The copies a model made (the ops' own copies are read from the IR).
+    if (isa_and_present<CIRCallOpInterface>(record.op))
+      fn->modelTransfers.push_back(memTransfers.back());
   }
+  for (const ModelWrite &write : fg->modelWrites)
+    fn->modelWrites.push_back({write.op, map(write.cell), write.reachable});
   for (const LaunchRecord &local : fg->launches) {
     LaunchRecord launch = local;
     launch.closure = mapOpt(local.closure);
@@ -1077,7 +1083,23 @@ void PointsToAnalysis::applyDeclarationTarget(TUCallSite &call,
       site.callee = target;
       SmallVector<DeferredEffect, 0> deferred;
       ModelContext ctx(*graph, *dataLayout, deferred, memTransfers);
+      // The writes belong to the graph of the call: the owner's (BU), or
+      // the one of the function holding it.
+      TUFunction *holder = owner;
+      if (!holder)
+        if (auto func = op->getParentOfType<cir::FuncOp>())
+          holder = functionMap.lookup(func.getOperation());
+      SmallVector<ModelWrite, 0> writes;
+      ctx.setWriteSink(&writes);
       model->apply(site, ctx);
+      finishModelWrites(*model, site, writes, 0);
+      if (holder) {
+        llvm::append_range(holder->modelWrites, writes);
+        for (size_t i = numTransfers; i < memTransfers.size(); ++i)
+          holder->modelTransfers.push_back(memTransfers[i]);
+      } else if (!writes.empty() || numTransfers != memTransfers.size()) {
+        unownedModelWrites = true;
+      }
       call.site.clobbersGlobals |= site.clobbersGlobals;
       call.site.modelled = model->name();
       for (const DeferredEffect &effect : deferred) {

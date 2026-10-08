@@ -1,0 +1,61 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Stored values (T22), unknown writers: an object passed to a function we
+// don't see may be written with anything (incomplete, the escape is the
+// reason), and so may an object reachable from it. A model that only reads
+// (strlen) keeps the answer complete; a defined callee's own stores are seen
+// in its body.
+
+// CHECK-LABEL: === values
+// CHECK-NEXT: escaped: {#cir.int<1> : !cir.int<s, 32>} defs=0 incomplete (EscapedTo, "@escape")
+// CHECK-NEXT: reachable: {#cir.int<2> : !cir.int<s, 32>} defs=0 incomplete (EscapedTo, "reachable from an escaped pointer")
+// CHECK-NEXT: read.only: {#cir.int<3> : !cir.int<s, 32>} defs=0 complete
+// The two constants come in either order (CI binds the callee, BU reads its
+// copy).
+// CHECK-NEXT: callee: {{[{]}}{{(#cir.int<4> : !cir.int<s, 32>, #cir.int<8> : !cir.int<s, 32>|#cir.int<8> : !cir.int<s, 32>, #cir.int<4> : !cir.int<s, 32>)}}{{[}]}} defs=0 complete
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!s8i = !cir.int<s, 8>
+
+module {
+cir.func private @escape(!cir.ptr<!s32i>)
+cir.func private @escape_pp(!cir.ptr<!cir.ptr<!s32i>>)
+cir.func private @strlen(!cir.ptr<!s8i>) -> !u64i
+cir.func internal @set8(%p: !cir.ptr<!s32i>) {
+  %c = cir.const #cir.int<8> : !s32i
+  cir.store %c, %p : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func @f() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %c1 = cir.const #cir.int<1> : !s32i
+  cir.store %c1, %x : !s32i, !cir.ptr<!s32i>
+  cir.call @escape(%x) : (!cir.ptr<!s32i>) -> ()
+  %v1 = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "escaped"}
+
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %py = cir.alloca "py" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %c2 = cir.const #cir.int<2> : !s32i
+  cir.store %c2, %y : !s32i, !cir.ptr<!s32i>
+  cir.store %y, %py : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape_pp(%py) : (!cir.ptr<!cir.ptr<!s32i>>) -> ()
+  %v2 = cir.load %y : !cir.ptr<!s32i>, !s32i {test.load = "reachable"}
+
+  %s = cir.alloca "s" align(4) : !cir.ptr<!s32i>
+  %c3 = cir.const #cir.int<3> : !s32i
+  cir.store %c3, %s : !s32i, !cir.ptr<!s32i>
+  %sc = cir.cast bitcast %s : !cir.ptr<!s32i> -> !cir.ptr<!s8i>
+  %n = cir.call @strlen(%sc) : (!cir.ptr<!s8i>) -> !u64i
+  %v3 = cir.load %s : !cir.ptr<!s32i>, !s32i {test.load = "read.only"}
+
+  %w = cir.alloca "w" align(4) : !cir.ptr<!s32i>
+  %c4 = cir.const #cir.int<4> : !s32i
+  cir.store %c4, %w : !s32i, !cir.ptr<!s32i>
+  cir.call @set8(%w) : (!cir.ptr<!s32i>) -> ()
+  %v4 = cir.load %w : !cir.ptr<!s32i>, !s32i {test.load = "callee"}
+  cir.return
+}
+}

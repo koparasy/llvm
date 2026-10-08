@@ -106,6 +106,20 @@ struct MemTransferRecord {
   bool ghosts = true;
 };
 
+/// A write a library model makes whose value the analysis does not know
+/// (ModelContext::modRef with Mod, a deferred effect with Mod, or, for a model
+/// that does not declare all of its writes, every object its call is handed):
+/// the stored-value queries (StoredValues.h) read the cell as unknown. The
+/// copies a model records are MemTransferRecords instead.
+struct ModelWrite {
+  /// The modelled call.
+  mlir::Operation *op = nullptr;
+  /// The object written: anywhere in the node of the cell.
+  Cell cell;
+  /// Also every node reachable from it (a deferred Reachable effect).
+  bool reachable = false;
+};
+
 /// Apply the copies \p transfers to \p graph until no link changes (see
 /// MemTransferRecord). Return false if that took too many rounds and every
 /// copy was done field-insensitively instead. A side whose node is collapsed
@@ -303,6 +317,8 @@ public:
   llvm::SmallVector<MemTransferRecord, 0> memTransfers;
   /// The kernel launches the models recorded, in walk order.
   llvm::SmallVector<LaunchRecord, 0> launches;
+  /// The writes of unknown value the models made, in walk order.
+  llvm::SmallVector<ModelWrite, 0> modelWrites;
   /// The node of each global and function symbol the graph names (its
   /// storage starts at the cell), sorted by symbol name. The
   /// interprocedural phase unifies the copies of one symbol across graphs.

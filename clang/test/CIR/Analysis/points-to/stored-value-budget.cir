@@ -1,0 +1,56 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=FULL
+// RUN: cir-opt %s -test-cir-points-to='mode=bu values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=FULL
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 max-query-visits=4 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CUT
+// RUN: cir-opt %s -test-cir-points-to='mode=bu values=1 max-query-visits=4 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CUT
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CYCLE
+
+// Stored values (T22), the budget: a value copied through eight objects
+// (cir.copy) is read back through the chain of copies, one cell visited per
+// copy. With the default budget (maxQueryVisits, 4096) that is the constant;
+// with 4 visits the query stops, incomplete for Reason Budget. Two objects
+// copied into each other form a cycle: the cell in progress reads as
+// incomplete rather than as nothing.
+
+// FULL-LABEL: === values
+// FULL-NEXT: chain: {#cir.int<42> : !cir.int<s, 32>} defs=0 complete
+// CUT-LABEL: === values
+// CUT-NEXT: chain: {} defs=0 incomplete (Budget, "stored-value query visits")
+// CYCLE: cycle: {#cir.int<1> : !cir.int<s, 32>} defs=0 incomplete (MergedAt, "a cycle of copies")
+
+!s32i = !cir.int<s, 32>
+
+module {
+cir.func @chain() -> !s32i {
+  %a0 = cir.alloca "a0" align(4) : !cir.ptr<!s32i>
+  %a1 = cir.alloca "a1" align(4) : !cir.ptr<!s32i>
+  %a2 = cir.alloca "a2" align(4) : !cir.ptr<!s32i>
+  %a3 = cir.alloca "a3" align(4) : !cir.ptr<!s32i>
+  %a4 = cir.alloca "a4" align(4) : !cir.ptr<!s32i>
+  %a5 = cir.alloca "a5" align(4) : !cir.ptr<!s32i>
+  %a6 = cir.alloca "a6" align(4) : !cir.ptr<!s32i>
+  %a7 = cir.alloca "a7" align(4) : !cir.ptr<!s32i>
+  %a8 = cir.alloca "a8" align(4) : !cir.ptr<!s32i>
+  %c = cir.const #cir.int<42> : !s32i
+  cir.store %c, %a0 : !s32i, !cir.ptr<!s32i>
+  cir.copy %a0 to %a1 : !cir.ptr<!s32i>
+  cir.copy %a1 to %a2 : !cir.ptr<!s32i>
+  cir.copy %a2 to %a3 : !cir.ptr<!s32i>
+  cir.copy %a3 to %a4 : !cir.ptr<!s32i>
+  cir.copy %a4 to %a5 : !cir.ptr<!s32i>
+  cir.copy %a5 to %a6 : !cir.ptr<!s32i>
+  cir.copy %a6 to %a7 : !cir.ptr<!s32i>
+  cir.copy %a7 to %a8 : !cir.ptr<!s32i>
+  %v = cir.load %a8 : !cir.ptr<!s32i>, !s32i {test.load = "chain"}
+  cir.return %v : !s32i
+}
+cir.func @cycle() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %c = cir.const #cir.int<1> : !s32i
+  cir.store %c, %x : !s32i, !cir.ptr<!s32i>
+  cir.copy %x to %y : !cir.ptr<!s32i>
+  cir.copy %y to %x : !cir.ptr<!s32i>
+  %v = cir.load %y : !cir.ptr<!s32i>, !s32i {test.load = "cycle"}
+  cir.return %v : !s32i
+}
+}

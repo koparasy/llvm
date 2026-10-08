@@ -156,10 +156,11 @@ bool PointsToAnalysis::mapThroughClone(const TUClone &clone,
 
 PointsToAnalysis::ContextWalkResult PointsToAnalysis::forEachContext(
     const TUFunction &fn, ArrayRef<RootGroup> roots,
-    function_ref<bool(ArrayRef<RootGroup>)> leaf, unsigned &numContexts) const {
+    function_ref<bool(const TUFunction &, ArrayRef<RootGroup>)> leaf,
+    unsigned &numContexts) const {
   ContextWalkResult result = ContextWalkResult::Done;
   // Answer the leaf with the reach groups closed in the graph they are in.
-  auto visitLeaf = [&](ArrayRef<RootGroup> groups) {
+  auto visitLeaf = [&](const TUFunction &at, ArrayRef<RootGroup> groups) {
     if (++numContexts > options.maxQueryContexts) {
       result = ContextWalkResult::OverBudget;
       return;
@@ -174,14 +175,14 @@ PointsToAnalysis::ContextWalkResult PointsToAnalysis::forEachContext(
       for (const Node *node : reach)
         group.cells.push_back(Cell(const_cast<Node *>(node)));
     }
-    if (!leaf(closed))
+    if (!leaf(at, closed))
       result = ContextWalkResult::Stopped;
   };
   std::function<void(const TUFunction &, ArrayRef<RootGroup>, unsigned)> walk =
       [&](const TUFunction &at, ArrayRef<RootGroup> groups, unsigned depth) {
         auto copies = coveredClones.find(&at);
         if (copies == coveredClones.end() || depth >= kMaxContextDepth) {
-          visitLeaf(groups);
+          visitLeaf(at, groups);
           return;
         }
         // The reach groups, closed in this graph once for all the copies.
@@ -210,7 +211,7 @@ PointsToAnalysis::ContextWalkResult PointsToAnalysis::forEachContext(
           }
           // SOUNDNESS: this graph is sound for this context too.
           if (!faithful) {
-            visitLeaf(groups);
+            visitLeaf(at, groups);
             continue;
           }
           walk(*clone->caller, mapped, depth + 1);
@@ -259,7 +260,7 @@ std::optional<AliasAnswer>
 PointsToAnalysis::aliasInContexts(const TUFunction &fn, Cell a, Cell b,
                                   uint64_t sizeA, uint64_t sizeB) const {
   std::optional<AliasResult> meet;
-  auto leaf = [&](ArrayRef<RootGroup> groups) {
+  auto leaf = [&](const TUFunction &, ArrayRef<RootGroup> groups) {
     for (Cell cellA : groups[0].cells)
       for (Cell cellB : groups[1].cells) {
         AliasResult result = aliasCells(cellA, cellB, sizeA, sizeB).result;
@@ -292,7 +293,7 @@ ObjectSet PointsToAnalysis::pointsToInContexts(Value value,
   if (!fn)
     return own;
   ObjectSet set;
-  auto leaf = [&](ArrayRef<RootGroup> groups) {
+  auto leaf = [&](const TUFunction &, ArrayRef<RootGroup> groups) {
     for (Cell cell : groups[0].cells) {
       if (!llvm::is_contained(set.cells, cell))
         set.cells.push_back(cell);
@@ -335,7 +336,7 @@ PointsToAnalysis::getModRefInContexts(const TUFunction &fn, Operation *call,
   groups[1].reach = true;
   collectCallRoots(*site, groups[1].cells, groups[1].cells);
   std::optional<ModRefResult> join;
-  auto leaf = [&](ArrayRef<RootGroup> leafGroups) {
+  auto leaf = [&](const TUFunction &, ArrayRef<RootGroup> leafGroups) {
     llvm::DenseSet<const Node *> reach;
     for (Cell cell : leafGroups[1].cells)
       reach.insert(cell.getNode());

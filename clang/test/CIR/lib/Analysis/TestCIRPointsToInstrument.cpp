@@ -38,10 +38,20 @@
 //     constant non-zero size: on every path through the check both accesses
 //     run, so the claim is about these two values.
 //
+//  6. with values=1, for every cir.load of an integer, bool, floating-point
+//     or pointer value for which PointsToAnalysis::isConstantAt gives a
+//     constant c (StoredValues.h), inserts after the load
+//       cir.call @__cir_pt_check_value(loaded, c, id)
+//     with both values as their bits in a !u64i (floating-point values
+//     bitcast, pointers converted). Value ids are their own sequence, in
+//     module order; the table lines read "value <id> @<func> <c> load(<def>)
+//     at <loc>".
+//
 // The runtime (clang/test/CIR/Analysis/points-to/Inputs/pt_check_runtime.c)
 // aborts with "PT-VIOLATION <id>" if the two byte ranges of a NoAlias pair
 // overlap, and with "PT-MUST-VIOLATION <id>" if the two addresses of a
-// MustAlias pair differ. A violation is an unsound answer, and the side
+// MustAlias pair differ, and with "PT-VALUE-VIOLATION <id>" if a load
+// claimed constant reads another value. A violation is an unsound answer, and the side
 // table names the pair; its MustAlias lines read "<id> @<func> must <rule>
 // ...".
 //
@@ -60,6 +70,10 @@
 //   print-candidates=1        also write every candidate that is not
 //                             checked, prefixed with "cand", with its answer
 //   must=0                    do not check the MustAlias answers
+//   values=1                  also check the constants of the loads
+//   inject-wrong-value=<id>   test only: check value <id> against its
+//                             constant plus one (a negative control: the
+//                             run must abort)
 //   inject-false-noalias=<id> test only: treat candidate <id> as NoAlias
 //                             (and always check it), whatever the analysis
 //                             says. A negative control: when the pair
@@ -77,6 +91,7 @@
 #include "clang/CIR/Dialect/Analysis/CIRPointerDecomposition.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/StoredValues.h"
 #include "clang/CIR/Dialect/Builder/CIRBaseBuilder.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/ADT/StringMap.h"
@@ -95,6 +110,7 @@ namespace {
 
 constexpr llvm::StringLiteral kCheckName = "__cir_pt_check";
 constexpr llvm::StringLiteral kMustCheckName = "__cir_pt_check_must";
+constexpr llvm::StringLiteral kValueCheckName = "__cir_pt_check_value";
 constexpr uint64_t kNoInjection = std::numeric_limits<uint64_t>::max();
 
 /// One address operand of a memory access.
@@ -222,6 +238,14 @@ struct TestCIRPointsToInstrumentPass
       *this, "print-candidates",
       llvm::cl::desc("Also write the candidates that are not checked"),
       llvm::cl::init(false)};
+  Option<bool> checkValues{
+      *this, "values",
+      llvm::cl::desc("Also check the constants of the loads (isConstantAt)"),
+      llvm::cl::init(false)};
+  Option<uint64_t> injectWrongValue{
+      *this, "inject-wrong-value",
+      llvm::cl::desc("Test only: check this value against a wrong constant"),
+      llvm::cl::init(kNoInjection)};
   Option<uint64_t> injectFalseNoAlias{
       *this, "inject-false-noalias",
       llvm::cl::desc("Test only: check this candidate as if it were NoAlias"),
@@ -451,6 +475,51 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
     plans.push_back(std::move(plan));
   }
 
+  // The constants of the loads (values=1), asked before the IR changes.
+  struct ValueCheck {
+    cir::LoadOp load;
+    TypedAttr constant;
+    uint64_t id;
+  };
+  SmallVector<ValueCheck> valueChecks;
+  if (checkValues) {
+    auto checkable = [&](Type type) {
+      if (isa<cir::BoolType, cir::PointerType>(type))
+        return true;
+      if (auto intTy = dyn_cast<cir::IntType>(type))
+        return intTy.getWidth() <= 64;
+      if (auto fpTy = dyn_cast<cir::FPTypeInterface>(type)) {
+        unsigned width = llvm::APFloat::getSizeInBits(fpTy.getFloatSemantics());
+        return width == 32 || width == 64;
+      }
+      return false;
+    };
+    uint64_t nextValueId = 0;
+    for (FunctionPlan &plan : plans)
+      plan.func.walk([&](cir::LoadOp load) {
+        auto ptrTy = dyn_cast<cir::PointerType>(load.getAddr().getType());
+        if (!ptrTy || ptrTy.getAddrSpace() || !checkable(load.getType()))
+          return;
+        std::optional<TypedAttr> c =
+            pt.isConstantAt(load.getAddr(), std::nullopt, load.getType());
+        if (!c)
+          return;
+        // A pointer constant: only null is checkable as bits.
+        if (auto ptr = dyn_cast<cir::ConstPtrAttr>(*c); ptr && !ptr.isNullValue())
+          return;
+        if (!isa<cir::IntAttr, cir::BoolAttr, cir::FPAttr, cir::ConstPtrAttr>(
+                *c))
+          return;
+        ValueCheck check{load, *c, nextValueId++};
+        if (table)
+          *table << "value " << check.id << " @"
+                 << plan.func.getSymName() << " " << check.constant << " load("
+                 << describeValue(load.getAddr()) << ") at "
+                 << formatLoc(load.getLoc()) << "\n";
+        valueChecks.push_back(check);
+      });
+  }
+
   // Instrument.
   cir::CIRBaseBuilderTy builder(*ctx);
   cir::PointerType voidPtrTy = builder.getVoidPtrTy();
@@ -510,10 +579,51 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
       }
   }
 
+  if (!valueChecks.empty()) {
+    cir::FuncOp check = declare(kValueCheckName, {u64Ty, u64Ty, u64Ty});
+    // The bits of \p value, of the load's type, in a !u64i.
+    auto bits = [&](Location loc, Value value) -> Value {
+      Type type = value.getType();
+      if (isa<cir::BoolType>(type))
+        return builder.createCast(loc, cir::CastKind::bool_to_int, value,
+                                  u64Ty);
+      if (isa<cir::PointerType>(type))
+        return builder.createPtrToInt(value, u64Ty);
+      if (auto fpTy = dyn_cast<cir::FPTypeInterface>(type)) {
+        unsigned width = llvm::APFloat::getSizeInBits(fpTy.getFloatSemantics());
+        Value raw = builder.createCast(loc, cir::CastKind::bitcast, value,
+                                       builder.getUIntNTy(width));
+        return width == 64 ? raw : builder.createIntCast(raw, u64Ty);
+      }
+      if (value.getType() == u64Ty)
+        return value;
+      return builder.createIntCast(value, u64Ty);
+    };
+    for (const ValueCheck &v : valueChecks) {
+      cir::LoadOp load = v.load;
+      Location loc = load.getLoc();
+      builder.setInsertionPointAfter(load);
+      TypedAttr expected = v.constant;
+      if (v.id == injectWrongValue) {
+        // The negative control: a constant that is not the one claimed.
+        if (auto i = dyn_cast<cir::IntAttr>(expected))
+          expected = cir::IntAttr::get(i.getType(), i.getValue() + 1);
+        else if (auto b = dyn_cast<cir::BoolAttr>(expected))
+          expected = cir::BoolAttr::get(ctx, !b.getValue());
+      }
+      Value constant = cir::ConstantOp::create(builder, loc, expected);
+      SmallVector<Value, 3> args{bits(loc, load.getResult()),
+                                 bits(loc, constant),
+                                 builder.getConstantInt(loc, u64Ty, v.id)};
+      builder.createCallOp(loc, check, args).setNothrow(true);
+    }
+  }
+
   if (table) {
     *table << "# functions " << plans.size() << " candidates " << numCandidates
            << " noalias " << numNoAlias << " checks " << numChecks << " must "
-           << numMust << " must-checks " << numMustChecks << "\n";
+           << numMust << " must-checks " << numMustChecks << " values "
+           << valueChecks.size() << "\n";
     SmallVector<std::pair<StringRef, unsigned>> rules;
     for (const auto &entry : checkedRules)
       rules.emplace_back(entry.getKey(), entry.getValue());

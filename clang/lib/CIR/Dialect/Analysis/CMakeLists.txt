@@ -13,6 +13,7 @@ add_clang_library(MLIRCIRAnalysis
   PointsTo/PointsToQueries.cpp
   PointsTo/PointsToTopDown.cpp
   PointsTo/PointsToVerifier.cpp
+  PointsTo/StoredValues.cpp
 
   LINK_LIBS PUBLIC
   MLIRCIR

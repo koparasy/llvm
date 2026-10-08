@@ -114,11 +114,20 @@ public:
   void setResultUnknown(const CallSiteRecord &site, NodeFlags status,
                         const Reason *why);
 
-  /// Defer an effect to the end of the walk (see DeferredEffect).
+  /// Defer an effect to the end of the walk (see DeferredEffect). An effect
+  /// with Mod is also a write of unknown value to what the cell reaches (see
+  /// setWriteSink).
   void defer(DeferredEffect::Kind kind, Cell cell, NodeFlags flags,
              const Reason *why) {
     deferred.push_back({kind, cell, flags, why});
+    if (writes && hasAny(flags, NodeFlags::Mod))
+      writes->push_back({nullptr, cell, /*reachable=*/true});
   }
+
+  /// Collect the writes of unknown value the model makes (modRef with Mod,
+  /// defer with Mod) into \p sink, with a null op; the caller fills the op
+  /// in (finishModelWrites).
+  void setWriteSink(llvm::SmallVectorImpl<ModelWrite> *sink) { writes = sink; }
 
   /// The unknown-call rule (LocalBuilder): what the pointer arguments reach
   /// escapes (Mod, Ref, deferred), the result is unknown, and the site
@@ -167,6 +176,7 @@ private:
   llvm::SmallVectorImpl<MemTransferRecord> &memTransfers;
   llvm::SmallVectorImpl<LaunchRecord> *launches = nullptr;
   llvm::SmallVectorImpl<CallSiteRecord> *extraCalls = nullptr;
+  llvm::SmallVectorImpl<ModelWrite> *writes = nullptr;
 };
 
 /// A library model.
@@ -193,6 +203,17 @@ public:
   /// binding the call to the body. False by default: a model applies to
   /// declarations only.
   virtual bool replacesDefinition() const { return false; }
+
+  /// Whether apply() reports every write it models to memory the caller can
+  /// see: through ModelContext::modRef or defer with Mod (a write of unknown
+  /// value), or addMemTransfer (a copy). The stored-value queries
+  /// (StoredValues.h) rely on it. False by default: every object the call is
+  /// handed (its pointer arguments, the pointer slots of its aggregate
+  /// arguments) and the object its pointer result points to are then read as
+  /// written with an unknown value. SOUNDNESS: a model that writes through
+  /// the graph directly (Graph::setLink on an argument, for instance) and
+  /// returns true here would hide that write from the stored-value queries.
+  virtual bool declaresAllWrites() const { return false; }
 
   /// The section of the standard the model relies on.
   virtual llvm::StringRef specCitation() const = 0;
@@ -242,6 +263,13 @@ private:
   llvm::SmallVector<const PointsToModel *, 2> predicates;
   const PointsToModelRegistry *fallback = nullptr;
 };
+
+/// After \p model applied to \p site with a write sink (ModelContext::
+/// setWriteSink) whose entries from \p first on it made: give them the op of
+/// the site, and, unless the model declaresAllWrites(), add a write of
+/// unknown value to every object the call is handed and to its result.
+void finishModelWrites(const PointsToModel &model, const CallSiteRecord &site,
+                       llvm::SmallVectorImpl<ModelWrite> &writes, size_t first);
 
 /// Register the generic C and C++ models: allocators, deallocators, the C
 /// string and memory functions, functions without a pointer effect (the

@@ -5,14 +5,17 @@
    empty range overlaps nothing. The check of a MustAlias pair: two
    addresses that differ mean the analysis claimed MustAlias for two
    accesses at different addresses: print "PT-MUST-VIOLATION <id>" and
-   abort. At exit, print "PT-CHECKS <n>", the number of overlap checks that
-   passed, and, if there were any, "PT-MUST-CHECKS <n>". */
+   abort. The check of a load the analysis claimed constant (values=1): a
+   loaded value that is not the constant (both as their bits) means a wrong
+   stored-value answer: print "PT-VALUE-VIOLATION <id>" and abort. At exit,
+   print "PT-CHECKS <n>", the number of overlap checks that passed, and, if
+   there were any, "PT-MUST-CHECKS <n>" and "PT-VALUE-CHECKS <n>". */
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-static unsigned long long pt_checks, pt_must_checks;
+static unsigned long long pt_checks, pt_must_checks, pt_value_checks;
 
 void __cir_pt_check(const void *p, uint64_t sa, const void *q, uint64_t sb,
                     uint64_t id) {
@@ -34,8 +37,19 @@ void __cir_pt_check_must(const void *p, const void *q, uint64_t id) {
   ++pt_must_checks;
 }
 
+void __cir_pt_check_value(uint64_t loaded, uint64_t expected, uint64_t id) {
+  if (loaded != expected) {
+    fprintf(stderr, "PT-VALUE-VIOLATION %llu\n", (unsigned long long)id);
+    fflush(stderr);
+    abort();
+  }
+  ++pt_value_checks;
+}
+
 __attribute__((destructor)) static void pt_report(void) {
   fprintf(stderr, "PT-CHECKS %llu\n", pt_checks);
   if (pt_must_checks)
     fprintf(stderr, "PT-MUST-CHECKS %llu\n", pt_must_checks);
+  if (pt_value_checks)
+    fprintf(stderr, "PT-VALUE-CHECKS %llu\n", pt_value_checks);
 }

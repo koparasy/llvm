@@ -1,0 +1,66 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Stored values (T22): a global starts with its initializer (or zero,
+// [basic.start.static]p2), which is always a write. An internal global
+// stored elsewhere gives both values; an untouched one its initializer; a
+// constant one its initializer, also inside a record or array initializer,
+// or past an array's explicit elements (a trailing zero). A global another
+// TU can write (external linkage, not constant) and an external declaration
+// are written by code we don't see: incomplete.
+
+// CHECK-LABEL: === values
+// CHECK-NEXT: init.and.store: {#cir.int<9> : !cir.int<s, 32>, #cir.int<7> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: init.only: {#cir.int<7> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: const.member: {#cir.int<2> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: const.elem: {#cir.int<30> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: trailing.zero: {#cir.int<0> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: zero.init: {#cir.int<0> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: visible: {#cir.int<1> : !cir.int<s, 32>} defs=0 incomplete (EscapedTo, "global visible to other TUs")
+// CHECK-NEXT: declared: {} defs=0 incomplete (EscapedTo, "global visible to other TUs")
+
+!s32i = !cir.int<s, 32>
+!rec_P = !cir.struct<"P" {data !s32i, data !s32i}>
+!arr4 = !cir.array<!s32i x 4>
+
+module {
+cir.global "private" internal @g = #cir.int<7> : !s32i
+cir.global "private" internal @h = #cir.int<7> : !s32i
+cir.global "private" constant internal @rec = #cir.const_record<{#cir.int<1> : !s32i, #cir.int<2> : !s32i}> : !rec_P
+cir.global "private" constant internal @arr = #cir.const_array<[#cir.int<10> : !s32i, #cir.int<20> : !s32i, #cir.int<30> : !s32i], trailing_zeros> : !arr4
+cir.global "private" internal @z = #cir.zero : !rec_P
+cir.global external @visible = #cir.int<1> : !s32i
+cir.global "private" external @declared : !s32i
+
+cir.func @setg() {
+  %g = cir.get_global @g : !cir.ptr<!s32i>
+  %c = cir.const #cir.int<9> : !s32i
+  cir.store %c, %g : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func @reads() {
+  %g = cir.get_global @g : !cir.ptr<!s32i>
+  %v1 = cir.load %g : !cir.ptr<!s32i>, !s32i {test.load = "init.and.store"}
+  %h = cir.get_global @h : !cir.ptr<!s32i>
+  %v2 = cir.load %h : !cir.ptr<!s32i>, !s32i {test.load = "init.only"}
+  %r = cir.get_global @rec : !cir.ptr<!rec_P>
+  %rb = cir.get_member %r[1] {name = "b"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  %v3 = cir.load %rb : !cir.ptr<!s32i>, !s32i {test.load = "const.member"}
+  %a = cir.get_global @arr : !cir.ptr<!arr4>
+  %two = cir.const #cir.int<2> : !s32i
+  %a2 = cir.get_element %a[%two : !s32i] : !cir.ptr<!arr4> -> !cir.ptr<!s32i>
+  %v4 = cir.load %a2 : !cir.ptr<!s32i>, !s32i {test.load = "const.elem"}
+  %three = cir.const #cir.int<3> : !s32i
+  %a3 = cir.get_element %a[%three : !s32i] : !cir.ptr<!arr4> -> !cir.ptr<!s32i>
+  %v5 = cir.load %a3 : !cir.ptr<!s32i>, !s32i {test.load = "trailing.zero"}
+  %z = cir.get_global @z : !cir.ptr<!rec_P>
+  %zb = cir.get_member %z[1] {name = "b"} : !cir.ptr<!rec_P> -> !cir.ptr<!s32i>
+  %v6 = cir.load %zb : !cir.ptr<!s32i>, !s32i {test.load = "zero.init"}
+  %vis = cir.get_global @visible : !cir.ptr<!s32i>
+  %v7 = cir.load %vis : !cir.ptr<!s32i>, !s32i {test.load = "visible"}
+  %d = cir.get_global @declared : !cir.ptr<!s32i>
+  %v8 = cir.load %d : !cir.ptr<!s32i>, !s32i {test.load = "declared"}
+  cir.return
+}
+}

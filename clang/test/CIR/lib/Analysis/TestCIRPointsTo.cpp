@@ -97,6 +97,16 @@
 //
 // closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU and
 // max-indirect-rounds=<n> PointsToAnalysisOptions::maxIndirectRounds.
+// values=1 (ci and bu modes) prints, even with print-graphs=0, what every
+// cir.load tagged with `test.load = "name"` may read (StoredValues.h:
+// PointsToAnalysis::valuesAtInContexts, the top-down union in bu mode):
+//
+//   === values
+//   <name>: {<const>, ...} defs=<n> complete|incomplete[ (<Kind>, "<detail>")]
+//       [contexts=<n>]
+//
+// max-query-visits=<n> sets the stored-value query budget.
+//
 // print-graphs=0 leaves out everything but the statistics, which end with one
 // line per unresolved indirect call: its location, its reason, and the first
 // reason the callee node got External or Incomplete. The statistics also
@@ -110,6 +120,7 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/StoredValues.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLHostFacts.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
@@ -193,6 +204,14 @@ struct TestCIRPointsToPass
       *this, "max-total-clone-nodes",
       llvm::cl::desc("In bu mode, the most nodes of all copies"),
       llvm::cl::init(PointsToAnalysisOptions().maxTotalCloneNodes)};
+
+  Option<bool> printValues{
+      *this, "values",
+      llvm::cl::desc("Print what each cir.load tagged test.load may read"),
+      llvm::cl::init(false)};
+  Option<unsigned> maxQueryVisits{
+      *this, "max-query-visits",
+      llvm::cl::desc("The stored-value query budget"), llvm::cl::init(4096)};
 
   void runOnOperation() override;
   void runLocal();
@@ -511,6 +530,84 @@ void TestCIRPointsToPass::runCI() {
             os << " < #" << parent;
           os << "\n";
         }
+      }
+    }
+
+    if (printValues) {
+      os << "=== values\n";
+      analysis.getStoredValueQuery().setMaxQueryVisits(maxQueryVisits);
+      module.walk([&](cir::LoadOp load) {
+        auto name = load->getAttrOfType<StringAttr>("test.load");
+        if (!name)
+          return;
+        unsigned numContexts = 0;
+        StoredValues values = analysis.valuesAtInContexts(
+            load.getAddr(), std::nullopt, load.getType(), &numContexts);
+        os << name.getValue() << ": {";
+        llvm::interleaveComma(values.consts, os,
+                              [&](TypedAttr c) { os << c; });
+        os << "} defs=" << values.defs.size()
+           << (values.complete ? " complete" : " incomplete");
+        if (!values.complete)
+          os << " (" << (values.why ? formatReason(values.why) : "-") << ")";
+        if (numContexts)
+          os << " contexts=" << numContexts;
+        if (explainSets && !values.complete)
+          for (const std::string &link : explainChain(values.why))
+            os << "\n    <- " << link;
+        os << "\n";
+      });
+      if (printStats) {
+        // Every load of an analysed function, by answer.
+        size_t numLoads = 0, numConstant = 0, numComplete = 0, numCtx = 0;
+        llvm::StringMap<unsigned> whyIncomplete;
+        llvm::TimeRecord start = llvm::TimeRecord::getCurrentTime(true);
+        for (const auto &fn : analysis.getFunctions())
+          fn->func->walk([&](cir::LoadOp load) {
+            ++numLoads;
+            unsigned contexts = 0;
+            StoredValues values = analysis.valuesAtInContexts(
+                load.getAddr(), std::nullopt, load.getType(), &contexts);
+            numCtx += contexts > 0;
+            if (!values.complete) {
+              ++whyIncomplete[values.why ? formatReason(values.why) : "-"];
+              return;
+            }
+            ++numComplete;
+            if (values.defs.empty() && values.consts.size() == 1)
+              ++numConstant;
+          });
+        llvm::TimeRecord end = llvm::TimeRecord::getCurrentTime(false);
+        end -= start;
+        const StoredValueQuery::Stats &qs =
+            analysis.getStoredValueQuery().getStats();
+        os << "--- value stats\n"
+           << "loads: " << numLoads << "\n"
+           << "loads with a complete answer: " << numComplete << "\n"
+           << "loads proven constant: " << numConstant << "\n"
+           << "loads answered from calling contexts: " << numCtx << "\n"
+           << "indexed writes: "
+           << analysis.getStoredValueQuery().getIndex().getWrites().size()
+           << " (entries "
+           << analysis.getStoredValueQuery().getIndex().getNumEntries()
+           << ")\n"
+           << "queries: " << qs.numQueries << " visits: " << qs.numVisits
+           << " budget hits: " << qs.numBudgetHits << "\n"
+           << "value query time (wall, s): " << end.getWallTime() << "\n";
+        SmallVector<std::pair<unsigned, StringRef>> sorted;
+        for (const auto &entry : whyIncomplete)
+          sorted.emplace_back(entry.getValue(), entry.getKey());
+        llvm::sort(sorted, [](const auto &a, const auto &b) {
+          return a.first != b.first ? a.first > b.first : a.second < b.second;
+        });
+        os << "ops written with an unknown value:";
+        for (const auto &entry :
+             analysis.getStoredValueQuery().getIndex().getUnknownWriteOps())
+          os << " " << entry.getKey() << "=" << entry.getValue();
+        os << "\n";
+        os << "incomplete loads by reason: " << sorted.size() << "\n";
+        for (auto [count, name] : llvm::ArrayRef(sorted).take_front(topExplanations))
+          os << "  " << name << " " << count << "\n";
       }
     }
 

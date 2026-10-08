@@ -1,0 +1,70 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CI
+
+// Stored values (T22) in calling contexts: Obj(int n) : size(n) {} (with the
+// -O0 spill of n), read by the methods @run and @run2. @main builds a and b
+// with 1024 and c with 512, and calls run(a), run(b), run2(a), run2(c).
+//
+// In BU mode, @run's own graph does not know what its callers stored into *this
+// (UnknownCaller). Its two calling contexts (the copies of its graph in
+// @main's) read the copies of a and b, which the copies of the ctor wrote:
+// with the ctor's n, which the chain of copies turns into @main's operand
+// 1024 (the spill slot is a node the copy does not include, read in the
+// ctor's own graph with the same chain). Every context gives 1024, so the
+// union is the constant. @run2's contexts give 1024 and 512: the set.
+// @main reads a.size itself: 1024 (its own graph has the ctor's copy).
+//
+// In CI mode, one set of formals for the ctor: the slot holds the formal n, a def.
+
+// BU-LABEL: === values
+// BU-NEXT: run.size: {#cir.int<1024> : !cir.int<s, 32>} defs=0 complete contexts=2
+// BU-NEXT: run2.size: {#cir.int<1024> : !cir.int<s, 32>, #cir.int<512> : !cir.int<s, 32>} defs=0 complete contexts=2
+// BU-NEXT: main.a.size: {#cir.int<1024> : !cir.int<s, 32>} defs=0 complete
+
+// CI-LABEL: === values
+// CI-NEXT: run.size: {} defs=1 complete
+// CI-NEXT: run2.size: {} defs=1 complete
+// CI-NEXT: main.a.size: {} defs=1 complete
+
+!s32i = !cir.int<s, 32>
+!rec_Obj = !cir.struct<class "Obj" {data !s32i}>
+module {
+// Obj(int n) : size(n) {}, with the -O0 spill of n.
+cir.func internal @ctor(%this: !cir.ptr<!rec_Obj>, %n: !s32i) {
+  %slot = cir.alloca "n.addr" align(4) : !cir.ptr<!s32i>
+  cir.store %n, %slot : !s32i, !cir.ptr<!s32i>
+  %m = cir.get_member %this[0] {name = "size"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!s32i>
+  %v = cir.load %slot : !cir.ptr<!s32i>, !s32i
+  cir.store %v, %m : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func internal @run(%this: !cir.ptr<!rec_Obj>) -> !s32i {
+  %m = cir.get_member %this[0] {name = "size"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!s32i>
+  %v = cir.load %m : !cir.ptr<!s32i>, !s32i {test.load = "run.size"}
+  cir.return %v : !s32i
+}
+cir.func internal @run2(%this: !cir.ptr<!rec_Obj>) -> !s32i {
+  %m = cir.get_member %this[0] {name = "size"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!s32i>
+  %v = cir.load %m : !cir.ptr<!s32i>, !s32i {test.load = "run2.size"}
+  cir.return %v : !s32i
+}
+cir.func @main() -> !s32i {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!rec_Obj>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!rec_Obj>
+  %c = cir.alloca "c" align(4) : !cir.ptr<!rec_Obj>
+  %k1 = cir.const #cir.int<1024> : !s32i
+  %k2 = cir.const #cir.int<512> : !s32i
+  cir.call @ctor(%a, %k1) : (!cir.ptr<!rec_Obj>, !s32i) -> ()
+  cir.call @ctor(%b, %k1) : (!cir.ptr<!rec_Obj>, !s32i) -> ()
+  cir.call @ctor(%c, %k2) : (!cir.ptr<!rec_Obj>, !s32i) -> ()
+  %r1 = cir.call @run(%a) : (!cir.ptr<!rec_Obj>) -> !s32i
+  %r2 = cir.call @run(%b) : (!cir.ptr<!rec_Obj>) -> !s32i
+  %r3 = cir.call @run2(%a) : (!cir.ptr<!rec_Obj>) -> !s32i
+  %r4 = cir.call @run2(%c) : (!cir.ptr<!rec_Obj>) -> !s32i
+  %ma = cir.get_member %a[0] {name = "size"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!s32i>
+  %v = cir.load %ma : !cir.ptr<!s32i>, !s32i {test.load = "main.a.size"}
+  cir.return %v : !s32i
+}
+}

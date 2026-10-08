@@ -69,8 +69,11 @@ void ModelContext::modRef(std::optional<Cell> cell, bool mod, bool ref) {
   if (!cell)
     return;
   NodeFlags flags = NodeFlags::None;
-  if (mod)
+  if (mod) {
     flags |= NodeFlags::Mod;
+    if (writes)
+      writes->push_back({nullptr, *cell, /*reachable=*/false});
+  }
   if (ref)
     flags |= NodeFlags::Ref;
   getGraph().addFlags(*cell, flags);
@@ -126,6 +129,26 @@ void ModelContext::addIndirectCall(const CallSiteRecord &site, Cell callee,
   call.args.assign(args.begin(), args.end());
   call.kind = CallKind::IndirectDeferred;
   extraCalls->push_back(std::move(call));
+}
+
+void cir::pointsto::finishModelWrites(const PointsToModel &model,
+                                      const CallSiteRecord &site,
+                                      SmallVectorImpl<ModelWrite> &writes,
+                                      size_t first) {
+  for (size_t i = first; i < writes.size(); ++i)
+    writes[i].op = site.call;
+  if (model.declaresAllWrites())
+    return;
+  // SOUNDNESS: the model may write what it is handed in ways it does not
+  // report (see PointsToModel::declaresAllWrites).
+  ModelContext::forEachPointerArg(
+      site, [&](Cell cell) { writes.push_back({site.call, cell, false}); });
+  if (site.result)
+    writes.push_back({site.call, *site.result, false});
+  if (site.resultSlots)
+    for (const auto &slot : *site.resultSlots)
+      if (slot.second)
+        writes.push_back({site.call, slot.second, false});
 }
 
 //===----------------------------------------------------------------------===//
@@ -239,6 +262,10 @@ public:
   bool replacesDefinition() const override {
     return accept == Accept::LibraryDefinitions;
   }
+  /// Every generic model reports its writes (audited for T22: the
+  /// allocators, the string functions, the pointer-free and escaping
+  /// functions write only through modRef, defer and addMemTransfer).
+  bool declaresAllWrites() const override { return true; }
 
 private:
   StringRef modelName;
@@ -315,6 +342,11 @@ public:
         ctx.modRef(arg, /*mod=*/false, /*ref=*/true);
 
     Cell heap = ctx.makeHeapObject(site, size);
+    // The stored-value queries: calloc's storage starts zeroed (C17
+    // 7.22.3.2p2) and strdup's holds a copy of the string, so neither starts
+    // indeterminate. Both are reported as writes of unknown value.
+    if (kind == AllocKind::Calloc || kind == AllocKind::StrDup)
+      ctx.modRef(heap, /*mod=*/true, /*ref=*/false);
     switch (kind) {
     case AllocKind::PosixMemalign:
       // C17 does not have posix_memalign; POSIX.1-2017 specifies it: "upon
@@ -557,6 +589,9 @@ public:
     case StringKind::StrNCpy:
       if (dst && src)
         ctx.addMemTransfer(site, *dst, *src, ctx.getConstantArg(site, 2));
+      // Past the end of the source string strncpy writes zeros, not the
+      // source's bytes (C17 7.24.2.4p3): a write of unknown value too.
+      ctx.modRef(dst, /*mod=*/true, /*ref=*/false);
       break;
     case StringKind::StrCat:
       // The copy starts at the terminating null of d, an offset we don't
@@ -763,6 +798,8 @@ public:
   }
 
   StringRef name() const override { return "memory-effects"; }
+  /// Writes only through defer (argMemOnly) or not at all.
+  bool declaresAllWrites() const override { return true; }
   StringRef specCitation() const override {
     return "#cir.memory_effects (CIRAttrs.td), the semantics of LLVM's "
            "memory(...) function attribute";

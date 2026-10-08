@@ -1,0 +1,90 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Stored values (T22): the union of every write. Two different stores give
+// both constants (flow-insensitive: the one before the load included); the
+// same constant twice gives it once. A store through a pointer that may
+// point to either of two objects counts for both. A write of 8 bytes over
+// the 4 read is a partial overlap: incomplete. So is a read of 8 bytes over a
+// write of 4, and a read of the low half of a stored 64-bit integer (the
+// queries don't split scalars into bytes). Writes to an array element
+// count for every element (element-relative offsets): a[i] = 5 for every i,
+// then a[3], is 5; a write to the other field of the element does not count.
+
+// CHECK-LABEL: === values
+// CHECK-NEXT: two: {#cir.int<1> : !cir.int<s, 32>, #cir.int<2> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: same: {#cir.int<3> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: via.a: {#cir.int<5> : !cir.int<s, 32>, #cir.int<4> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: partial: {} defs=0 incomplete (UnhandledOp, "overlaps the read partially")
+// CHECK-NEXT: inside: {} defs=0 incomplete (UnhandledOp, "a part of a stored constant not understood")
+// CHECK-NEXT: elem: {#cir.int<5> : !cir.int<s, 32>} defs=0 complete
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!rec_E = !cir.struct<"E" {data !s32i, data !s32i}>
+!arrE = !cir.array<!rec_E x 8>
+
+module {
+cir.func @two() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %c1 = cir.const #cir.int<1> : !s32i
+  %c2 = cir.const #cir.int<2> : !s32i
+  cir.store %c1, %x : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "two"}
+  cir.store %c2, %x : !s32i, !cir.ptr<!s32i>
+  cir.return %v : !s32i
+}
+cir.func @same() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %c = cir.const #cir.int<3> : !s32i
+  %d = cir.const #cir.int<3> : !s32i
+  cir.store %c, %x : !s32i, !cir.ptr<!s32i>
+  cir.store %d, %x : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "same"}
+  cir.return %v : !s32i
+}
+// p = cond ? &a : &b; *p = 5; a = 4; read a: {4, 5} (unification makes a
+// and b one node, so b's write counts for a too).
+cir.func @via(%cond: !cir.bool) -> !s32i {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %p = cir.select if %cond then %a else %b : (!cir.bool, !cir.ptr<!s32i>, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  %c4 = cir.const #cir.int<4> : !s32i
+  %c5 = cir.const #cir.int<5> : !s32i
+  cir.store %c5, %p : !s32i, !cir.ptr<!s32i>
+  cir.store %c4, %a : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %a : !cir.ptr<!s32i>, !s32i {test.load = "via.a"}
+  cir.return %v : !s32i
+}
+cir.func @partial() -> !s64i {
+  %x = cir.alloca "x" align(8) : !cir.ptr<!s64i>
+  %lo = cir.cast bitcast %x : !cir.ptr<!s64i> -> !cir.ptr<!s32i>
+  %c = cir.const #cir.int<7> : !s32i
+  cir.store %c, %lo : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s64i>, !s64i {test.load = "partial"}
+  cir.return %v : !s64i
+}
+cir.func @inside() -> !s32i {
+  %x = cir.alloca "x" align(8) : !cir.ptr<!s64i>
+  %c = cir.const #cir.int<7> : !s64i
+  cir.store %c, %x : !s64i, !cir.ptr<!s64i>
+  %lo = cir.cast bitcast %x : !cir.ptr<!s64i> -> !cir.ptr<!s32i>
+  %v = cir.load %lo : !cir.ptr<!s32i>, !s32i {test.load = "inside"}
+  cir.return %v : !s32i
+}
+cir.func @elem(%i: !s32i) -> !s32i {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!arrE>
+  %e = cir.get_element %a[%i : !s32i] : !cir.ptr<!arrE> -> !cir.ptr<!rec_E>
+  %x = cir.get_member %e[0] {name = "x"} : !cir.ptr<!rec_E> -> !cir.ptr<!s32i>
+  %y = cir.get_member %e[1] {name = "y"} : !cir.ptr<!rec_E> -> !cir.ptr<!s32i>
+  %c5 = cir.const #cir.int<5> : !s32i
+  %c6 = cir.const #cir.int<6> : !s32i
+  cir.store %c5, %x : !s32i, !cir.ptr<!s32i>
+  cir.store %c6, %y : !s32i, !cir.ptr<!s32i>
+  %three = cir.const #cir.int<3> : !s32i
+  %e3 = cir.get_element %a[%three : !s32i] : !cir.ptr<!arrE> -> !cir.ptr<!rec_E>
+  %x3 = cir.get_member %e3[0] {name = "x"} : !cir.ptr<!rec_E> -> !cir.ptr<!s32i>
+  %v = cir.load %x3 : !cir.ptr<!s32i>, !s32i {test.load = "elem"}
+  cir.return %v : !s32i
+}
+}

@@ -1474,7 +1474,10 @@ void LocalBuilder::dispatchCall(size_t index, CIRCallOpInterface call) {
       SmallVector<CallSiteRecord, 0> extraCalls;
       ctx.setLaunchSink(&fg->launches);
       ctx.setCallSink(&extraCalls);
+      size_t firstWrite = fg->modelWrites.size();
+      ctx.setWriteSink(&fg->modelWrites);
       model->apply(site, ctx);
+      finishModelWrites(*model, site, fg->modelWrites, firstWrite);
       site.kind = CallKind::Modelled;
       site.modelled = model->name();
       // The calls the model makes: indirect, so decided after the walk (or
@@ -1576,7 +1579,10 @@ void LocalBuilder::applyResolvedTargets(CallSiteRecord &site) {
         CallSiteRecord targetSite = site;
         targetSite.callee = target;
         ModelContext ctx(*fg, dataLayout, deferredEffects);
+        size_t firstWrite = fg->modelWrites.size();
+        ctx.setWriteSink(&fg->modelWrites);
         model->apply(targetSite, ctx);
+        finishModelWrites(*model, targetSite, fg->modelWrites, firstWrite);
         site.clobbersGlobals |= targetSite.clobbersGlobals;
         site.modelled = model->name();
         continue;

@@ -148,6 +148,9 @@ namespace cir::pointsto {
 class GlobalNodes;
 class PointsToModelRegistry;
 class PointsToAnalysis;
+class StoredValueIndex;
+class StoredValueQuery;
+struct StoredValues;
 
 /// How calls to functions with a body are bound (see the file comment).
 enum class PointsToMode : uint8_t {
@@ -313,6 +316,12 @@ struct TUFunction {
   std::vector<std::unique_ptr<TUCallSite>> inheritedCalls;
   /// BU mode: the call-graph SCC of the function (its graph's index).
   unsigned scc = 0;
+  /// The writes of unknown value and the copies the models of the calls in
+  /// this function's graph made (own sites, and the declaration targets of
+  /// indirect sites resolved in this graph), cells of this graph: what the
+  /// stored-value queries (StoredValues.h) read besides the function's ops.
+  llvm::SmallVector<ModelWrite, 0> modelWrites;
+  llvm::SmallVector<MemTransferRecord, 0> modelTransfers;
 };
 
 /// BU mode: one copy of a function's graph into a caller's graph, at a call.
@@ -598,6 +607,28 @@ public:
   ///    ModRef otherwise.
   mlir::ModRefResult getModRef(mlir::Operation *op, mlir::Value location) const;
 
+  /// The values the memory \p addr points to may hold, an access of \p size
+  /// bytes (std::nullopt: the size of its pointee type) read as \p type
+  /// (null: the pointee type), over every write the module makes to it (see
+  /// StoredValues.h for the rules). BU mode, top-down: if the answer from the
+  /// own graph of addr's function is incomplete or has defs, and the function
+  /// is covered, the union over its calling contexts (constants only: the
+  /// defs of a caller's context are other functions' values, dropped and
+  /// counted incomplete); complete only if every context is.
+  /// \p numContexts, if given, is set to the number of contexts used (0 for
+  /// the own graph's answer).
+  StoredValues valuesAtInContexts(mlir::Value addr,
+                                  std::optional<uint64_t> size = std::nullopt,
+                                  mlir::Type type = {},
+                                  unsigned *numContexts = nullptr) const;
+  /// The one constant the memory \p addr points to holds, if
+  /// valuesAtInContexts is complete with exactly one constant and no def.
+  std::optional<mlir::TypedAttr>
+  isConstantAt(mlir::Value addr, std::optional<uint64_t> size = std::nullopt,
+               mlir::Type type = {}) const;
+  /// The stored-value query engine (built on first use).
+  StoredValueQuery &getStoredValueQuery() const;
+
   mlir::ModuleOp getModule() const { return module; }
   Graph &getGraph() { return *graph; }
   const Graph &getGraph() const { return *graph; }
@@ -673,6 +704,8 @@ public:
 private:
   friend mlir::LogicalResult
   verifyPointsToAnalysis(const PointsToAnalysis &analysis);
+  friend class StoredValueIndex;
+  friend class StoredValueQuery;
 
   void run();
   void buildLocal(cir::FuncOp func, bool formalsComplete);
@@ -830,15 +863,17 @@ private:
   };
   /// How an enumeration of contexts ended.
   enum class ContextWalkResult : uint8_t { Done, Stopped, OverBudget };
-  /// Call \p leaf on \p roots (cells of \p fn's graph) in each calling
+  /// Call \p leaf with the function of the graph it is in and \p roots
+  /// (cells of \p fn's graph) in each calling
   /// context of \p fn: mapped through every copy of \p fn, recursively up
   /// to a graph whose function is not covered or an exact cell without an
   /// image. \p leaf returns false to stop. \p numContexts counts the leaves
   /// visited.
-  ContextWalkResult
-  forEachContext(const TUFunction &fn, llvm::ArrayRef<RootGroup> roots,
-                 llvm::function_ref<bool(llvm::ArrayRef<RootGroup>)> leaf,
-                 unsigned &numContexts) const;
+  ContextWalkResult forEachContext(
+      const TUFunction &fn, llvm::ArrayRef<RootGroup> roots,
+      llvm::function_ref<bool(const TUFunction &, llvm::ArrayRef<RootGroup>)>
+          leaf,
+      unsigned &numContexts) const;
   /// The function whose graph a top-down query about \p value starts from:
   /// its function if it is covered and top-down queries are on, else null.
   const TUFunction *getTopDownFunction(mlir::Value value) const;
@@ -925,6 +960,11 @@ private:
   llvm::StringMap<unsigned> unhandledOps;
   PointsToAnalysisStats stats;
   bool verifyErrors = false;
+  /// Set if a model wrote at a call no analysed function holds: the
+  /// stored-value queries then read everything as incomplete.
+  bool unownedModelWrites = false;
+  /// StoredValues.h, built on first use.
+  mutable std::unique_ptr<StoredValueQuery> storedValues;
 
   // Query caches, filled lazily; the graph does not change after run().
   mutable bool queryIndexBuilt = false;

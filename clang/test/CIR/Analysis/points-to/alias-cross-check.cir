@@ -96,6 +96,22 @@
 // RUN: cir-opt %S/models-unknown.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/modref.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/modref.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-budget.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-budget.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-copy.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-copy.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-escape.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-escape.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-global.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-global.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-member.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-member.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-two.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-two.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-uninit.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-uninit.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-unique.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-unique.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-alias.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-alias.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-basic.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
@@ -221,6 +237,22 @@
 // RUN: cir-opt %S/models-unknown.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/modref.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/modref.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-budget.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-budget.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-copy.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-copy.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-escape.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-escape.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-global.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-global.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-member.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-member.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-two.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-two.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-uninit.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-uninit.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-unique.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-unique.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-alias.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-alias.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-basic.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
