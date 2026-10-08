@@ -1,23 +1,32 @@
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1})" \
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=0 subobjects=0})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both})" \
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both bu=0 subobjects=0})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
-// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=both host-facts-closed-tu=1' \
+// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=both host-facts-closed-tu=1 host-facts-bu=0 host-facts-subobjects=0' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-BOTH
-// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1' \
+// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=0 host-facts-subobjects=0' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
 // RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-LEGACY
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=1})" \
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=1 subobjects=0})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both bu=1})" \
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both bu=1 subobjects=0})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN-BU
-// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=1' \
+// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=1 host-facts-subobjects=0' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
 // RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=1 subobjects=1})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
 // RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=1 host-facts-subobjects=1' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
+// The defaults (bu=1 subobjects=1, what --cir-offload-host-facts=ipo|both
+// runs): the same verdicts as bottom-up.
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN-BU
+// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=both host-facts-closed-tu=1' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PASS-DEFAULT
+// PASS-DEFAULT: remark: host-facts-disagreements: 4 of 4 candidate fields (closed-tu, bu, subobjects)
 //
 // Bottom-up (bu=1, T17): the same verdicts. Under closed-TU the launch record
 // in @run's graph is replaced by its copy in @main's graph (every caller of
@@ -151,7 +160,7 @@ module attributes {cir.offload.container} {
 // PASS-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field B legacy=not stamped ({{.*}}) ipo=noalias
 // PASS-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field P legacy=not stamped ({{.*}}) ipo=noalias
 // PASS-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field Q legacy=not stamped ({{.*}}) ipo=noalias
-// PASS-BOTH: remark: host-facts-disagreements: 4 of 4 candidate fields (closed-tu)
+// PASS-BOTH: remark: host-facts-disagreements: 4 of 4 candidate fields (closed-tu, ci)
 // PASS-BOTH-NOT: llvm.noalias
 
 // InferKernelParamNoAlias stamps only USM pointer parameters; the accessor

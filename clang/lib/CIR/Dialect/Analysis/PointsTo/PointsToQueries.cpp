@@ -74,6 +74,8 @@ StringRef cir::pointsto::getAliasRuleName(AliasRule rule) {
     return "disjoint-subobjects";
   case AliasRule::SubobjectOverlap:
     return "subobject-overlap";
+  case AliasRule::CallingContexts:
+    return "calling-contexts";
   }
   llvm_unreachable("unknown alias rule");
 }
@@ -172,6 +174,25 @@ AliasResult PointsToAnalysis::alias(Value a, Value b,
 AliasAnswer
 PointsToAnalysis::aliasWithRule(Value a, Value b, std::optional<uint64_t> sizeA,
                                 std::optional<uint64_t> sizeB) const {
+  AliasAnswer own = aliasOwn(a, b, sizeA, sizeB);
+  // BU: the own graph's MayAlias between cells of a covered function may be
+  // NoAlias (or MustAlias) in each of its calling contexts.
+  if (!own.result.isMay() || own.rule == AliasRule::BothNull ||
+      own.rule == AliasRule::NotAnalysed ||
+      own.rule == AliasRule::DifferentFunctions)
+    return own;
+  const TUFunction *fn = getTopDownFunction(a);
+  if (!fn)
+    return own;
+  std::optional<AliasAnswer> answer =
+      aliasInContexts(*fn, pointsTo(a).cells.front(), pointsTo(b).cells.front(),
+                      getAccessSize(a, sizeA), getAccessSize(b, sizeB));
+  return answer ? *answer : own;
+}
+
+AliasAnswer PointsToAnalysis::aliasOwn(Value a, Value b,
+                                       std::optional<uint64_t> sizeA,
+                                       std::optional<uint64_t> sizeB) const {
   // The same SSA value is the same address (the MLIR convention, which
   // LocalAliasAnalysis and CIRBasicAliasAnalysis follow too).
   if (a == b)
@@ -556,6 +577,14 @@ std::string PointsToAnalysis::explainAnswer(const AliasAnswer &answer, Value a,
     return "a, b: disjoint ranges of one object, in different subobjects";
   case AliasRule::SubobjectOverlap:
     return "a, b: subobjects of one object whose ranges may overlap";
+  case AliasRule::CallingContexts: {
+    std::string out;
+    llvm::raw_string_ostream os(out);
+    os << "a, b: " << answer.result << " in each of the " << answer.contexts
+       << " calling contexts of @"
+       << a.getParentRegion()->getParentOfType<cir::FuncOp>().getSymName();
+    return out;
+  }
   }
   llvm_unreachable("unknown alias rule");
 }
@@ -586,6 +615,24 @@ static std::optional<uint64_t> getConstantLength(Value length) {
 }
 
 ModRefResult PointsToAnalysis::getModRef(Operation *op, Value location) const {
+  ModRefResult own = getModRefOwn(op, location);
+  // BU: what a call of a covered function may access in each of its calling
+  // contexts. The other ops ask alias(), which enumerates the contexts.
+  if (own.isNoModRef() || !isa<CIRCallOpInterface>(op))
+    return own;
+  if (op->getParentOfType<cir::FuncOp>().getOperation() !=
+      getFunctionOf(location))
+    return own;
+  const TUFunction *fn = getTopDownFunction(location);
+  if (!fn)
+    return own;
+  std::optional<ModRefResult> inContexts =
+      getModRefInContexts(*fn, op, location);
+  return inContexts ? own.intersect(*inContexts) : own;
+}
+
+ModRefResult PointsToAnalysis::getModRefOwn(Operation *op,
+                                            Value location) const {
   using MRR = ModRefResult;
   // BU: an op and a location of two functions are in two graphs.
   if (options.mode == PointsToMode::BU &&
@@ -746,15 +793,9 @@ bool PointsToAnalysis::collectNamedSymbols(
   return true;
 }
 
-const llvm::DenseSet<const Node *> &
-PointsToAnalysis::getCallReach(const TUCallSite &call) const {
-  std::unique_ptr<llvm::DenseSet<const Node *>> &slot =
-      callReach[call.site.call];
-  if (slot)
-    return *slot;
-  slot = std::make_unique<llvm::DenseSet<const Node *>>();
-  llvm::DenseSet<const Node *> &reach = *slot;
-
+void PointsToAnalysis::collectCallRoots(
+    const TUCallSite &call, SmallVectorImpl<Cell> &locals,
+    SmallVectorImpl<Cell> &symbolsOut) const {
   // The call's own site and the calls a model makes on its behalf (a
   // synthetic site on the same op): all of them run during the call.
   buildQueryIndex();
@@ -763,24 +804,23 @@ PointsToAnalysis::getCallReach(const TUCallSite &call) const {
   if (extra != syntheticSitesOf.end())
     llvm::append_range(sites, extra->second);
 
-  SmallVector<Cell, 8> roots;
   bool allGlobals = false;
   for (const TUCallSite *one : sites) {
     const CallSiteRecord &site = one->site;
     for (const std::optional<Cell> &arg : site.args)
       if (arg)
-        roots.push_back(*arg);
+        locals.push_back(*arg);
     for (const auto &[index, slots] : site.aggregateArgs)
       for (auto [off, cell] : slots)
         if (cell)
-          roots.push_back(cell);
+          locals.push_back(cell);
     // The result: the callee may write a fresh object and return it.
     if (site.result)
-      roots.push_back(*site.result);
+      locals.push_back(*site.result);
     if (site.resultSlots)
       for (auto [off, cell] : *site.resultSlots)
         if (cell)
-          roots.push_back(cell);
+          locals.push_back(cell);
 
     // The globals the callee may name.
     allGlobals |= site.clobbersGlobals ||
@@ -792,22 +832,23 @@ PointsToAnalysis::getCallReach(const TUCallSite &call) const {
     if (one->resolution == CallResolution::Direct) {
       if (const TUFunction *callee =
               functionMap.lookup(cir::FuncOp(one->callee).getOperation()))
-        allGlobals = !collectNamedSymbols(*callee, visited, roots);
+        allGlobals = !collectNamedSymbols(*callee, visited, symbolsOut);
     } else if (one->resolution == CallResolution::Indirect) {
       for (FlatSymbolRefAttr target : one->targets)
         if (const TUFunction *callee = lookupFunction(target.getAttr()))
-          if (!collectNamedSymbols(*callee, visited, roots)) {
+          if (!collectNamedSymbols(*callee, visited, symbolsOut)) {
             allGlobals = true;
             break;
           }
     }
   }
-  if (allGlobals) {
-    buildQueryIndex();
+  if (allGlobals)
     for (auto [name, node] : symbolNodeOf)
-      roots.push_back(Cell(node));
-  }
+      symbolsOut.push_back(Cell(node));
+}
 
+void PointsToAnalysis::closeReach(ArrayRef<Cell> roots,
+                                  llvm::DenseSet<const Node *> &reach) const {
   // Through links, ghost links, subobjects (a callee given an object may
   // access its members), and from a member at offset 0 to its object
   // (pointer-interconvertibility).
@@ -822,7 +863,19 @@ PointsToAnalysis::getCallReach(const TUCallSite &call) const {
         worklist.push_back(next);
     });
   }
-  return reach;
+}
+
+const llvm::DenseSet<const Node *> &
+PointsToAnalysis::getCallReach(const TUCallSite &call) const {
+  std::unique_ptr<llvm::DenseSet<const Node *>> &slot =
+      callReach[call.site.call];
+  if (slot)
+    return *slot;
+  slot = std::make_unique<llvm::DenseSet<const Node *>>();
+  SmallVector<Cell, 8> roots;
+  collectCallRoots(call, roots, roots);
+  closeReach(roots, *slot);
+  return *slot;
 }
 
 ModRefResult PointsToAnalysis::getCallModRef(Operation *call,
@@ -834,66 +887,55 @@ ModRefResult PointsToAnalysis::getCallModRef(Operation *call,
   const TUCallSite *site = findCallSite(call);
   if (!site)
     return ModRefResult::getModAndRef();
-  const Node *node = set.cells.front().getNode();
-  // Subobjects: the location's bytes include those of its children, which
-  // have their own nodes; the rules below hold for each of them.
-  SmallVector<const Node *, 4> parts;
-  graph->forEachInSubtree(node, [&](const Node *n) { parts.push_back(n); });
-  if (parts.size() > 1) {
+  return callModRefOf(set.cells, getCallReach(*site));
+}
+
+ModRefResult PointsToAnalysis::callModRefOf(
+    ArrayRef<Cell> location, const llvm::DenseSet<const Node *> &reach) const {
+  ModRefResult result = ModRefResult::getNoModRef();
+  for (Cell cell : location) {
+    const Node *node = cell.getNode();
+    // Subobjects: the location's bytes include those of its children, which
+    // have their own nodes; the rules below hold for each of them.
+    SmallVector<const Node *, 4> parts;
+    graph->forEachInSubtree(node, [&](const Node *n) { parts.push_back(n); });
     bool reached = false;
     NodeFlags flags = NodeFlags::None;
     for (const Node *part : parts) {
+      // SOUNDNESS: code we don't see may run during any call (an unknown or
+      // unresolved callee, or one further down), and it may write any object
+      // it can reach. That is every External node, and also every
+      // Incomplete one: an unknown caller may have kept the pointer it passed
+      // us where that code finds it. Their Mod and Ref flags record only the
+      // analysed code's accesses (status propagation spreads External, not
+      // Mod), so they don't refine the answer either.
+      // SOUNDNESS: a USM allocation is also accessed by device code, which
+      // runs asynchronously and is synchronized with by calls (a wait, an
+      // event, the next command) whose arguments need not reach the
+      // allocation. So is the memory an asynchronous command reads or writes
+      // (AsyncAccess).
       if (isUnknownReachable(part) || part->hasFlags(NodeFlags::HasUSM) ||
           part->hasFlags(NodeFlags::AsyncAccess))
         return ModRefResult::getModAndRef();
-      reached |= getCallReach(*site).contains(part);
+      // SOUNDNESS: a call (and everything it calls) reaches an existing
+      // object only through a pointer: one it is passed, one it loads from
+      // memory it reaches, or one it takes from a global by name. The binding
+      // unified the callee's formals with these arguments, so the pointers
+      // the callee derives from them are in nodes reachable from the
+      // arguments. A fresh object the call allocates is reached through its
+      // result, or through an argument or a global it is stored into.
+      reached |= reach.contains(part);
       flags |= part->getFlags();
     }
     if (!reached)
-      return ModRefResult::getNoModRef();
-    bool mod = hasAny(flags, NodeFlags::Mod);
-    bool ref = hasAny(flags, NodeFlags::Ref);
-    if (mod && ref)
-      return ModRefResult::getModAndRef();
-    if (mod)
-      return ModRefResult::getMod();
-    return ref ? ModRefResult::getRef() : ModRefResult::getNoModRef();
+      continue;
+    // SOUNDNESS: the nodes are complete, so all code that accesses them is
+    // analysed, and every analysed access set Mod or Ref on them (merges OR
+    // the flags). A node never written anywhere is not written by this call.
+    if (hasAny(flags, NodeFlags::Mod))
+      result = result.merge(ModRefResult::getMod());
+    if (hasAny(flags, NodeFlags::Ref))
+      result = result.merge(ModRefResult::getRef());
   }
-  // SOUNDNESS: code we don't see may run during any call (an unknown or
-  // unresolved callee, or one further down), and it may write any object it
-  // can reach. That is every External node, and also every Incomplete one:
-  // an unknown caller may have kept the pointer it passed us where that
-  // code finds it. Their Mod and Ref flags record only the analysed code's
-  // accesses (status propagation spreads External, not Mod), so they don't
-  // refine the answer either.
-  if (isUnknownReachable(node))
-    return ModRefResult::getModAndRef();
-  // SOUNDNESS: a USM allocation is also accessed by device code, which runs
-  // asynchronously and is synchronized with by calls (a wait, an event, the
-  // next command) whose arguments need not reach the allocation. So is the
-  // memory an asynchronous command reads or writes (AsyncAccess).
-  if (node->hasFlags(NodeFlags::HasUSM) ||
-      node->hasFlags(NodeFlags::AsyncAccess))
-    return ModRefResult::getModAndRef();
-  // SOUNDNESS: a call (and everything it calls) reaches an existing object
-  // only through a pointer: one it is passed, one it loads from memory it
-  // reaches, or one it takes from a global by name. Context-insensitive
-  // binding unified the callee's formals with these arguments, so the
-  // pointers the callee derives from them are in nodes reachable from the
-  // arguments. A fresh object the call allocates is reached through its
-  // result, or through an argument or a global it is stored into.
-  if (!getCallReach(*site).contains(node))
-    return ModRefResult::getNoModRef();
-  // SOUNDNESS: the node is complete, so all code that accesses it is
-  // analysed, and every analysed access set Mod or Ref on it (merges OR the
-  // flags). A node never written anywhere is not written by this call.
-  bool mod = node->hasFlags(NodeFlags::Mod);
-  bool ref = node->hasFlags(NodeFlags::Ref);
-  if (mod && ref)
-    return ModRefResult::getModAndRef();
-  if (mod)
-    return ModRefResult::getMod();
-  if (ref)
-    return ModRefResult::getRef();
-  return ModRefResult::getNoModRef();
+  return result;
 }

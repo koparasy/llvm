@@ -28,7 +28,10 @@ class PointsToAnalysis;
 
 /// The points-to analysis as an mlir::AliasAnalysis implementation. It holds
 /// a reference to \p analysis, which must outlive it and must not change
-/// (the IR must not be modified while queries run).
+/// (the IR must not be modified while queries run). In the bottom-up mode
+/// (with PointsToAnalysisOptions::topDownQueries, the default) the answers
+/// about the values of a covered function are the meet over its calling
+/// contexts (PointsToTopDown.cpp).
 ///
 /// Combining with the other implementations: mlir::AliasAnalysis::alias
 /// returns the first answer that is not MayAlias, in registration order
@@ -42,7 +45,10 @@ class PointsToAnalysis;
 /// offsets and computes the same ranges otherwise. It answers NoAlias only
 /// for distinct allocas, whose nodes, if unified, have two origins, which
 /// rules out MustAlias and PartialAlias here, or for disjoint ranges of one
-/// base, which are disjoint here too. The test pass
+/// base, which are disjoint here too. The top-down answers keep this: an
+/// image of a node keeps the offset differences of the cells in it, and
+/// distinct allocas of a function have distinct images, or one image with
+/// two origins. The test pass
 /// -test-cir-alias-analysis{use-points-to=1} asserts this on every pair it
 /// prints.
 class CIRPointsToAliasAnalysis {

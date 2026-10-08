@@ -13,7 +13,9 @@
 // use-points-to=1 builds the points-to analysis (PointsToAnalysis, with the
 // generic library models) of the module that holds the operation and
 // registers CIRPointsToAliasAnalysis after CIRBasicAliasAnalysis.
-// mode=bu runs the bottom-up mode (PointsToMode::BU).
+// mode=bu runs the bottom-up mode (PointsToMode::BU), with the top-down
+// queries unless td=0 (PointsToAnalysisOptions::topDownQueries);
+// max-query-contexts=<n> sets PointsToAnalysisOptions::maxQueryContexts.
 // closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU, and sycl=1 adds
 // the SYCL plug-in (addSYCLPointsToPlugin: the host API models and the
 // device-write rule).
@@ -61,7 +63,8 @@ struct PointsToHolder {
   std::unique_ptr<PointsToAnalysis> analysis;
 
   PointsToHolder(Operation *op, bool closedTU, bool sycl = false,
-                 bool bottomUp = false, bool subobjects = false) {
+                 bool bottomUp = false, bool subobjects = false,
+                 bool topDown = true, unsigned maxQueryContexts = 64) {
     registerGenericModels(registry);
     auto module = dyn_cast<ModuleOp>(op);
     if (!module)
@@ -71,6 +74,8 @@ struct PointsToHolder {
     if (bottomUp)
       options.mode = PointsToMode::BU;
     options.subobjects = subobjects;
+    options.topDownQueries = topDown;
+    options.maxQueryContexts = maxQueryContexts;
     if (sycl)
       cir::addSYCLPointsToPlugin(options);
     analysis = std::make_unique<PointsToAnalysis>(module, &registry, options);
@@ -156,6 +161,15 @@ struct PointsToOptions : public PassWrapper<Derived, OperationPass<>> {
       llvm::cl::desc("Points-to: give class, union and array members their "
                      "own nodes (PointsToAnalysisOptions::subobjects)"),
       llvm::cl::init(false)};
+  Pass::Option<bool> topDown{
+      *this, "td",
+      llvm::cl::desc("Points-to, bu: answer from the calling contexts "
+                     "(PointsToAnalysisOptions::topDownQueries)"),
+      llvm::cl::init(true)};
+  Pass::Option<unsigned> maxQueryContexts{
+      *this, "max-query-contexts",
+      llvm::cl::desc("Points-to, bu: the most calling contexts per query"),
+      llvm::cl::init(64)};
   Pass::Option<bool> pointsToOnly{
       *this, "points-to-only",
       llvm::cl::desc("Print the answers of the points-to analysis alone"),
@@ -188,7 +202,8 @@ struct TestCIRAliasAnalysisPass
       return;
     }
     PointsToHolder holder(getOperation(), this->closedTU, this->syclModels,
-                          this->ptMode == "bu", this->subobjects);
+                          this->ptMode == "bu", this->subobjects,
+                          this->topDown, this->maxQueryContexts);
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);
@@ -232,7 +247,8 @@ struct TestCIRAliasAnalysisModRefPass
       return;
     }
     PointsToHolder holder(getOperation(), this->closedTU, this->syclModels,
-                          this->ptMode == "bu", this->subobjects);
+                          this->ptMode == "bu", this->subobjects,
+                          this->topDown, this->maxQueryContexts);
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);
@@ -290,6 +306,14 @@ struct TestCIRPointsToAliasSamplePass
       llvm::cl::desc("Points-to: give class, union and array members their "
                      "own nodes"),
       llvm::cl::init(false)};
+  Option<bool> topDown{
+      *this, "td",
+      llvm::cl::desc("Points-to, bu: answer from the calling contexts"),
+      llvm::cl::init(true)};
+  Option<unsigned> maxQueryContexts{
+      *this, "max-query-contexts",
+      llvm::cl::desc("Points-to, bu: the most calling contexts per query"),
+      llvm::cl::init(64)};
   Option<std::string> showRule{
       *this, "show-rule",
       llvm::cl::desc("Print the first pairs (show=<n>) a points-to rule "
@@ -331,7 +355,7 @@ void TestCIRPointsToAliasSamplePass::runOnOperation() {
 
   llvm::TimeRecord start = llvm::TimeRecord::getCurrentTime(true);
   PointsToHolder holder(target, closedTU, /*sycl=*/false, ptMode == "bu",
-                        subobjects);
+                        subobjects, topDown, maxQueryContexts);
   llvm::TimeRecord built = llvm::TimeRecord::getCurrentTime(false);
   built -= start;
   const PointsToAnalysis &pt = *holder.analysis;
@@ -416,8 +440,10 @@ void TestCIRPointsToAliasSamplePass::runOnOperation() {
   cir::CIRBasicAliasAnalysis basic(target);
   SmallVector<AliasResult, 0> basicResults = measure(
       basicCol, [&](Value a, Value b) { return basic.alias(a, b); });
+  PointsToQueryStats statsBefore = pt.getQueryStats();
   SmallVector<AliasResult, 0> ptResults =
       measure(ptCol, [&](Value a, Value b) { return pt.alias(a, b); });
+  PointsToQueryStats td = pt.getQueryStats();
   mlir::AliasAnalysis defaultAA(target);
   cir::registerCIRAliasAnalyses(defaultAA, target);
   SmallVector<AliasResult, 0> defaultResults = measure(
@@ -444,6 +470,23 @@ void TestCIRPointsToAliasSamplePass::runOnOperation() {
                        100 * column->counts[1] / n, 100 * column->counts[2] / n,
                        100 * column->counts[3] / n,
                        column->seconds * 1e9 / n);
+  }
+
+  if (ptMode == "bu" && topDown) {
+    // The top-down queries of the points-to column alone.
+    size_t queries = td.numQueries - statsBefore.numQueries;
+    size_t walked = td.numEnumerated - statsBefore.numEnumerated +
+                    td.numStopped - statsBefore.numStopped;
+    size_t contexts = td.totalContexts - statsBefore.totalContexts;
+    os << "top-down queries: " << queries
+       << " (uncovered: " << td.numUncovered - statsBefore.numUncovered
+       << ", enumerated: " << td.numEnumerated - statsBefore.numEnumerated
+       << ", stopped: " << td.numStopped - statsBefore.numStopped
+       << ", budget hits: " << td.numBudgetHits - statsBefore.numBudgetHits
+       << ", refined: " << td.numRefined - statsBefore.numRefined << ")\n";
+    os << llvm::format("contexts per query: max %zu, mean %.2f\n",
+                       td.maxContexts,
+                       walked ? static_cast<double>(contexts) / walked : 0.0);
   }
 
   // How the two analyses relate, pair by pair.

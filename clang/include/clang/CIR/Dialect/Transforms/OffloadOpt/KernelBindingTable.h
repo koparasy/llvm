@@ -169,19 +169,23 @@ enum class HostFactsMode { Legacy, IPO, Both };
 llvm::StringRef getHostFactsModeName(HostFactsMode mode);
 std::optional<HostFactsMode> parseHostFactsMode(llvm::StringRef name);
 
+// The points-to analysis behind IPO and Both. By default it is the
+// bottom-up mode with subobject nodes (and top-down queries); bottomUp =
+// false is the escape hatch to the context-insensitive analysis
+// (--cir-offload-host-facts-ci).
 struct HostFactsOptions {
   HostFactsMode mode = HostFactsMode::Legacy;
   // The points-to analysis treats every function as having only the callers
   // in the module (PointsToAnalysisOptions::assumeClosedTU). Off by default
-  // (plan D2); -cir-offload-assume-closed-tu (T18) will map onto it.
+  // (plan D2); -cir-offload-assume-closed-tu sets it.
   bool assumeClosedTU = false;
   // The points-to analysis runs in its bottom-up mode (PointsToMode::BU):
   // the launch records of a function its callers copied are read in the
-  // callers' graphs.
-  bool bottomUp = false;
+  // callers' graphs. On by default.
+  bool bottomUp = true;
   /// Give class, union and array members their own points-to nodes
-  /// (PointsToAnalysisOptions::subobjects). Off by default.
-  bool subobjects = false;
+  /// (PointsToAnalysisOptions::subobjects). On by default.
+  bool subobjects = true;
 };
 
 // Which closure fields of a SYCL kernel are candidates for llvm.noalias, read

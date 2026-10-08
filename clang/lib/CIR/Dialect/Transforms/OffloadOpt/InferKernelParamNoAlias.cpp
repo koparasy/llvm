@@ -100,7 +100,8 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
         << "host-facts-disagreements: " << disagreements << " of "
         << table.getHostFactsComparisons().size() << " candidate fields ("
         << (hostFactsClosedTU ? "closed-tu" : "open")
-        << (hostFactsBottomUp ? ", bu" : "") << ")";
+        << (hostFactsBottomUp ? ", bu" : ", ci")
+        << (hostFactsSubobjects ? ", subobjects" : "") << ")";
   }
   mlir::MLIRContext *ctx = &getContext();
   llvm::StringRef noAliasName = mlir::LLVM::LLVMDialect::getNoAliasAttrName();

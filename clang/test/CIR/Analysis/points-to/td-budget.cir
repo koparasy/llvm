@@ -1,0 +1,63 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu max-query-contexts=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=ONE
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu max-query-contexts=2' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=TWO
+// RUN: cir-opt %s -test-cir-points-to-alias-sample='mode=bu max-query-contexts=1 pairs=200' -o /dev/null | FileCheck %s --check-prefix=STATS1
+// RUN: cir-opt %s -test-cir-points-to-alias-sample='mode=bu pairs=200' -o /dev/null | FileCheck %s --check-prefix=STATS2
+
+// The top-down budget (PointsToAnalysisOptions::maxQueryContexts): @read
+// has two calling contexts (td-members.cir's first case). With room for one
+// context only, the query answers from @read's own graph: MayAlias. With two
+// it is the meet over both: NoAlias.
+
+// ONE-LABEL: Testing : "read"
+// ONE-NEXT: a#0 <-> b#0: MayAlias
+// ONE-NEXT: why: a: an escaped pointer passed to @escape ({{.*}}); b: an escaped pointer passed to @escape ({{.*}})
+
+// TWO-LABEL: Testing : "read"
+// TWO-NEXT: a#0 <-> b#0: NoAlias
+
+// The sampler counts the budget hits.
+// STATS1: top-down queries: {{[0-9]+}} (uncovered: {{[0-9]+}}, enumerated: 0, stopped: {{[0-9]+}}, budget hits: {{[1-9][0-9]*}}, refined: 0)
+// STATS2: top-down queries: {{[0-9]+}} (uncovered: {{[0-9]+}}, enumerated: {{[1-9][0-9]*}}, stopped: {{[0-9]+}}, budget hits: 0, refined: {{[1-9][0-9]*}})
+// STATS2: contexts per query: max 2, mean {{.*}}
+
+!s32i = !cir.int<s, 32>
+!rec_Obj = !cir.struct<class "Obj" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+module {
+cir.func private @escape(!cir.ptr<!s32i>)
+cir.func internal @read(%this: !cir.ptr<!rec_Obj>) {
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a = cir.load %ma : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %at = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.load %mb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %bt = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  cir.return
+}
+// obj.a = &x; obj.b = &y; escape(&x); read(&obj)
+cir.func @c1() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%x) : (!cir.ptr<!s32i>) -> ()
+  cir.call @read(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+// obj.a = &x; obj.b = &y; escape(&y); read(&obj)
+cir.func @c2() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%y) : (!cir.ptr<!s32i>) -> ()
+  cir.call @read(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+}

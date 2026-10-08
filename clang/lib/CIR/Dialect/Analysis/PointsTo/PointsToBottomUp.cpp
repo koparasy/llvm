@@ -706,12 +706,21 @@ void PointsToAnalysis::computeCoveringLaunches() {
     return fn->formalsComplete && !recursive.contains(func) &&
            numCopies.lookup(func) && !notCovered.contains(func);
   };
+  coveredClones.clear();
+  for (const std::unique_ptr<TUClone> &clone : clones)
+    if (covered(clone->callee))
+      coveredClones[clone->callee].push_back(clone.get());
   coveringLaunches.clear();
   for (const LaunchRecord &launch : launches) {
     const TUFunction *owner = getLaunchOwner(launch);
     if (!owner || !covered(owner))
       coveringLaunches.push_back(launch);
   }
+}
+
+bool PointsToAnalysis::isCovered(cir::FuncOp func) const {
+  const TUFunction *fn = functionMap.lookup(func.getOperation());
+  return fn && coveredClones.contains(fn);
 }
 
 ObjectSet PointsToAnalysis::pointsTo(Value value,

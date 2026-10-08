@@ -1,0 +1,186 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu td=0 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=OWN
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=TD
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=TD
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu subobjects=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=TD
+// RUN: cir-opt %s -test-cir-alias-analysis-modref='points-to-only=1 mode=bu td=0' -o /dev/null 2>&1 | FileCheck %s --check-prefix=MODREF
+// RUN: cir-opt %s -test-cir-alias-analysis-modref='points-to-only=1 mode=bu' -o /dev/null 2>&1 | FileCheck %s --check-prefix=MODREF
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CI
+// RUN: cir-opt %s -test-cir-points-to='mode=bu contexts=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CTX
+
+// Top-down queries (T18): obj.a = &x; obj.b = &y; built in a caller, read in
+// a callee method through `this`. @read has two callers: @c1 lets x escape
+// to code we don't see, @c2 lets y escape. @read's own graph is the join of
+// its two contexts (projectClones): both this->a and this->b may refer to
+// unknown memory there, so its own answer is MayAlias. In each context only
+// one of the two escaped (UnescapedObject), so the meet over the two
+// contexts, the top-down answer, is NoAlias.
+//
+// @read2 has the same body and three callers: @c3 and @c4 like @c1 and @c2,
+// and @c5, which stores one pointer into both members. In @c5's context the
+// two loads give one object, so the meet is MayAlias.
+
+// OWN-LABEL: Testing : "read"
+// OWN-NEXT: a#0 <-> b#0: MayAlias
+// OWN-NEXT: why: a: an escaped pointer passed to @escape ({{.*}}); b: an escaped pointer passed to @escape ({{.*}})
+// OWN-LABEL: Testing : "read2"
+// OWN-NEXT: a2#0 <-> b2#0: MayAlias
+// OWN-LABEL: Testing : "inner"
+// OWN-NEXT: ia#0 <-> ib#0: MayAlias
+
+// TD-LABEL: Testing : "read"
+// TD-NEXT: a#0 <-> b#0: NoAlias
+// TD-LABEL: Testing : "read2"
+// TD-NEXT: a2#0 <-> b2#0: MayAlias
+// TD-LABEL: Testing : "inner"
+// TD-NEXT: ia#0 <-> ib#0: NoAlias
+
+// The call in @read2 writes *a2 (through @touch). Its mod/ref of b2 is
+// asked in the contexts too; @c4's context (b2 escaped) and @c5's (b2 is a2)
+// keep it ModRef.
+// MODREF-LABEL: Testing : "read2"
+// MODREF: touch -> b2#0: ModRef
+
+// pointsToInContexts: a and b are two distinct objects in each of @read's
+// two contexts (x escaped in one, so the union is incomplete). In @read2 the
+// pull-back from @c5's copy merged a2's and b2's nodes, so each context has
+// both objects for both values.
+// CTX: @read a in 2 contexts -> [[X1:n[0-9]+]]+0 [[X2:n[0-9]+]]+0 incomplete
+// CTX: @read b in 2 contexts -> n{{[0-9]+}}+0 n{{[0-9]+}}+0 incomplete
+// CTX: @read2 a2 in 3 contexts -> [[S:.*]] incomplete
+// CTX: @read2 b2 in 3 contexts -> [[S]] incomplete
+// CTX: @inner ia in 2 contexts -> n{{[0-9]+}}+0 n{{[0-9]+}}+0 incomplete
+
+// CI-LABEL: Testing : "read"
+// CI-NEXT: a#0 <-> b#0: MayAlias
+
+!s32i = !cir.int<s, 32>
+!rec_Obj = !cir.struct<class "Obj" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+module {
+cir.func private @escape(!cir.ptr<!s32i>)
+cir.func internal @touch(%p: !cir.ptr<!s32i>) {
+  %c1 = cir.const #cir.int<1> : !s32i
+  cir.store %c1, %p : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func internal @read(%this: !cir.ptr<!rec_Obj>) {
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a = cir.load %ma : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %at = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.load %mb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %bt = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  cir.return
+}
+cir.func internal @read2(%this: !cir.ptr<!rec_Obj>) {
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a = cir.load %ma : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %at = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a2"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.load %mb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %bt = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b2"}
+  cir.call @touch(%a) {test.ptr = "touch"} : (!cir.ptr<!s32i>) -> ()
+  cir.return
+}
+// obj.a = &x; obj.b = &y; escape(&x); read(&obj)
+cir.func @c1() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%x) : (!cir.ptr<!s32i>) -> ()
+  cir.call @read(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+// obj.a = &x; obj.b = &y; escape(&y); read(&obj)
+cir.func @c2() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%y) : (!cir.ptr<!s32i>) -> ()
+  cir.call @read(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+cir.func @c3() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%x) : (!cir.ptr<!s32i>) -> ()
+  cir.call @read2(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+cir.func @c4() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%y) : (!cir.ptr<!s32i>) -> ()
+  cir.call @read2(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+// obj.a = obj.b = &x; read2(&obj)
+cir.func @c5() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @read2(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+// Two levels: @inner is called only by @mid, which @c6 and @c7 call like @c1
+// and @c2. @inner's one context, @mid's copy, is the join of @mid's two;
+// the walk goes on through @mid's copies to @c6 and @c7.
+cir.func internal @inner(%this: !cir.ptr<!rec_Obj>) {
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a = cir.load %ma : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %at = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "ia"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.load %mb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %bt = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "ib"}
+  cir.return
+}
+cir.func internal @mid(%this: !cir.ptr<!rec_Obj>) {
+  cir.call @inner(%this) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+cir.func @c6() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%x) : (!cir.ptr<!s32i>) -> ()
+  cir.call @mid(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+cir.func @c7() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%y) : (!cir.ptr<!s32i>) -> ()
+  cir.call @mid(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+}

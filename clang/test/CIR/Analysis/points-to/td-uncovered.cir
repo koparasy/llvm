@@ -1,0 +1,102 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-opt %s -test-cir-points-to='mode=bu contexts=1' -o /dev/null | FileCheck %s --check-prefix=CTX
+
+// A function that is not covered answers from its own graph. @read has the
+// body and the two callers of td-members.cir's first case, but external
+// linkage: with closed-tu off another TU may call it with anything, so its
+// formals are Incomplete and the contexts here are not all of them. @read_esc
+// is internal, but its address escapes to code we don't see (@register), so
+// it is not covered even under closed-tu. Under closed-tu @read is covered,
+// and the two contexts give NoAlias.
+
+// OPEN-LABEL: Testing : "read"
+// OPEN-NEXT: a#0 <-> b#0: MayAlias
+// OPEN-LABEL: Testing : "read_esc"
+// OPEN-NEXT: ea#0 <-> eb#0: MayAlias
+
+// CLOSED-LABEL: Testing : "read"
+// CLOSED-NEXT: a#0 <-> b#0: NoAlias
+// CLOSED-LABEL: Testing : "read_esc"
+// CLOSED-NEXT: ea#0 <-> eb#0: MayAlias
+
+// CTX: @read a in uncovered, 0 contexts ->
+// CTX: @read_esc ea in uncovered, 0 contexts ->
+
+!s32i = !cir.int<s, 32>
+!rec_Obj = !cir.struct<class "Obj" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+
+module {
+cir.func private @escape(!cir.ptr<!s32i>)
+cir.func @read(%this: !cir.ptr<!rec_Obj>) {
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a = cir.load %ma : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %at = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.load %mb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %bt = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  cir.return
+}
+// obj.a = &x; obj.b = &y; escape(&x); read(&obj)
+cir.func @c1() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%x) : (!cir.ptr<!s32i>) -> ()
+  cir.call @read(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+// obj.a = &x; obj.b = &y; escape(&y); read(&obj)
+cir.func @c2() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%y) : (!cir.ptr<!s32i>) -> ()
+  cir.call @read(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+cir.func private @register(!cir.ptr<!cir.func<(!cir.ptr<!rec_Obj>)>>)
+cir.func internal @read_esc(%this: !cir.ptr<!rec_Obj>) {
+  %ma = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a = cir.load %ma : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %at = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "ea"}
+  %mb = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.load %mb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %bt = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "eb"}
+  cir.return
+}
+cir.func @c3() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%x) : (!cir.ptr<!s32i>) -> ()
+  cir.call @read_esc(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  %fp = cir.get_global @read_esc : !cir.ptr<!cir.func<(!cir.ptr<!rec_Obj>)>>
+  cir.call @register(%fp) : (!cir.ptr<!cir.func<(!cir.ptr<!rec_Obj>)>>) -> ()
+  cir.return
+}
+cir.func @c4() {
+  %o = cir.alloca "o" align(8) : !cir.ptr<!rec_Obj>
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %ma = cir.get_member %o[0] {name = "a"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ma : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %mb = cir.get_member %o[1] {name = "b"} : !cir.ptr<!rec_Obj> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %mb : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @escape(%y) : (!cir.ptr<!s32i>) -> ()
+  cir.call @read_esc(%o) : (!cir.ptr<!rec_Obj>) -> ()
+  cir.return
+}
+}

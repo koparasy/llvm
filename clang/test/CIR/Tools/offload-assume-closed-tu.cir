@@ -1,0 +1,144 @@
+// -cir-offload-assume-closed-tu (plan D2, off by default) reaches the
+// points-to analysis behind --cir-offload-host-facts=ipo|both: the
+// host-facts summary remark names the mode, and the verdicts change. The input
+// is sycl-host-facts-both.cir's (two buffers and two USM pointers built by
+// @setup into members of a Bench object, launched by @run through `this`).
+// --cir-offload-host-facts=ipo|both runs the bottom-up points-to analysis
+// with subobject nodes; --cir-offload-host-facts-ci is the escape hatch to
+// the context-insensitive one.
+
+// RUN: rm -rf %t && split-file %s %t
+// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   --cir-offload-host-facts=both -output=%t/open.cir 2>&1 | FileCheck %s --check-prefix=OPEN
+// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   --cir-offload-host-facts=both -cir-offload-assume-closed-tu -output=%t/closed.cir 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   --cir-offload-host-facts=both --cir-offload-host-facts-closed-tu -output=%t/alias.cir 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   --cir-offload-host-facts=both -cir-offload-assume-closed-tu --cir-offload-host-facts-ci \
+// RUN:   -output=%t/ci.cir 2>&1 | FileCheck %s --check-prefix=CI
+// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   --cir-offload-host-facts=ipo -cir-offload-assume-closed-tu -output=%t/ipo.cir
+// RUN: FileCheck %s --check-prefix=IPO --input-file=%t/ipo.cir
+// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   --cir-offload-host-facts=ipo -output=%t/ipo-open.cir
+// RUN: FileCheck %s --check-prefix=IPO-OPEN --input-file=%t/ipo-open.cir
+
+// Open: @setup and @run may have callers in other TUs; legacy and points-to
+// agree (nothing stamped).
+// OPEN-NOT: host-facts-disagreement:
+// OPEN: remark: host-facts-disagreements: 0 of 4 candidate fields (open, bu, subobjects)
+
+// Closed TU: points-to sees @main's objects, legacy stops at `this`.
+// CLOSED-COUNT-4: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field {{[ABPQ]}} legacy=not stamped ({{.*}}) ipo=noalias
+// CLOSED: remark: host-facts-disagreements: 4 of 4 candidate fields (closed-tu, bu, subobjects)
+
+// CI: host-facts-disagreements: 4 of 4 candidate fields (closed-tu, ci, subobjects)
+
+// ipo stamps the two USM pointer parameters under closed-tu only.
+// IPO: cir.func @_ZTSZ4mainEUlvE_({{.*}}field = "P", kind = "pointer", path = ["P"]}, llvm.noalias}, {{.*}}field = "Q", kind = "pointer", path = ["Q"]}, llvm.noalias})
+// IPO-OPEN-NOT: llvm.noalias
+
+//--- host.cir
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_bench = !cir.struct<class "Bench" {data !rec_buf, data !rec_buf, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module {
+cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+cir.func private @_ZN4sycl3_V113malloc_deviceIfEEPv(!u64i) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) func_info<#cir.cxx_ctor<!rec_buf, custom>> attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) func_info<#cir.cxx_ctor<!rec_acc, custom>> attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+  %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+  %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+  cir.return %1 : !cir.ptr<!s8i>
+}
+// Bench::setup(): constructs both member buffers and allocates both
+// member USM pointers.
+cir.func @setup(%this: !cir.ptr<!rec_bench>, %r: !cir.ptr<!rec_range>, %n: !u64i) {
+  %a = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_bench> -> !cir.ptr<!rec_buf>
+  cir.call @buffer_alloc(%a, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+  %b = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_bench> -> !cir.ptr<!rec_buf>
+  cir.call @buffer_alloc(%b, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+  %p = cir.get_member %this[2] {name = "p"} : !cir.ptr<!rec_bench> -> !cir.ptr<!cir.ptr<!f32>>
+  %pv = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPv(%n) : (!u64i) -> !cir.ptr<!f32>
+  cir.store %pv, %p : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+  %q = cir.get_member %this[3] {name = "q"} : !cir.ptr<!rec_bench> -> !cir.ptr<!cir.ptr<!f32>>
+  %qv = cir.call @_ZN4sycl3_V113malloc_deviceIfEEPv(%n) : (!u64i) -> !cir.ptr<!f32>
+  cir.store %qv, %q : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+  cir.return
+}
+// Bench::run(): launches the kernel on accessors to this->a and this->b,
+// and on this->p and this->q.
+cir.func @run(%this: !cir.ptr<!rec_bench>, %ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>) {
+  %view = cir.alloca "view" align(8) : !cir.ptr<!rec_view>
+  %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+  %a = cir.get_member %this[0] {name = "a"} : !cir.ptr<!rec_bench> -> !cir.ptr<!rec_buf>
+  %b = cir.get_member %this[1] {name = "b"} : !cir.ptr<!rec_bench> -> !cir.ptr<!rec_buf>
+  %f0 = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+  cir.call @accessor_from_buffer(%f0, %a, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+  %f1 = cir.get_member %lam[1] {name = "B"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+  cir.call @accessor_from_buffer(%f1, %b, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!s8i>) -> ()
+  %mp = cir.get_member %this[2] {name = "p"} : !cir.ptr<!rec_bench> -> !cir.ptr<!cir.ptr<!f32>>
+  %pv = cir.load %mp : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+  %f2 = cir.get_member %lam[2] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+  cir.store %pv, %f2 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+  %mq = cir.get_member %this[3] {name = "q"} : !cir.ptr<!rec_bench> -> !cir.ptr<!cir.ptr<!f32>>
+  %qv = cir.load %mq : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+  %f3 = cir.get_member %lam[3] {name = "Q"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+  cir.store %qv, %f3 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+  %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+  cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) -> ()
+  %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+  %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+  cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %view, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_view>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+  cir.return
+}
+cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %h: !cir.ptr<!s8i>, %r: !cir.ptr<!rec_range>, %n: !u64i) {
+  %bench = cir.alloca "bench" align(8) : !cir.ptr<!rec_bench>
+  cir.call @setup(%bench, %r, %n) : (!cir.ptr<!rec_bench>, !cir.ptr<!rec_range>, !u64i) -> ()
+  cir.call @run(%bench, %ev, %q, %h) : (!cir.ptr<!rec_bench>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>) -> ()
+  cir.return
+}
+}
+
+//--- device.cir
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_bench = !cir.struct<class "Bench" {data !rec_buf, data !rec_buf, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_view = !cir.struct<"view" {data !cir.ptr<!u64i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc, data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_lam>}>
+
+module {
+cir.func @_ZTSZ4mainEUlvE_(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}}, %arg1: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "A", init_arg = 1 : i32, kind = "accessor", path = ["A"]}}, %arg2: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}}, %arg3: !cir.ptr<!rec_range> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "B", init_arg = 1 : i32, kind = "accessor", path = ["B"]}}, %arg4: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}, %arg5: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "Q", kind = "pointer", path = ["Q"]}}) cc(spir_kernel) {
+  cir.return
+}
+}

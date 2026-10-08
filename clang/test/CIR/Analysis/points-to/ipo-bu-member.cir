@@ -1,4 +1,5 @@
-// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1 td=0' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=TD
 // RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CI
 // RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 print-stats=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=STATS
 // RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 contexts=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CTX
@@ -23,6 +24,14 @@
 // BU-LABEL: Testing : "read2"
 // BU-NEXT: ra2#0 <-> rb2#0: MayAlias
 // BU-NEXT: why: a, b: same node at the same offset, which has no known origin
+
+// With the top-down queries (td=1, the default), @read2's pair is answered
+// in its one calling context, @main's copy, where both loads give the one
+// object @init2's copy of @make allocates: MustAlias.
+// TD-LABEL: Testing : "read"
+// TD-NEXT: ra#0 <-> rb#0: NoAlias
+// TD-LABEL: Testing : "read2"
+// TD-NEXT: ra2#0 <-> rb2#0: MustAlias
 
 // CI-LABEL: Testing : "init"
 // CI-NEXT: a#0 <-> b#0: MayAlias

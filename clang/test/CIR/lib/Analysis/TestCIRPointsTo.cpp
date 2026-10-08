@@ -87,7 +87,8 @@
 //
 // The stats then start with "--- bu stats" and add the copy counters.
 // contexts=1 also prints each tagged value of a function in the contexts of
-// the calls that copied its graph (see printInContexts).
+// the calls that copied its graph, and in all of its calling contexts
+// (pointsToInContexts; see printInContexts).
 // max-clone-nodes=<n> and max-total-clone-nodes=<n> set the budgets.
 //
 // subobjects=1 sets PointsToAnalysisOptions::subobjects (in local mode,
@@ -300,6 +301,17 @@ void printInContexts(raw_ostream &os, const PointsToAnalysis &analysis,
       }
       os << (set.complete ? " complete" : " incomplete") << "\n";
     }
+    // The top-down set: every calling context of a covered function.
+    unsigned numContexts = 0;
+    ObjectSet all = analysis.pointsToInContexts(op->getResult(0), &numContexts);
+    os << "@" << func.getSymName() << " " << name.getValue() << " in "
+       << (analysis.isCovered(func) ? "" : "uncovered, ") << numContexts
+       << " contexts ->";
+    for (Cell cell : all.cells) {
+      os << " ";
+      Graph::printCell(os, cell);
+    }
+    os << (all.complete ? " complete" : " incomplete") << "\n";
   });
 }
 

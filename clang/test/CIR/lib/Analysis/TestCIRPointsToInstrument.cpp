@@ -38,6 +38,9 @@
 // Options:
 //   closed-tu=1               PointsToAnalysisOptions::assumeClosedTU
 //   mode=bu                   the bottom-up mode (PointsToMode::BU)
+//   td=0                      bu: answer from each function's own graph
+//                             (PointsToAnalysisOptions::topDownQueries)
+//   max-query-contexts=<n>    bu: PointsToAnalysisOptions::maxQueryContexts
 //   max-pairs-per-func=<n>    as above
 //   seed=<s>                  the sampling seed
 //   table=<path>              write the side table: one line per check,
@@ -180,6 +183,14 @@ struct TestCIRPointsToInstrumentPass
       llvm::cl::desc("Points-to: give class, union and array members their "
                      "own nodes"),
       llvm::cl::init(false)};
+  Option<bool> topDown{
+      *this, "td",
+      llvm::cl::desc("Points-to, bu: answer from the calling contexts"),
+      llvm::cl::init(true)};
+  Option<unsigned> maxQueryContexts{
+      *this, "max-query-contexts",
+      llvm::cl::desc("Points-to, bu: the most calling contexts per query"),
+      llvm::cl::init(64)};
   Option<unsigned> maxPairs{
       *this, "max-pairs-per-func",
       llvm::cl::desc("The most pairs checked per function (0 = all)"),
@@ -277,6 +288,8 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
   if (ptMode == "bu")
     options.mode = PointsToMode::BU;
   options.subobjects = subobjects;
+  options.topDownQueries = topDown;
+  options.maxQueryContexts = maxQueryContexts;
   PointsToAnalysis pt(module, &registry, options);
   DataLayout dataLayout(module);
 

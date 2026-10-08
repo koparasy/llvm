@@ -6,7 +6,9 @@
 // alias-analysis*.cir tests in the parent directory run it in their own RUN
 // lines. A failure is an assertion in the pass, so only the exit status is
 // checked. When adding a points-to test, add it here, also in the bottom-up
-// block below (and a subobject test in the subobject block at the end).
+// block below (and a subobject test in the subobject block at the end). The
+// bottom-up lines run the top-down queries (T18, td=1 by default) too; the
+// td-*.cir tests are also in the subobject block.
 //
 // RUN: cir-opt %S/aggregate-values.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/aggregate-values.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
@@ -106,6 +108,12 @@
 // RUN: cir-opt %S/subobj-gemm.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/summary.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/summary.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-budget.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-budget.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-members.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-members.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-uncovered.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-uncovered.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/unhandled-op.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/unhandled-op.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/virtual.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
@@ -223,6 +231,12 @@
 // RUN: cir-opt %S/subobj-gemm.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/summary.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/summary.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-budget.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-budget.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-members.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-members.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-uncovered.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-uncovered.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/unhandled-op.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/unhandled-op.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/virtual.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
@@ -259,3 +273,15 @@
 // RUN: cir-opt %S/subobj-gemm.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-gemm.cir -test-cir-alias-analysis='use-points-to=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-gemm.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-budget.cir -test-cir-alias-analysis='use-points-to=1 subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-budget.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-budget.cir -test-cir-alias-analysis='use-points-to=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-budget.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-members.cir -test-cir-alias-analysis='use-points-to=1 subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-members.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-members.cir -test-cir-alias-analysis='use-points-to=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-members.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-uncovered.cir -test-cir-alias-analysis='use-points-to=1 subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-uncovered.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-uncovered.cir -test-cir-alias-analysis='use-points-to=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/td-uncovered.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null

@@ -98,25 +98,45 @@ llvm::cl::opt<std::string> HostFacts(
                    "KernelBindingTable trace, the default), ipo (points-to), "
                    "or both (legacy is used; disagreements are remarks)"),
     llvm::cl::init("legacy"), llvm::cl::cat(CIROffloadMergeCategory));
-// Temporary: -cir-offload-assume-closed-tu (T18) will replace it.
-llvm::cl::opt<bool> HostFactsClosedTU(
-    "cir-offload-host-facts-closed-tu",
-    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, assume every "
-                   "caller of every host function is in this TU"),
-    llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
-// Temporary: the bottom-up points-to mode (T17), until it is the default.
+// Plan D2: the host points-to analysis may assume that every caller of every
+// host function is in this TU. Off by default: a function another TU can call
+// (external, linkonce_odr, weak) then has Incomplete formals.
+llvm::cl::opt<bool> AssumeClosedTU(
+    "cir-offload-assume-closed-tu",
+    llvm::cl::desc("Assume every caller of every host function is in this TU "
+                   "(the points-to analysis behind "
+                   "--cir-offload-host-facts=ipo|both)"),
+    llvm::cl::cat(CIROffloadMergeCategory));
+// The old spelling, kept for scripts.
+llvm::cl::alias
+    HostFactsClosedTU("cir-offload-host-facts-closed-tu",
+                      llvm::cl::desc("Alias for "
+                                     "-cir-offload-assume-closed-tu"),
+                      llvm::cl::aliasopt(AssumeClosedTU), llvm::cl::Hidden);
+// The points-to analysis of --cir-offload-host-facts=ipo|both is the
+// bottom-up mode (T17) with subobject nodes (T17b) and top-down queries
+// (T18). --cir-offload-host-facts-ci is the escape hatch to the
+// context-insensitive analysis; -bu=false and -subobjects=false turn the two
+// parts off one by one.
 llvm::cl::opt<bool> HostFactsBottomUp(
     "cir-offload-host-facts-bu",
     llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, run the points-to "
-                   "analysis bottom-up (context-sensitive)"),
+                   "analysis bottom-up (context-sensitive; the default)"),
+    llvm::cl::init(true), llvm::cl::Hidden,
+    llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<bool> HostFactsCI(
+    "cir-offload-host-facts-ci",
+    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, run the points-to "
+                   "analysis context-insensitively (overrides "
+                   "--cir-offload-host-facts-bu)"),
     llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
-// Temporary: the subobject nodes of points-to (T17b), until they are the
-// default.
 llvm::cl::opt<bool> HostFactsSubobjects(
     "cir-offload-host-facts-subobjects",
     llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, give class, union "
-                   "and array members their own points-to nodes"),
-    llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
+                   "and array members their own points-to nodes (the "
+                   "default)"),
+    llvm::cl::init(true), llvm::cl::Hidden,
+    llvm::cl::cat(CIROffloadMergeCategory));
 llvm::cl::opt<bool> HostFactsCensus(
     "cir-offload-host-facts-census",
     llvm::cl::desc("Under --cir-offload-host-facts=both, also remark both "
@@ -460,17 +480,15 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   {
     std::unique_ptr<mlir::Pass> noAlias =
         mlir::createOffloadInferKernelParamNoAliasPass();
-    if (HostFacts != "legacy" || HostFactsClosedTU || HostFactsCensus ||
-        HostFactsBottomUp || HostFactsSubobjects) {
+    {
+      auto flag = [](bool on) { return on ? "true" : "false"; };
       std::string options = "host-facts=" + HostFacts;
-      if (HostFactsClosedTU)
-        options += " host-facts-closed-tu=true";
-      if (HostFactsBottomUp)
-        options += " host-facts-bu=true";
-      if (HostFactsSubobjects)
-        options += " host-facts-subobjects=true";
-      if (HostFactsCensus)
-        options += " host-facts-census=true";
+      options += " host-facts-closed-tu=" + std::string(flag(AssumeClosedTU));
+      options += " host-facts-bu=" +
+                 std::string(flag(HostFactsBottomUp && !HostFactsCI));
+      options +=
+          " host-facts-subobjects=" + std::string(flag(HostFactsSubobjects));
+      options += " host-facts-census=" + std::string(flag(HostFactsCensus));
       if (mlir::failed(noAlias->initializeOptions(
               options, [](const llvm::Twine &message) {
                 reportError(message);

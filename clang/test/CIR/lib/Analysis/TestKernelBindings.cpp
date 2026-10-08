@@ -44,13 +44,14 @@ struct PrintKernelBindingsPass
 
   Option<bool> bottomUp{
       *this, "bu",
-      llvm::cl::desc("Under ipo/both, run the points-to analysis bottom-up"),
-      llvm::cl::init(false)};
+      llvm::cl::desc("Under ipo/both, run the points-to analysis bottom-up "
+                     "(the default; bu=0 runs it context-insensitively)"),
+      llvm::cl::init(cir::HostFactsOptions().bottomUp)};
   Option<bool> subobjects{
       *this, "subobjects",
       llvm::cl::desc("Under ipo/both, give class, union and array members "
-                     "their own points-to nodes"),
-      llvm::cl::init(false)};
+                     "their own points-to nodes (the default)"),
+      llvm::cl::init(cir::HostFactsOptions().subobjects)};
 
   StringRef getArgument() const final { return "test-print-kernel-bindings"; }
   StringRef getDescription() const final {

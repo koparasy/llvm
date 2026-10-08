@@ -433,14 +433,17 @@ def OffloadInferKernelParamNoAlias
     Option<"hostFactsClosedTU", "host-facts-closed-tu", "bool",
            /*default=*/"false",
            "Under ipo/both, assume the module holds every caller of every "
-           "function (PointsToAnalysisOptions::assumeClosedTU).">,
-    Option<"hostFactsBottomUp", "host-facts-bu", "bool", /*default=*/"false",
+           "function (PointsToAnalysisOptions::assumeClosedTU; "
+           "-cir-offload-assume-closed-tu of cir-offload-merge).">,
+    Option<"hostFactsBottomUp", "host-facts-bu", "bool", /*default=*/"true",
            "Under ipo/both, run the points-to analysis bottom-up "
-           "(PointsToMode::BU).">,
+           "(PointsToMode::BU, the default); false runs it "
+           "context-insensitively.">,
     Option<"hostFactsSubobjects", "host-facts-subobjects", "bool",
-           /*default=*/"false",
+           /*default=*/"true",
            "Under ipo/both, give class, union and array members their own "
-           "points-to nodes (PointsToAnalysisOptions::subobjects).">,
+           "points-to nodes (PointsToAnalysisOptions::subobjects, the "
+           "default).">,
     Option<"hostFactsCensus", "host-facts-census", "bool", /*default=*/"false",
            "Under both, also emit one host-facts remark per candidate field "
            "with both verdicts.">,

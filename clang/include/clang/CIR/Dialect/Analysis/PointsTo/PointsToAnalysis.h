@@ -78,8 +78,16 @@
 // them, and also projects what each copy learnt in its caller's context
 // (status flags, and which of its nodes the caller merged) back into the
 // graph it was copied from, so that each function's own graph stays sound
-// for all of its callers. Queries about a value of a function answer from
-// that function's graph; values of two different functions are MayAlias.
+// for all of its callers. Values of two different functions are MayAlias.
+//
+// Top-down queries (BU mode, PointsToAnalysisOptions::topDownQueries; see
+// PointsToTopDown.cpp for the rules and their soundness argument): a query
+// about values of a function every execution of which runs in a context that
+// copied its graph (a covered function) maps the values through each copy
+// into the callers' graphs, up to graphs whose function is not covered, and
+// answers the meet over those calling contexts. Past
+// PointsToAnalysisOptions::maxQueryContexts contexts, and for any other
+// function, a query answers from the function's own graph.
 //
 // Queries (PointsToQueries.cpp) run on the finished graph: alias, getModRef
 // and explainAlias. CIRPointsToAliasAnalysis wraps them as an
@@ -158,7 +166,7 @@ struct PointsToAnalysisOptions {
   size_t maxTotalCloneNodes = 2000000;
   /// Treat every function as if all of its callers were in the module: no
   /// formal starts Incomplete. Tests set it; the -cir-offload-assume-closed-tu
-  /// flag maps onto it later.
+  /// flag of cir-offload-merge sets it for the SYCL host facts.
   bool assumeClosedTU = false;
   /// Subobject nodes (PointsToGraph.h): every member of class, union or
   /// array type a cir.get_member names gets its own child node, so that a
@@ -169,6 +177,13 @@ struct PointsToAnalysisOptions {
   /// targets; past it, a call that gains a target gets the unknown-call
   /// rule (Reason Budget).
   unsigned maxIndirectRounds = 32;
+  /// BU: answer alias, pointsToInContexts and getModRef queries about the
+  /// values of a covered function as the meet over its calling contexts
+  /// (top-down; see the file comment). Off: from the function's own graph.
+  bool topDownQueries = true;
+  /// BU, top-down queries: the most calling contexts one query enumerates;
+  /// past it, the query answers from the function's own graph.
+  unsigned maxQueryContexts = 64;
   /// If set, called on a registry the analysis owns, which is asked before
   /// the registry passed to the constructor (its fallback): how a client
   /// adds a plug-in's models (the SYCL ones, from OffloadOpt) without this
@@ -385,6 +400,10 @@ enum class AliasRule : uint8_t {
   /// Different nodes in one tree whose ranges may overlap there (or an
   /// array, a collapsed node, or unknown code in the way): MayAlias.
   SubobjectOverlap,
+  /// BU, top-down: the values of a covered function, mapped into each of
+  /// its calling contexts, get this answer in every one of them (the meet;
+  /// AliasAnswer::contexts says how many).
+  CallingContexts,
 };
 
 llvm::StringRef getAliasRuleName(AliasRule rule);
@@ -393,6 +412,29 @@ llvm::StringRef getAliasRuleName(AliasRule rule);
 struct AliasAnswer {
   mlir::AliasResult result;
   AliasRule rule;
+  /// AliasRule::CallingContexts: the number of calling contexts.
+  unsigned contexts = 0;
+};
+
+/// Counters of the top-down queries (BU mode), for statistics and tests.
+struct PointsToQueryStats {
+  /// Queries about values of one function that the own graph left at
+  /// MayAlias (alias) or not NoModRef (getModRef), or any pointsToInContexts.
+  size_t numQueries = 0;
+  /// Of those: about a function that is not covered; that enumerated its
+  /// contexts to the end; that stopped early (a context answered MayAlias or
+  /// ModRef, which the meet can't improve); that ran past maxQueryContexts.
+  size_t numUncovered = 0;
+  size_t numEnumerated = 0;
+  size_t numStopped = 0;
+  size_t numBudgetHits = 0;
+  /// Queries whose answer the contexts made more precise than the own
+  /// graph's.
+  size_t numRefined = 0;
+  /// The contexts visited, summed over the queries that enumerated or
+  /// stopped, and the most one query visited.
+  size_t totalContexts = 0;
+  size_t maxContexts = 0;
 };
 
 /// Counters of one run, for statistics and tests.
@@ -491,6 +533,20 @@ public:
   /// every context. CI mode, or an empty path: pointsTo(value).
   ObjectSet pointsTo(mlir::Value value,
                      llvm::ArrayRef<mlir::Operation *> callPath) const;
+  /// BU mode, top-down: what \p value may point to in every calling context
+  /// of its function, if the function is covered (see the file comment):
+  /// the union of the sets of the contexts, cells of the callers' graphs,
+  /// complete only if each context's set is. Otherwise, over budget, with
+  /// topDownQueries off, or in CI mode: pointsTo(value). \p numContexts, if
+  /// given, is set to the number of contexts (0 for pointsTo(value)).
+  ObjectSet pointsToInContexts(mlir::Value value,
+                               unsigned *numContexts = nullptr) const;
+  /// BU mode: whether every execution of \p func runs in a context that
+  /// copied its graph (its formals are complete, it is not recursive, and
+  /// every call to it, of at least one, is a copy). The launch records of
+  /// such a function are replaced by their copies (getLaunches), and the
+  /// top-down queries enumerate its contexts.
+  bool isCovered(cir::FuncOp func) const;
   /// What the pointer slot at \p cell may hold: its link target. A slot
   /// without a link holds nothing seen, which is all it may hold only if
   /// its node is complete.
@@ -589,6 +645,8 @@ public:
   }
 
   const PointsToAnalysisStats &getStats() const { return stats; }
+  /// The counters of the top-down queries run so far.
+  const PointsToQueryStats &getQueryStats() const { return queryStats; }
 
   /// The ops the local phase sent to the pessimistic default, summed over
   /// the functions (see LocalBuilder).
@@ -663,7 +721,8 @@ private:
   /// Project what the copies learnt in their callers' graphs back into the
   /// graphs they were copied from. Returns whether it changed anything.
   bool projectClones();
-  /// The records of getLaunches() in BU mode.
+  /// The covered functions and their copies (isCovered), and the records of
+  /// getLaunches() in BU mode.
   void computeCoveringLaunches();
   /// The function whose graph holds \p launch.
   const TUFunction *getLaunchOwner(const LaunchRecord &launch) const;
@@ -709,6 +768,75 @@ private:
 
   // Queries (PointsToQueries.cpp).
   uint64_t getAccessSize(mlir::Value ptr, std::optional<uint64_t> size) const;
+  /// aliasWithRule from the own graph.
+  AliasAnswer aliasOwn(mlir::Value a, mlir::Value b,
+                       std::optional<uint64_t> sizeA,
+                       std::optional<uint64_t> sizeB) const;
+  mlir::ModRefResult getModRefOwn(mlir::Operation *op,
+                                  mlir::Value location) const;
+  /// The roots of what \p call may access (see getCallReach): the cells of
+  /// its arguments and results (and of the calls a model makes on its
+  /// behalf) in \p locals, the symbol nodes its callees may name in
+  /// \p symbolsOut (every symbol node if one may call code we don't see).
+  void collectCallRoots(const TUCallSite &call,
+                        llvm::SmallVectorImpl<Cell> &locals,
+                        llvm::SmallVectorImpl<Cell> &symbolsOut) const;
+  /// Add to \p reach every node reachable from \p roots (links, ghost links,
+  /// subobjects, offset-0 parents).
+  void closeReach(llvm::ArrayRef<Cell> roots,
+                  llvm::DenseSet<const Node *> &reach) const;
+  /// getCallModRef's rules for the location cells \p location, given what
+  /// the call may reach.
+  mlir::ModRefResult
+  callModRefOf(llvm::ArrayRef<Cell> location,
+               const llvm::DenseSet<const Node *> &reach) const;
+
+  // Top-down queries (PointsToTopDown.cpp).
+  /// One copy's map from the source nodes (resolved now) to their copies.
+  struct CloneIndex {
+    /// Per resolved source node: (the offset of the copied source node in
+    /// it, the copy's cell).
+    llvm::DenseMap<const Node *, llvm::SmallVector<std::pair<int64_t, Cell>, 1>>
+        images;
+  };
+  const CloneIndex &getCloneIndex(const TUClone &clone) const;
+  /// Add to \p out the images of \p cells, cells of the copied function's
+  /// graph, through \p clone in the caller's graph. \p exact: false if a
+  /// cell has no faithful image (see PointsToTopDown.cpp); otherwise the
+  /// cells without an image are dropped.
+  bool mapThroughClone(const TUClone &clone, llvm::ArrayRef<Cell> cells,
+                       llvm::SmallVectorImpl<Cell> &out, bool exact) const;
+  /// Cells a top-down query maps into the calling contexts. An exact group
+  /// stands for the cells themselves: a context where one of them has no
+  /// faithful image is answered in the graph the walk is in. A reach group
+  /// stands for every node reachable from its cells: before each copy it is
+  /// closed over the links of the graph it is in, and the nodes without an
+  /// image are dropped (see PointsToTopDown.cpp).
+  struct RootGroup {
+    llvm::SmallVector<Cell, 2> cells;
+    bool reach = false;
+  };
+  /// How an enumeration of contexts ended.
+  enum class ContextWalkResult : uint8_t { Done, Stopped, OverBudget };
+  /// Call \p leaf on \p roots (cells of \p fn's graph) in each calling
+  /// context of \p fn: mapped through every copy of \p fn, recursively up
+  /// to a graph whose function is not covered or an exact cell without an
+  /// image. \p leaf returns false to stop. \p numContexts counts the leaves
+  /// visited.
+  ContextWalkResult
+  forEachContext(const TUFunction &fn, llvm::ArrayRef<RootGroup> roots,
+                 llvm::function_ref<bool(llvm::ArrayRef<RootGroup>)> leaf,
+                 unsigned &numContexts) const;
+  /// The function whose graph a top-down query about \p value starts from:
+  /// its function if it is covered and top-down queries are on, else null.
+  const TUFunction *getTopDownFunction(mlir::Value value) const;
+  void countContexts(ContextWalkResult result, unsigned numContexts) const;
+  std::optional<AliasAnswer> aliasInContexts(const TUFunction &fn, Cell a,
+                                             Cell b, uint64_t sizeA,
+                                             uint64_t sizeB) const;
+  std::optional<mlir::ModRefResult>
+  getModRefInContexts(const TUFunction &fn, mlir::Operation *op,
+                      mlir::Value location) const;
   AliasAnswer aliasCells(Cell a, Cell b, uint64_t sizeA, uint64_t sizeB) const;
   std::string explainAnswer(const AliasAnswer &answer, mlir::Value a,
                             mlir::Value b) const;
@@ -763,6 +891,9 @@ private:
   llvm::SmallVector<LaunchRecord, 0> launches;
   /// BU mode: getLaunches().
   llvm::SmallVector<LaunchRecord, 0> coveringLaunches;
+  /// BU mode: the covered functions (isCovered), with their copies.
+  llvm::DenseMap<const TUFunction *, llvm::SmallVector<const TUClone *, 2>>
+      coveredClones;
   CallPathTable callPaths;
   std::vector<std::unique_ptr<TUClone>> clones;
   std::vector<Partition> partitions;
@@ -793,6 +924,9 @@ private:
   mutable llvm::DenseMap<mlir::Operation *,
                          std::unique_ptr<llvm::DenseSet<const Node *>>>
       callReach;
+  mutable llvm::DenseMap<const TUClone *, std::unique_ptr<CloneIndex>>
+      cloneIndex;
+  mutable PointsToQueryStats queryStats;
 };
 
 } // namespace cir::pointsto
