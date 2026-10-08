@@ -353,6 +353,13 @@ public:
   /// Call before build(). Off by default.
   void setDeferIndirectCalls(bool defer) { deferIndirectCalls = defer; }
 
+  /// Give every member of class, struct, union or array type that a
+  /// cir.get_member names its own child node (Graph::getSubobject), and fold
+  /// back the children used past their extent at the end of the walk (see
+  /// the file comment of PointsToGraph.h). Call before build(). Off by
+  /// default.
+  void setSubobjects(bool enable) { subobjects = enable; }
+
   /// Walk the body and return the finished graph. Call once. Under
   /// -cir-points-to-verify the graph is verified before it is returned.
   std::unique_ptr<FunctionGraph> build();
@@ -507,6 +514,16 @@ private:
   bool verifyErrors = false;
   bool formalsComplete = false;
   bool deferIndirectCalls = false;
+  bool subobjects = false;
+  /// The size of the child a cir.get_member gets with setSubobjects, or
+  /// std::nullopt for a member that stays cells of its parent.
+  std::optional<uint64_t> getSubobjectSize(cir::GetMemberOp op);
+  /// A pointer step of \p op from \p base by \p delta bytes (std::nullopt:
+  /// a dynamic index over elements of \p elemSize bytes) that leaves a
+  /// child's slot collapses the child's parents.
+  void collapseIfLeavingSubobject(mlir::Operation *op, Cell base,
+                                  std::optional<int64_t> delta,
+                                  std::optional<int64_t> elemSize);
 };
 
 } // namespace cir::pointsto

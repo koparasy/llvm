@@ -169,6 +169,7 @@ SYCLHostFacts::SYCLHostFacts(ModuleOp container,
   ptOptions.assumeClosedTU = options.assumeClosedTU;
   if (options.bottomUp)
     ptOptions.mode = pointsto::PointsToMode::BU;
+  ptOptions.subobjects = options.subobjects;
   addSYCLPointsToPlugin(ptOptions);
   ownedAnalysis =
       std::make_unique<PointsToAnalysis>(host, ownedRegistry.get(), ptOptions);

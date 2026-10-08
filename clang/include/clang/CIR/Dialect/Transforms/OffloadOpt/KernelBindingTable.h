@@ -179,6 +179,9 @@ struct HostFactsOptions {
   // the launch records of a function its callers copied are read in the
   // callers' graphs.
   bool bottomUp = false;
+  /// Give class, union and array members their own points-to nodes
+  /// (PointsToAnalysisOptions::subobjects). Off by default.
+  bool subobjects = false;
 };
 
 // Which closure fields of a SYCL kernel are candidates for llvm.noalias, read

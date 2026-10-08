@@ -1,0 +1,162 @@
+// RUN: cir-opt %s -test-cir-points-to='subobjects=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=LOCAL
+// RUN: cir-opt %s -test-cir-points-to -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=FLAT
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 subobjects=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefixes=SUB,CELL
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=NOSUB
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1 subobjects=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CELL
+
+// struct T { int *p; int *q; };  struct U { int *r; int *s; };
+// struct S { T a; U b; };
+//
+// @inner: a collapse inside s.a (its bytes indexed as char) leaves s.b
+// field-sensitive: s.b.r and s.b.s keep their own targets. Without
+// subobjects, the collapse of s.a is a collapse of all of s.
+//
+// The four pointers come from four calls of @fresh: four heap nodes in
+// bottom-up mode, where the collapse is what merges them.
+//
+// @whole: indexing the whole of s as char collapses s together with its
+// children: every link of s, s.a and s.b ends up in one node.
+
+// The two members are children of the alloca's node; the char indexing
+// collapsed a's child only.
+// LOCAL-LABEL: === @inner
+// LOCAL-NEXT: n0 [Stack|Mod|Ref] size=32 origins={stack(cir.alloca 's' {{.*}})} links={} sub={0:16->[[A:n[0-9]+]]+0, 16:16->[[B:n[0-9]+]]+0}
+// LOCAL-NEXT: [[A]] [Stack|Collapsed|Mod|Ref] size=16 origins={} links={0->[[T:n[0-9]+]]+0} reasons={Collapsed: CollapsedAt(cir.ptr_stride {{.*}}, "dynamic index")}
+// LOCAL-NEXT: [[B]] [Stack|Mod|Ref] size=16 origins={} links={0->[[R:n[0-9]+]]+0, 8->[[S:n[0-9]+]]+0}
+// LOCAL: p -> [[T]]+0
+// LOCAL-NEXT: q -> [[T]]+0
+// LOCAL-NEXT: r -> [[R]]+0
+// LOCAL-NEXT: s2 -> [[S]]+0
+// LOCAL-LABEL: === @whole
+// LOCAL-NEXT: n0 [Stack|Collapsed|Mod|Ref] size=32 origins={stack(cir.alloca 's' {{.*}})} links={0->[[W:n[0-9]+]]+0} reasons={Collapsed: {{.*}}}
+// LOCAL-NOT: sub=
+// LOCAL: wp -> [[W]]+0
+// LOCAL-NEXT: wr -> [[W]]+0
+
+// FLAT-LABEL: === @inner
+// FLAT-NEXT: n0 [Stack|Collapsed|Mod|Ref] size=32 origins={stack(cir.alloca 's' {{.*}})} links={0->[[T:n[0-9]+]]+0}
+// FLAT: p -> [[T]]+0
+// FLAT-NEXT: q -> [[T]]+0
+// FLAT-NEXT: r -> [[T]]+0
+// FLAT-NEXT: s2 -> [[T]]+0
+
+// SUB-LABEL: Testing : "inner"
+// SUB-DAG: r#0 <-> s2#0: NoAlias
+// SUB-DAG: p#0 <-> r#0: NoAlias
+// SUB-DAG: p#0 <-> q#0: MayAlias
+// SUB-LABEL: Testing : "whole"
+// SUB-DAG: wp#0 <-> wr#0: MayAlias
+// SUB-NEXT: why: a, b: same node at the same offset
+// CELL-LABEL: Testing : "parent_cell"
+// The whole object overlaps each member (s and s.a are the same address);
+// the members, and the fields of two members, are disjoint. s is one
+// object, and each child is only a member of it, so the answers are those
+// the same node would give.
+// CELL-DAG: whole#0 <-> amem#0: MustAlias
+// CELL-DAG: whole#0 <-> bmem#0: PartialAlias
+// CELL-DAG: amem#0 <-> bmem#0: NoAlias
+// CELL-DAG: whole#0 <-> bfield#0: PartialAlias
+// CELL-DAG: amem#0 <-> bfield#0: NoAlias
+// CELL-DAG: bmem#0 <-> bfield#0: PartialAlias
+// CELL-DAG: bfield#0 <-> afield#0: NoAlias
+// CELL-DAG: amem#0 <-> afield#0: PartialAlias
+
+// NOSUB-LABEL: Testing : "inner"
+// NOSUB-DAG: r#0 <-> s2#0: MayAlias
+// NOSUB-DAG: p#0 <-> r#0: MayAlias
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_T = !cir.struct<"T" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_U = !cir.struct<"U" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_S = !cir.struct<"S" {data !rec_T, data !rec_U}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func internal @fresh() -> !cir.ptr<!s32i> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+
+cir.func internal @inner(%i: !s64i) {
+  %s = cir.alloca "s" align(8) : !cir.ptr<!rec_S>
+  %a = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %ap = cir.get_member %a[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %aq = cir.get_member %a[1] {name = "q"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %br = cir.get_member %b[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %bs = cir.get_member %b[1] {name = "s"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %x1 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %x2 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %x3 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %x4 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  cir.store %x1, %ap : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x2, %aq : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x3, %br : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x4, %bs : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  // The bytes of s.a indexed as char: a's node collapses.
+  %abytes = cir.cast bitcast %a : !cir.ptr<!rec_T> -> !cir.ptr<!s8i>
+  %ai = cir.ptr_stride %abytes, %i : (!cir.ptr<!s8i>, !s64i) -> !cir.ptr<!s8i>
+  %c0 = cir.const #cir.int<0> : !s8i
+  cir.store %c0, %ai : !s8i, !cir.ptr<!s8i>
+  %lp = cir.load %ap : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %lq = cir.load %aq : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %lr = cir.load %br : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %ls = cir.load %bs : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %tp = cir.cast bitcast %lp : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p"}
+  %tq = cir.cast bitcast %lq : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "q"}
+  %tr = cir.cast bitcast %lr : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "r"}
+  %ts = cir.cast bitcast %ls : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "s2"}
+  cir.return
+}
+
+cir.func internal @whole(%i: !s64i) {
+  %s = cir.alloca "s" align(8) : !cir.ptr<!rec_S>
+  %a = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %ap = cir.get_member %a[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %br = cir.get_member %b[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %x1 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %x3 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  cir.store %x1, %ap : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x3, %br : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  // The bytes of the whole of s indexed as char.
+  %sbytes = cir.cast bitcast %s : !cir.ptr<!rec_S> -> !cir.ptr<!s8i>
+  %si = cir.ptr_stride %sbytes, %i : (!cir.ptr<!s8i>, !s64i) -> !cir.ptr<!s8i>
+  %c0 = cir.const #cir.int<0> : !s8i
+  cir.store %c0, %si : !s8i, !cir.ptr<!s8i>
+  %lp = cir.load %ap : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %lr = cir.load %br : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %tp = cir.cast bitcast %lp : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "wp"}
+  %tr = cir.cast bitcast %lr : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "wr"}
+  cir.return
+}
+
+// Identity: the whole object and its members.
+cir.func internal @parent_cell() {
+  %s = cir.alloca "s" align(8) : !cir.ptr<!rec_S>
+  %a = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %w0 = cir.cast bitcast %s : !cir.ptr<!rec_S> -> !cir.ptr<!rec_S> {test.ptr = "whole"}
+  %am = cir.cast bitcast %a : !cir.ptr<!rec_T> -> !cir.ptr<!rec_T> {test.ptr = "amem"}
+  %bm = cir.cast bitcast %b : !cir.ptr<!rec_U> -> !cir.ptr<!rec_U> {test.ptr = "bmem"}
+  %bp = cir.get_member %b[1] {name = "s"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %ap = cir.get_member %a[1] {name = "q"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %bpt = cir.cast bitcast %bp : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "bfield"}
+  %apt = cir.cast bitcast %ap : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "afield"}
+  cir.return
+}
+
+cir.func @main() {
+  %c0 = cir.const #cir.int<0> : !s64i
+  cir.call @inner(%c0) : (!s64i) -> ()
+  cir.call @whole(%c0) : (!s64i) -> ()
+  cir.call @parent_cell() : () -> ()
+  cir.return
+}
+}

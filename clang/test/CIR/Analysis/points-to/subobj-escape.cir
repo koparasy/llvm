@@ -1,0 +1,138 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1 subobjects=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='subobjects=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=LOCAL
+
+// struct T { int *p; int *q; };  struct U { int *r; int *s; };
+// struct S { T a; U b; };
+//
+// Where a pointer to a member may reach the rest of its object, and how the
+// subobject nodes stay sound there (PointsToGraph.h):
+//
+// @interconvert: a standard-layout object and its first member are
+// pointer-interconvertible: @widen casts &s.a back to an S* and writes s.b
+// through it. The child of s.a is then used past its extent, and is folded
+// back into s: what main reads from s.b.r is what @widen stored.
+// CHECK-LABEL: === @interconvert formals=complete
+// CHECK-NEXT: @interconvert x -> [[X:n[0-9]+]]+0 complete
+// CHECK-NEXT: @interconvert r -> [[X]]+0 complete
+
+// @escape_first: &s.a escapes to unknown code, which may reach all of s
+// (the same rule): s.b is External too. @escape_second: &s.b escapes, which
+// gives unknown code no way to s.a ([expr.add]): s.a stays complete.
+// CHECK-LABEL: === @escape_first formals=complete
+// CHECK-NEXT: @escape_first r -> {{n[0-9]+}}+0 incomplete
+// CHECK-LABEL: === @escape_second formals=complete
+// CHECK-NEXT: @escape_second p -> {{n[0-9]+}}+0 complete
+
+// LOCAL-LABEL: === @leave
+// @leave: char* arithmetic from s.b back to s.a, which a member pointer
+// can't do in a UB-free program; the local phase sees it and collapses s
+// with its children.
+// LOCAL-NEXT: n0 [Stack|Collapsed|Mod|Ref] size=32 origins={stack(cir.alloca 's' {{.*}})} links={0->{{n[0-9]+}}+0} reasons={Collapsed: CollapsedAt(cir.ptr_stride {{.*}}, "pointer arithmetic leaves a subobject")}
+
+// @union: a union member of a struct gets a child, the members of the union
+// do not: both of its members are cells of the union's child.
+// LOCAL-LABEL: === @union
+// LOCAL-NEXT: n0 [Stack|Mod] size=24 origins={stack(cir.alloca 'v' {{.*}})} links={} sub={8:16->[[UN:n[0-9]+]]+0}
+// LOCAL-NEXT: [[UN]] [Stack|Mod] size=16 origins={} links={0->{{n[0-9]+}}+0}
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_T = !cir.struct<"T" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_U = !cir.struct<"U" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_S = !cir.struct<"S" {data !rec_T, data !rec_U}>
+!rec_TU = !cir.union<"TU" {data !rec_T, data !rec_U}>
+!rec_V = !cir.struct<"V" {data !s64i, data !rec_TU}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func private @unknown(!cir.ptr<!void>)
+
+cir.func internal @widen(%a: !cir.ptr<!rec_T>, %x: !cir.ptr<!s32i>) {
+  %s = cir.cast bitcast %a : !cir.ptr<!rec_T> -> !cir.ptr<!rec_S>
+  %b = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %r = cir.get_member %b[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %r : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+cir.func internal @interconvert() {
+  %s = cir.alloca "s" align(8) : !cir.ptr<!rec_S>
+  %a = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %x = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i> {test.ptr = "x"}
+  cir.call @widen(%a, %x) : (!cir.ptr<!rec_T>, !cir.ptr<!s32i>) -> ()
+  %b = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %rp = cir.get_member %b[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.load %rp : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %tr = cir.cast bitcast %r : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "r"}
+  cir.return
+}
+
+cir.func internal @escape_first() {
+  %s = cir.alloca "s" align(8) : !cir.ptr<!rec_S>
+  %a = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %av = cir.cast bitcast %a : !cir.ptr<!rec_T> -> !cir.ptr<!void>
+  cir.call @unknown(%av) : (!cir.ptr<!void>) -> ()
+  %b = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %rp = cir.get_member %b[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %r = cir.load %rp : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %tr = cir.cast bitcast %r : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "r"}
+  cir.return
+}
+
+cir.func internal @escape_second() {
+  %s = cir.alloca "s" align(8) : !cir.ptr<!rec_S>
+  %b = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %bv = cir.cast bitcast %b : !cir.ptr<!rec_U> -> !cir.ptr<!void>
+  cir.call @unknown(%bv) : (!cir.ptr<!void>) -> ()
+  %a = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %pp = cir.get_member %a[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %p = cir.load %pp : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %tp = cir.cast bitcast %p : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p"}
+  cir.return
+}
+
+cir.func internal @leave() {
+  %s = cir.alloca "s" align(8) : !cir.ptr<!rec_S>
+  %a = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %pp = cir.get_member %a[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %null = cir.const #cir.ptr<null> : !cir.ptr<!s32i>
+  cir.store %null, %pp : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %b = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %bytes = cir.cast bitcast %b : !cir.ptr<!rec_U> -> !cir.ptr<!s8i>
+  %m16 = cir.const #cir.int<-16> : !s64i
+  %back = cir.ptr_stride %bytes, %m16 : (!cir.ptr<!s8i>, !s64i) -> !cir.ptr<!s8i>
+  %ap = cir.cast bitcast %back : !cir.ptr<!s8i> -> !cir.ptr<!cir.ptr<!s32i>>
+  %v = cir.load %ap : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  cir.return
+}
+
+cir.func internal @union() {
+  %v = cir.alloca "v" align(8) : !cir.ptr<!rec_V>
+  %un = cir.get_member %v[1] {name = "un"} : !cir.ptr<!rec_V> -> !cir.ptr<!rec_TU>
+  %t = cir.get_member %un[0] {name = "t"} : !cir.ptr<!rec_TU> -> !cir.ptr<!rec_T>
+  %u = cir.get_member %un[1] {name = "u"} : !cir.ptr<!rec_TU> -> !cir.ptr<!rec_U>
+  %tp = cir.get_member %t[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %ur = cir.get_member %u[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %x = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.store %x, %tp : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %ur : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+cir.func @main() {
+  cir.call @interconvert() : () -> ()
+  cir.call @escape_first() : () -> ()
+  cir.call @escape_second() : () -> ()
+  cir.call @leave() : () -> ()
+  cir.call @union() : () -> ()
+  cir.return
+}
+}

@@ -175,6 +175,11 @@ struct TestCIRPointsToInstrumentPass
       *this, "mode",
       llvm::cl::desc("Points-to: ci (context-insensitive) or bu (bottom-up)"),
       llvm::cl::init("ci")};
+  Option<bool> subobjects{
+      *this, "subobjects",
+      llvm::cl::desc("Points-to: give class, union and array members their "
+                     "own nodes"),
+      llvm::cl::init(false)};
   Option<unsigned> maxPairs{
       *this, "max-pairs-per-func",
       llvm::cl::desc("The most pairs checked per function (0 = all)"),
@@ -271,6 +276,7 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
   options.assumeClosedTU = closedTU;
   if (ptMode == "bu")
     options.mode = PointsToMode::BU;
+  options.subobjects = subobjects;
   PointsToAnalysis pt(module, &registry, options);
   DataLayout dataLayout(module);
 

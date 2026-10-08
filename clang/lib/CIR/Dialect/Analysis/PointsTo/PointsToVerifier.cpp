@@ -200,6 +200,21 @@ cir::pointsto::verifyPointsToAnalysis(const PointsToAnalysis &analysis) {
              << " targets, is not\n";
           ok = false;
         }
+      // Subobjects: to the children, and up from a child at offset 0.
+      for (const SubobjectLink &sub : node->getSubobjects())
+        if (!sub.child.getNode()->hasFlags(flag)) {
+          os << nodeName(node) << " is " << getFlagName(flag) << " but "
+             << nodeName(sub.child.getNode()) << ", its child at " << sub.offset
+             << ", is not\n";
+          ok = false;
+        }
+      for (const ParentLink &parent : graph.getParents(node))
+        if (parent.offset == 0 && !parent.parent->hasFlags(flag)) {
+          os << nodeName(node) << " is " << getFlagName(flag) << " but "
+             << nodeName(parent.parent)
+             << ", which it is at offset 0 of, is not\n";
+          ok = false;
+        }
     }
     if (node->hasFlags(NodeFlags::Summary)) {
       const Reason *why = node->getReason(NodeFlags::Summary);

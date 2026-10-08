@@ -70,6 +70,10 @@ StringRef cir::pointsto::getAliasRuleName(AliasRule rule) {
     return "overlap-not-singleton";
   case AliasRule::DifferentFunctions:
     return "different-functions";
+  case AliasRule::DisjointSubobjects:
+    return "disjoint-subobjects";
+  case AliasRule::SubobjectOverlap:
+    return "subobject-overlap";
   }
   llvm_unreachable("unknown alias rule");
 }
@@ -90,6 +94,41 @@ static bool isSingleton(const Node *node) {
   return node->getOrigins().size() == 1 &&
          !hasAny(node->getFlags(), NodeFlags::Summary) &&
          !isUnknownReachable(node);
+}
+
+/// The one parent of \p node if it is only a member of that parent: no
+/// origin of its own (nothing else was merged into it) and exactly one
+/// parent link, not on an array (whose child is the member of every
+/// element). Null otherwise.
+static const ParentLink *getOnlyParent(const Graph &graph, const Node *node,
+                                       SmallVectorImpl<ParentLink> &storage) {
+  if (!node->getOrigins().empty())
+    return nullptr;
+  storage = graph.getParents(node);
+  if (storage.size() != 1 || storage.front().parent->isArray() ||
+      storage.front().parent->isCollapsed())
+    return nullptr;
+  return &storage.front();
+}
+
+/// isSingleton, where a child that is only a member of its parent
+/// (getOnlyParent) stands for one object if its parent does.
+static bool isSingleton(const Graph &graph, const Node *node) {
+  if (hasAny(node->getFlags(), NodeFlags::Summary) || isUnknownReachable(node))
+    return false;
+  for (unsigned depth = 0; depth < 64; ++depth) {
+    if (node->getOrigins().size() == 1)
+      return isSingleton(node);
+    SmallVector<ParentLink, 1> parents;
+    const ParentLink *parent = getOnlyParent(graph, node, parents);
+    if (!parent)
+      return false;
+    node = parent->parent;
+    if (hasAny(node->getFlags(), NodeFlags::Summary) ||
+        isUnknownReachable(node))
+      return false;
+  }
+  return false;
 }
 
 /// Whether \p value is a null pointer, or is computed from one by the steps
@@ -167,6 +206,49 @@ PointsToAnalysis::aliasWithRule(Value a, Value b, std::optional<uint64_t> sizeA,
                     getAccessSize(a, sizeA), getAccessSize(b, sizeB));
 }
 
+namespace {
+/// A node a cell is in, directly or through subobject links, and the cell's
+/// offset in it. Not exact when an array or collapsed node on the way loses
+/// the position.
+struct AncestorCell {
+  const Node *node;
+  int64_t offset;
+  bool exact;
+  /// Every node below this one on the way is only a member of its parent
+  /// (getOnlyParent): the cell is this node's offset, in its objects only.
+  bool pure;
+};
+} // namespace
+
+/// The cell \p cell (resolved) and the cells it is in its ancestors: for a
+/// child at [o, o + size) of a parent whose start is the child's offset c,
+/// the child's offset x is o + (x - c) in the parent.
+static SmallVector<AncestorCell, 4> collectAncestors(const Graph &graph,
+                                                     Cell cell) {
+  constexpr size_t kMaxAncestors = 64;
+  SmallVector<AncestorCell, 4> out;
+  const Node *node = cell.getRawNode();
+  out.push_back({node, cell.getRawOffset(),
+                 !node->isCollapsed() && !node->isArray(), /*pure=*/true});
+  for (size_t i = 0; i < out.size() && out.size() < kMaxAncestors; ++i) {
+    AncestorCell at = out[i];
+    SmallVector<ParentLink, 1> parents = graph.getParents(at.node);
+    bool onlyMember = at.node->getOrigins().empty() && parents.size() == 1;
+    for (const ParentLink &parent : parents) {
+      bool exact = at.exact && !parent.parent->isArray() &&
+                   !parent.parent->isCollapsed();
+      int64_t offset = parent.offset + (at.offset - parent.childOffset);
+      if (llvm::any_of(out, [&](const AncestorCell &c) {
+            return c.node == parent.parent && c.offset == offset &&
+                   c.exact == exact;
+          }))
+        continue;
+      out.push_back({parent.parent, offset, exact, at.pure && onlyMember});
+    }
+  }
+  return out;
+}
+
 AliasAnswer PointsToAnalysis::aliasCells(Cell cellA, Cell cellB, uint64_t sizeA,
                                          uint64_t sizeB) const {
   cellA = cellA.resolve();
@@ -175,6 +257,57 @@ AliasAnswer PointsToAnalysis::aliasCells(Cell cellA, Cell cellB, uint64_t sizeA,
   const Node *nodeB = cellB.getNode();
   bool unknownA = isUnknownReachable(nodeA);
   bool unknownB = isUnknownReachable(nodeB);
+
+  // Rule 2b: different nodes of one tree of subobjects.
+  // SOUNDNESS: a child is the bytes [o, o + size) of each of its parents, so
+  // two cells with a common ancestor overlap only where their ranges, placed
+  // in that ancestor, do; with no common ancestor they are different objects
+  // (rule 2). Every common ancestor is checked: a child with several parents
+  // is in each. Unknown code may have made a pointer anywhere in an object
+  // it reaches (the argument of rule 3), so then the offsets say nothing.
+  if (nodeA != nodeB && graph->hasSubobjects()) {
+    SmallVector<AncestorCell, 4> upA = collectAncestors(*graph, cellA);
+    SmallVector<AncestorCell, 4> upB = collectAncestors(*graph, cellB);
+    bool related = false, overlap = false;
+    const AncestorCell *pureA = nullptr, *pureB = nullptr;
+    for (const AncestorCell &a : upA)
+      for (const AncestorCell &b : upB) {
+        if (a.node != b.node)
+          continue;
+        related = true;
+        if (!a.exact || !b.exact || sizeA == kUnknownSize ||
+            sizeB == kUnknownSize ||
+            (a.offset < b.offset + static_cast<int64_t>(sizeB) &&
+             b.offset < a.offset + static_cast<int64_t>(sizeA)) ||
+            a.offset == b.offset)
+          overlap = true;
+        if (!pureA && a.exact && b.exact && a.pure && b.pure) {
+          pureA = &a;
+          pureB = &b;
+        }
+      }
+    if (related) {
+      if (unknownA || unknownB)
+        return {AliasResult::MayAlias, AliasRule::SubobjectOverlap};
+      if (!overlap)
+        return {AliasResult::NoAlias, AliasRule::DisjointSubobjects};
+      // SOUNDNESS: on a pure way up (each node below is only a member of
+      // its one parent) both cells are fixed bytes of the ancestor's
+      // objects; if it is one object, the same-node rules below apply to
+      // the offsets in it.
+      if (pureA && isSingleton(*graph, pureA->node)) {
+        if (pureA->offset == pureB->offset)
+          return sizeA == kUnknownSize || sizeB == kUnknownSize
+                     ? AliasAnswer{AliasResult::MayAlias,
+                                   AliasRule::UnknownSize}
+                     : AliasAnswer{AliasResult::MustAlias,
+                                   AliasRule::SameAddress};
+        if (sizeA != kUnknownSize && sizeB != kUnknownSize)
+          return {AliasResult::PartialAlias, AliasRule::PartialOverlap};
+      }
+      return {AliasResult::MayAlias, AliasRule::SubobjectOverlap};
+    }
+  }
 
   // Rule 2: different nodes.
   if (nodeA != nodeB) {
@@ -233,7 +366,7 @@ AliasAnswer PointsToAnalysis::aliasCells(Cell cellA, Cell cellB, uint64_t sizeA,
     return {AliasResult::MayAlias, AliasRule::ArrayMayOverlap};
   }
 
-  bool singleton = isSingleton(nodeA);
+  bool singleton = isSingleton(*graph, nodeA);
   // SOUNDNESS: on a plain node of known code, a cell (N, o) is offset o of
   // one of the objects N stands for, laid out the same way (a conflicting
   // layout collapses the node). Equal offsets are the same address only if
@@ -419,6 +552,10 @@ std::string PointsToAnalysis::explainAnswer(const AliasAnswer &answer, Value a,
     return "a, b: overlapping ranges of one object";
   case AliasRule::DifferentFunctions:
     return "a, b: values of two functions, whose graphs are apart";
+  case AliasRule::DisjointSubobjects:
+    return "a, b: disjoint ranges of one object, in different subobjects";
+  case AliasRule::SubobjectOverlap:
+    return "a, b: subobjects of one object whose ranges may overlap";
   }
   llvm_unreachable("unknown alias rule");
 }
@@ -671,18 +808,19 @@ PointsToAnalysis::getCallReach(const TUCallSite &call) const {
       roots.push_back(Cell(node));
   }
 
+  // Through links, ghost links, subobjects (a callee given an object may
+  // access its members), and from a member at offset 0 to its object
+  // (pointer-interconvertibility).
   SmallVector<const Node *, 16> worklist;
   for (Cell root : roots)
     if (const Node *node = root.getNode(); reach.insert(node).second)
       worklist.push_back(node);
   while (!worklist.empty()) {
     const Node *node = worklist.pop_back_val();
-    for (auto [off, target] : node->getLinks())
-      if (const Node *next = target.getNode(); reach.insert(next).second)
+    graph->forEachSuccessor(node, [&](Node *next) {
+      if (reach.insert(next).second)
         worklist.push_back(next);
-    for (const GhostLink &ghost : node->getGhostLinks())
-      if (const Node *next = ghost.target.getNode(); reach.insert(next).second)
-        worklist.push_back(next);
+    });
   }
   return reach;
 }
@@ -697,6 +835,30 @@ ModRefResult PointsToAnalysis::getCallModRef(Operation *call,
   if (!site)
     return ModRefResult::getModAndRef();
   const Node *node = set.cells.front().getNode();
+  // Subobjects: the location's bytes include those of its children, which
+  // have their own nodes; the rules below hold for each of them.
+  SmallVector<const Node *, 4> parts;
+  graph->forEachInSubtree(node, [&](const Node *n) { parts.push_back(n); });
+  if (parts.size() > 1) {
+    bool reached = false;
+    NodeFlags flags = NodeFlags::None;
+    for (const Node *part : parts) {
+      if (isUnknownReachable(part) || part->hasFlags(NodeFlags::HasUSM) ||
+          part->hasFlags(NodeFlags::AsyncAccess))
+        return ModRefResult::getModAndRef();
+      reached |= getCallReach(*site).contains(part);
+      flags |= part->getFlags();
+    }
+    if (!reached)
+      return ModRefResult::getNoModRef();
+    bool mod = hasAny(flags, NodeFlags::Mod);
+    bool ref = hasAny(flags, NodeFlags::Ref);
+    if (mod && ref)
+      return ModRefResult::getModAndRef();
+    if (mod)
+      return ModRefResult::getMod();
+    return ref ? ModRefResult::getRef() : ModRefResult::getNoModRef();
+  }
   // SOUNDNESS: code we don't see may run during any call (an unknown or
   // unresolved callee, or one further down), and it may write any object it
   // can reach. That is every External node, and also every Incomplete one:

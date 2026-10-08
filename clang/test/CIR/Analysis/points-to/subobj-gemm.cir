@@ -1,0 +1,110 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 subobjects=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=SUB
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu subobjects=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=SUB
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=FLAT
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=GRAPH
+
+// A reduced sycl-bench gemm (S17, N28): the benchmark object holds its
+// arguments, whose table has libstdc++'s _M_single_bucket pattern (the
+// bucket pointer points into the table itself and is indexed dynamically,
+// which makes the table's node an array of pointers), and three holders
+// that a factory fills with three heap objects.
+//
+//   struct Node { Node *next; };
+//   struct Table { Node **buckets; Node *single; };
+//   struct Args { long n; Table t; };
+//   struct Holder { int *ptr; long *count; };
+//   struct Bench { Args args; Holder A, B, C; };
+//   void initTable(Table *t, long i) { t->buckets = &t->single;
+//                                      t->buckets[i] = nullptr-ish; }
+//   void make(Holder *h) { h->ptr = new int; h->count = new long; }
+//   int main() { Bench b; initTable(&b.args.t, i);
+//                make(&b.A); make(&b.B); make(&b.C); ... }
+//
+// Bottom-up, each call of make gets its own copy of its graph: three heap
+// objects. With subobjects, the table's array smash stays in b.args.t and
+// the three holders keep them apart: NoAlias. Without subobjects, the smash
+// is of all of b, an array of 8-byte elements, which folds the holders'
+// pointers onto one slot and merges the three objects: MayAlias.
+
+// SUB-LABEL: Testing : "main"
+// SUB-DAG: a#0 <-> b#0: NoAlias
+// SUB-DAG: a#0 <-> c#0: NoAlias
+// SUB-DAG: b#0 <-> c#0: NoAlias
+
+// FLAT-LABEL: Testing : "main"
+// FLAT-DAG: a#0 <-> b#0: MayAlias
+// FLAT-NEXT: why: a, b: same node (an array of 8-byte elements; the accesses may overlap in one element) [8 objects merged into one node, {{.*}}]
+// FLAT-DAG: a#0 <-> c#0: MayAlias
+// FLAT-DAG: b#0 <-> c#0: MayAlias
+
+// In @main's graph: b has its four children, and the three holders point to
+// three heap nodes.
+// GRAPH: [Stack|Mod|Ref] size=72 origins={stack(cir.alloca 'b' {{.*}})} links={} sub={0:24->{{n[0-9]+}}+0, 24:16->{{n[0-9]+}}+0, 40:16->{{n[0-9]+}}+0, 56:16->{{n[0-9]+}}+0}
+// GRAPH-LABEL: === @main formals=complete
+// GRAPH-NEXT: @main a -> [[A:n[0-9]+]]+0 complete
+// GRAPH-NEXT: @main b -> [[B:n[0-9]+]]+0 complete
+// GRAPH-NEXT: @main c -> [[C:n[0-9]+]]+0 complete
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_Node = !cir.struct<"Node" {data !cir.ptr<!cir.struct<"Node">>}>
+!rec_Table = !cir.struct<"Table" {data !cir.ptr<!cir.ptr<!rec_Node>>, data !cir.ptr<!rec_Node>}>
+!rec_Args = !cir.struct<"Args" {data !s64i, data !rec_Table}>
+!rec_Holder = !cir.struct<"Holder" {data !cir.ptr<!s32i>, data !cir.ptr<!s64i>}>
+!rec_Bench = !cir.struct<"Bench" {data !rec_Args, data !rec_Holder, data !rec_Holder, data !rec_Holder}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+
+cir.func internal @initTable(%t: !cir.ptr<!rec_Table>, %i: !s64i) {
+  %bucketsp = cir.get_member %t[0] {name = "buckets"} : !cir.ptr<!rec_Table> -> !cir.ptr<!cir.ptr<!cir.ptr<!rec_Node>>>
+  %single = cir.get_member %t[1] {name = "single"} : !cir.ptr<!rec_Table> -> !cir.ptr<!cir.ptr<!rec_Node>>
+  cir.store %single, %bucketsp : !cir.ptr<!cir.ptr<!rec_Node>>, !cir.ptr<!cir.ptr<!cir.ptr<!rec_Node>>>
+  %buckets = cir.load %bucketsp : !cir.ptr<!cir.ptr<!cir.ptr<!rec_Node>>>, !cir.ptr<!cir.ptr<!rec_Node>>
+  %slot = cir.ptr_stride %buckets, %i : (!cir.ptr<!cir.ptr<!rec_Node>>, !s64i) -> !cir.ptr<!cir.ptr<!rec_Node>>
+  %c8 = cir.const #cir.int<8> : !u64i
+  %raw = cir.call @_Znwm(%c8) : (!u64i) -> !cir.ptr<!void>
+  %node = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!rec_Node>
+  cir.store %node, %slot : !cir.ptr<!rec_Node>, !cir.ptr<!cir.ptr<!rec_Node>>
+  cir.return
+}
+
+cir.func internal @make(%h: !cir.ptr<!rec_Holder>) {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  %ptr = cir.get_member %h[0] {name = "ptr"} : !cir.ptr<!rec_Holder> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %p, %ptr : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %c8 = cir.const #cir.int<8> : !u64i
+  %rawc = cir.call @_Znwm(%c8) : (!u64i) -> !cir.ptr<!void>
+  %cnt = cir.cast bitcast %rawc : !cir.ptr<!void> -> !cir.ptr<!s64i>
+  %count = cir.get_member %h[1] {name = "count"} : !cir.ptr<!rec_Holder> -> !cir.ptr<!cir.ptr<!s64i>>
+  cir.store %cnt, %count : !cir.ptr<!s64i>, !cir.ptr<!cir.ptr<!s64i>>
+  cir.return
+}
+
+cir.func @main(%i: !s64i) {
+  %b = cir.alloca "b" align(8) : !cir.ptr<!rec_Bench>
+  %args = cir.get_member %b[0] {name = "args"} : !cir.ptr<!rec_Bench> -> !cir.ptr<!rec_Args>
+  %t = cir.get_member %args[1] {name = "t"} : !cir.ptr<!rec_Args> -> !cir.ptr<!rec_Table>
+  cir.call @initTable(%t, %i) : (!cir.ptr<!rec_Table>, !s64i) -> ()
+  %ha = cir.get_member %b[1] {name = "A"} : !cir.ptr<!rec_Bench> -> !cir.ptr<!rec_Holder>
+  %hb = cir.get_member %b[2] {name = "B"} : !cir.ptr<!rec_Bench> -> !cir.ptr<!rec_Holder>
+  %hc = cir.get_member %b[3] {name = "C"} : !cir.ptr<!rec_Bench> -> !cir.ptr<!rec_Holder>
+  cir.call @make(%ha) : (!cir.ptr<!rec_Holder>) -> ()
+  cir.call @make(%hb) : (!cir.ptr<!rec_Holder>) -> ()
+  cir.call @make(%hc) : (!cir.ptr<!rec_Holder>) -> ()
+  %pa = cir.get_member %ha[0] {name = "ptr"} : !cir.ptr<!rec_Holder> -> !cir.ptr<!cir.ptr<!s32i>>
+  %pb = cir.get_member %hb[0] {name = "ptr"} : !cir.ptr<!rec_Holder> -> !cir.ptr<!cir.ptr<!s32i>>
+  %pc = cir.get_member %hc[0] {name = "ptr"} : !cir.ptr<!rec_Holder> -> !cir.ptr<!cir.ptr<!s32i>>
+  %la = cir.load %pa : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %lb = cir.load %pb : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %lc = cir.load %pc : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %ta = cir.cast bitcast %la : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %tb = cir.cast bitcast %lb : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  %tc = cir.cast bitcast %lc : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "c"}
+  cir.return
+}
+}

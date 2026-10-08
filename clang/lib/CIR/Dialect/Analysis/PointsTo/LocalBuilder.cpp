@@ -518,6 +518,13 @@ std::unique_ptr<FunctionGraph> LocalBuilder::build() {
   });
   defineBlockArguments();
   closeMemTransfers(graph, fg->memTransfers);
+  // A child at offset 0 used past its extent was a pointer to its parent
+  // (pointer-interconvertibility): fold it back, then relate the copies
+  // again, as the merge may have added links in their ranges.
+  if (subobjects)
+    while (graph.absorbOverflowingSubobjects(graph.makeReason(
+        Reason::Kind::MergedAt, func, "member used as its enclosing object")))
+      closeMemTransfers(graph, fg->memTransfers);
   applyDeferredEffects();
   if (deferIndirectCalls) {
     for (size_t index : indirectCalls)
@@ -1122,7 +1129,20 @@ void LocalBuilder::visitAddressStep(Operation *op) {
   else if (auto elementOp = dyn_cast<cir::GetElementOp>(op))
     elemSize = getTypeSizeInBytes(elementOp.getElementType(), dataLayout);
 
+  if (subobjects && (strideOp || isa<cir::DerivedClassAddrOp>(op)))
+    collapseIfLeavingSubobject(op, *base, step.offset, elemSize);
+
   if (step.offset) {
+    // A member of class, union or array type is its own child node.
+    if (subobjects)
+      if (auto member = dyn_cast<cir::GetMemberOp>(op))
+        if (std::optional<uint64_t> size = getSubobjectSize(member)) {
+          define(result,
+                 graph.getSubobject(shift(*base, *step.offset), *size,
+                                    graph.makeReason(Reason::Kind::MergedAt, op,
+                                                     "subobject")));
+          return;
+        }
     // Pointer arithmetic is only defined within an array, so a non-zero
     // constant stride is evidence that the node is an array of the element
     // type (the classic DSA rule). Without it, `p = p + 1` in a loop unifies
@@ -1146,6 +1166,64 @@ void LocalBuilder::visitAddressStep(Operation *op) {
     graph.collapse(base->getNode(), graph.makeReason(Reason::Kind::CollapsedAt,
                                                      op, "unknown offset"));
   define(result, *base);
+}
+
+std::optional<uint64_t> LocalBuilder::getSubobjectSize(cir::GetMemberOp op) {
+  // The members of a union are one region; they get no children.
+  auto recordTy = dyn_cast<cir::RecordType>(op.getAddrTy().getPointee());
+  if (!recordTy || recordTy.isUnion() || recordTy.isIncomplete())
+    return std::nullopt;
+  uint64_t index = op.getIndex();
+  if (index >= recordTy.getNumElements())
+    return std::nullopt;
+  // An empty member holds no byte (and [[no_unique_address]] may overlap it
+  // with another member).
+  ArrayRef<cir::RecordMemberKind> kinds = recordTy.getMemberKinds();
+  if (index < kinds.size() && kinds[index] != cir::RecordMemberKind::Data)
+    return std::nullopt;
+  Type member = recordTy.getElementType(index);
+  if (auto memberRecord = dyn_cast<cir::RecordType>(member)) {
+    if (memberRecord.isIncomplete())
+      return std::nullopt;
+  } else if (!isa<cir::ArrayType>(member)) {
+    return std::nullopt; // A scalar or a pointer: a cell of the parent.
+  }
+  std::optional<int64_t> size = getTypeSizeInBytes(member, dataLayout);
+  if (!size || *size <= 0)
+    return std::nullopt;
+  return static_cast<uint64_t>(*size);
+}
+
+void LocalBuilder::collapseIfLeavingSubobject(Operation *op, Cell base,
+                                              std::optional<int64_t> delta,
+                                              std::optional<int64_t> elemSize) {
+  Graph &graph = fg->getGraph();
+  Cell from = base.resolve();
+  SmallVector<ParentLink, 1> parents = graph.getParents(from.getNode());
+  const Reason *why = nullptr;
+  for (const ParentLink &parent : parents) {
+    int64_t start = parent.childOffset;
+    int64_t end = start + static_cast<int64_t>(parent.size);
+    bool leaves;
+    if (delta) {
+      // One past the end is still a pointer into the subobject.
+      int64_t to = from.getOffset() + *delta;
+      leaves = to < start || to > end;
+    } else {
+      // A dynamic index over elements larger than the subobject.
+      leaves = !elemSize || *elemSize > end - start;
+    }
+    if (!leaves)
+      continue;
+    // SOUNDNESS: the program computes a pointer outside the member from a
+    // pointer to it (char* arithmetic, a cast to a derived class), which only
+    // a parent's node can describe: the parent and all its children become
+    // one field-insensitive node.
+    if (!why)
+      why = graph.makeReason(Reason::Kind::CollapsedAt, op,
+                             "pointer arithmetic leaves a subobject");
+    graph.collapse(parent.parent, why);
+  }
 }
 
 /// The byte offset of the address point \p point inside a vtable (group) of
@@ -1981,13 +2059,112 @@ struct TransferApplier {
 };
 } // namespace
 
+namespace {
+/// The copies derived from the subobject links in the ranges of the copies:
+/// a copy of an object is a copy of each of its children into the matching
+/// child of the other side (made there if it is missing), recursively, plus
+/// one of the node's own cells. A child the range covers only partly is
+/// copied over the part it covers.
+struct SubobjectTransfers {
+  Graph &graph;
+  SmallVector<MemTransferRecord, 0> records;
+  llvm::DenseSet<
+      std::tuple<const Node *, int64_t, const Node *, int64_t, uint64_t>>
+      seen;
+
+  /// Add the copy of \p length bytes from \p src to \p dst made for
+  /// \p record, unless it is there. Return whether it was added.
+  bool add(const MemTransferRecord &record, Cell dst, Cell src,
+           uint64_t length) {
+    dst = dst.resolve();
+    src = src.resolve();
+    if (dst == src)
+      return false;
+    if (!seen.insert({dst.getRawNode(), dst.getRawOffset(), src.getRawNode(),
+                      src.getRawOffset(), length})
+             .second)
+      return false;
+    records.push_back({record.op, dst, src, length, record.ghosts});
+    return true;
+  }
+
+  /// Derive the copies of the children in the ranges of every record (the
+  /// derived ones included). Return whether a record was added.
+  bool expand() {
+    bool grew = false;
+    for (size_t i = 0; i < records.size(); ++i) {
+      MemTransferRecord record = records[i];
+      int64_t length = static_cast<int64_t>(std::min<uint64_t>(
+          record.length, std::numeric_limits<int64_t>::max()));
+      for (bool fromDst : {false, true}) {
+        Cell x = (fromDst ? record.dst : record.src).resolve();
+        Cell y = fromDst ? record.src : record.dst;
+        const Node *node = x.getRawNode();
+        if (!node->getNumSubobjects())
+          continue;
+        std::optional<uint64_t> elem = node->getArrayElemSize();
+        for (const SubobjectLink &sub : node->getSubobjects()) {
+          // The positions of the child relative to x: once, or once per
+          // element the range covers on an array node.
+          int64_t first = sub.offset - x.getRawOffset();
+          int64_t step = elem ? static_cast<int64_t>(*elem) : 0;
+          auto size = static_cast<int64_t>(sub.size);
+          if (step && length / step > static_cast<int64_t>(kMaxTransferSlots)) {
+            // Too many elements to list: the other side becomes an array of
+            // the same elements, where one position stands for all.
+            graph.markArray(y.getNode(), *elem,
+                            graph.makeReason(Reason::Kind::CollapsedAt,
+                                             record.op, "copied range"));
+            step = 0;
+          }
+          for (int64_t k = first; k < length; k += step) {
+            if (k + size > 0) {
+              Cell xc, yc;
+              uint64_t n;
+              if (k >= 0 && k + size <= length) {
+                xc = sub.child;
+                yc = graph.getSubobject(
+                    Cell(y.getRawNode(), y.getRawOffset() + k), sub.size);
+                n = sub.size;
+              } else {
+                int64_t a = std::max<int64_t>(k, 0);
+                int64_t b = std::min<int64_t>(k + size, length);
+                xc = Cell(sub.child.getRawNode(),
+                          sub.child.getRawOffset() + (a - k));
+                yc = Cell(y.getRawNode(), y.getRawOffset() + a);
+                n = static_cast<uint64_t>(b - a);
+              }
+              grew |= fromDst ? add(record, xc, yc, n) : add(record, yc, xc, n);
+            }
+            if (!step)
+              break;
+          }
+        }
+      }
+    }
+    return grew;
+  }
+};
+} // namespace
+
 bool cir::pointsto::closeMemTransfers(Graph &graph,
                                       ArrayRef<MemTransferRecord> transfers) {
+  // Subobjects (PointsToGraph.h): the copies of the children in the ranges
+  // are copies too, made as the children appear.
+  std::optional<SubobjectTransfers> subobjects;
+  if (graph.hasSubobjects()) {
+    subobjects.emplace(SubobjectTransfers{graph, {}, {}});
+    subobjects->records.assign(transfers.begin(), transfers.end());
+  }
   // Unification is symmetric, so this treats dst and src alike: it only
   // ever adds links and merges targets, which over-approximates the
   // one-directional copy. That is the DSA treatment of memcpy, with offsets.
   for (unsigned round = 0; round != kMaxTransferRounds; ++round) {
     bool changed = false;
+    if (subobjects) {
+      changed |= subobjects->expand();
+      transfers = subobjects->records;
+    }
     for (const MemTransferRecord &record : transfers)
       changed |= TransferApplier{graph, record}.apply();
     if (!changed)

@@ -1,0 +1,155 @@
+// RUN: cir-opt %s -test-cir-points-to='subobjects=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='subobjects=1 mode=bu closed-tu=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 subobjects=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=ALIAS
+
+// struct T { int *p; int *q; };  struct U { int *r; int *s; };
+// struct S { T a; U b; };
+//
+// Copies of objects with subobject nodes (closeMemTransfers): a copy of a
+// whole object is a copy of each child into the matching child of the other
+// side, made there if it is missing; a copy of one member relates that
+// child only.
+
+// @whole: cir.copy of all of s1 into s2. s2's children mirror s1's, and the
+// pointers read back from s2.a.p and s2.b.r are those stored in s1.
+// CHECK-LABEL: === @whole
+// CHECK-DAG: x1 -> [[X1:n[0-9]+]]+0
+// CHECK-DAG: x2 -> [[X2:n[0-9]+]]+0
+// CHECK-DAG: ap -> [[X1]]+0
+// CHECK-DAG: br -> [[X2]]+0
+
+// @member: cir.copy of s1.a into s2.a only: s2.a.p is s1.a.p, while s2.b.r
+// keeps its own target.
+// CHECK-LABEL: === @member
+// CHECK-DAG: x1 -> [[M1:n[0-9]+]]+0
+// CHECK-DAG: x3 -> [[M3:n[0-9]+]]+0
+// CHECK-DAG: ap -> [[M1]]+0
+// CHECK-DAG: br -> [[M3]]+0
+
+// @bytes: memcpy of s1 into a heap buffer that has no children yet; the
+// buffer, read as an S, gets children that hold s1's pointers.
+// CHECK-LABEL: === @bytes
+// CHECK: [[BUF:n[0-9]+]] [Heap|Mod|Ref] size=32 origins={heap({{.*}})} links={} sub={0:16->{{n[0-9]+}}+0, 16:16->{{n[0-9]+}}+0}
+// CHECK-DAG: x1 -> [[B1:n[0-9]+]]+0
+// CHECK-DAG: x2 -> [[B2:n[0-9]+]]+0
+// CHECK-DAG: ap -> [[B1]]+0
+// CHECK-DAG: br -> [[B2]]+0
+
+// BU-LABEL: === @whole
+// BU-DAG: ap -> [[X1:n[0-9]+]]+0 complete
+// BU-DAG: x1 -> [[X1]]+0 complete
+
+// ALIAS-LABEL: Testing : "whole"
+// ALIAS-DAG: x1#0 <-> x2#0: NoAlias
+// ALIAS-DAG: x1#0 <-> ap#0: MustAlias
+// ALIAS-DAG: x2#0 <-> br#0: MustAlias
+// ALIAS-DAG: ap#0 <-> br#0: NoAlias
+// ALIAS-LABEL: Testing : "member"
+// ALIAS-DAG: x1#0 <-> ap#0: MustAlias
+// ALIAS-DAG: x3#0 <-> br#0: MustAlias
+// ALIAS-DAG: x1#0 <-> br#0: NoAlias
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_T = !cir.struct<"T" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_U = !cir.struct<"U" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_S = !cir.struct<"S" {data !rec_T, data !rec_U}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func internal @fresh() -> !cir.ptr<!s32i> {
+  %c4 = cir.const #cir.int<4> : !u64i
+  %raw = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+  %p = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  cir.return %p : !cir.ptr<!s32i>
+}
+
+cir.func internal @whole() {
+  %s1 = cir.alloca "s1" align(8) : !cir.ptr<!rec_S>
+  %s2 = cir.alloca "s2" align(8) : !cir.ptr<!rec_S>
+  %a1 = cir.get_member %s1[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b1 = cir.get_member %s1[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %a1p = cir.get_member %a1[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b1r = cir.get_member %b1[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %x1 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %x2 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %t1 = cir.cast bitcast %x1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x1"}
+  %t2 = cir.cast bitcast %x2 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x2"}
+  cir.store %x1, %a1p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x2, %b1r : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.copy %s1 to %s2 : !cir.ptr<!rec_S>
+  %a2 = cir.get_member %s2[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b2 = cir.get_member %s2[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %a2p = cir.get_member %a2[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b2r = cir.get_member %b2[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %lp = cir.load %a2p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %lr = cir.load %b2r : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %tp = cir.cast bitcast %lp : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "ap"}
+  %tr = cir.cast bitcast %lr : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "br"}
+  cir.return
+}
+
+cir.func internal @member() {
+  %s1 = cir.alloca "s1" align(8) : !cir.ptr<!rec_S>
+  %s2 = cir.alloca "s2" align(8) : !cir.ptr<!rec_S>
+  %a1 = cir.get_member %s1[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b1 = cir.get_member %s1[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %a1p = cir.get_member %a1[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b1r = cir.get_member %b1[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %a2 = cir.get_member %s2[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b2 = cir.get_member %s2[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %a2p = cir.get_member %a2[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b2r = cir.get_member %b2[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %x1 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %x2 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %x3 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %t1 = cir.cast bitcast %x1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x1"}
+  %t3 = cir.cast bitcast %x3 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x3"}
+  cir.store %x1, %a1p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x2, %b1r : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x3, %b2r : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.copy %a1 to %a2 : !cir.ptr<!rec_T>
+  %lp = cir.load %a2p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %lr = cir.load %b2r : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %tp = cir.cast bitcast %lp : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "ap"}
+  %tr = cir.cast bitcast %lr : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "br"}
+  cir.return
+}
+
+cir.func internal @bytes() {
+  %s1 = cir.alloca "s1" align(8) : !cir.ptr<!rec_S>
+  %a1 = cir.get_member %s1[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b1 = cir.get_member %s1[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %a1p = cir.get_member %a1[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b1r = cir.get_member %b1[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %x1 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %x2 = cir.call @fresh() : () -> !cir.ptr<!s32i>
+  %t1 = cir.cast bitcast %x1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x1"}
+  %t2 = cir.cast bitcast %x2 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x2"}
+  cir.store %x1, %a1p : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x2, %b1r : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %c32 = cir.const #cir.int<32> : !u64i
+  %raw = cir.call @_Znwm(%c32) : (!u64i) -> !cir.ptr<!void>
+  %src = cir.cast bitcast %s1 : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  cir.libc.memcpy %c32 bytes from %src to %raw : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  %s2 = cir.cast bitcast %raw : !cir.ptr<!void> -> !cir.ptr<!rec_S>
+  %a2 = cir.get_member %s2[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b2 = cir.get_member %s2[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %a2p = cir.get_member %a2[0] {name = "p"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %b2r = cir.get_member %b2[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %lp = cir.load %a2p : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %lr = cir.load %b2r : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %tp = cir.cast bitcast %lp : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "ap"}
+  %tr = cir.cast bitcast %lr : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "br"}
+  cir.return
+}
+
+cir.func @main() {
+  cir.call @whole() : () -> ()
+  cir.call @member() : () -> ()
+  cir.call @bytes() : () -> ()
+  cir.return
+}
+}

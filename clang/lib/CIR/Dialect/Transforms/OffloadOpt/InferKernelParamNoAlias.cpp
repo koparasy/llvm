@@ -72,6 +72,7 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
     options.mode = *mode;
     options.assumeClosedTU = hostFactsClosedTU;
     options.bottomUp = hostFactsBottomUp;
+    options.subobjects = hostFactsSubobjects;
     ownTable.emplace(container, options);
   }
   cir::KernelBindingTable &table =

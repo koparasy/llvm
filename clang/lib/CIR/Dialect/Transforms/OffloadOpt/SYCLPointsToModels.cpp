@@ -1239,10 +1239,13 @@ bool cir::applySYCLDeviceWrites(PointsToAnalysis &analysis) {
       continue; // The launch got the unknown-call rule.
     Node *closure = launch.closure->getNode();
     SmallVector<Cell, 8> reached;
-    for (const auto &link : closure->getLinks())
-      reached.push_back(link.second);
-    for (const GhostLink &ghost : closure->getGhostLinks())
-      reached.push_back(ghost.target);
+    // The closure's members may be subobject nodes of their own.
+    graph.forEachInSubtree(closure, [&](const Node *part) {
+      for (const auto &link : part->getLinks())
+        reached.push_back(link.second);
+      for (const GhostLink &ghost : part->getGhostLinks())
+        reached.push_back(ghost.target);
+    });
     const Reason *why = nullptr;
     for (Cell cell : reached) {
       if (cell.getNode()->hasFlags(NodeFlags::External))

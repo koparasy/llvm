@@ -61,7 +61,7 @@ struct PointsToHolder {
   std::unique_ptr<PointsToAnalysis> analysis;
 
   PointsToHolder(Operation *op, bool closedTU, bool sycl = false,
-                 bool bottomUp = false) {
+                 bool bottomUp = false, bool subobjects = false) {
     registerGenericModels(registry);
     auto module = dyn_cast<ModuleOp>(op);
     if (!module)
@@ -70,6 +70,7 @@ struct PointsToHolder {
     options.assumeClosedTU = closedTU;
     if (bottomUp)
       options.mode = PointsToMode::BU;
+    options.subobjects = subobjects;
     if (sycl)
       cir::addSYCLPointsToPlugin(options);
     analysis = std::make_unique<PointsToAnalysis>(module, &registry, options);
@@ -150,6 +151,11 @@ struct PointsToOptions : public PassWrapper<Derived, OperationPass<>> {
   Pass::Option<bool> syclModels{
       *this, "sycl", llvm::cl::desc("Points-to: add the SYCL host API models"),
       llvm::cl::init(false)};
+  Pass::Option<bool> subobjects{
+      *this, "subobjects",
+      llvm::cl::desc("Points-to: give class, union and array members their "
+                     "own nodes (PointsToAnalysisOptions::subobjects)"),
+      llvm::cl::init(false)};
   Pass::Option<bool> pointsToOnly{
       *this, "points-to-only",
       llvm::cl::desc("Print the answers of the points-to analysis alone"),
@@ -182,7 +188,7 @@ struct TestCIRAliasAnalysisPass
       return;
     }
     PointsToHolder holder(getOperation(), this->closedTU, this->syclModels,
-                          this->ptMode == "bu");
+                          this->ptMode == "bu", this->subobjects);
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);
@@ -226,7 +232,7 @@ struct TestCIRAliasAnalysisModRefPass
       return;
     }
     PointsToHolder holder(getOperation(), this->closedTU, this->syclModels,
-                          this->ptMode == "bu");
+                          this->ptMode == "bu", this->subobjects);
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);
@@ -279,6 +285,11 @@ struct TestCIRPointsToAliasSamplePass
       *this, "mode",
       llvm::cl::desc("Points-to: ci (context-insensitive) or bu (bottom-up)"),
       llvm::cl::init("ci")};
+  Option<bool> subobjects{
+      *this, "subobjects",
+      llvm::cl::desc("Points-to: give class, union and array members their "
+                     "own nodes"),
+      llvm::cl::init(false)};
   Option<std::string> showRule{
       *this, "show-rule",
       llvm::cl::desc("Print the first pairs (show=<n>) a points-to rule "
@@ -319,7 +330,8 @@ void TestCIRPointsToAliasSamplePass::runOnOperation() {
   }
 
   llvm::TimeRecord start = llvm::TimeRecord::getCurrentTime(true);
-  PointsToHolder holder(target, closedTU, /*sycl=*/false, ptMode == "bu");
+  PointsToHolder holder(target, closedTU, /*sycl=*/false, ptMode == "bu",
+                        subobjects);
   llvm::TimeRecord built = llvm::TimeRecord::getCurrentTime(false);
   built -= start;
   const PointsToAnalysis &pt = *holder.analysis;
@@ -417,7 +429,8 @@ void TestCIRPointsToAliasSamplePass::runOnOperation() {
 
   os << "=== points-to alias sample: " << pairs.size() << " pairs, seed "
      << seed << (closedTU ? ", closed-tu" : "")
-     << (ptMode == "bu" ? ", bu" : "") << "\n";
+     << (ptMode == "bu" ? ", bu" : "")
+     << (subobjects ? ", subobjects" : "") << "\n";
   os << "functions sampled: " << perFunction.size()
      << ", pointer values: " << all.size() << "\n";
   os << llvm::format("points-to analysis: %.1f ms\n",

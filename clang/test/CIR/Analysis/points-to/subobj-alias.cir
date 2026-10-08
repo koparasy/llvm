@@ -1,0 +1,130 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1 subobjects=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 subobjects=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=FLAT
+// RUN: cir-opt %s -test-cir-alias-analysis-modref='points-to-only=1 closed-tu=1 subobjects=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=MODREF
+
+// struct T { int *p; int *q; };  struct U { int *r; int *s; };
+// struct S { T a; U b; };  struct W { int x; S s; };
+//
+// Alias queries over subobject nodes compare two cells by their absolute
+// byte ranges in a common ancestor (rules disjoint-subobjects and
+// subobject-overlap). w.s is a child of w at 8, w.s.a a child of w.s at 0
+// (w + 8), w.s.b a child of w.s at 16 (w + 24).
+
+// @nested: cells of a grandchild, its parent, a sibling, and the root.
+// CHECK-LABEL: Testing : "nested"
+// CHECK-DAG: wx#0 <-> sbr#0: NoAlias
+// CHECK-DAG: wx#0 <-> ss#0: NoAlias
+// CHECK-DAG: whole#0 <-> sbr#0: PartialAlias
+// CHECK-DAG: ss#0 <-> sbr#0: PartialAlias
+// CHECK-DAG: sb#0 <-> saq#0: NoAlias
+// CHECK-DAG: saq#0 <-> sbr#0: NoAlias
+// CHECK-DAG: sa#0 <-> saq#0: PartialAlias
+// CHECK-DAG: ss#0 <-> sa#0: MustAlias
+// CHECK-DAG: whole#0 <-> wx#0: MustAlias
+
+// @two_parents: p = c ? &w1.s.a : &w2.s.a. The child of w1.s and the child
+// of w2.s are one node with two parents: p overlaps both objects' a, never
+// their b, and it stands for two objects: a1 too, so even w1 and a1 are only
+// MayAlias, while w1 and b1 (a member of w1 alone) are PartialAlias.
+// CHECK-LABEL: Testing : "two_parents"
+// CHECK-DAG: p#0 <-> b1#0: NoAlias
+// CHECK-DAG: p#0 <-> b2#0: NoAlias
+// CHECK-DAG: p#0 <-> a1#0: MayAlias
+// CHECK-DAG: w1#0 <-> p#0: MayAlias
+// CHECK-DAG: w1#0 <-> a1#0: MayAlias
+// CHECK-DAG: w1#0 <-> b1#0: PartialAlias
+// CHECK-DAG: b1#0 <-> b2#0: NoAlias
+
+// BU-LABEL: Testing : "nested"
+// BU-DAG: wx#0 <-> sbr#0: NoAlias
+// BU-DAG: saq#0 <-> sbr#0: NoAlias
+// BU-LABEL: Testing : "two_parents"
+// BU-DAG: p#0 <-> b1#0: NoAlias
+// BU-DAG: p#0 <-> a1#0: MayAlias
+
+// Without subobjects, w is one node: the same answers from byte ranges in
+// it, except for the two objects of @two_parents, merged into one node.
+// FLAT-LABEL: Testing : "nested"
+// FLAT-DAG: wx#0 <-> sbr#0: NoAlias
+// FLAT-DAG: saq#0 <-> sbr#0: NoAlias
+// FLAT-LABEL: Testing : "two_parents"
+// FLAT-DAG: p#0 <-> b1#0: NoAlias
+// FLAT-DAG: b1#0 <-> b2#0: MayAlias
+
+// @modref: @set_b writes w.s.b only. A location in w.s.a is not reached by
+// the call; w as a whole is (its bytes include w.s.b).
+// MODREF-LABEL: Testing : "modref"
+// MODREF-DAG: set_call -> ma#0: NoModRef
+// MODREF-DAG: set_call -> mb#0: Mod
+// MODREF-DAG: set_call -> mw#0: Mod
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_T = !cir.struct<"T" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_U = !cir.struct<"U" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_S = !cir.struct<"S" {data !rec_T, data !rec_U}>
+!rec_W = !cir.struct<"W" {data !s32i, data !rec_S}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func internal @nested() {
+  %w = cir.alloca "w" align(8) : !cir.ptr<!rec_W> {test.ptr = "whole"}
+  %x = cir.get_member %w[0] {name = "x"} : !cir.ptr<!rec_W> -> !cir.ptr<!s32i>
+  %s = cir.get_member %w[1] {name = "s"} : !cir.ptr<!rec_W> -> !cir.ptr<!rec_S>
+  %a = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %aq = cir.get_member %a[1] {name = "q"} : !cir.ptr<!rec_T> -> !cir.ptr<!cir.ptr<!s32i>>
+  %br = cir.get_member %b[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %tx = cir.cast bitcast %x : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "wx"}
+  %ts = cir.cast bitcast %s : !cir.ptr<!rec_S> -> !cir.ptr<!rec_S> {test.ptr = "ss"}
+  %ta = cir.cast bitcast %a : !cir.ptr<!rec_T> -> !cir.ptr<!rec_T> {test.ptr = "sa"}
+  %tb = cir.cast bitcast %b : !cir.ptr<!rec_U> -> !cir.ptr<!rec_U> {test.ptr = "sb"}
+  %taq = cir.cast bitcast %aq : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "saq"}
+  %tbr = cir.cast bitcast %br : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!cir.ptr<!s32i>> {test.ptr = "sbr"}
+  cir.return
+}
+
+cir.func internal @two_parents(%c: !cir.bool) {
+  %w1 = cir.alloca "w1" align(8) : !cir.ptr<!rec_W> {test.ptr = "w1"}
+  %w2 = cir.alloca "w2" align(8) : !cir.ptr<!rec_W>
+  %s1 = cir.get_member %w1[1] {name = "s"} : !cir.ptr<!rec_W> -> !cir.ptr<!rec_S>
+  %s2 = cir.get_member %w2[1] {name = "s"} : !cir.ptr<!rec_W> -> !cir.ptr<!rec_S>
+  %a1 = cir.get_member %s1[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %a2 = cir.get_member %s2[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b1 = cir.get_member %s1[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %b2 = cir.get_member %s2[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %p = cir.select if %c then %a1 else %a2 : (!cir.bool, !cir.ptr<!rec_T>, !cir.ptr<!rec_T>) -> !cir.ptr<!rec_T>
+  %tp = cir.cast bitcast %p : !cir.ptr<!rec_T> -> !cir.ptr<!rec_T> {test.ptr = "p"}
+  %ta1 = cir.cast bitcast %a1 : !cir.ptr<!rec_T> -> !cir.ptr<!rec_T> {test.ptr = "a1"}
+  %tb1 = cir.cast bitcast %b1 : !cir.ptr<!rec_U> -> !cir.ptr<!rec_U> {test.ptr = "b1"}
+  %tb2 = cir.cast bitcast %b2 : !cir.ptr<!rec_U> -> !cir.ptr<!rec_U> {test.ptr = "b2"}
+  cir.return
+}
+
+cir.func internal @set_b(%b: !cir.ptr<!rec_U>) {
+  %r = cir.get_member %b[0] {name = "r"} : !cir.ptr<!rec_U> -> !cir.ptr<!cir.ptr<!s32i>>
+  %null = cir.const #cir.ptr<null> : !cir.ptr<!s32i>
+  cir.store %null, %r : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+
+cir.func internal @modref() {
+  %w = cir.alloca "w" align(8) : !cir.ptr<!rec_W> {test.ptr = "mw"}
+  %s = cir.get_member %w[1] {name = "s"} : !cir.ptr<!rec_W> -> !cir.ptr<!rec_S>
+  %a = cir.get_member %s[0] {name = "a"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_T>
+  %b = cir.get_member %s[1] {name = "b"} : !cir.ptr<!rec_S> -> !cir.ptr<!rec_U>
+  %ta = cir.cast bitcast %a : !cir.ptr<!rec_T> -> !cir.ptr<!rec_T> {test.ptr = "ma"}
+  %tb = cir.cast bitcast %b : !cir.ptr<!rec_U> -> !cir.ptr<!rec_U> {test.ptr = "mb"}
+  cir.call @set_b(%b) {test.ptr = "set_call"} : (!cir.ptr<!rec_U>) -> ()
+  cir.return
+}
+
+cir.func @main(%c: !cir.bool) {
+  cir.call @nested() : () -> ()
+  cir.call @two_parents(%c) : (!cir.bool) -> ()
+  cir.call @modref() : () -> ()
+  cir.return
+}
+}

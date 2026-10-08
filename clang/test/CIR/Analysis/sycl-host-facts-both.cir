@@ -14,6 +14,10 @@
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN-BU
 // RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=1' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=1 subobjects=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
+// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=1 host-facts-subobjects=1' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
 //
 // Bottom-up (bu=1, T17): the same verdicts. Under closed-TU the launch record
 // in @run's graph is replaced by its copy in @main's graph (every caller of

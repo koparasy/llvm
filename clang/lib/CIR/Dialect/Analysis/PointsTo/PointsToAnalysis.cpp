@@ -402,6 +402,12 @@ void PointsToAnalysis::runFixpoint() {
       projected = projectClones();
       changed |= projected;
     }
+    // A merge can make a child at offset 0 overflow its slot.
+    if (options.subobjects && graph->absorbOverflowingSubobjects(reasons.make(
+                                  Reason::Kind::MergedAt, nullptr,
+                                  "member used as its enclosing object"))) {
+      changed = projected = true;
+    }
     if (!changed)
       changed = resolveIndirectCalls(/*finalize=*/true, bound);
     if (bound || projected)
@@ -541,6 +547,7 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
   // its own caller; runFixpoint marks the function's own graph.
   builder.setFormalsComplete(bottomUp || formalsComplete);
   builder.setDeferIndirectCalls(true);
+  builder.setSubobjects(options.subobjects);
   std::unique_ptr<FunctionGraph> fg = builder.build();
   if (builder.hadVerifyErrors())
     verifyErrors = true;
@@ -1092,16 +1099,10 @@ bool PointsToAnalysis::markEscapedFunctions() {
         if (origin.kind == Origin::Kind::FuncSym)
           if (auto sym = dyn_cast_if_present<FlatSymbolRefAttr>(origin.sym))
             consider(sym, unknownTargetWhy);
-      for (auto [off, cell] : node->getLinks()) {
-        const Node *next = cell.getNode();
+      graph->forEachSuccessor(node, [&](Node *next) {
         if (visited.insert(next).second)
           worklist.push_back(next);
-      }
-      for (const GhostLink &ghost : node->getGhostLinks()) {
-        const Node *next = ghost.target.getNode();
-        if (visited.insert(next).second)
-          worklist.push_back(next);
-      }
+      });
     }
   }
   if (causes.empty())
@@ -1484,6 +1485,19 @@ void PointsToAnalysis::markSummaries() {
   // The reason \p node is a summary, or null.
   auto summaryReason = [&](const Node *node) -> const Reason * {
     ArrayRef<Origin> origins = node->getOrigins();
+    // Subobjects: a child stands for the member of each object its parents
+    // stand for (it gets their Summary from them), and for the objects
+    // merged into it besides.
+    if (graph->hasSubobjects()) {
+      SmallVector<ParentLink, 1> parents = graph->getParents(node);
+      if (parents.size() > 1 || (!parents.empty() && !origins.empty()) ||
+          llvm::any_of(parents, [](const ParentLink &parent) {
+            return parent.parent->isArray();
+          }))
+        return reasons.make(Reason::Kind::SummaryObject,
+                            origins.empty() ? nullptr : origins.front().site,
+                            "merged origins");
+    }
     if (origins.empty())
       return nullptr;
     if (origins.size() > 1 || hasAny(node->getFlags(), NodeFlags::UnknownObj))

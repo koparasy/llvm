@@ -272,6 +272,11 @@ void PointsToAnalysis::processSCC(unsigned scc) {
     }
   }
 
+  // Subobjects: a binding may use a member as its enclosing object (a child
+  // at offset 0 past its extent). The fixpoint folds such children back
+  // (absorbOverflowingSubobjects), in this graph and in every copy of it:
+  // a copy has the same extent, so it overflows too.
+
   Partition &done = partitions[findPartition(scc)];
   done.state = Partition::State::Done;
   graph->flushShared();

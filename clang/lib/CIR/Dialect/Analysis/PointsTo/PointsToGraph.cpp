@@ -25,6 +25,11 @@
 //    element size; links that then collide at the same offset are unified,
 //    links that then overlap trigger the misalignment rule.
 //  - Collapsed with anything. The result is collapsed.
+//  - Subobjects (see PointsToGraph.h): a link of a node that runs into one
+//    of its children; a child that resolves to its parent at another offset,
+//    or a cycle of subobject links (the object holds itself). A collapse
+//    unifies the children into the node; markArray keeps the children that
+//    fit one element, re-keyed modulo its size, and unifies the others.
 //
 //===----------------------------------------------------------------------===//
 
@@ -344,6 +349,20 @@ static int64_t normalizeOffset(const Node *node, int64_t offset) {
   return offset;
 }
 
+/// The flags that flow from a parent to its children, from a child to its
+/// parents, and from a child at offset 0 to its parents (see the file comment
+/// of PointsToGraph.h).
+static constexpr NodeFlags kDownFlags = NodeFlags::All & ~NodeFlags::Collapsed;
+static constexpr NodeFlags kUpFlags = NodeFlags::Mod | NodeFlags::Ref |
+                                      NodeFlags::HasUSM |
+                                      NodeFlags::AsyncAccess;
+static constexpr NodeFlags kUpAtZeroFlags =
+    kUpFlags | NodeFlags::External | NodeFlags::Incomplete;
+
+/// How deep a chain of subobject links is followed (a guard; real nesting is
+/// far shallower).
+static constexpr unsigned kMaxSubobjectDepth = 64;
+
 Cell Cell::resolve() const {
   if (!node)
     return *this;
@@ -381,6 +400,14 @@ SmallVector<GhostLink, 2> Node::getGhostLinks() const {
   result.reserve(ghosts.size());
   for (const GhostLink &ghost : ghosts)
     result.push_back({ghost.offset, ghost.field, ghost.target.resolve()});
+  return result;
+}
+
+SmallVector<SubobjectLink, 2> Node::getSubobjects() const {
+  SmallVector<SubobjectLink, 2> result;
+  result.reserve(subs.size());
+  for (const SubobjectLink &sub : subs)
+    result.push_back({sub.offset, sub.size, sub.child.resolve()});
   return result;
 }
 
@@ -474,12 +501,15 @@ void Graph::addFlags(Cell cell, NodeFlags flags, const Reason *why) {
     collapse(node, why);
     node = cell.getNode();
   }
+  NodeFlags before = node->flags;
   node->flags |= flags;
   for (unsigned i = 0; i < numFlagBits; ++i) {
     auto bit = static_cast<NodeFlags>(1u << i);
     if (hasAny(flags & NodeFlags::StatusMask, bit))
       recordReason(node, bit, why);
   }
+  if (node->flags != before)
+    propagateTreeFlags(node);
 }
 
 size_t Graph::markReachable(Cell from, NodeFlags flags, const Reason *why,
@@ -510,16 +540,13 @@ size_t Graph::markReachable(Cell from, NodeFlags flags, const Reason *why,
       r = derived;
     }
     addFlags(Cell(node), flags, r);
-    for (const auto &link : node->links) {
-      Node *target = link.second.getNode();
+    // The flags may have spread to the tree of subobjects around the node
+    // (propagateTreeFlags), but the walk still visits each of them, for the
+    // nodes their links reach.
+    forEachSuccessor(node, [&](Node *target) {
       if (target && visited.insert(target).second)
         worklist.push_back(target);
-    }
-    for (const GhostLink &ghost : node->ghosts) {
-      Node *target = ghost.target.getNode();
-      if (target && visited.insert(target).second)
-        worklist.push_back(target);
-    }
+    });
   }
   return visited.size();
 }
@@ -579,6 +606,16 @@ bool Graph::isMisaligned(const Node *node) const {
     if (links.front().first + int64_t(*elem) - links.back().first <
         int64_t(pointerSize))
       return true;
+  // A pointer slot of the node itself must not run into a subobject (its
+  // own slots are in the child).
+  for (const auto &link : links) {
+    const SubobjectLink *next = llvm::upper_bound(
+        node->subs, link.first,
+        [](int64_t o, const SubobjectLink &sub) { return o < sub.offset; });
+    if (next != node->subs.end() &&
+        link.first + int64_t(pointerSize) > next->offset)
+      return true;
+  }
   return false;
 }
 
@@ -591,7 +628,7 @@ void Graph::collapseIfMisaligned(Node *node, const Reason *why,
 Cell Graph::getLink(Cell from, const Reason *why) {
   if (std::optional<Cell> existing = lookupLink(from))
     return *existing;
-  Cell src = from.resolve();
+  Cell src = descend(from);
   assert(src && "getLink on an empty cell");
   Cell target(newNode(), 0);
   Worklist worklist;
@@ -602,7 +639,7 @@ Cell Graph::getLink(Cell from, const Reason *why) {
 }
 
 std::optional<Cell> Graph::lookupLink(Cell from) const {
-  Cell src = from.resolve();
+  Cell src = descend(from);
   if (!src)
     return std::nullopt;
   auto &links = src.getRawNode()->links;
@@ -613,7 +650,7 @@ std::optional<Cell> Graph::lookupLink(Cell from) const {
 }
 
 void Graph::setLink(Cell from, Cell to, const Reason *why) {
-  Cell src = from.resolve();
+  Cell src = descend(from);
   assert(src && to && "setLink on an empty cell");
   Worklist worklist;
   insertLink(src.getRawNode(), src.getRawOffset(), to, worklist);
@@ -653,13 +690,13 @@ void Graph::renormalizeGhosts(Node *node, Worklist &worklist) {
   auto old = std::move(node->ghosts);
   node->ghosts.clear();
   for (const GhostLink &ghost : old)
-    insertGhost(node, ghost.offset, ghost.field, ghost.target, worklist);
+    insertGhostDeep(node, ghost.offset, ghost.field, ghost.target, worklist);
 }
 
 Cell Graph::getGhostLink(Cell from, GhostField field, const Reason *why) {
   if (std::optional<Cell> existing = lookupGhostLink(from, field))
     return *existing;
-  Cell src = from.resolve();
+  Cell src = descend(from);
   assert(src && field && "getGhostLink on an empty cell or field");
   Cell target(newNode(), 0);
   Worklist worklist;
@@ -669,7 +706,7 @@ Cell Graph::getGhostLink(Cell from, GhostField field, const Reason *why) {
 }
 
 std::optional<Cell> Graph::lookupGhostLink(Cell from, GhostField field) const {
-  Cell src = from.resolve();
+  Cell src = descend(from);
   if (!src || !field)
     return std::nullopt;
   auto &ghosts = src.getRawNode()->ghosts;
@@ -682,7 +719,7 @@ std::optional<Cell> Graph::lookupGhostLink(Cell from, GhostField field) const {
 
 void Graph::setGhostLink(Cell from, GhostField field, Cell to,
                          const Reason *why) {
-  Cell src = from.resolve();
+  Cell src = descend(from);
   assert(src && to && field && "setGhostLink on an empty cell or field");
   Worklist worklist;
   insertGhost(src.getRawNode(), src.getRawOffset(), field, to, worklist);
@@ -743,12 +780,16 @@ void Graph::merge(Node *survivor, Node *merged, int64_t delta,
   auto mergedGhosts = std::move(merged->ghosts);
   auto mergedOrigins = std::move(merged->origins);
   auto mergedReasons = std::move(merged->reasons);
+  auto mergedSubs = std::move(merged->subs);
+  auto mergedParents = std::move(merged->parents);
   NodeFlags mergedFlags = merged->flags;
   uint64_t mergedSize = merged->size;
   merged->links.clear();
   merged->ghosts.clear();
   merged->origins.clear();
   merged->reasons.clear();
+  merged->subs.clear();
+  merged->parents.clear();
   merged->flags = NodeFlags::None;
   merged->size = 0;
   merged->arrayElemSize.reset();
@@ -761,6 +802,20 @@ void Graph::merge(Node *survivor, Node *merged, int64_t delta,
   if (merged->shared && !survivor->shared)
     sharedFrontier.push_back(Cell(survivor));
   merged->shared = false;
+
+  // A subobject link of the survivor to the merged node now names the
+  // survivor itself: the same bytes (drop it), or the object holds itself
+  // at a shift (collapse, below).
+  bool selfShift = false;
+  llvm::erase_if(survivor->subs, [&](const SubobjectLink &sub) {
+    Cell child = sub.child.resolve();
+    if (child.getRawNode() != survivor)
+      return false;
+    if (child.getRawOffset() != normalizeOffset(survivor, sub.offset))
+      selfShift = true;
+    return true;
+  });
+  llvm::append_range(survivor->parents, mergedParents);
 
   // Collapsed is applied by collapseImpl below, which also moves the links.
   survivor->flags |= mergedFlags & ~NodeFlags::Collapsed;
@@ -776,17 +831,30 @@ void Graph::merge(Node *survivor, Node *merged, int64_t delta,
       survivor->size = std::max(survivor->size, static_cast<uint64_t>(end));
   }
 
-  if (collapseResult)
+  if (collapseResult || selfShift)
     collapseImpl(survivor, why, worklist);
   else if (elem && !survivor->arrayElemSize)
     markArrayImpl(survivor, *elem, why, worklist);
 
+  // The children first, so that the links of the merged node land in them.
+  for (const SubobjectLink &sub : mergedSubs)
+    attachSub(survivor, sub.offset + delta, sub.size, sub.child, worklist, why);
   for (const auto &[off, target] : mergedLinks)
-    insertLink(survivor, off + delta, target, worklist);
+    insertLinkDeep(survivor, off + delta, target, worklist, why);
   for (const GhostLink &ghost : mergedGhosts)
-    insertGhost(survivor, ghost.offset + delta, ghost.field, ghost.target,
-                worklist);
+    insertGhostDeep(survivor, ghost.offset + delta, ghost.field, ghost.target,
+                    worklist);
   collapseIfMisaligned(survivor, why, worklist);
+  // The merge may have closed a cycle of subobject links (a child merged
+  // with an ancestor): the object holds itself.
+  if (!survivor->subs.empty() && !survivor->isCollapsed())
+    for (const SubobjectLink &sub : survivor->subs)
+      if (Node *child = sub.child.getNode();
+          child != survivor && isInSubtree(child, survivor)) {
+        collapseImpl(survivor, why, worklist);
+        break;
+      }
+  propagateTreeFlags(survivor);
 }
 
 void Graph::collapseImpl(Node *node, const Reason *why, Worklist &worklist) {
@@ -796,6 +864,8 @@ void Graph::collapseImpl(Node *node, const Reason *why, Worklist &worklist) {
   node->flags |= NodeFlags::Collapsed;
   recordReason(node, NodeFlags::Collapsed, why);
   node->arrayElemSize.reset();
+  // A field-insensitive node has no subobjects: its children join it.
+  absorbSubs(node, std::nullopt, worklist, why);
   renormalizeGhosts(node, worklist);
   if (node->links.empty())
     return;
@@ -827,11 +897,14 @@ void Graph::markArrayImpl(Node *node, uint64_t elemSize, const Reason *why,
   if (node->arrayElemSize)
     return;
   node->arrayElemSize = elemSize;
+  // The children that fit one element move to their offset modulo its size,
+  // the others join the node.
+  absorbSubs(node, elemSize, worklist, why);
   // Re-insert the links at their offsets modulo the element size.
   auto oldLinks = std::move(node->links);
   node->links.clear();
   for (const auto &[off, target] : oldLinks)
-    insertLink(node, off, target, worklist);
+    insertLinkDeep(node, off, target, worklist, why);
   renormalizeGhosts(node, worklist);
   collapseIfMisaligned(node, why, worklist);
 }
@@ -842,6 +915,402 @@ void Graph::markArray(Node *node, uint64_t elemSize, const Reason *why) {
   Worklist worklist;
   markArrayImpl(node, elemSize, why, worklist);
   runWorklist(worklist, why);
+}
+
+//===----------------------------------------------------------------------===//
+// Graph: subobjects
+//===----------------------------------------------------------------------===//
+
+const SubobjectLink *Graph::findSubAt(const Node *node, int64_t offset) {
+  // Sorted by offset and disjoint: the last link starting at or before it.
+  const SubobjectLink *it = llvm::upper_bound(
+      node->subs, offset,
+      [](int64_t o, const SubobjectLink &sub) { return o < sub.offset; });
+  if (it == node->subs.begin())
+    return nullptr;
+  --it;
+  return offset < it->offset + static_cast<int64_t>(it->size) ? it : nullptr;
+}
+
+Cell Graph::descend(Cell cell) const {
+  Cell cur = cell.resolve();
+  for (unsigned depth = 0; cur && depth < kMaxSubobjectDepth; ++depth) {
+    Node *node = cur.getRawNode();
+    if (node->subs.empty())
+      break;
+    const SubobjectLink *hit = findSubAt(node, cur.getRawOffset());
+    if (!hit)
+      break;
+    Cell next =
+        Cell(hit->child.getRawNode(),
+             hit->child.getRawOffset() + cur.getRawOffset() - hit->offset)
+            .resolve();
+    if (next.getRawNode() == node)
+      break;
+    cur = next;
+  }
+  return cur;
+}
+
+SmallVector<ParentLink, 1> Graph::getParents(const Node *node) const {
+  SmallVector<ParentLink, 1> result;
+  const Node *live = Cell(const_cast<Node *>(node)).getNode();
+  if (!live)
+    return result;
+  for (Cell back : live->parents) {
+    Cell at = back.resolve();
+    Node *parent = at.getRawNode();
+    if (!parent || parent == live)
+      continue;
+    const SubobjectLink *sub = findSubAt(parent, at.getRawOffset());
+    if (!sub || sub->offset != at.getRawOffset())
+      continue;
+    Cell child = sub->child.resolve();
+    if (child.getRawNode() != live)
+      continue;
+    if (llvm::any_of(result, [&](const ParentLink &p) {
+          return p.parent == parent && p.offset == sub->offset;
+        }))
+      continue;
+    result.push_back({parent, sub->offset, sub->size, child.getRawOffset()});
+  }
+  return result;
+}
+
+void Graph::forEachInSubtree(const Node *node,
+                             function_ref<void(const Node *)> fn) const {
+  const Node *root = Cell(const_cast<Node *>(node)).getNode();
+  if (!root)
+    return;
+  SmallPtrSet<const Node *, 8> seen;
+  SmallVector<const Node *, 8> worklist{root};
+  seen.insert(root);
+  while (!worklist.empty()) {
+    const Node *n = worklist.pop_back_val();
+    fn(n);
+    for (const SubobjectLink &sub : n->subs)
+      if (const Node *child = sub.child.getNode();
+          child && seen.insert(child).second)
+        worklist.push_back(child);
+  }
+}
+
+bool Graph::isInSubtree(const Node *ancestor, const Node *node) const {
+  bool found = false;
+  forEachInSubtree(ancestor, [&](const Node *n) { found |= n == node; });
+  return found;
+}
+
+void Graph::forEachSuccessor(const Node *node, function_ref<void(Node *)> fn,
+                             bool allParents) const {
+  for (const auto &link : node->links)
+    fn(link.second.getNode());
+  for (const GhostLink &ghost : node->ghosts)
+    fn(ghost.target.getNode());
+  for (const SubobjectLink &sub : node->subs)
+    fn(sub.child.getNode());
+  if (node->parents.empty())
+    return;
+  for (const ParentLink &parent : getParents(node))
+    if (allParents || parent.offset == 0)
+      fn(parent.parent);
+}
+
+void Graph::propagateTreeFlags(Node *start) {
+  start = Cell(start).getNode();
+  if (!start || (start->subs.empty() && start->parents.empty()))
+    return;
+  // Add the flags \p mask of \p from to \p to, with their reasons.
+  auto transfer = [&](const Node *from, Node *to, NodeFlags mask) {
+    NodeFlags add = from->flags & mask & ~to->flags;
+    if (add == NodeFlags::None)
+      return false;
+    to->flags |= add;
+    for (unsigned i = 0; i < numFlagBits; ++i) {
+      auto bit = static_cast<NodeFlags>(1u << i);
+      if (hasAny(add & NodeFlags::StatusMask, bit))
+        recordReason(to, bit, from->getReason(bit));
+    }
+    return true;
+  };
+  SmallVector<Node *, 8> worklist{start};
+  SmallPtrSet<Node *, 8> queued;
+  queued.insert(start);
+  auto push = [&](Node *n) {
+    if (queued.insert(n).second)
+      worklist.push_back(n);
+  };
+  while (!worklist.empty()) {
+    Node *node = worklist.pop_back_val();
+    queued.erase(node);
+    if (node->isForwarded())
+      continue;
+    SmallVector<ParentLink, 1> parents = getParents(node);
+    // Take what the neighbours have, then hand on what this node has.
+    for (const ParentLink &parent : parents)
+      transfer(parent.parent, node, kDownFlags);
+    for (const SubobjectLink &sub : node->subs)
+      if (Node *child = sub.child.getNode(); child != node)
+        transfer(child, node, sub.offset == 0 ? kUpAtZeroFlags : kUpFlags);
+    for (const SubobjectLink &sub : node->subs)
+      if (Node *child = sub.child.getNode();
+          child != node && transfer(node, child, kDownFlags))
+        push(child);
+    for (const ParentLink &parent : parents)
+      if (transfer(node, parent.parent,
+                   parent.offset == 0 ? kUpAtZeroFlags : kUpFlags))
+        push(parent.parent);
+  }
+}
+
+void Graph::insertLinkDeep(Node *node, int64_t offset, Cell target,
+                           Worklist &worklist, const Reason *why) {
+  if (node->subs.empty()) {
+    insertLink(node, offset, target, worklist);
+    return;
+  }
+  Cell at = descend(Cell(node, offset));
+  insertLink(at.getRawNode(), at.getRawOffset(), target, worklist);
+  if (at.getRawNode() != node)
+    collapseIfMisaligned(at.getRawNode(), why, worklist);
+}
+
+void Graph::insertGhostDeep(Node *node, int64_t offset, GhostField field,
+                            Cell target, Worklist &worklist) {
+  if (node->subs.empty()) {
+    insertGhost(node, offset, field, target, worklist);
+    return;
+  }
+  Cell at = descend(Cell(node, offset));
+  insertGhost(at.getRawNode(), at.getRawOffset(), field, target, worklist);
+}
+
+void Graph::attachSub(Node *node, int64_t offset, uint64_t size, Cell child,
+                      Worklist &worklist, const Reason *why) {
+  anySubobjects = true;
+  Cell at = Cell(node, offset).resolve();
+  Node *n = at.getRawNode();
+  int64_t o = at.getRawOffset();
+  Cell c = child.resolve();
+  auto fallback = [&] { worklist.emplace_back(c, Cell(n, o)); };
+  // Find the node the range belongs to: inside an existing child, go down.
+  for (unsigned depth = 0;; ++depth) {
+    if (c.getRawNode() == n) {
+      // The child is the node itself: the same bytes, or itself at a shift.
+      if (c.getRawOffset() != o)
+        collapseImpl(n, why, worklist);
+      return;
+    }
+    int64_t end = o + static_cast<int64_t>(size);
+    if (depth >= kMaxSubobjectDepth || n->isCollapsed() ||
+        (n->arrayElemSize &&
+         (o < 0 || end > static_cast<int64_t>(*n->arrayElemSize)))) {
+      fallback();
+      return;
+    }
+    const SubobjectLink *container = nullptr;
+    bool partial = false;
+    for (const SubobjectLink &sub : n->subs) {
+      int64_t subEnd = sub.offset + static_cast<int64_t>(sub.size);
+      if (sub.offset >= end || o >= subEnd)
+        continue;
+      if (sub.offset == o && sub.size == size) {
+        // The same range: one object.
+        worklist.emplace_back(sub.child, c);
+        return;
+      }
+      if (sub.offset <= o && end <= subEnd) {
+        container = &sub;
+        break;
+      }
+      if (o <= sub.offset && subEnd <= end)
+        continue; // Moves into the new child below.
+      partial = true;
+    }
+    if (partial) {
+      fallback();
+      return;
+    }
+    if (!container)
+      break;
+    Cell next = Cell(container->child.getRawNode(),
+                     container->child.getRawOffset() + o - container->offset)
+                    .resolve();
+    if (next.getRawNode() == n) {
+      fallback();
+      return;
+    }
+    n = next.getRawNode();
+    o = next.getRawOffset();
+  }
+  Node *cn = c.getRawNode();
+  int64_t co = c.getRawOffset();
+  // A child that holds its parent would make a cycle: the object would
+  // contain itself.
+  if (isInSubtree(cn, n)) {
+    fallback();
+    return;
+  }
+
+  // Move what the node holds in the range into the child.
+  int64_t end = o + static_cast<int64_t>(size);
+  auto inRange = [&](int64_t off) { return off >= o && off < end; };
+  SmallVector<std::pair<int64_t, Cell>, 4> movedLinks;
+  llvm::erase_if(n->links, [&](const std::pair<int64_t, Cell> &link) {
+    if (!inRange(link.first))
+      return false;
+    movedLinks.push_back(link);
+    return true;
+  });
+  SmallVector<GhostLink, 2> movedGhosts;
+  llvm::erase_if(n->ghosts, [&](const GhostLink &ghost) {
+    if (!inRange(ghost.offset))
+      return false;
+    movedGhosts.push_back(ghost);
+    return true;
+  });
+  SmallVector<SubobjectLink, 2> movedSubs;
+  llvm::erase_if(n->subs, [&](const SubobjectLink &sub) {
+    if (!inRange(sub.offset))
+      return false;
+    movedSubs.push_back(sub);
+    return true;
+  });
+  SubobjectLink *pos =
+      llvm::lower_bound(n->subs, o, [](const SubobjectLink &sub, int64_t off) {
+        return sub.offset < off;
+      });
+  n->subs.insert(pos, {o, size, c});
+  cn->parents.push_back(Cell(n, o));
+  if (o == 0)
+    zeroOffsetParents.push_back(Cell(n));
+  if (n->shared && !cn->shared)
+    sharedFrontier.push_back(c);
+  else if (cn->shared && !n->shared)
+    sharedFrontier.push_back(Cell(n));
+  if (end > 0)
+    n->size = std::max(n->size, static_cast<uint64_t>(end));
+  if (int64_t childEnd = co + static_cast<int64_t>(size); childEnd > 0)
+    cn->size = std::max(cn->size, static_cast<uint64_t>(childEnd));
+
+  for (const auto &[off, target] : movedLinks) {
+    Cell to = Cell(cn, co + off - o).resolve();
+    insertLinkDeep(to.getRawNode(), to.getRawOffset(), target, worklist, why);
+  }
+  for (const GhostLink &ghost : movedGhosts) {
+    Cell to = Cell(cn, co + ghost.offset - o).resolve();
+    insertGhostDeep(to.getRawNode(), to.getRawOffset(), ghost.field,
+                    ghost.target, worklist);
+  }
+  for (const SubobjectLink &sub : movedSubs)
+    attachSub(cn, co + sub.offset - o, sub.size, sub.child, worklist, why);
+  if (Node *live = Cell(cn).getNode(); live && !live->isForwarded())
+    collapseIfMisaligned(live, why, worklist);
+  propagateTreeFlags(cn);
+}
+
+Cell Graph::getSubobject(Cell at, uint64_t size, const Reason *why) {
+  Cell start = at.resolve();
+  if (!start || size == 0)
+    return start;
+  // An existing child for exactly this range, at any depth.
+  Cell cur = start;
+  for (unsigned depth = 0; depth < kMaxSubobjectDepth; ++depth) {
+    Node *node = cur.getRawNode();
+    int64_t off = cur.getRawOffset();
+    const SubobjectLink *hit = findSubAt(node, off);
+    if (!hit)
+      break;
+    if (hit->offset == off && hit->size == size)
+      return hit->child.resolve();
+    if (off + static_cast<int64_t>(size) >
+        hit->offset + static_cast<int64_t>(hit->size))
+      break;
+    Cell next = Cell(hit->child.getRawNode(),
+                     hit->child.getRawOffset() + off - hit->offset)
+                    .resolve();
+    if (next.getRawNode() == node)
+      break;
+    cur = next;
+  }
+  Node *child = newNode();
+  child->size = size;
+  Worklist worklist;
+  attachSub(start.getRawNode(), start.getRawOffset(), size, Cell(child, 0),
+            worklist, why);
+  runWorklist(worklist, why);
+  return Cell(child, 0).resolve();
+}
+
+void Graph::absorbSubs(Node *node, std::optional<uint64_t> elemSize,
+                       Worklist &worklist, const Reason *why) {
+  if (node->subs.empty())
+    return;
+  auto subs = std::move(node->subs);
+  node->subs.clear();
+  for (const SubobjectLink &sub : subs) {
+    if (elemSize) {
+      auto e = static_cast<int64_t>(*elemSize);
+      int64_t norm = ((sub.offset % e) + e) % e;
+      if (norm + static_cast<int64_t>(sub.size) <= e) {
+        attachSub(node, norm, sub.size, sub.child, worklist, why);
+        continue;
+      }
+    }
+    worklist.emplace_back(Cell(node, sub.offset), sub.child);
+  }
+}
+
+bool Graph::absorbOverflowingSubobjects(const Reason *why) {
+  if (!anySubobjects)
+    return false;
+  // Whether the child cell \p child of a slot of \p size bytes has bytes
+  // outside it: then a pointer to the member was used as a pointer to the
+  // object (or the child stands for a larger object too, which the folding
+  // covers as well).
+  auto overflows = [&](Cell child, uint64_t size) {
+    const Node *node = child.getRawNode();
+    int64_t start = child.getRawOffset();
+    auto slot = static_cast<int64_t>(size);
+    if (start != 0 || node->size > size)
+      return true;
+    if (std::optional<uint64_t> elem = node->arrayElemSize;
+        elem && *elem > size)
+      return true;
+    for (const auto &link : node->links)
+      if (link.first < 0 || link.first + int64_t(pointerSize) > slot)
+        return true;
+    for (const GhostLink &ghost : node->ghosts)
+      if (ghost.offset < 0 || ghost.offset >= slot)
+        return true;
+    for (const SubobjectLink &sub : node->subs)
+      if (sub.offset < 0 || sub.offset + static_cast<int64_t>(sub.size) > slot)
+        return true;
+    return false;
+  };
+  bool changed = false;
+  for (bool again = true; again;) {
+    again = false;
+    Worklist worklist;
+    // The nodes that may still have a child at offset 0, each once.
+    SmallPtrSet<Node *, 32> seen;
+    llvm::erase_if(zeroOffsetParents, [&](Cell cell) {
+      Node *node = cell.getNode();
+      if (!seen.insert(node).second || node->subs.empty() ||
+          node->subs.front().offset != 0)
+        return true;
+      const SubobjectLink &sub = node->subs.front();
+      Cell child = sub.child.resolve();
+      if (child.getRawNode() != node && overflows(child, sub.size))
+        worklist.emplace_back(Cell(node, 0), child);
+      return false;
+    });
+    if (worklist.empty())
+      break;
+    runWorklist(worklist, why);
+    again = changed = true;
+  }
+  return changed;
 }
 
 //===----------------------------------------------------------------------===//
@@ -861,10 +1330,11 @@ void Graph::flushShared() {
     if (!node || node->shared)
       continue;
     node->shared = true;
-    for (const auto &link : node->links)
-      sharedFrontier.push_back(link.second);
-    for (const GhostLink &ghost : node->ghosts)
-      sharedFrontier.push_back(ghost.target);
+    // A tree of subobjects is shared as a whole: a copy of part of it would
+    // hold bytes the shared rest also holds.
+    forEachSuccessor(
+        node, [&](Node *next) { sharedFrontier.push_back(Cell(next)); },
+        /*allParents=*/true);
   }
 }
 
@@ -924,12 +1394,11 @@ CloneMap Graph::cloneInto(Graph &dst, ArrayRef<Cell> roots, NodeFlags keepMask,
   // link order deterministically.
   for (Cell root : roots)
     visit(root);
-  for (size_t i = 0; i < order.size(); ++i) {
-    for (const auto &link : order[i]->links)
-      visit(link.second);
-    for (const GhostLink &ghost : order[i]->ghosts)
-      visit(ghost.target);
-  }
+  // A node comes with its whole tree of subobjects, parents included.
+  for (size_t i = 0; i < order.size(); ++i)
+    forEachSuccessor(
+        order[i], [&](Node *next) { visit(Cell(next)); },
+        /*allParents=*/true);
 
   // The copies have the same collapse and array state as their sources, so
   // the (already normalized and sorted) links carry over unchanged.
@@ -946,6 +1415,17 @@ CloneMap Graph::cloneInto(Graph &dst, ArrayRef<Cell> roots, NodeFlags keepMask,
       copy->ghosts.push_back({ghost.offset, ghost.field,
                               Cell(result.nodeMap[t.getRawNode()].getRawNode(),
                                    t.getRawOffset())});
+    }
+    for (const SubobjectLink &sub : src->subs) {
+      Cell t = sub.child.resolve();
+      Node *child = result.nodeMap[t.getRawNode()].getRawNode();
+      copy->subs.push_back(
+          {sub.offset, sub.size, Cell(child, t.getRawOffset())});
+      // The back link (on a shared child too, which is in this graph).
+      child->parents.push_back(Cell(copy, sub.offset));
+      dst.anySubobjects = true;
+      if (sub.offset == 0)
+        dst.zeroOffsetParents.push_back(Cell(copy));
     }
   }
   return result;
@@ -1076,6 +1556,17 @@ void Graph::print(raw_ostream &os) const {
           ", ");
       os << '}';
     }
+    if (!node->subs.empty()) {
+      os << " sub={";
+      llvm::interleave(
+          node->subs, os,
+          [&](const SubobjectLink &sub) {
+            os << sub.offset << ':' << sub.size << "->";
+            printCell(os, sub.child);
+          },
+          ", ");
+      os << '}';
+    }
     if (!node->reasons.empty()) {
       os << " reasons={";
       llvm::interleave(
@@ -1109,6 +1600,7 @@ bool Graph::verify(raw_ostream *errs) const {
     if (node->isForwarded()) {
       if (!node->links.empty() || !node->ghosts.empty() ||
           !node->origins.empty() || !node->reasons.empty() ||
+          !node->subs.empty() || !node->parents.empty() ||
           node->flags != NodeFlags::None)
         fail(node, "forwarded node still holds state");
       // A cycle in the forwarding chain would make resolve() loop.
@@ -1174,6 +1666,50 @@ bool Graph::verify(raw_ostream *errs) const {
       for (size_t j = 0; j < i; ++j)
         if (node->origins[i] == node->origins[j])
           fail(node, "duplicate origin");
+
+    // Subobject links.
+    const auto &subs = node->subs;
+    if (!subs.empty() && node->isCollapsed())
+      fail(node, "collapsed node has subobject links");
+    for (size_t i = 0; i < subs.size(); ++i) {
+      const SubobjectLink &sub = subs[i];
+      int64_t end = sub.offset + static_cast<int64_t>(sub.size);
+      if (sub.size == 0)
+        fail(node, "subobject link of size 0");
+      if (i && subs[i - 1].offset + static_cast<int64_t>(subs[i - 1].size) >
+                   sub.offset)
+        fail(node, "subobject links not sorted and disjoint");
+      if (normalizeOffset(node, sub.offset) != sub.offset)
+        fail(node, "subobject link offset not normalized");
+      if (std::optional<uint64_t> elem = node->arrayElemSize)
+        if (sub.offset < 0 || end > static_cast<int64_t>(*elem))
+          fail(node, "subobject link outside one array element");
+      const Node *child = sub.child.getNode();
+      if (!child) {
+        fail(node, "null subobject link target");
+        continue;
+      }
+      if (child->isForwarded())
+        fail(node, "subobject link resolves to a forwarded node");
+      if (child == node || isInSubtree(child, node))
+        fail(node, "subobject link cycle");
+      NodeFlags down = node->flags & kDownFlags & ~child->flags;
+      NodeFlags up = child->flags &
+                     (sub.offset == 0 ? kUpAtZeroFlags : kUpFlags) &
+                     ~node->flags;
+      if (down != NodeFlags::None)
+        fail(node, "child n" + Twine(child->id) + " lacks the flags " +
+                       toString(down));
+      if (up != NodeFlags::None)
+        fail(node, "lacks the flags " + toString(up) + " of child n" +
+                       Twine(child->id));
+    }
+    for (const auto &link : links)
+      if (findSubAt(node, link.first))
+        fail(node, "link inside a subobject link's range");
+    for (const GhostLink &ghost : ghosts)
+      if (findSubAt(node, ghost.offset))
+        fail(node, "ghost link inside a subobject link's range");
   }
   return ok;
 }

@@ -54,7 +54,10 @@
 //       rule instead (Reason Budget). A callee node that is still empty (no
 //       origin, no flag) when nothing else changes gets the unknown-call
 //       rule too.
-//     - PointsToAnalysisOptions::extraFixpointRule, if set.
+//     - PointsToAnalysisOptions::extraFixpointRule, if set;
+//     - with PointsToAnalysisOptions::subobjects, fold back into its parent
+//       every child at offset 0 used past its extent
+//       (Graph::absorbOverflowingSubobjects).
 //
 //  6. Mark the summary nodes (markSummaries): a node that may stand for
 //     more than one simultaneously live concrete object gets Summary, with a
@@ -157,6 +160,11 @@ struct PointsToAnalysisOptions {
   /// formal starts Incomplete. Tests set it; the -cir-offload-assume-closed-tu
   /// flag maps onto it later.
   bool assumeClosedTU = false;
+  /// Subobject nodes (PointsToGraph.h): every member of class, union or
+  /// array type a cir.get_member names gets its own child node, so that a
+  /// collapse inside one member leaves its siblings field-sensitive. Off by
+  /// default.
+  bool subobjects = false;
   /// The number of rounds of indirect-call resolution that may bind new
   /// targets; past it, a call that gains a target gets the unknown-call
   /// rule (Reason Budget).
@@ -371,6 +379,12 @@ enum class AliasRule : uint8_t {
   /// BU mode: values of two different functions, whose graphs are apart:
   /// MayAlias.
   DifferentFunctions,
+  /// Subobjects: different nodes in one tree of subobject links (a common
+  /// ancestor), whose byte ranges in the ancestor are disjoint: NoAlias.
+  DisjointSubobjects,
+  /// Different nodes in one tree whose ranges may overlap there (or an
+  /// array, a collapsed node, or unknown code in the way): MayAlias.
+  SubobjectOverlap,
 };
 
 llvm::StringRef getAliasRuleName(AliasRule rule);

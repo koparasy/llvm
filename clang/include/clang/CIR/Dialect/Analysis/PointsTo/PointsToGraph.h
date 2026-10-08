@@ -45,6 +45,51 @@
 // their targets. Unification, cloning, reachability and printing treat them
 // like links.
 //
+// Subobject nodes
+// ---------------
+// A node may hold child nodes for some of its subobjects (structure-sensitive
+// points-to, Balatsouras and Smaragdakis, SAS 2016): a subobject link
+// (offset, size -> child cell) says that the bytes [offset, offset + size) of
+// the node are the object the child stands for. The local phase makes one for
+// each member of class, union or array type a cir.get_member names (opt-in,
+// LocalBuilder::setSubobjects); Graph::getSubobject is the primitive.
+//
+// SOUNDNESS: in a UB-free program, pointer arithmetic on a pointer to a member
+// subobject stays within that subobject or one past its end ([expr.add], and
+// the object representation of a non-array object is only reachable from a
+// pointer to that object). It cannot reach a sibling member, so two sibling
+// members can have independent nodes, and a collapse or an array smash inside
+// one of them leaves the others field-sensitive. A pointer to the whole object
+// (the parent at offset 0, its address cast to char*, a whole-object copy)
+// still sees every member: the parent's cells keep their byte offsets, and
+// every access to a cell of the parent goes to the child that holds the byte.
+// The exceptions, and how they stay sound:
+//  - pointer-interconvertibility ([basic.compound]p4): a standard-layout
+//    object and its first member have the same address, and a cast turns a
+//    pointer to the member into one to the object. A child at offset 0 is
+//    therefore folded back into its parent (absorbOverflowingSubobjects) as
+//    soon as it is used past its own extent, and External and Incomplete
+//    flow from it up to the parent;
+//  - arithmetic the local phase sees leave a child (a char* offset, a
+//    derived-class cast) collapses the child's parents (LocalBuilder);
+//  - a collapse, or an array smash whose element a child does not fit in,
+//    absorbs the children (unifies them into the parent at their offsets).
+// Base-class subobjects stay in the parent (a later refinement), and the
+// members of a union get no children (a union is one region).
+//
+// Identity versus contents: a cell of a node always means that byte of the
+// node, so (parent, 0) is the whole object while the child cell is the
+// member; alias queries compare cells by (common ancestor, absolute offset).
+// Contents (links, ghost links) always live in the deepest node that holds
+// the byte: getLink, setLink and the ghost link accessors descend, and a link
+// is never stored on a node inside the range of one of its subobject links.
+// Every flag but Collapsed flows from a parent to its children (a part of an
+// unknown, external or heap object is one too), and Mod, Ref, HasUSM and
+// AsyncAccess flow from a child to its parents (an access to a member is an
+// access to the object). Merging two parents with children at the same range
+// unifies the children; a child that overlaps another one only partially is
+// unified into the parent instead, which is sound.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef CLANG_CIR_DIALECT_ANALYSIS_POINTSTO_POINTSTOGRAPH_H
@@ -318,6 +363,24 @@ struct GhostLink {
   Cell target;
 };
 
+/// A subobject link: the bytes [offset, offset + size) of a node are the
+/// object of the child cell (see the file comment).
+struct SubobjectLink {
+  int64_t offset;
+  uint64_t size;
+  Cell child;
+};
+
+/// One parent of a node, as Graph::getParents gives it: \p parent holds the
+/// node at [offset, offset + size), whose start is \p childOffset of the
+/// node.
+struct ParentLink {
+  Node *parent;
+  int64_t offset;
+  uint64_t size;
+  int64_t childOffset;
+};
+
 /// An abstract memory object. Nodes are created and mutated only by Graph.
 class Node {
 public:
@@ -344,6 +407,10 @@ public:
   /// The ghost links with resolved targets, sorted by (offset, field).
   llvm::SmallVector<GhostLink, 2> getGhostLinks() const;
   size_t getNumGhostLinks() const { return ghosts.size(); }
+
+  /// The subobject links with resolved children, sorted by offset.
+  llvm::SmallVector<SubobjectLink, 2> getSubobjects() const;
+  size_t getNumSubobjects() const { return subs.size(); }
 
   llvm::ArrayRef<Origin> getOrigins() const { return origins; }
 
@@ -375,6 +442,12 @@ private:
   llvm::SmallVector<Origin, 1> origins;
   /// First reason per status bit, sorted by bit.
   llvm::SmallVector<std::pair<NodeFlags, const Reason *>, 0> reasons;
+  /// Subobject links, sorted by offset, their ranges disjoint.
+  llvm::SmallVector<SubobjectLink, 0> subs;
+  /// Back links: the cell of each parent at which a subobject link to this
+  /// node was made. Entries go stale (the parent absorbed the child, the
+  /// link moved); Graph::getParents keeps only the valid ones.
+  llvm::SmallVector<Cell, 0> parents;
   /// Reachable from a node Graph::markShared was given (see there).
   bool shared = false;
 };
@@ -431,7 +504,9 @@ struct CloneOptions {
 ///  - unifying a node with itself at a different (normalized) offset;
 ///  - merging two arrays of different element size;
 ///  - markArray with a different element size than the node already has;
-///  - an explicit collapse().
+///  - an explicit collapse();
+///  - a link of a node that runs into one of its subobjects, a cycle of
+///    subobject links, or a child that is its own parent at a shift.
 class Graph {
 public:
   /// \p pointerSize is the size of a pointer slot in bytes. \p reasons is a
@@ -457,16 +532,18 @@ public:
   Node *makeNode(NodeFlags flags = NodeFlags::None);
 
   /// Set \p flags on the node of \p cell. For each status bit that has no
-  /// reason yet, record \p why (if non-null).
+  /// reason yet, record \p why (if non-null). The flags then spread over
+  /// the node's tree of subobjects as the file comment says.
   void addFlags(Cell cell, NodeFlags flags, const Reason *why = nullptr);
   /// Set the status bits \p flags on the node of \p from and on every node
   /// reachable from it through links and ghost links (all of a node's links,
-  /// whatever the offset of \p from). The node of \p from records \p why; the
-  /// nodes reached from it record one derived reason, "reachable from an
-  /// escaped pointer", whose cause is \p why. The walk is iterative with a
-  /// visited set, so cycles and long chains are fine. \p flags must not contain
-  /// Collapsed (collapsing would rewrite the links being walked). Returns the
-  /// number of nodes visited.
+  /// whatever the offset of \p from), subobject links, and from a child to
+  /// the parents it is at offset 0 of (forEachSuccessor). The node of \p from
+  /// records \p why; the nodes reached from it record one derived reason,
+  /// "reachable from an escaped pointer", whose cause is \p why. The walk is
+  /// iterative with a visited set, so cycles and long chains are fine. \p flags
+  /// must not contain Collapsed (collapsing would rewrite the links being
+  /// walked). Returns the number of nodes visited.
   ///
   /// With \p stopAtFlagged the walk does not go past a node other than the
   /// one of \p from that already has all of \p flags: propagating a flag from
@@ -530,7 +607,41 @@ public:
   /// node stays collapsed.
   void markArray(Node *node, uint64_t elemSize, const Reason *why = nullptr);
 
-  /// Deep-copy the nodes reachable from \p roots into \p dst. Flags are
+  // Subobject nodes (see the file comment).
+
+  /// The child cell of the subobject of \p size bytes at \p at, made on first
+  /// use: the bytes the node holds in that range (links, ghost links, the
+  /// subobjects inside it) move into the child, which gets the node's flags.
+  /// A range inside an existing child is made inside that child. Where a
+  /// child can't be placed (the node is collapsed, the range does not fit
+  /// one array element, it overlaps another child only partly, or the child
+  /// would contain its parent) the result is the plain cell \p at.
+  Cell getSubobject(Cell at, uint64_t size, const Reason *why = nullptr);
+  /// \p cell resolved, then moved into the deepest child that holds its
+  /// byte: where its contents are stored. The cell itself if no child does.
+  Cell descend(Cell cell) const;
+  /// The valid parents of \p node (resolved), without duplicates.
+  llvm::SmallVector<ParentLink, 1> getParents(const Node *node) const;
+  /// Whether any subobject link was ever made in this graph.
+  bool hasSubobjects() const { return anySubobjects; }
+  /// Fold back into its parent every child at offset 0 of a parent whose
+  /// own extent (size, links, ghost links, children) leaves its slot:
+  /// pointer-interconvertibility (see the file comment). Returns whether it
+  /// changed the graph.
+  bool absorbOverflowingSubobjects(const Reason *why = nullptr);
+  /// Call \p fn on \p node (resolved) and on every node below it through
+  /// subobject links, each once.
+  void forEachInSubtree(const Node *node,
+                        llvm::function_ref<void(const Node *)> fn) const;
+  /// Call \p fn on each node an escape from \p node reaches in one step: the
+  /// targets of its links and ghost links, its children, and the parents it
+  /// is at offset 0 of (pointer-interconvertibility). With \p allParents,
+  /// every parent: the nodes a copy of \p node must come with.
+  void forEachSuccessor(const Node *node, llvm::function_ref<void(Node *)> fn,
+                        bool allParents = false) const;
+
+  /// Deep-copy the nodes reachable from \p roots into \p dst, each with its
+  /// whole tree of subobjects (parents included). Flags are
   /// masked with \p keepMask (status reasons follow their bits), origins are
   /// copied with their ctx, and reasons are copied into dst's table unless it
   /// is shared with this graph. Links and ghost links, including cycles, are
@@ -541,9 +652,9 @@ public:
 
   /// Shared nodes (the bottom-up phase): a node is shared when it is
   /// reachable from a node passed to markShared, through links and ghost
-  /// links, as the graph is now. Off unless enabled; then the graph keeps
-  /// track as links are added and nodes merge, and flushShared brings
-  /// isShared up to date.
+  /// links, as the graph is now; a tree of subobjects is shared as a whole. Off
+  /// unless enabled; then the graph keeps track as links are added and nodes
+  /// merge, and flushShared brings isShared up to date.
   void enableSharedTracking() { trackShared = true; }
   /// Make the node of \p cell, and what it reaches, shared (after the next
   /// flushShared).
@@ -566,7 +677,7 @@ public:
   /// \code
   ///   n<id> [<flags>] size=<n>[ arr=<elem>] origins={<origin>, ...}
   ///     links={<off>-><cell>, ...}[ ghost={<off>:<field>-><cell>, ...}]
-  ///     [ reasons={<Flag>: <reason>, ...}]
+  ///     [ sub={<off>:<size>-><cell>, ...}][ reasons={<Flag>: <reason>, ...}]
   /// \endcode
   /// (on one line). A cell prints as `n<id>+<off>` or `n<id>-<off>`. An origin
   /// prints as `<kind>(<what>)`, where kind is stack, global, heap, ghost or
@@ -585,8 +696,11 @@ public:
   /// nodes reachable from links are not forwarded; forwarded nodes hold no
   /// state; collapsed nodes have at most one link, at 0, and no element size;
   /// array offsets are in [0, elemSize); ghost links are sorted and unique,
-  /// normalized like offsets, and resolve to live nodes. Report problems to
-  /// \p errs if given.
+  /// normalized like offsets, and resolve to live nodes; subobject links are
+  /// sorted, disjoint, inside one element of an array, absent on a collapsed
+  /// node, free of cycles, with no link or ghost link of the node in their
+  /// ranges, and the flags of each tree agree (see the file comment). Report
+  /// problems to \p errs if given.
   bool verify(llvm::raw_ostream *errs = nullptr) const;
 
 private:
@@ -602,6 +716,28 @@ private:
   void insertLink(Node *node, int64_t offset, Cell target, Worklist &worklist);
   void insertGhost(Node *node, int64_t offset, GhostField field, Cell target,
                    Worklist &worklist);
+  /// insertLink / insertGhost into the deepest child holding the byte.
+  void insertLinkDeep(Node *node, int64_t offset, Cell target,
+                      Worklist &worklist, const Reason *why);
+  void insertGhostDeep(Node *node, int64_t offset, GhostField field,
+                       Cell target, Worklist &worklist);
+  /// Hang \p child below \p node at [offset, offset + size), or unify it
+  /// into the node there if that is not possible (see getSubobject).
+  void attachSub(Node *node, int64_t offset, uint64_t size, Cell child,
+                 Worklist &worklist, const Reason *why);
+  /// The subobject link of \p node whose range holds byte \p offset.
+  static const SubobjectLink *findSubAt(const Node *node, int64_t offset);
+  /// Unify every child of \p node into it at its offset (for a collapse), or
+  /// with \p elemSize only those that do not fit one element of that size,
+  /// re-keying the others modulo it (for markArray).
+  void absorbSubs(Node *node, std::optional<uint64_t> elemSize,
+                  Worklist &worklist, const Reason *why);
+  /// Whether \p ancestor is \p node or below it through subobject links.
+  bool isInSubtree(const Node *ancestor, const Node *node) const;
+  /// Bring the flags of the tree around \p node in line (see the file
+  /// comment): down to the children, Mod/Ref/HasUSM/AsyncAccess up to the
+  /// parents, and External/Incomplete up from a child at offset 0.
+  void propagateTreeFlags(Node *node);
   /// Re-key the ghost links of \p node after its normalization changed
   /// (collapse, markArray).
   void renormalizeGhosts(Node *node, Worklist &worklist);
@@ -611,6 +747,10 @@ private:
 
   unsigned pointerSize;
   bool trackShared = false;
+  bool anySubobjects = false;
+  /// The nodes a subobject link at offset 0 was made on (forwarded ones
+  /// included): those absorbOverflowingSubobjects checks.
+  std::vector<Cell> zeroOffsetParents;
   /// Cells whose nodes are to become shared at the next flushShared: the
   /// targets of links added to shared nodes, and the survivors of merges
   /// with a shared node.

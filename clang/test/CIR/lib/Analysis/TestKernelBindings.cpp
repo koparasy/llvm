@@ -46,6 +46,11 @@ struct PrintKernelBindingsPass
       *this, "bu",
       llvm::cl::desc("Under ipo/both, run the points-to analysis bottom-up"),
       llvm::cl::init(false)};
+  Option<bool> subobjects{
+      *this, "subobjects",
+      llvm::cl::desc("Under ipo/both, give class, union and array members "
+                     "their own points-to nodes"),
+      llvm::cl::init(false)};
 
   StringRef getArgument() const final { return "test-print-kernel-bindings"; }
   StringRef getDescription() const final {
@@ -70,6 +75,7 @@ struct PrintKernelBindingsPass
     options.mode = *mode;
     options.assumeClosedTU = closedTU;
     options.bottomUp = bottomUp;
+    options.subobjects = subobjects;
     cir::KernelBindingTable(getOperation(), options).print(llvm::errs());
   }
 };

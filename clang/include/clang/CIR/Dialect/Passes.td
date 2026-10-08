@@ -437,6 +437,10 @@ def OffloadInferKernelParamNoAlias
     Option<"hostFactsBottomUp", "host-facts-bu", "bool", /*default=*/"false",
            "Under ipo/both, run the points-to analysis bottom-up "
            "(PointsToMode::BU).">,
+    Option<"hostFactsSubobjects", "host-facts-subobjects", "bool",
+           /*default=*/"false",
+           "Under ipo/both, give class, union and array members their own "
+           "points-to nodes (PointsToAnalysisOptions::subobjects).">,
     Option<"hostFactsCensus", "host-facts-census", "bool", /*default=*/"false",
            "Under both, also emit one host-facts remark per candidate field "
            "with both verdicts.">,

@@ -1121,4 +1121,188 @@ TEST(PointsToGraphTest, GhostLinksCloneAndPropagate) {
                         "n1 [Ghost] size=0 origins={} links={}\n");
 }
 
+//===----------------------------------------------------------------------===//
+// Subobject nodes (T17b).
+//===----------------------------------------------------------------------===//
+
+TEST(PointsToGraphTest, SubobjectContentsLiveInTheChild) {
+  Graph g;
+  Node *s = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Node *t = g.makeNode();
+  // A link stored before the child exists moves into it.
+  g.setLink(Cell(s, 24), Cell(t));
+  Cell b = g.getSubobject(Cell(s, 16), 16);
+  ASSERT_NE(b.getNode(), s);
+  EXPECT_EQ(b.getOffset(), 0);
+  EXPECT_TRUE(g.hasSubobjects());
+  EXPECT_EQ(s->getNumLinks(), 0u);
+  EXPECT_TRUE(sameCell(*g.lookupLink(Cell(b.getNode(), 8)), Cell(t)));
+  // The parent's cell reads and writes the child's bytes.
+  EXPECT_TRUE(sameCell(*g.lookupLink(Cell(s, 24)), Cell(t)));
+  EXPECT_TRUE(sameCell(g.descend(Cell(s, 24)), Cell(b.getNode(), 8)));
+  // The same range again is the same child; the child got the kind.
+  EXPECT_TRUE(sameCell(g.getSubobject(Cell(s, 16), 16), b));
+  EXPECT_TRUE(b.getNode()->hasFlags(NodeFlags::Stack));
+  auto parents = g.getParents(b.getNode());
+  ASSERT_EQ(parents.size(), 1u);
+  EXPECT_EQ(parents[0].parent, s);
+  EXPECT_EQ(parents[0].offset, 16);
+  EXPECT_EQ(parents[0].size, 16u);
+  EXPECT_VERIFIED(g);
+  EXPECT_EQ(printed(g), "n0 [Stack] size=32 origins={stack(?)} links={} "
+                        "sub={16:16->n2+0}\n"
+                        "n1 [] size=0 origins={} links={}\n"
+                        "n2 [Stack] size=16 origins={} links={8->n1+0}\n");
+}
+
+TEST(PointsToGraphTest, SubobjectCollapseStaysInside) {
+  Graph g;
+  Node *s = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Cell a = g.getSubobject(Cell(s, 0), 16);
+  Cell b = g.getSubobject(Cell(s, 16), 16);
+  Node *t1 = g.makeNode(), *t2 = g.makeNode(), *t3 = g.makeNode();
+  g.setLink(Cell(a.getNode(), 0), Cell(t1));
+  g.setLink(Cell(b.getNode(), 0), Cell(t2));
+  g.setLink(Cell(b.getNode(), 8), Cell(t3));
+  // A collapse of a child leaves its sibling and its parent alone.
+  g.collapse(a.getNode());
+  EXPECT_TRUE(a.getNode()->isCollapsed());
+  EXPECT_FALSE(s->isCollapsed());
+  EXPECT_FALSE(
+      sameCell(*g.lookupLink(Cell(s, 16)), *g.lookupLink(Cell(s, 24))));
+  EXPECT_EQ(s->getNumSubobjects(), 2u);
+  EXPECT_VERIFIED(g);
+  // A collapse of the parent absorbs every child.
+  g.collapse(s);
+  Node *live = Cell(s).getNode();
+  EXPECT_TRUE(live->isCollapsed());
+  EXPECT_EQ(live->getNumSubobjects(), 0u);
+  EXPECT_TRUE(sameCell(a, Cell(live, 0)));
+  EXPECT_TRUE(sameCell(b, Cell(live, 0)));
+  EXPECT_TRUE(sameCell(Cell(t1), Cell(t2)));
+  EXPECT_TRUE(sameCell(Cell(t2), Cell(t3)));
+  EXPECT_VERIFIED(g);
+}
+
+TEST(PointsToGraphTest, SubobjectArraySmash) {
+  Graph g;
+  Node *s = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Cell small = g.getSubobject(Cell(s, 8), 8);
+  Cell big = g.getSubobject(Cell(s, 16), 32);
+  // An array of 16-byte elements: the 8-byte child fits one element and
+  // stays, re-keyed; the 32-byte one does not and joins the node.
+  g.markArray(s, 16);
+  Node *live = Cell(s).getNode();
+  EXPECT_EQ(live->getArrayElemSize(), std::optional<uint64_t>(16));
+  ASSERT_EQ(live->getNumSubobjects(), 1u);
+  EXPECT_EQ(live->getSubobjects()[0].offset, 8);
+  EXPECT_TRUE(sameCell(live->getSubobjects()[0].child, small));
+  EXPECT_EQ(big.getNode(), live);
+  EXPECT_VERIFIED(g);
+}
+
+TEST(PointsToGraphTest, SubobjectUnifyPairsChildren) {
+  Graph g;
+  Node *p = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Node *q = g.makeNode(NodeFlags::Heap);
+  Cell pa = g.getSubobject(Cell(p, 0), 16);
+  Cell pb = g.getSubobject(Cell(p, 16), 16);
+  Cell qa = g.getSubobject(Cell(q, 0), 16);
+  Cell qb = g.getSubobject(Cell(q, 16), 16);
+  Node *t1 = g.makeNode(), *t2 = g.makeNode();
+  g.setLink(Cell(pb.getNode(), 0), Cell(t1));
+  g.setLink(Cell(qb.getNode(), 0), Cell(t2));
+  // The same layout: the children unify pairwise.
+  g.unify(Cell(p), Cell(q));
+  EXPECT_TRUE(sameCell(pa, qa));
+  EXPECT_TRUE(sameCell(pb, qb));
+  EXPECT_FALSE(sameCell(pa, pb));
+  EXPECT_TRUE(sameCell(Cell(t1), Cell(t2)));
+  // Flags flow down to the children: the parent is now Stack|Heap.
+  EXPECT_TRUE(pb.getNode()->hasFlags(NodeFlags::Stack | NodeFlags::Heap));
+  EXPECT_VERIFIED(g);
+
+  // A child that overlaps another one only partly is unified into the
+  // parent (no child), which is sound.
+  Graph h;
+  Node *x = h.makeNode(stackOrigin(), NodeFlags::Stack);
+  Node *y = h.makeNode(NodeFlags::Heap);
+  h.getSubobject(Cell(x, 0), 16);
+  Cell yc = h.getSubobject(Cell(y, 8), 16);
+  h.unify(Cell(x), Cell(y));
+  Node *live = Cell(x).getNode();
+  EXPECT_EQ(live->getNumSubobjects(), 1u);
+  EXPECT_EQ(yc.getNode(), live);
+  EXPECT_EQ(yc.getOffset(), 8);
+  EXPECT_VERIFIED(h);
+}
+
+TEST(PointsToGraphTest, SubobjectFlagsAndEscapes) {
+  Graph g;
+  Node *s = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Cell first = g.getSubobject(Cell(s, 0), 8);
+  Cell second = g.getSubobject(Cell(s, 8), 8);
+  // A write to a member is a write to the object, and to its other members
+  // through it.
+  g.addFlags(second, NodeFlags::Mod);
+  EXPECT_TRUE(s->hasFlags(NodeFlags::Mod));
+  EXPECT_TRUE(first.getNode()->hasFlags(NodeFlags::Mod));
+  // An escape of a member not at offset 0 reaches neither the object nor
+  // the other members ([expr.add]).
+  g.markReachable(second, NodeFlags::External);
+  EXPECT_FALSE(s->hasFlags(NodeFlags::External));
+  EXPECT_FALSE(first.getNode()->hasFlags(NodeFlags::External));
+  // An escape of the member at offset 0 reaches the object
+  // (pointer-interconvertibility), and so its other members.
+  g.markReachable(first, NodeFlags::External);
+  EXPECT_TRUE(s->hasFlags(NodeFlags::External));
+  EXPECT_TRUE(second.getNode()->hasFlags(NodeFlags::External));
+  EXPECT_VERIFIED(g);
+}
+
+TEST(PointsToGraphTest, SubobjectInterconvertibleAbsorbed) {
+  Graph g;
+  Node *s = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Cell a = g.getSubobject(Cell(s, 0), 16);
+  Cell b = g.getSubobject(Cell(s, 16), 16);
+  Node *t = g.makeNode();
+  // Within its extent: nothing to do.
+  g.setLink(Cell(a.getNode(), 8), Cell(t));
+  EXPECT_FALSE(g.absorbOverflowingSubobjects());
+  // Used as the whole object (a store at +16 through the member's
+  // pointer): folded back, and the store lands in the second member.
+  Node *u = g.makeNode();
+  g.setLink(Cell(a.getNode(), 16), Cell(u));
+  EXPECT_TRUE(g.absorbOverflowingSubobjects());
+  EXPECT_EQ(a.getNode(), Cell(s).getNode());
+  EXPECT_TRUE(sameCell(*g.lookupLink(Cell(b.getNode(), 0)), Cell(u)));
+  EXPECT_FALSE(g.absorbOverflowingSubobjects());
+  EXPECT_VERIFIED(g);
+}
+
+TEST(PointsToGraphTest, SubobjectCloneAndCycles) {
+  Graph g;
+  Node *s = g.makeNode(stackOrigin(), NodeFlags::Stack);
+  Cell b = g.getSubobject(Cell(s, 8), 8);
+  Node *t = g.makeNode();
+  g.setLink(Cell(b.getNode(), 0), Cell(t));
+  // A copy of the child comes with its parent.
+  Graph dst;
+  CloneMap map = g.cloneInto(dst, {b});
+  EXPECT_EQ(map.size(), 3u);
+  Cell cs = map.lookup(s);
+  ASSERT_TRUE(cs);
+  ASSERT_EQ(cs.getNode()->getNumSubobjects(), 1u);
+  EXPECT_TRUE(sameCell(cs.getNode()->getSubobjects()[0].child,
+                       map.lookup(b.getNode())));
+  EXPECT_TRUE(sameCell(*dst.lookupLink(Cell(cs.getNode(), 8)), map.lookup(t)));
+  EXPECT_EQ(dst.getParents(map.lookup(b.getNode()).getNode()).size(), 1u);
+  EXPECT_VERIFIED(dst);
+  // A child unified with its parent at its own offset holds itself at a
+  // shift: the node collapses.
+  g.unify(Cell(s, 0), b);
+  EXPECT_TRUE(Cell(s).getNode()->isCollapsed());
+  EXPECT_VERIFIED(g);
+}
+
 } // namespace

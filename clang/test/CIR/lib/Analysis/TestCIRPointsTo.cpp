@@ -90,6 +90,10 @@
 // the calls that copied its graph (see printInContexts).
 // max-clone-nodes=<n> and max-total-clone-nodes=<n> set the budgets.
 //
+// subobjects=1 sets PointsToAnalysisOptions::subobjects (in local mode,
+// LocalBuilder::setSubobjects); the stats then count the subobject links and
+// the nodes with a parent.
+//
 // closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU and
 // max-indirect-rounds=<n> PointsToAnalysisOptions::maxIndirectRounds.
 // print-graphs=0 leaves out everything but the statistics, which end with one
@@ -174,6 +178,11 @@ struct TestCIRPointsToPass
       llvm::cl::desc("In bu mode, also print each tagged pointer value in the "
                      "calling contexts of one and two calls "
                      "(PointsToAnalysis::pointsTo(value, callPath))"),
+      llvm::cl::init(false)};
+  Option<bool> subobjects{
+      *this, "subobjects",
+      llvm::cl::desc("Give every member of class, union or array type its own "
+                     "child node (PointsToAnalysisOptions::subobjects)"),
       llvm::cl::init(false)};
   Option<unsigned> maxCloneNodes{
       *this, "max-clone-nodes",
@@ -380,6 +389,7 @@ void TestCIRPointsToPass::runCI() {
   PointsToAnalysisOptions options;
   options.assumeClosedTU = closedTU;
   options.maxIndirectRounds = maxIndirectRounds;
+  options.subobjects = subobjects;
   bool bottomUp = mode == "bu";
   if (bottomUp) {
     options.mode = PointsToMode::BU;
@@ -500,8 +510,14 @@ void TestCIRPointsToPass::runCI() {
     const PointsToAnalysisStats &stats = analysis.getStats();
     llvm::StringMap<unsigned> collapseReasons, resolutions;
     size_t numNodes = 0, numCollapsed = 0, numExternal = 0, numIncomplete = 0;
+    size_t numSubobjectLinks = 0, numChildren = 0, numCollapsedChildren = 0;
     for (const Node *node : graph.nodes()) {
       ++numNodes;
+      numSubobjectLinks += node->getNumSubobjects();
+      if (!graph.getParents(node).empty()) {
+        ++numChildren;
+        numCollapsedChildren += node->isCollapsed();
+      }
       if (node->hasFlags(NodeFlags::External))
         ++numExternal;
       if (node->hasFlags(NodeFlags::Incomplete))
@@ -532,8 +548,12 @@ void TestCIRPointsToPass::runCI() {
        << "TU live nodes: " << numNodes << "\n"
        << "collapsed nodes: " << numCollapsed << "\n"
        << "external nodes: " << numExternal << "\n"
-       << "incomplete nodes: " << numIncomplete << "\n"
-       << "direct calls: " << stats.numDirectCalls << "\n"
+       << "incomplete nodes: " << numIncomplete << "\n";
+    if (options.subobjects)
+      os << "subobject links: " << numSubobjectLinks << "\n"
+         << "subobject nodes: " << numChildren << " (collapsed "
+         << numCollapsedChildren << ")\n";
+    os << "direct calls: " << stats.numDirectCalls << "\n"
        << "bindings unified: " << stats.numBindings << "\n"
        << "indirect calls resolved: " << stats.numIndirectResolved << "\n"
        << "indirect calls unresolved: " << stats.numIndirectUnresolved << "\n"
@@ -788,6 +808,7 @@ void TestCIRPointsToPass::runLocal() {
       return;
     llvm::TimeRecord start = llvm::TimeRecord::getCurrentTime(true);
     LocalBuilder builder(func, &symbols, /*reasons=*/nullptr, models);
+    builder.setSubobjects(subobjects);
     std::unique_ptr<FunctionGraph> fg = builder.build();
     llvm::TimeRecord end = llvm::TimeRecord::getCurrentTime(false);
     end -= start;
