@@ -33,13 +33,16 @@
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToGraph.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <optional>
 #include <string>
 
 namespace cir::pointsto {
+class PointsToAnalysis;
 class PointsToModelRegistry;
+struct PointsToAnalysisOptions;
 } // namespace cir::pointsto
 
 namespace cir {
@@ -55,6 +58,26 @@ pointsto::GhostField getSYCLKernelField();
 /// Register the SYCL host API models (see the file comment) by role.
 void registerSYCLPointsToModels(pointsto::PointsToModelRegistry &registry);
 
+/// The device-write rule, a rule of the points-to fixpoint
+/// (PointsToAnalysisOptions::extraFixpointRule). A kernel is code we don't
+/// see that runs on what its closure reaches: it may store any pointer value
+/// it can read into any memory it can write, USM memory or buffer storage,
+/// where the host may load it later (a memcpy back, a host accessor, the
+/// write-back to a buffer's host memory). So at each recorded launch,
+/// everything the closure's pointer slots and `$storage` ghost links reach
+/// becomes External, as the arguments of an unknown call do: the objects
+/// themselves (the device may store pointers to them) and their contents,
+/// transitively. The closure object is not: the kernel gets a copy of it.
+/// Nothing is merged and no origin is added, so the identity of each
+/// allocation stays known: device code cannot create host-visible
+/// allocations. Returns whether a node got the flag.
+bool applySYCLDeviceWrites(pointsto::PointsToAnalysis &analysis);
+
+/// Add the SYCL plug-in to \p options: the host API models
+/// (registerSYCLPointsToModels, through extraModels) and the device-write
+/// rule (applySYCLDeviceWrites, through extraFixpointRule).
+void addSYCLPointsToPlugin(pointsto::PointsToAnalysisOptions &options);
+
 /// The kernel name a `kernel.info` marker function names: the string its
 /// CompileTimeKernelInfo record's first member (a string_view) points to,
 /// found structurally from the globals its body reads. Empty if none.
@@ -67,6 +90,21 @@ std::string getSYCLKernelInfoName(cir::FuncOp kernelInfo);
 std::optional<int64_t>
 getSYCLClosureFieldOffset(mlir::ModuleOp module, mlir::Type closure,
                           mlir::ArrayAttr path, const mlir::DataLayout &layout);
+
+/// getSYCLClosureFieldOffset for many queries on one module: the member
+/// names are read once.
+class SYCLClosureLayout {
+public:
+  explicit SYCLClosureLayout(mlir::ModuleOp module);
+
+  /// The byte offset and the type of the member \p path of \p closure.
+  std::optional<std::pair<int64_t, mlir::Type>>
+  getField(mlir::Type closure, mlir::ArrayAttr path,
+           const mlir::DataLayout &layout) const;
+
+private:
+  llvm::DenseMap<std::pair<mlir::Type, mlir::StringAttr>, unsigned> members;
+};
 
 } // namespace cir
 

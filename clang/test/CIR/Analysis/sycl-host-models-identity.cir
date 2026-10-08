@@ -7,15 +7,19 @@
 
 // The cases of sycl-accessor-buffer-identity.cir, run through both the
 // legacy KernelBindingTable trace (LEGACY, the same verdicts as there) and
-// the points-to SYCL models (PT): same `$storage` ghost node (or host
-// memory, or pointer target) = the same memory; distinct and complete =
-// distinct. The inputs are that test's, plus the roles CIRGen gives the
-// launch glue, the USM allocation and getDeviceKernelInfo (untagged there,
-// so the legacy output does not change), and a body for std::vector::data,
-// which points-to analyses rather than models. The first eleven cases are
-// identity cases: ten agree, one is a context-insensitivity mismatch
-// (DISTINCT HOST MEMORY). The last four are policy cases (local accessor,
-// nested accessor, pointer in a struct, two launches): they agree too.
+// the points-to SYCL plug-in with SYCLHostFacts (PT): one line per candidate
+// field with its identity (the `$storage` ghost node and `$host` memory, or
+// the pointer's target), `same` for two fields that share memory, the
+// verdicts at the launch and over every launch of the kernel. A kernel
+// launch makes everything its closure reaches External (the device-write
+// rule), which does not reject a field: SYCLHostFacts decides by allocation
+// identity. The inputs are that test's, which carry the roles CIRGen gives
+// the launch glue, the USM allocation and getDeviceKernelInfo, and a body
+// for std::vector::data, which points-to analyses rather than models. The
+// first eleven cases are identity cases: ten agree, one is stricter under
+// points-to (DISTINCT HOST MEMORY). The last four are policy cases (local
+// accessor, nested accessor, pointer in a struct, two launches): they agree
+// too.
 
 // -----
 // DISTINCT: three local buffers, each accessed once.
@@ -105,10 +109,11 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note C: buffer 'bc'
 // Agree.
 // PT-LABEL: === launches
-// PT: field A accessor storage=[[A:n[0-9]+]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
-// PT-NEXT: field B accessor storage=[[B:n[0-9]+]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
-// PT-NEXT: field C accessor storage=[[C:n[0-9]+]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
 // PT-NEXT: no-alias A B C
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias A B C
 
 // -----
 // DISTINCT HOST MEMORY: buffers over three distinct std::vectors.
@@ -200,18 +205,21 @@ module attributes {cir.offload.container} {
 // LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // LEGACY: no-alias A B C
 // LEGACY: no-alias-note A: buffer 'ba' over std::vector 'va'
-// MISMATCH, explained: std::vector::data is analysed (its role is not
+// MISMATCH (points-to is stricter), explained: the vectors' storage is
+// never allocated in this input, so the host memory has no allocation site.
+// It is also one node: std::vector::data is analysed (its role is not
 // modelled) and context-insensitively, so its one formal binds the three
-// vectors: their storages are one node. Legacy reads each call's own operand.
-// Context-sensitive cloning (T17) separates them.
+// vectors. Legacy reads each call's own operand. Context-sensitive cloning
+// (T17) separates them.
 // PT-LABEL: === launches
-// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H:n[0-9]+]]+0 [Mod|Ref] complete
-// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H]]+0
-// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H]]+0
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [External|Mod|Ref] unknown (accessor 'A': the host memory of buffer 'ba' (ghost {{n[0-9]+}}): {{n[0-9]+}} has no allocation site the analysis sees)
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [External|Mod|Ref] unknown (accessor 'B': the host memory of buffer 'bb' (ghost {{n[0-9]+}}): {{n[0-9]+}} has no allocation site the analysis sees)
+// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [External|Mod|Ref] unknown (accessor 'C': the host memory of buffer 'bc' (ghost {{n[0-9]+}}): {{n[0-9]+}} has no allocation site the analysis sees)
 // PT-NEXT: same A B
 // PT-NEXT: same A C
 // PT-NEXT: same B C
 // PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
 
 // -----
 // SAME BUFFER: two accessors on one buffer.
@@ -299,11 +307,12 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note B: 'B' and 'A' use the same memory, buffer 'ba'
 // Agree.
 // PT-LABEL: === launches
-// PT: field A accessor storage=[[A:n[0-9]+]]+0
-// PT-NEXT: field B accessor storage=[[A]]+0
-// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
 // PT-NEXT: same A B
 // PT-NEXT: no-alias C
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias C
 
 // -----
 // BUFFER COPY: b2 = b1 shares b1's storage.
@@ -385,10 +394,11 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note B:
 // Agree.
 // PT-LABEL: === launches
-// PT: field A accessor storage=[[A:n[0-9]+]]+0
-// PT-NEXT: field B accessor storage=[[A]]+0
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
 // PT-NEXT: same A B
 // PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
 
 // -----
 // SUB-BUFFER: two sub-buffers of one parent.
@@ -473,10 +483,11 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note A: 'A' and 'B' use the same memory, buffer 'p'
 // Agree.
 // PT-LABEL: === launches
-// PT: field A accessor storage=[[A:n[0-9]+]]+0
-// PT-NEXT: field B accessor storage=[[A]]+0
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
 // PT-NEXT: same A B
 // PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
 
 // -----
 // REINTERPRET: a reinterpreted buffer is its source.
@@ -557,10 +568,11 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note A: 'A' and 'B' use the same memory, buffer 'b1'
 // Agree.
 // PT-LABEL: === launches
-// PT: field A accessor storage=[[A:n[0-9]+]]+0
-// PT-NEXT: field B accessor storage=[[A]]+0
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
 // PT-NEXT: same A B
 // PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
 
 // -----
 // PARAMETER: a buffer reached through a function parameter is unknown.
@@ -640,9 +652,10 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note B: the buffer is a function parameter
 // Agree.
 // PT-LABEL: === launches
-// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
-// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Incomplete|Ref] origins=0 host=none unknown (storage made by no model)
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Incomplete|External|Ref] origins=0 host=none unknown (accessor 'B': {{n[0-9]+}} has no allocation site the analysis sees)
 // PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
 
 // -----
 // OVERLAPPING HOST MEMORY: two buffers over one vector.
@@ -733,16 +746,18 @@ module attributes {cir.offload.container} {
 // LEGACY-NOT: no-alias A
 // LEGACY: no-alias-note A: 'A' and 'B' use the same memory, buffer 'ba' over std::vector 'v'
 // LEGACY: no-alias-note C: the host pointer of buffer 'bc' has unknown provenance
-// Agree (not no-alias). Points-to: v.mid is a constant stride into the same vector
-// storage node, so C is the same memory; legacy: unknown provenance.
+// Agree (not no-alias). Points-to: v.mid is a constant stride into the same
+// vector storage node, so the three share memory, which this input never
+// allocates (no allocation site); legacy: unknown provenance.
 // PT-LABEL: === launches
-// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H:n[0-9]+]]+0
-// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H]]+0
-// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[H]]+0
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [External|Mod|Ref] unknown (accessor 'A': the host memory of buffer 'ba' (ghost {{n[0-9]+}}): {{n[0-9]+}} has no allocation site the analysis sees)
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [External|Mod|Ref] unknown (accessor 'B': the host memory of buffer 'bb' (ghost {{n[0-9]+}}): {{n[0-9]+}} has no allocation site the analysis sees)
+// PT-NEXT: field C accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [External|Mod|Ref] unknown (accessor 'C': the host memory of buffer 'bc' (ghost {{n[0-9]+}}): {{n[0-9]+}} has no allocation site the analysis sees)
 // PT-NEXT: same A B
 // PT-NEXT: same A C
 // PT-NEXT: same B C
 // PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
 
 // -----
 // MIXED: an accessor and a USM pointer.
@@ -829,10 +844,11 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note P: a USM allocation
 // Agree.
 // PT-LABEL: === launches
-// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
-// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[U2:n[0-9]+]]+0 [Heap|Summary|Mod|Ref|HasUSM] complete
-// PT-NEXT: field P pointer target=[[U1:n[0-9]+]]+0 [Heap|Summary|Ref|HasUSM] complete
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [Heap|External|Summary|Mod|Ref|HasUSM] complete
+// PT-NEXT: field P pointer target={{n[0-9]+}}+0 [Heap|External|Summary|Ref|HasUSM] complete
 // PT-NEXT: no-alias A B P
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias A B P
 
 // -----
 // USM HOST POINTER: a buffer over the USM allocation the kernel also captures.
@@ -910,10 +926,11 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note A: 'A' and 'P' use the same memory, buffer 'ba' over a USM allocation
 // Agree.
 // PT-LABEL: === launches
-// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[U:n[0-9]+]]+0
-// PT-NEXT: field P pointer target=[[U]]+0
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [Heap|External|Summary|Mod|Ref|HasUSM] complete
+// PT-NEXT: field P pointer target={{n[0-9]+}}+0 [Heap|External|Summary|Mod|Ref|HasUSM] complete
 // PT-NEXT: same A P
 // PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
 
 // -----
 // ASSIGNED: a buffer assigned after construction is unknown.
@@ -993,13 +1010,15 @@ module attributes {cir.offload.container} {
 // LEGACY-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // LEGACY-NOT: no-alias A
 // LEGACY: no-alias-note B: buffer 'b2' is not constructed exactly once
-// Agree (not no-alias). Points-to: the assignment unifies b2's storage with b1's;
-// legacy: b2 is not constructed exactly once.
+// Agree (not no-alias). Points-to: the assignment unifies b2's storage with
+// b1's (two allocations in one node); legacy: b2 is not constructed exactly
+// once.
 // PT-LABEL: === launches
-// PT: field A accessor storage=[[A:n[0-9]+]]+0 [Ghost|Summary|Ref] origins=2 host=none complete
-// PT-NEXT: field B accessor storage=[[A]]+0
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=2 host=none unknown (accessor 'A': {{n[0-9]+}} merges 2 allocations (sycl-host-models-identity.cir:{{[0-9]+}}, sycl-host-models-identity.cir:{{[0-9]+}}))
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=2 host=none unknown (accessor 'B': {{n[0-9]+}} merges 2 allocations (sycl-host-models-identity.cir:{{[0-9]+}}, sycl-host-models-identity.cir:{{[0-9]+}}))
 // PT-NEXT: same A B
 // PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
 
 // -----
 // LOCAL ACCESSOR: work-group local memory is not a candidate.
@@ -1080,10 +1099,10 @@ module attributes {cir.offload.container} {
 // LEGACY-NOT: no-alias-note L
 // Policy case; agree.
 // PT-LABEL: === launches
-// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
-// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Ref] origins=1 host=none complete
-// PT-NEXT: field L local accessor
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
 // PT-NEXT: no-alias A B
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias A B
 
 // -----
 // NESTED: an accessor inside a captured struct blocks noalias.
@@ -1165,9 +1184,11 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-blocked: captured 'S' holds a nested accessor
 // Policy case; agree.
 // PT-LABEL: === launches
-// PT: field S.acc not in closure
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
 // PT-NEXT: blocked: captured 'S' holds a nested accessor
 // PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
 
 // -----
 // POINTER IN STRUCT: a captured struct holding a pointer blocks noalias.
@@ -1243,10 +1264,11 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note P: captured struct 'S' holds a pointer
 // Policy case; agree.
 // PT-LABEL: === launches
-// PT: field P pointer target={{n[0-9]+}}+0 [Heap|Summary|Ref|HasUSM] complete
-// PT-NEXT: field Q pointer target={{n[0-9]+}}+0 [Heap|Summary|Ref|HasUSM] complete
+// PT: field P pointer target={{n[0-9]+}}+0 [Heap|External|Summary|Ref|HasUSM] complete
+// PT-NEXT: field Q pointer target={{n[0-9]+}}+0 [Heap|External|Summary|Ref|HasUSM] complete
 // PT-NEXT: blocked: captured struct 'S' holds a pointer
 // PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
 
 // -----
 // TWO LAUNCHES: distinct at one launch, the same buffer at the other.
@@ -1341,8 +1363,11 @@ module attributes {cir.offload.container} {
 // LEGACY: no-alias-note A: 'A' and 'B' use the same memory, buffer 'ba'
 // Policy case; agree.
 // PT-LABEL: === launches
-// PT: launch @main launch.direct_impl kernels={_ZTSZ4mainEUlvE_}
-// PT: no-alias A B
-// PT: launch @main launch.direct_impl kernels={_ZTSZ4mainEUlvE_}
-// PT: same A B
-// PT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: no-alias A B
+// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// PT-NEXT: same A B
+// PT-NEXT: no-alias{{$}}
+// PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}

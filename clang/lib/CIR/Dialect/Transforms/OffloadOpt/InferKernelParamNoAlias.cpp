@@ -30,6 +30,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/Diagnostics.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/Passes.h"
@@ -37,6 +38,7 @@
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 
 namespace mlir {
+#define GEN_PASS_DECL_OFFLOADINFERKERNELPARAMNOALIAS
 #define GEN_PASS_DEF_OFFLOADINFERKERNELPARAMNOALIAS
 #include "clang/CIR/Dialect/Passes.h.inc"
 } // namespace mlir
@@ -56,7 +58,47 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
   mlir::ModuleOp container = getOperation();
   if (!cir::isOffloadContainer(container))
     return;
-  cir::KernelBindingTable &table = getAnalysis<cir::KernelBindingTable>();
+  std::optional<cir::HostFactsMode> mode = cir::parseHostFactsMode(hostFacts);
+  if (!mode) {
+    container.emitError() << "unknown host-facts mode '" << hostFacts
+                          << "' (expected legacy, ipo or both)";
+    return signalPassFailure();
+  }
+  // The legacy table is the cached analysis the other container passes share;
+  // the other modes build their own (only the noalias fields differ).
+  std::optional<cir::KernelBindingTable> ownTable;
+  if (*mode != cir::HostFactsMode::Legacy) {
+    cir::HostFactsOptions options;
+    options.mode = *mode;
+    options.assumeClosedTU = hostFactsClosedTU;
+    ownTable.emplace(container, options);
+  }
+  cir::KernelBindingTable &table =
+      ownTable ? *ownTable : getAnalysis<cir::KernelBindingTable>();
+  if (*mode == cir::HostFactsMode::Both) {
+    // Legacy is the result; report where the two sources differ.
+    unsigned disagreements = 0;
+    for (const cir::HostFactsComparison &cmp :
+         table.getHostFactsComparisons()) {
+      mlir::Location loc = container.getLoc();
+      if (const cir::KernelBinding *binding = table.lookup(cmp.kernel))
+        if (!binding->deviceKernels.empty())
+          loc = binding->deviceKernels.front()->getLoc();
+      if (cmp.disagrees()) {
+        ++disagreements;
+        mlir::emitRemark(loc) << cir::formatHostFactsDisagreement(cmp);
+      } else if (hostFactsCensus) {
+        mlir::emitRemark(loc)
+            << "host-facts: kernel " << cmp.kernel << " field " << cmp.field
+            << " " << cir::formatHostFactsVerdict("legacy", cmp.legacy) << " "
+            << cir::formatHostFactsVerdict("ipo", cmp.ipo);
+      }
+    }
+    mlir::emitRemark(container.getLoc())
+        << "host-facts-disagreements: " << disagreements << " of "
+        << table.getHostFactsComparisons().size() << " candidate fields ("
+        << (hostFactsClosedTU ? "closed-tu" : "open") << ")";
+  }
   mlir::MLIRContext *ctx = &getContext();
   llvm::StringRef noAliasName = mlir::LLVM::LLVMDialect::getNoAliasAttrName();
   bool changed = false;

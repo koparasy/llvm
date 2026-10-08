@@ -263,6 +263,8 @@ void PointsToAnalysis::run() {
     bool bound = false;
     changed |= resolveIndirectCalls(/*finalize=*/false, bound);
     changed |= markEscapedFunctions();
+    if (options.extraFixpointRule)
+      changed |= options.extraFixpointRule(*this);
     if (!changed)
       changed = resolveIndirectCalls(/*finalize=*/true, bound);
     if (bound)

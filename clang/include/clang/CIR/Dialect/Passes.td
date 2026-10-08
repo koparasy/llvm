@@ -424,6 +424,20 @@ def OffloadInferKernelParamNoAlias
   }];
   let constructor = "mlir::createOffloadInferKernelParamNoAliasPass()";
   let dependentDialects = ["cir::CIRDialect"];
+  let options = [
+    Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"legacy\"",
+           "Where the noalias fields come from: legacy (the "
+           "KernelBindingTable trace), ipo (SYCLHostFacts, from points-to), "
+           "or both (legacy is used; every candidate field on which they "
+           "differ gets a host-facts-disagreement remark).">,
+    Option<"hostFactsClosedTU", "host-facts-closed-tu", "bool",
+           /*default=*/"false",
+           "Under ipo/both, assume the module holds every caller of every "
+           "function (PointsToAnalysisOptions::assumeClosedTU).">,
+    Option<"hostFactsCensus", "host-facts-census", "bool", /*default=*/"false",
+           "Under both, also emit one host-facts remark per candidate field "
+           "with both verdicts.">,
+  ];
 }
 
 def OffloadPropagateSYCLKernelArgs

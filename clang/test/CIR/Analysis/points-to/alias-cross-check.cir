@@ -98,3 +98,5 @@
 // RUN: cir-opt %S/../sycl-host-models.cir -split-input-file -test-cir-alias-analysis='use-points-to=1 sycl=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/../sycl-host-models-identity.cir -split-input-file -test-cir-alias-analysis='use-points-to=1 sycl=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/../sycl-host-models-identity.cir -split-input-file -test-cir-alias-analysis='use-points-to=1 sycl=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/../sycl-device-writes.cir -split-input-file -test-cir-alias-analysis='use-points-to=1 sycl=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/../sycl-device-writes.cir -split-input-file -test-cir-alias-analysis='use-points-to=1 sycl=1 closed-tu=1' -o /dev/null 2>/dev/null

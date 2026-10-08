@@ -14,7 +14,8 @@
 // generic library models) of the module that holds the operation and
 // registers CIRPointsToAliasAnalysis after CIRBasicAliasAnalysis.
 // closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU, and sycl=1 adds
-// the SYCL host API models (registerSYCLPointsToModels).
+// the SYCL plug-in (addSYCLPointsToPlugin: the host API models and the
+// device-write rule).
 // points-to-only=1 prints the answers of the points-to analysis alone.
 // explain=1 follows each MayAlias line with "  why: <explainAlias>".
 //
@@ -66,7 +67,7 @@ struct PointsToHolder {
     PointsToAnalysisOptions options;
     options.assumeClosedTU = closedTU;
     if (sycl)
-      options.extraModels = cir::registerSYCLPointsToModels;
+      cir::addSYCLPointsToPlugin(options);
     analysis = std::make_unique<PointsToAnalysis>(module, &registry, options);
   }
 };

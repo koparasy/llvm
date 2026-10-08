@@ -2,6 +2,7 @@ add_clang_library(MLIRCIROffloadOpt
   KernelBindingTable.cpp
   KernelCloning.cpp
   SYCLKernelParams.cpp
+  SYCLHostFacts.cpp
   SYCLPointsToModels.cpp
   DeadKernelElimination.cpp
   KernelArgConstantPropagation.cpp

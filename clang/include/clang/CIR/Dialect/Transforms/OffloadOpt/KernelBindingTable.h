@@ -154,6 +154,84 @@ struct LaunchSite {
   bool hasGeometry() const { return pushConfigCall != nullptr; }
 };
 
+// Where KernelBinding::syclNoAliasFields come from (the
+// --cir-offload-host-facts flag of cir-offload-merge):
+//  - Legacy: the KernelBindingTable trace of the collapsed launch clone (the
+//    default);
+//  - IPO: SYCLHostFacts, built on the points-to analysis of the host module;
+//  - Both: both; the result is Legacy's, and every candidate field on which
+//    they differ is recorded (KernelBindingTable::getHostFactsComparisons)
+//    and reported as a host-facts-disagreement remark.
+enum class HostFactsMode { Legacy, IPO, Both };
+
+// The name of `mode` as the flag spells it ("legacy", "ipo", "both"), and the
+// mode a name spells, if any.
+llvm::StringRef getHostFactsModeName(HostFactsMode mode);
+std::optional<HostFactsMode> parseHostFactsMode(llvm::StringRef name);
+
+struct HostFactsOptions {
+  HostFactsMode mode = HostFactsMode::Legacy;
+  // The points-to analysis treats every function as having only the callers
+  // in the module (PointsToAnalysisOptions::assumeClosedTU). Off by default
+  // (plan D2); -cir-offload-assume-closed-tu (T18) will map onto it.
+  bool assumeClosedTU = false;
+};
+
+// Which closure fields of a SYCL kernel are candidates for llvm.noalias, read
+// off the device kernel's parameters (cir.sycl_kernel_param): captured USM
+// pointers and global-memory accessors held directly by the closure. Any other
+// parameter that can carry a pointer to global memory -- a pointer or accessor
+// nested in a captured struct, a struct holding a pointer, a stream or
+// annotated pointer, a parameter with no recorded field -- may alias the
+// candidates without being proven distinct, so it disables noalias for the
+// whole kernel. Both host-facts sources (legacy and SYCLHostFacts) take their
+// candidates and poison from here.
+struct SYCLNoAliasCandidates {
+  llvm::StringMap<bool> fields; // field -> holds an accessor (else a pointer)
+  std::string poison;           // why noalias is off for the kernel, if it is
+};
+
+// The candidates of one device kernel.
+void classifySYCLKernelParams(cir::FuncOp kernel, SYCLNoAliasCandidates &out);
+
+// The candidates of a kernel compiled for several devices (multi-arch): every
+// device copy must agree on them, else the kernel is poisoned.
+SYCLNoAliasCandidates
+getSYCLNoAliasCandidates(llvm::ArrayRef<cir::FuncOp> deviceKernels);
+
+// The noalias verdict for one candidate closure field of a kernel, with the
+// memory it resolved to or why it was rejected.
+struct NoAliasDecision {
+  bool ok = false;
+  std::string note;
+};
+
+// Fold the verdicts of one launch (`here`) into the running verdicts of a
+// kernel, ANDed over its launches: a field stays eligible only if it is here
+// and at every earlier launch; the first rejection's note is kept, and a field
+// missing at a launch is rejected as "not captured at every launch".
+void andNoAliasDecisions(llvm::StringMap<NoAliasDecision> here,
+                         bool &seenAnySite,
+                         llvm::StringMap<NoAliasDecision> &decisions);
+
+// One candidate field under --cir-offload-host-facts=both: the legacy and the
+// SYCLHostFacts verdicts. They disagree iff legacyOk != ipoOk.
+struct HostFactsComparison {
+  std::string kernel;
+  std::string field;
+  NoAliasDecision legacy;
+  NoAliasDecision ipo;
+  bool disagrees() const { return legacy.ok != ipo.ok; }
+};
+
+// "<source>=noalias" or "<source>=not stamped (<note>)", as the remarks and
+// the table print a verdict.
+std::string formatHostFactsVerdict(llvm::StringRef source,
+                                   const NoAliasDecision &decision);
+// The text of the host-facts-disagreement remark for `cmp`:
+// "host-facts-disagreement: kernel K field F legacy=<...> ipo=<...>".
+std::string formatHostFactsDisagreement(const HostFactsComparison &cmp);
+
 // Binding for one kernel, keyed by its device mangled name. A name may resolve
 // in several device modules (multi-arch); the owning module of each kernel is
 // recoverable via k->getParentOfType<mlir::ModuleOp>().
@@ -277,7 +355,11 @@ public:
   // `container` is the offload container module, i.e. a module carrying the
   // `cir.offload.container` unit attribute. The host and device modules are
   // recovered from it via the `cir` container helpers.
-  explicit KernelBindingTable(mlir::ModuleOp container);
+  explicit KernelBindingTable(mlir::ModuleOp container)
+      : KernelBindingTable(container, HostFactsOptions()) {}
+  // `options` select where syclNoAliasFields come from (see HostFactsMode).
+  // Only the noalias fields and notes depend on them.
+  KernelBindingTable(mlir::ModuleOp container, const HostFactsOptions &options);
 
   const KernelBinding *lookup(llvm::StringRef kernelName) const;
 
@@ -304,6 +386,16 @@ public:
 
   void print(llvm::raw_ostream &os) const;
 
+  const HostFactsOptions &getHostFactsOptions() const {
+    return hostFactsOptions;
+  }
+  // Under HostFactsMode::Both, the two verdicts of every candidate field of
+  // every SYCL kernel, in binding order and then by field name. Empty in the
+  // other modes.
+  llvm::ArrayRef<HostFactsComparison> getHostFactsComparisons() const {
+    return hostFactsComparisons;
+  }
+
 private:
   // Adds the SYCL name-string <-> spir_kernel bindings and their eligibility.
   void bindSYCLKernels(mlir::ModuleOp container);
@@ -313,6 +405,12 @@ private:
   // bindSYCLKernels, so every binding already has its name-string.
   void recordSYCLLaunchSites(mlir::ModuleOp container);
 
+  // Under HostFactsMode::IPO or Both, compute the noalias verdicts with
+  // SYCLHostFacts from the same candidates, and replace the legacy ones (IPO)
+  // or record both (Both, hostFactsComparisons).
+  void applyHostFacts(mlir::ModuleOp container,
+                      const llvm::StringMap<SYCLNoAliasCandidates> &candidates);
+
   // Keys are StringRefs into the `cu.kernel_name` attribute storage (CUDA) or
   // the device kernel's symbol-name storage (SYCL), so the table's lifetime is
   // tied to the container IR it was built from.
@@ -320,6 +418,8 @@ private:
   // The scope the stubs and launch sites live in, so a visibility question
   // about a binding does not depend on the caller passing the right module.
   mlir::ModuleOp hostModule;
+  HostFactsOptions hostFactsOptions;
+  llvm::SmallVector<HostFactsComparison, 0> hostFactsComparisons;
 };
 
 } // namespace cir

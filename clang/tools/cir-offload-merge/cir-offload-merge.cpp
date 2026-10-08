@@ -92,6 +92,24 @@ llvm::cl::opt<bool> DisableCirPropKernelArgs(
     llvm::cl::desc("Disable constant kernel-argument propagation"),
     llvm::cl::cat(CIROffloadMergeCategory));
 
+llvm::cl::opt<std::string> HostFacts(
+    "cir-offload-host-facts",
+    llvm::cl::desc("Where the SYCL noalias host facts come from: legacy (the "
+                   "KernelBindingTable trace, the default), ipo (points-to), "
+                   "or both (legacy is used; disagreements are remarks)"),
+    llvm::cl::init("legacy"), llvm::cl::cat(CIROffloadMergeCategory));
+// Temporary: -cir-offload-assume-closed-tu (T18) will replace it.
+llvm::cl::opt<bool> HostFactsClosedTU(
+    "cir-offload-host-facts-closed-tu",
+    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, assume every "
+                   "caller of every host function is in this TU"),
+    llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<bool> HostFactsCensus(
+    "cir-offload-host-facts-census",
+    llvm::cl::desc("Under --cir-offload-host-facts=both, also remark both "
+                   "verdicts of every candidate field"),
+    llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
+
 struct InputTarget {
   std::string Input;
   std::string Target;
@@ -426,7 +444,24 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   // USM allocations are pairwise distinct at every visible launch. Runs at
   // container level (needs the host<->device binding table) after mem2reg/sccp
   // have exposed the host allocation sources the analysis traces.
-  pm.addPass(mlir::createOffloadInferKernelParamNoAliasPass());
+  {
+    std::unique_ptr<mlir::Pass> noAlias =
+        mlir::createOffloadInferKernelParamNoAliasPass();
+    if (HostFacts != "legacy" || HostFactsClosedTU || HostFactsCensus) {
+      std::string options = "host-facts=" + HostFacts;
+      if (HostFactsClosedTU)
+        options += " host-facts-closed-tu=true";
+      if (HostFactsCensus)
+        options += " host-facts-census=true";
+      if (mlir::failed(noAlias->initializeOptions(
+              options, [](const llvm::Twine &message) {
+                reportError(message);
+                return mlir::failure();
+              })))
+        return reportError("bad --cir-offload-host-facts options");
+    }
+    pm.addPass(std::move(noAlias));
+  }
 
   // Propagate SYCL scalar captures that are the same compile-time constant at
   // every visible launch into the device kernel body. Runs at container level

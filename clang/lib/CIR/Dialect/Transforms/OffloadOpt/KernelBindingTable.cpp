@@ -21,12 +21,14 @@
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/Passes.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLHostFacts.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -393,7 +395,42 @@ bool KernelBindingTable::allLaunchSitesVisible(
   });
 }
 
-KernelBindingTable::KernelBindingTable(mlir::ModuleOp container) {
+llvm::StringRef cir::getHostFactsModeName(HostFactsMode mode) {
+  switch (mode) {
+  case HostFactsMode::Legacy:
+    return "legacy";
+  case HostFactsMode::IPO:
+    return "ipo";
+  case HostFactsMode::Both:
+    return "both";
+  }
+  llvm_unreachable("unknown host-facts mode");
+}
+
+std::optional<HostFactsMode> cir::parseHostFactsMode(llvm::StringRef name) {
+  return llvm::StringSwitch<std::optional<HostFactsMode>>(name)
+      .Case("legacy", HostFactsMode::Legacy)
+      .Case("ipo", HostFactsMode::IPO)
+      .Case("both", HostFactsMode::Both)
+      .Default(std::nullopt);
+}
+
+std::string cir::formatHostFactsVerdict(llvm::StringRef source,
+                                        const NoAliasDecision &decision) {
+  if (decision.ok)
+    return (source + "=noalias").str();
+  return (source + "=not stamped (" + decision.note + ")").str();
+}
+
+std::string cir::formatHostFactsDisagreement(const HostFactsComparison &cmp) {
+  return "host-facts-disagreement: kernel " + cmp.kernel + " field " +
+         cmp.field + " " + formatHostFactsVerdict("legacy", cmp.legacy) + " " +
+         formatHostFactsVerdict("ipo", cmp.ipo);
+}
+
+KernelBindingTable::KernelBindingTable(mlir::ModuleOp container,
+                                       const HostFactsOptions &options)
+    : hostFactsOptions(options) {
   // `container` must be an offload container; the helpers assert the unit attr
   // and recover the nested host and device modules.
   mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
@@ -1900,20 +1937,8 @@ static MemIdentity resolveAccessorIdentity(MemoryReader &reader, MemLoc loc,
                               "not model");
 }
 
-namespace {
-/// Which closure fields of a SYCL kernel are candidates for llvm.noalias, read
-/// off the device kernel's parameters (cir.sycl_kernel_param): captured USM
-/// pointers and global-memory accessors held directly by the closure. Any
-/// other parameter that can carry a pointer to global memory -- a pointer or
-/// accessor nested in a captured struct, a struct holding a pointer, a stream
-/// or annotated pointer, a parameter with no recorded field -- may alias the
-/// candidates without being proven distinct, so it disables noalias for the
-/// whole kernel.
-struct NoAliasCandidates {
-  llvm::StringMap<bool> fields; // field -> holds an accessor (else a pointer)
-  std::string poison;           // why noalias is off for the kernel, if it is
-};
-} // namespace
+// The noalias candidates of a kernel: see SYCLNoAliasCandidates.
+using NoAliasCandidates = SYCLNoAliasCandidates;
 
 static bool containsPointer(mlir::Type type) {
   if (mlir::isa<cir::PointerType>(type))
@@ -1936,7 +1961,8 @@ static bool isLocalPointer(mlir::Type type) {
   return as && as.getValue() == 3;
 }
 
-static void classifyKernelParams(cir::FuncOp kernel, NoAliasCandidates &out) {
+void cir::classifySYCLKernelParams(cir::FuncOp kernel,
+                                   SYCLNoAliasCandidates &out) {
   auto poison = [&](llvm::Twine why) {
     if (out.poison.empty())
       out.poison = why.str();
@@ -1979,14 +2005,28 @@ static void classifyKernelParams(cir::FuncOp kernel, NoAliasCandidates &out) {
   }
 }
 
-namespace {
-/// The running noalias verdict for one candidate closure field of a kernel,
-/// with the memory it resolved to or why it was rejected.
-struct NoAliasDecision {
-  bool ok = false;
-  std::string note;
-};
-} // namespace
+SYCLNoAliasCandidates
+cir::getSYCLNoAliasCandidates(llvm::ArrayRef<cir::FuncOp> deviceKernels) {
+  SYCLNoAliasCandidates merged;
+  for (auto [i, kernel] : llvm::enumerate(deviceKernels)) {
+    SYCLNoAliasCandidates c;
+    classifySYCLKernelParams(kernel, c);
+    if (i == 0) {
+      merged = std::move(c);
+      continue;
+    }
+    if (!c.poison.empty() && merged.poison.empty())
+      merged.poison = c.poison;
+    if (c.fields.size() != merged.fields.size() ||
+        llvm::any_of(c.fields, [&](const auto &f) {
+          auto it = merged.fields.find(f.first());
+          return it == merged.fields.end() || it->second != f.second;
+        }))
+      if (merged.poison.empty())
+        merged.poison = "the kernel's device copies disagree on its captures";
+  }
+  return merged;
+}
 
 /// The memory a candidate closure field refers to: the USM allocation of a
 /// captured pointer, or the buffer behind a captured accessor.
@@ -2075,6 +2115,12 @@ static void foldClosureNoAlias(MemoryReader &reader, mlir::Value closureOperand,
     }
   }
 
+  andNoAliasDecisions(std::move(here), seenAnySite, decisions);
+}
+
+void cir::andNoAliasDecisions(llvm::StringMap<NoAliasDecision> here,
+                              bool &seenAnySite,
+                              llvm::StringMap<NoAliasDecision> &decisions) {
   if (!seenAnySite) {
     decisions = std::move(here);
     seenAnySite = true;
@@ -2292,25 +2338,8 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
   for (auto &binding : bindings) {
     if (binding.second.kind != BindingKind::SYCLName)
       continue;
-    NoAliasCandidates merged;
-    for (auto [i, kernel] : llvm::enumerate(binding.second.deviceKernels)) {
-      NoAliasCandidates c;
-      classifyKernelParams(kernel, c);
-      if (i == 0) {
-        merged = std::move(c);
-        continue;
-      }
-      if (!c.poison.empty() && merged.poison.empty())
-        merged.poison = c.poison;
-      if (c.fields.size() != merged.fields.size() ||
-          llvm::any_of(c.fields, [&](const auto &f) {
-            auto it = merged.fields.find(f.first());
-            return it == merged.fields.end() || it->second != f.second;
-          }))
-        if (merged.poison.empty())
-          merged.poison = "the kernel's device copies disagree on its captures";
-    }
-    noAliasCandidates[binding.first] = std::move(merged);
+    noAliasCandidates[binding.first] =
+        getSYCLNoAliasCandidates(binding.second.deviceKernels);
   }
 
   llvm::StringMap<llvm::StringSet<>> noAliasFields;
@@ -2335,6 +2364,9 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
     if (cit != constArgs.end())
       binding.second.syclConstArgs = std::move(cit->second);
   }
+
+  if (hostFactsOptions.mode != HostFactsMode::Legacy)
+    applyHostFacts(container, noAliasCandidates);
 
   hostModule.walk([&](cir::CallOp call) {
     if (!isGetDeviceKernelInfoCall(call))
@@ -2372,6 +2404,51 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
       site.syclNDRange = geomIt->second;
     binding.launchSites.push_back(site);
   });
+}
+
+// --cir-offload-host-facts=ipo|both: the noalias verdicts of SYCLHostFacts,
+// which replace the legacy ones (ipo) or are compared with them (both). The
+// candidates and the poison are the same for both sources.
+void KernelBindingTable::applyHostFacts(
+    mlir::ModuleOp container,
+    const llvm::StringMap<SYCLNoAliasCandidates> &candidates) {
+  SYCLHostFacts facts(container, hostFactsOptions);
+  for (auto &entry : bindings) {
+    KernelBinding &binding = entry.second;
+    if (binding.kind != BindingKind::SYCLName)
+      continue;
+    auto candIt = candidates.find(entry.first);
+    if (candIt == candidates.end() || candIt->second.fields.empty())
+      continue;
+    llvm::StringMap<NoAliasDecision> ipo =
+        facts.noAliasFields(entry.first, candIt->second);
+    if (hostFactsOptions.mode == HostFactsMode::IPO) {
+      binding.syclNoAliasFields.clear();
+      binding.syclNoAliasNotes.clear();
+      for (auto &d : ipo) {
+        if (d.second.ok)
+          binding.syclNoAliasFields.insert(d.first());
+        binding.syclNoAliasNotes[d.first()] = d.second.note;
+      }
+      continue;
+    }
+    llvm::SmallVector<llvm::StringRef, 4> names;
+    for (const auto &f : candIt->second.fields)
+      names.push_back(f.first());
+    llvm::sort(names);
+    for (llvm::StringRef name : names) {
+      HostFactsComparison cmp;
+      cmp.kernel = entry.first.str();
+      cmp.field = name.str();
+      cmp.legacy.ok = binding.syclNoAliasFields.contains(name);
+      auto noteIt = binding.syclNoAliasNotes.find(name);
+      cmp.legacy.note = noteIt != binding.syclNoAliasNotes.end()
+                            ? noteIt->second
+                            : "no launch of the kernel is recovered";
+      cmp.ipo = ipo.lookup(name);
+      hostFactsComparisons.push_back(std::move(cmp));
+    }
+  }
 }
 
 const KernelBinding *
@@ -2445,6 +2522,11 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
           !binding.second.launchSites.empty())
         os << "//   no-alias-blocked: " << binding.second.syclNoAliasBlocked
            << "\n";
+      for (const HostFactsComparison &cmp : hostFactsComparisons)
+        if (cmp.kernel == binding.first)
+          os << "//   host-facts " << cmp.field << ": "
+             << formatHostFactsVerdict("legacy", cmp.legacy) << " "
+             << formatHostFactsVerdict("ipo", cmp.ipo) << "\n";
     } else {
       cir::FuncOp stub = binding.second.hostStub;
       os << "//   host-stub @" << stub.getName() << "\n";
@@ -2510,6 +2592,17 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
          << (launch.isDefaultStream() ? "default" : "explicit") << "\n";
     }
     os << "//\n";
+  }
+  if (hostFactsOptions.mode == HostFactsMode::Both) {
+    unsigned disagreements = 0;
+    for (const HostFactsComparison &cmp : hostFactsComparisons) {
+      if (!cmp.disagrees())
+        continue;
+      ++disagreements;
+      os << "// " << formatHostFactsDisagreement(cmp) << "\n";
+    }
+    os << "// host-facts-disagreements: " << disagreements << " of "
+       << hostFactsComparisons.size() << " candidate fields\n";
   }
   os << "// ----------------------------\n";
 }

@@ -1,0 +1,146 @@
+// RUN: cir-opt %s -split-input-file -cir-points-to-verify \
+// RUN:   -pass-pipeline="builtin.module(test-cir-points-to{mode=ci sycl=1 print-graphs=0 explain=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=PT
+// RUN: cir-opt %s -split-input-file -cir-points-to-verify \
+// RUN:   -pass-pipeline="builtin.module(test-cir-points-to{mode=ci sycl=1 closed-tu=1 print-graphs=0 explain=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=PT
+// RUN: cir-opt %s -split-input-file \
+// RUN:   -test-cir-alias-analysis='use-points-to=1 points-to-only=1 sycl=1' \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=AA
+// RUN: cir-opt %s -split-input-file \
+// RUN:   -test-cir-alias-analysis='use-points-to=1 points-to-only=1 sycl=1 closed-tu=1' \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=AA
+
+// The device-write rule of the SYCL points-to plug-in (applySYCLDeviceWrites,
+// N25): a kernel is code we don't see that may store any pointer it can read
+// into any memory it can write, so everything its closure reaches is
+// External. The host stores p2 into the USM allocation q, launches a kernel
+// that captures p and q, and loads r = *q afterwards. The kernel may have
+// stored p into q[0] (`q[0] = p`), so r may equal p: MayAlias. The twin
+// without the launch keeps NoAlias (r can only be p2).
+//
+// A V2 runtime twin (pt-run.sh) is not feasible here: it needs a device to
+// run the kernel that does the store.
+//
+// SYCLHostFacts still gives `no-alias P Q` for K1: External does not reject a
+// field, the two fields are distinct allocations whose pointer values the
+// host fixed. K2 captures r, whose value was loaded from q, which the device
+// may have written: its identity is unknown, so K2 gets no noalias.
+
+// -----
+// LAUNCH: the kernel K1 captures p and q.
+
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_handler = !cir.struct<class "sycl::_V1::handler" {data !cir.ptr<!s8i>}>
+!rec_lam1 = !cir.struct<"lam1" {data !cir.ptr<!f32>, data !cir.ptr<!cir.ptr<!f32>>}>
+!rec_lam2 = !cir.struct<"lam2" {data !cir.ptr<!f32>, data !cir.ptr<!f32>}>
+
+module {
+  cir.global "private" constant cir_private @".str1" = #cir.const_array<"_ZTS2K1" : !cir.array<!s8i x 7>, trailing_zeros> : !cir.array<!s8i x 8>
+  cir.global "private" constant cir_private @".str2" = #cir.const_array<"_ZTS2K2" : !cir.array<!s8i x 7>, trailing_zeros> : !cir.array<!s8i x 8>
+  cir.global "private" constant internal @kinfo1 = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str1"> : !cir.ptr<!s8i>, #cir.int<7> : !u64i}> : !rec_sv}> : !rec_ctki
+  cir.global "private" constant internal @kinfo2 = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str2"> : !cir.ptr<!s8i>, #cir.int<7> : !u64i}> : !rec_sv}> : !rec_ctki
+  cir.func private @malloc_device(!u64i) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+  cir.func internal @kernel_info1() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+    %0 = cir.get_global @kinfo1 : !cir.ptr<!rec_ctki>
+    %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+    cir.return %1 : !cir.ptr<!s8i>
+  }
+  cir.func internal @kernel_info2() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+    %0 = cir.get_global @kinfo2 : !cir.ptr<!rec_ctki>
+    %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+    cir.return %1 : !cir.ptr<!s8i>
+  }
+  cir.func internal @parallel_for1(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam1>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+    %info = cir.call @kernel_info1() : () -> !cir.ptr<!s8i>
+    cir.return
+  }
+  cir.func internal @parallel_for2(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam2>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+    %info = cir.call @kernel_info2() : () -> !cir.ptr<!s8i>
+    cir.return
+  }
+  cir.func @main(%h: !cir.ptr<!rec_handler>, %n: !u64i) {
+    %p = cir.call @malloc_device(%n) {test.ptr = "p"} : (!u64i) -> !cir.ptr<!f32>
+    %p2 = cir.call @malloc_device(%n) {test.ptr = "p2"} : (!u64i) -> !cir.ptr<!f32>
+    %qf = cir.call @malloc_device(%n) : (!u64i) -> !cir.ptr<!f32>
+    %q = cir.cast bitcast %qf : !cir.ptr<!f32> -> !cir.ptr<!cir.ptr<!f32>>
+    cir.store %p2, %q : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+    %lam1 = cir.alloca "lam1" align(8) : !cir.ptr<!rec_lam1>
+    %fP = cir.get_member %lam1[0] {name = "P"} : !cir.ptr<!rec_lam1> -> !cir.ptr<!cir.ptr<!f32>>
+    cir.store %p, %fP : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+    %fQ = cir.get_member %lam1[1] {name = "Q"} : !cir.ptr<!rec_lam1> -> !cir.ptr<!cir.ptr<!cir.ptr<!f32>>>
+    cir.store %q, %fQ : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!cir.ptr<!cir.ptr<!f32>>>
+    cir.call @parallel_for1(%h, %lam1) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam1>) -> ()
+    // After the kernel: the host reads back the pointer in q[0].
+    %r = cir.load %q : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32> {test.ptr = "r"}
+    %lam2 = cir.alloca "lam2" align(8) : !cir.ptr<!rec_lam2>
+    %gP = cir.get_member %lam2[0] {name = "P"} : !cir.ptr<!rec_lam2> -> !cir.ptr<!cir.ptr<!f32>>
+    cir.store %p, %gP : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+    %gR = cir.get_member %lam2[1] {name = "R"} : !cir.ptr<!rec_lam2> -> !cir.ptr<!cir.ptr<!f32>>
+    cir.store %r, %gR : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+    cir.call @parallel_for2(%h, %lam2) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam2>) -> ()
+    cir.return
+  }
+  cir.func @_ZTS2K1(%pp: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}},
+                    %qq: !cir.ptr<!cir.ptr<!f32>, target_address_space(1)> {cir.sycl_kernel_param = {field = "Q", kind = "pointer", path = ["Q"]}}) cc(spir_kernel) {
+    cir.return
+  }
+  cir.func @_ZTS2K2(%pp: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}},
+                    %rr: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "R", kind = "pointer", path = ["R"]}}) cc(spir_kernel) {
+    cir.return
+  }
+}
+
+// PT-LABEL: === launches
+// PT:      kernel _ZTS2K1
+// PT-NEXT:     field P pointer target={{n[0-9]+}}+0 [Heap|External|{{.*}}HasUSM] complete
+// PT-NEXT:     field Q pointer target={{n[0-9]+}}+0 [Heap|External|{{.*}}HasUSM] complete
+// PT-NEXT:     no-alias P Q
+// PT:      kernel _ZTS2K2
+// PT-NEXT:     field P pointer target={{n[0-9]+}}+0 [Heap|External|{{.*}}HasUSM] complete
+// PT-NEXT:     field R pointer target={{n[0-9]+}}+0 [Heap|External|{{.*}}HasUSM] unknown (pointer 'R': a pointer to {{n[0-9]+}} is held in {{n[0-9]+}}, which code we don't see may write: it is an escaped pointer written by device code: a kernel may store pointers into the memory its closure reaches ({{.*}}))
+// PT-NEXT:     no-alias{{$}}
+// PT-NEXT: kernel _ZTS2K1: no-alias P Q
+// PT-NEXT:   note P: a USM allocation ({{n[0-9]+}}, sycl-device-writes.cir:{{[0-9]+}})
+// PT-NEXT:   note Q: a USM allocation ({{n[0-9]+}}, sycl-device-writes.cir:{{[0-9]+}})
+// PT-NEXT: kernel _ZTS2K2: no-alias{{$}}
+// PT-NEXT:   note P: 'R' may alias it: pointer 'R': a pointer to
+
+// The alias queries use the escape rule: p, p2 and q are all External after
+// the launch, so even p and p2 are MayAlias here (SYCLHostFacts, above, uses
+// allocation identity instead).
+// AA-LABEL: Testing : "main"
+// AA-DAG: p#0 <-> p2#0: MayAlias
+// AA-DAG: p#0 <-> r#0: MayAlias
+// AA-DAG: p2#0 <-> r#0: MayAlias
+
+// -----
+// NO LAUNCH: the same host code with no kernel. r can only hold p2.
+
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+
+module {
+  cir.func private @malloc_device(!u64i) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+  cir.func @main(%n: !u64i) {
+    %p = cir.call @malloc_device(%n) {test.ptr = "p"} : (!u64i) -> !cir.ptr<!f32>
+    %p2 = cir.call @malloc_device(%n) {test.ptr = "p2"} : (!u64i) -> !cir.ptr<!f32>
+    %qf = cir.call @malloc_device(%n) : (!u64i) -> !cir.ptr<!f32>
+    %q = cir.cast bitcast %qf : !cir.ptr<!f32> -> !cir.ptr<!cir.ptr<!f32>>
+    cir.store %p2, %q : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+    %r = cir.load %q : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32> {test.ptr = "r"}
+    cir.return
+  }
+}
+
+// AA-LABEL: Testing : "main"
+// AA-DAG: p#0 <-> p2#0: NoAlias
+// AA-DAG: p#0 <-> r#0: NoAlias
+// p2 vs r is MustAlias under closed-tu, MayAlias open (main may be
+// re-entered: a Summary object).
+// AA-DAG: p2#0 <-> r#0: {{MayAlias|MustAlias}}

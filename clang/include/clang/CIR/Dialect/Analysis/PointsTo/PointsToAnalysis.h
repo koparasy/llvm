@@ -54,6 +54,7 @@
 //       rule instead (Reason Budget). A callee node that is still empty (no
 //       origin, no flag) when nothing else changes gets the unknown-call
 //       rule too.
+//     - PointsToAnalysisOptions::extraFixpointRule, if set.
 //
 //  6. Mark the summary nodes (markSummaries): a node that may stand for
 //     more than one simultaneously live concrete object gets Summary, with a
@@ -113,6 +114,7 @@ namespace cir::pointsto {
 
 class GlobalNodes;
 class PointsToModelRegistry;
+class PointsToAnalysis;
 
 struct PointsToAnalysisOptions {
   /// Treat every function as if all of its callers were in the module: no
@@ -128,6 +130,13 @@ struct PointsToAnalysisOptions {
   /// adds a plug-in's models (the SYCL ones, from OffloadOpt) without this
   /// library depending on the plug-in.
   std::function<void(PointsToModelRegistry &)> extraModels;
+  /// If set, one more rule of the fixpoint of step 5 (see the file comment),
+  /// run in every round after the built-in ones: how a plug-in adds a rule
+  /// about the records its models made (the SYCL device-write rule, which
+  /// treats what a kernel launch's closure reaches as written by code we
+  /// don't see). It must only add flags or merge nodes, and return whether
+  /// it changed the graph; status propagation runs after it.
+  std::function<bool(PointsToAnalysis &)> extraFixpointRule;
 };
 
 /// What the interprocedural phase did with a call site.

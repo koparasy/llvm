@@ -39,6 +39,7 @@
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/SymbolTable.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
@@ -350,15 +351,17 @@ std::string cir::getSYCLKernelInfoName(cir::FuncOp kernelInfo) {
   return result;
 }
 
-std::optional<int64_t>
-cir::getSYCLClosureFieldOffset(ModuleOp module, Type closure, ArrayAttr path,
-                               const DataLayout &layout) {
+cir::SYCLClosureLayout::SYCLClosureLayout(ModuleOp module) {
   // The member names of each record, from the cir.get_member ops on it.
-  llvm::DenseMap<std::pair<Type, StringAttr>, unsigned> members;
   module.walk([&](cir::GetMemberOp op) {
     Type base = op.getAddrTy().getPointee();
     members.try_emplace({base, op.getNameAttr()}, op.getIndex());
   });
+}
+
+std::optional<std::pair<int64_t, Type>>
+cir::SYCLClosureLayout::getField(Type closure, ArrayAttr path,
+                                 const DataLayout &layout) const {
   int64_t offset = 0;
   Type type = closure;
   for (Attribute elem : path) {
@@ -372,7 +375,15 @@ cir::getSYCLClosureFieldOffset(ModuleOp module, Type closure, ArrayAttr path,
     offset += rec.getElementOffset(layout, it->second);
     type = rec.getElementType(it->second);
   }
-  return offset;
+  return std::make_pair(offset, type);
+}
+
+std::optional<int64_t>
+cir::getSYCLClosureFieldOffset(ModuleOp module, Type closure, ArrayAttr path,
+                               const DataLayout &layout) {
+  if (auto field = SYCLClosureLayout(module).getField(closure, path, layout))
+    return field->first;
+  return std::nullopt;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1189,4 +1200,65 @@ void cir::registerSYCLPointsToModels(PointsToModelRegistry &registry) {
   // geometry constructors (their bodies hold the sizes), and the internal
   // glue only modelled bodies reach (queue.kernel_impl, handler.kernel_impl,
   // handler.wrap_kernel, handler.store_lambda).
+}
+
+//===----------------------------------------------------------------------===//
+// The device-write rule
+//===----------------------------------------------------------------------===//
+
+// SOUNDNESS: the launch models record a launch as reading the closure (Ref)
+// and keeping nothing (no escape), which is what the runtime does. But the
+// kernel itself is code we don't see, and it runs on the device while (and
+// after) the host continues. It may store any pointer value it can read (a
+// captured pointer, or one loaded from memory it reaches) into any memory it
+// can write: USM allocations, and buffer storage, which the runtime copies to
+// the buffer's host memory. The host can then load such a pointer: from USM
+// memory, a memcpy back, a host accessor or the write-back. So, as for the
+// arguments of an unknown call, everything the closure reaches becomes
+// External: what the pointer slots and the accessor `$storage` ghosts of the
+// closure point to, and everything reachable from that (through links and
+// the `$host` ghost). The closure object itself is not: the kernel gets a
+// copy, and writes to the copy are not seen by the host.
+//
+// Making only the contents External would not be enough: the device may store
+// a pointer to the allocation itself (`q[0] = p` with p and q both USM), and
+// a host load of q[0] must then not be NoAlias with p, which the escape rule
+// of the alias queries would answer for an allocation that is not External.
+//
+// No node is merged and no origin is added: device code cannot create an
+// allocation the host can see, so the allocation identity of each node (its
+// origins) is unchanged. SYCLHostFacts decides noalias by that identity, not
+// by the escape rule (see SYCLHostFacts.cpp).
+bool cir::applySYCLDeviceWrites(PointsToAnalysis &analysis) {
+  Graph &graph = analysis.getGraph();
+  bool changed = false;
+  for (const LaunchRecord &launch : analysis.getLaunches()) {
+    if (!launch.closure)
+      continue; // The launch got the unknown-call rule.
+    Node *closure = launch.closure->getNode();
+    SmallVector<Cell, 8> reached;
+    for (const auto &link : closure->getLinks())
+      reached.push_back(link.second);
+    for (const GhostLink &ghost : closure->getGhostLinks())
+      reached.push_back(ghost.target);
+    const Reason *why = nullptr;
+    for (Cell cell : reached) {
+      if (cell.getNode()->hasFlags(NodeFlags::External))
+        continue; // Propagation spreads it to what the node reaches.
+      if (!why)
+        why = graph.makeReason(
+            Reason::Kind::EscapedTo, launch.call,
+            "written by device code: a kernel may store pointers into the "
+            "memory its closure reaches");
+      graph.markReachable(cell, NodeFlags::External, why,
+                          /*stopAtFlagged=*/true);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+void cir::addSYCLPointsToPlugin(PointsToAnalysisOptions &options) {
+  options.extraModels = registerSYCLPointsToModels;
+  options.extraFixpointRule = applySYCLDeviceWrites;
 }

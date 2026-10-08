@@ -17,6 +17,8 @@
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <optional>
+
 using namespace mlir;
 
 namespace {
@@ -24,6 +26,21 @@ struct PrintKernelBindingsPass
     : public PassWrapper<PrintKernelBindingsPass,
                          OperationPass<mlir::ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PrintKernelBindingsPass)
+
+  PrintKernelBindingsPass() = default;
+  PrintKernelBindingsPass(const PrintKernelBindingsPass &pass)
+      : PassWrapper(pass) {}
+
+  Option<std::string> hostFacts{
+      *this, "host-facts",
+      llvm::cl::desc("Where the noalias fields come from: legacy, ipo or both "
+                     "(--cir-offload-host-facts)"),
+      llvm::cl::init("legacy")};
+  Option<bool> closedTU{
+      *this, "closed-tu",
+      llvm::cl::desc("Under ipo/both, assume every caller of every function "
+                     "is in the module"),
+      llvm::cl::init(false)};
 
   StringRef getArgument() const final { return "test-print-kernel-bindings"; }
   StringRef getDescription() const final {
@@ -34,7 +51,20 @@ struct PrintKernelBindingsPass
     // other module alone.
     if (!cir::isOffloadContainer(getOperation()))
       return;
-    getAnalysis<cir::KernelBindingTable>().print(llvm::errs());
+    std::optional<cir::HostFactsMode> mode = cir::parseHostFactsMode(hostFacts);
+    if (!mode) {
+      getOperation().emitError() << "unknown host-facts mode '" << hostFacts
+                                 << "'";
+      return signalPassFailure();
+    }
+    if (*mode == cir::HostFactsMode::Legacy) {
+      getAnalysis<cir::KernelBindingTable>().print(llvm::errs());
+      return;
+    }
+    cir::HostFactsOptions options;
+    options.mode = *mode;
+    options.assumeClosedTU = closedTU;
+    cir::KernelBindingTable(getOperation(), options).print(llvm::errs());
   }
 };
 } // namespace

@@ -14,7 +14,10 @@
 // submission runs, and the kernel launches, keyed on the `cir.sycl_host_api`
 // roles CIRGen tags the host API with. The launch section prints, per closure
 // field of each launched kernel, the storage (accessor) or object (pointer)
-// it refers to; same node = same memory, distinct and complete = distinct.
+// it refers to, and the verdicts of SYCLHostFacts: same node = same memory;
+// distinct = two complete identities, each one allocation that the field can
+// only hold the analysed value of. Everything a kernel's closure reaches is
+// External (the device-write rule), which does not make it unknown.
 
 // -----
 // ROLES: one row of the role table each. Three buffer(range) buffers have
@@ -197,7 +200,7 @@ module {
 // The closure: one $storage ghost link per accessor field, apart from the
 // pointer slots (the impl pointers point to runtime objects).
 // CHECK: [Stack|Mod|Ref] size=216 origins={stack(cir.alloca 'lam'{{.*}} ghost={0:$storage->[[A:n[0-9]+]]+0, 16:$storage->[[B:n[0-9]+]]+0, 32:$storage->[[C:n[0-9]+]]+0, 48:$storage->[[A]]+0, 64:$storage->[[B]]+0, 80:$storage->[[C]]+0, 96:$storage->[[G:n[0-9]+]]+0, 112:$storage->[[G]]+0,
-// CHECK: [[A]] [Ghost|Summary|Ref] size=0 origins={ghost(cir.call
+// CHECK: [[A]] [Ghost|External|Summary|Ref] size=0 origins={ghost(cir.call{{.*}}"written by device code: a kernel may store pointers into the memory its closure reaches"
 // CHECK: @vector_data return -> [[VEC:n[0-9]+]]+0
 // CHECK-LABEL: === calls
 // CHECK: @main cir.call @buffer_reinterpret -> model buffer.reinterpret
@@ -209,33 +212,39 @@ module {
 // CHECK-LABEL: === launches
 // CHECK-NEXT: launch @main handler.kernel kernels={_ZTS1K} closure=[[LAM:n[0-9]+]]+0 geometry=[[R:n[0-9]+]]+0
 // CHECK-NEXT:   kernel _ZTS1K
-// CHECK-NEXT:     field A accessor storage=[[A]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
-// CHECK-NEXT:     field B accessor storage=[[B]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
-// CHECK-NEXT:     field C accessor storage=[[C]]+0 [Ghost|Summary|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field A accessor storage=[[A]]+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field B accessor storage=[[B]]+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field C accessor storage=[[C]]+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
 // CHECK-NEXT:     field D accessor storage=[[A]]+0
 // CHECK-NEXT:     field E accessor storage=[[B]]+0
 // CHECK-NEXT:     field F accessor storage=[[C]]+0
-// CHECK-NEXT:     field G accessor storage=[[G]]+0 [Ghost|Summary|Ref] origins=2 host=none complete
+// CHECK-NEXT:     field G accessor storage=[[G]]+0 [Ghost|External|Summary|Ref] origins=2 host=none unknown (accessor 'G': [[G]] merges 2 allocations (sycl-host-models.cir:{{[0-9]+}}, sycl-host-models.cir:{{[0-9]+}}))
 // CHECK-NEXT:     field H accessor storage=[[G]]+0
-// CHECK-NEXT:     field O accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none unknown (External: UnmodelledRole, "buffer.other: storage not known"
-// CHECK-NEXT:     field P accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none unknown (External: UnmodelledRole, "accessor.other: storage not known"
+// CHECK-NEXT:     field O accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none unknown (accessor 'O': the storage {{n[0-9]+}} is made by buffer.other, which the analysis cannot place)
+// CHECK-NEXT:     field P accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none unknown (accessor 'P': the storage {{n[0-9]+}} is made by accessor.other, which the analysis cannot place)
 // CHECK-NEXT:     field Q accessor storage=[[A]]+0
-// CHECK-NEXT:     field V accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[VEC]]+0 [Mod|Ref] complete
-// CHECK-NEXT:     field W accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[USM:n[0-9]+]]+0 [Heap|Summary|Mod|Ref|HasUSM] complete
-// CHECK-NEXT:     field U pointer target=[[USM]]+0 [Heap|Summary|Mod|Ref|HasUSM] complete
+// CHECK-NEXT:     field U pointer target=[[USM:n[0-9]+]]+0 [Heap|External|Summary|Mod|Ref|HasUSM] complete
+// The vector's storage is never allocated in this input: V's host memory has
+// no allocation site.
+// CHECK-NEXT:     field V accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host=[[VEC]]+0 [External|Mod|Ref] unknown (accessor 'V': the host memory of buffer 'bv' (ghost {{n[0-9]+}}): [[VEC]] has no allocation site the analysis sees)
+// CHECK-NEXT:     field W accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host=[[USM]]+0 [Heap|External|Summary|Mod|Ref|HasUSM] complete
 // CHECK-NEXT:     same A D
 // CHECK-NEXT:     same A Q
 // CHECK-NEXT:     same B E
 // CHECK-NEXT:     same C F
 // CHECK-NEXT:     same D Q
 // CHECK-NEXT:     same G H
-// CHECK-NEXT:     same W U
+// CHECK-NEXT:     same U W
 // CHECK-NEXT:     no-alias{{$}}
 // CHECK-NEXT: launch @main handler.kernel kernels={_ZTS2K2} closure={{n[0-9]+}}+0 geometry=null
 // CHECK-NEXT:   kernel _ZTS2K2
-// CHECK:          no-alias A B V U
+// CHECK-NEXT:     field A accessor storage=[[A]]+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field B accessor storage=[[B]]+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field U pointer target=[[USM]]+0 [Heap|External|Summary|Mod|Ref|HasUSM] complete
+// CHECK-NEXT:     field V accessor storage={{n[0-9]+}}+0
+// CHECK-NEXT:     no-alias{{$}}
 // CHECK-NEXT: kernel _ZTS1K: no-alias{{$}}
-// CHECK-NEXT: kernel _ZTS2K2: no-alias A B V U
+// CHECK-NEXT: kernel _ZTS2K2: no-alias{{$}}
 
 // -----
 // SUBMIT: queue::submit's body is analysed; it builds the cgfo and hands it
@@ -345,7 +354,7 @@ module {
 // CHECK-LABEL: === launches
 // CHECK-NEXT: launch @cgf_call handler.kernel kernels={_ZTS2KS}
 // CHECK-NEXT:   kernel _ZTS2KS
-// CHECK-NEXT:     field A accessor storage={{n[0-9]+}}+0 [Ghost|Incomplete|Summary|Ref] origins=1 host=none unknown (Incomplete: UnknownCaller, "formal #0" at cir.func {{.*}} @invoker_call)
+// CHECK-NEXT:     field A accessor storage={{n[0-9]+}}+0 [Ghost|Incomplete|External|Summary|Ref] origins=1 host=none unknown (accessor 'A': a handle of storage {{n[0-9]+}} ({{n[0-9]+}}) may be assigned by code we don't see: it is reachable from parameter #0 of @invoker_call, which may have callers that are not analysed ({{.*}}))
 // CHECK: kernel _ZTS2KS: no-alias{{$}}
 
 // CLOSED-LABEL: === @invoker_call formals=complete
@@ -354,8 +363,8 @@ module {
 // CLOSED-LABEL: === launches
 // CLOSED-NEXT: launch @cgf_call handler.kernel kernels={_ZTS2KS}
 // CLOSED-NEXT:   kernel _ZTS2KS
-// CLOSED-NEXT:     field A accessor storage=[[SA:n[0-9]+]]+0 [Ghost|Ref] origins=1 host=none complete
-// CLOSED-NEXT:     field B accessor storage=[[SB:n[0-9]+]]+0 [Ghost|Ref] origins=1 host=none complete
+// CLOSED-NEXT:     field A accessor storage=[[SA:n[0-9]+]]+0 [Ghost|External|Ref] origins=1 host=none complete
+// CLOSED-NEXT:     field B accessor storage=[[SB:n[0-9]+]]+0 [Ghost|External|Ref] origins=1 host=none complete
 // CLOSED-NEXT:     no-alias A B
 
 // -----
@@ -432,8 +441,10 @@ module {
 // queue::parallel_for shortcut (queue.kernel, with an sret event). The
 // closure is the last pointer operand to a non-SYCL record; the geometry an
 // nd_range passed by address (a range passed by value has no cell). The
-// USM allocations the closure holds are only read: no escape. The event the
-// runtime fills holds runtime pointers.
+// runtime only reads the USM allocations the closure holds (Ref), but the
+// kernel, which nothing names here, may store pointers into them: they are
+// External (the device-write rule). The event the runtime fills holds
+// runtime pointers.
 
 !s8i = !cir.int<s, 8>
 !u64i = !cir.int<u, 64>
@@ -469,8 +480,8 @@ module {
 }
 
 // CHECK-LABEL: === TU graph
-// CHECK: [[X:n[0-9]+]] [Heap|Summary|Ref|HasUSM] size=0 origins={heap(cir.call
-// CHECK: [[Y:n[0-9]+]] [Heap|Summary|Ref|HasUSM] size=0 origins={heap(cir.call
+// CHECK: [[X:n[0-9]+]] [Heap|External|Summary|Ref|HasUSM] size=0 origins={heap(cir.call
+// CHECK: [[Y:n[0-9]+]] [Heap|External|Summary|Ref|HasUSM] size=0 origins={heap(cir.call
 // CHECK: [[LAM:n[0-9]+]] [Stack|Mod|Ref] size=16 origins={stack(cir.alloca 'lam'{{.*}} links={0->[[X]]+0, 8->[[Y]]+0}
 // CHECK: [Stack|Mod] size=8 origins={stack(cir.alloca 'ev'{{.*}} links={0->[[RT:n[0-9]+]]+0}
 // CHECK: [[RT]] [UnknownObj|Incomplete|External] size=0 origins={} links={} reasons={Incomplete: EscapedTo({{.*}}"kept by the SYCL runtime")
@@ -575,16 +586,25 @@ module {
     %c4 = cir.const #cir.int<4> : !u64i
     cir.call @queue_fill(%ev, %q, %pv, %pat, %c4) : (!cir.ptr<!rec_event>, !cir.ptr<!rec_queue>, !cir.ptr<!void>, !cir.ptr<!cir.ptr<!f32>>, !u64i) -> ()
     cir.call @event_wait(%ev) {test.ptr = "wait"} : (!cir.ptr<!rec_event>) -> ()
-    // The kernel.
+    // The kernel. Besides A, it captures memory of its own (a buffer over hk,
+    // two more USM allocations): everything a kernel reaches becomes
+    // External (the device-write rule), and the mod/ref facts above are about
+    // memory the device does not reach.
+    %hk = cir.alloca "hk" align(4) : !cir.ptr<!cir.array<!f32 x 16>>
+    %hkp = cir.cast array_to_ptrdecay %hk : !cir.ptr<!cir.array<!f32 x 16>> -> !cir.ptr<!f32>
+    %bk = cir.alloca "bk" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_host_ptr(%bk, %hkp, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+    %d2 = cir.call @malloc_device(%n) : (!u64i) -> !cir.ptr<!f32>
+    %s2 = cir.call @malloc_device(%n) : (!u64i) -> !cir.ptr<!f32>
     %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
     %fA = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
     cir.call @accessor_from_buffer(%fA, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
     %fH = cir.get_member %lam[1] {name = "H"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
-    cir.call @accessor_from_buffer(%fH, %bh, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+    cir.call @accessor_from_buffer(%fH, %bk, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
     %fD = cir.get_member %lam[2] {name = "D"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
-    cir.store %d, %fD : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+    cir.store %d2, %fD : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
     %fS = cir.get_member %lam[3] {name = "S"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
-    cir.store %s, %fS : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+    cir.store %s2, %fS : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
     cir.call @parallel_for(%h, %lam) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
     // h.copy(accA, out) and h.copy(in, accA) through by-value accessor
     // copies: out holds a pointer copied out of A's storage, which in holds.
@@ -616,19 +636,21 @@ module {
 // The storage A (n7-like) holds y's pointer (copied in from `in`), which
 // `out` gets back; d holds x's pointer copied from s; every element of parr
 // holds x's (an array of one pointer); the host memory the commands touch is
-// AsyncAccess, the buffer's host memory hb only Mod and Ref.
+// AsyncAccess, the buffer's host memory hb only Mod and Ref. The kernel
+// reaches A's storage, so y, which it holds, is External: the device may
+// have stored another pointer there (the device-write rule).
 // CHECK-LABEL: === TU graph
-// CHECK: [[X:n[0-9]+]] [Stack|Summary|Ref] size=4 origins={stack(cir.alloca 'x'
+// CHECK: [[X:n[0-9]+]] [Stack|Summary] size=4 origins={stack(cir.alloca 'x'
 // CHECK: [Stack|Summary|Mod|AsyncAccess] size=64 origins={stack(cir.alloca 'hm'{{.*}} links={0->[[X]]+0}
 // CHECK: [[HB:n[0-9]+]] [Stack|Summary|Mod|Ref] size=64 origins={stack(cir.alloca 'hb'
 // CHECK: ghost={0:$storage->[[SA:n[0-9]+]]+0}
-// CHECK: [[SA]] [Ghost|Summary|Mod|Ref] size=0 origins={ghost(cir.call{{.*}} links={0->[[Y:n[0-9]+]]+0}
-// CHECK: [Ghost|Summary|Mod|Ref] size=0 origins={ghost(cir.call{{.*}} ghost={0:$host->[[HB]]+0}
+// CHECK: [[SA]] [Ghost|External|Summary|Mod|Ref] size=0 origins={ghost(cir.call{{.*}} links={0->[[Y:n[0-9]+]]+0}
+// CHECK: [Ghost|Summary|Mod] size=0 origins={ghost(cir.call{{.*}} ghost={0:$host->[[HB]]+0}
 // CHECK: [[D:n[0-9]+]] [Heap|Summary|Mod|Ref|HasUSM|AsyncAccess] size=8 origins={heap(cir.call{{.*}} links={0->[[X]]+0}
 // CHECK: [[S:n[0-9]+]] [Heap|Summary|Mod|Ref|HasUSM|AsyncAccess] size=8 origins={heap(cir.call{{.*}} links={0->[[X]]+0}
 // CHECK: [Stack|Summary|Mod|AsyncAccess] size=32 arr=8 origins={stack(cir.alloca 'parr'{{.*}} links={0->[[X]]+0}
 // CHECK: [Stack|Summary|Mod|AsyncAccess] size=8 origins={stack(cir.alloca 'out'{{.*}} links={0->[[Y]]+0}
-// CHECK: [[Y]] [Stack|Summary|Ref] size=4 origins={stack(cir.alloca 'y'
+// CHECK: [[Y]] [Stack|External|Summary|Ref] size=4 origins={stack(cir.alloca 'y'
 // CHECK-NOT: === @buffer_dtor
 // CHECK-NOT: === @accessor_dtor
 // CHECK: === @main formals=incomplete
@@ -646,17 +668,19 @@ module {
 // CHECK-LABEL: === launches
 // CHECK-NEXT: launch @main handler.kernel kernels={_ZTS1M}
 // CHECK-NEXT:   kernel _ZTS1M
-// CHECK-NEXT:     field A accessor storage=[[SA]]+0 [Ghost|Summary|Mod|Ref] origins=1 host=none complete
-// CHECK-NEXT:     field H accessor storage={{n[0-9]+}}+0 [Ghost|Summary|Mod|Ref] origins=1 host=[[HB]]+0 [Stack|Summary|Mod|Ref] complete
-// CHECK-NEXT:     field D pointer target=[[D]]+0 [Heap|Summary|Mod|Ref|HasUSM|AsyncAccess] complete
-// CHECK-NEXT:     field S pointer target=[[S]]+0 [Heap|Summary|Mod|Ref|HasUSM|AsyncAccess] complete
-// CHECK-NEXT:     no-alias A H D S
-// CHECK-NEXT: kernel _ZTS1M: no-alias A H D S
+// External (the device-write rule) does not reject a field: the four are
+// distinct allocations.
+// CHECK-NEXT:     field A accessor storage=[[SA]]+0 [Ghost|External|Summary|Mod|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field D pointer target={{n[0-9]+}}+0 [Heap|External|Summary|Ref|HasUSM] complete
+// CHECK-NEXT:     field H accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [Stack|External|Summary|Mod|Ref] complete
+// CHECK-NEXT:     field S pointer target={{n[0-9]+}}+0 [Heap|External|Summary|Ref|HasUSM] complete
+// CHECK-NEXT:     no-alias A D H S
+// CHECK-NEXT: kernel _ZTS1M: no-alias A D H S
 
 // CLOSED: launch @main handler.kernel kernels={_ZTS1M}
-// CLOSED:      field H accessor storage={{n[0-9]+}}+0 [Ghost|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [Stack|Mod|Ref] complete
-// CLOSED:      no-alias A H D S
-// CLOSED-NEXT: kernel _ZTS1M: no-alias A H D S
+// CLOSED:      field H accessor storage={{n[0-9]+}}+0 [Ghost|External|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [Stack|External|Mod|Ref] complete
+// CLOSED:      no-alias A D H S
+// CLOSED-NEXT: kernel _ZTS1M: no-alias A D H S
 
 // The event wait takes no pointer to hm but synchronizes with the copy into
 // it: ModRef. Memory no command touches is not: x (NoModRef), hb (only the

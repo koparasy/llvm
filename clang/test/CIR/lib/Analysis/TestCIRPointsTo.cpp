@@ -48,32 +48,28 @@
 //                             | indirect-unresolved (<Kind>, "<detail>")
 //                               [bound={@f, ...}]
 //
-// sycl=1 adds the SYCL host API models (OffloadOpt's
-// registerSYCLPointsToModels, through PointsToAnalysisOptions::extraModels)
-// and, in ci mode, prints the kernel launches they record, even with
-// print-graphs=0:
+// sycl=1 adds the SYCL plug-in (OffloadOpt's addSYCLPointsToPlugin: the
+// host API models and the device-write rule) and, in ci mode, prints the
+// kernel launches they record and the noalias verdicts of SYCLHostFacts,
+// even with print-graphs=0:
 //
 //   === launches
 //   launch @<func> <model> kernels={<name>, ...} closure=<cell>
 //       geometry=<cell>
 //     kernel <name>[ (no device function)]
-//       field <path> accessor storage=<cell> [<flags>] origins=<n>
-//           host=<cell or none> <complete | unknown (<why>)>
-//       field <path> pointer target=<cell> [<flags>] <complete | ...>
-//       field <path> <not in closure | local accessor>
-//       blocked: <why>
-//       same <a> <b>            for each pair with the same identity
-//       no-alias <field> ...    the fields distinct from every other one
-//   kernel <name>: no-alias <field> ...   over every launch of the kernel
+//       field <name> accessor storage=<node> [<flags>] origins=<n>
+//           host=<node [<flags>] or none> <complete | unknown (<why>)>
+//       field <name> pointer target=<node> [<flags>] <complete | ...>
+//       blocked: <why>          the candidates' poison, if any
+//       same <a> <b>            for each pair with the same memory
+//       no-alias <field> ...    the fields no-alias at this launch
+//   kernel <name>: no-alias <field> ...   SYCLHostFacts::noAliasFields,
+//                                         over every launch of the kernel
+//     note <field>: <note>                with explain=1
 //
-// The identity of an accessor field is the `$storage` ghost node of the
-// accessor in the closure and the `$host` memory of that storage; of a
-// pointer field, the object it points to. Two identities are the same if
-// their nodes are; distinct if both are complete (no External, Incomplete or
-// UnknownObj, and a storage made by a model) and their nodes and host memory
-// differ; unknown otherwise. A captured struct that holds a pointer, or an
-// accessor inside a captured struct, blocks the kernel (as
-// KernelBindingTable does).
+// The fields are the noalias candidates of the kernel's device function
+// (getSYCLNoAliasCandidates), by name; their identities and verdicts are
+// SYCLHostFacts::identityOfClosureField and noAliasFields.
 //
 // closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU and
 // max-indirect-rounds=<n> PointsToAnalysisOptions::maxIndirectRounds.
@@ -90,10 +86,12 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToVerifier.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLHostFacts.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -267,7 +265,7 @@ void TestCIRPointsToPass::runCI() {
   options.assumeClosedTU = closedTU;
   options.maxIndirectRounds = maxIndirectRounds;
   if (syclModels)
-    options.extraModels = cir::registerSYCLPointsToModels;
+    cir::addSYCLPointsToPlugin(options);
   bool anyFailed = false;
 
   SmallVector<ModuleOp> modules;
@@ -501,69 +499,17 @@ void TestCIRPointsToPass::runCI() {
     signalPassFailure();
 }
 
-namespace {
-/// The memory identity of one closure field (see the file comment).
-struct FieldIdentity {
-  std::string path;
-  enum Kind { Storage, Pointer, Skipped } kind = Skipped;
-  const Node *node = nullptr; // the storage, or the pointer's target
-  const Node *host = nullptr; // the storage's host memory
-  bool complete = false;
-  std::string why;
-};
-
-enum class Verdict { Same, Distinct, Unknown };
-} // namespace
-
-static bool isCompleteNode(const Node *node) {
-  return node && !hasAny(node->getFlags(), NodeFlags::External |
-                                               NodeFlags::Incomplete |
-                                               NodeFlags::UnknownObj);
-}
-
-/// One reason a node is not complete, for the field lines.
-static std::string incompleteWhy(const Node *node) {
-  if (!node)
-    return "no node";
-  for (NodeFlags flag :
-       {NodeFlags::External, NodeFlags::Incomplete, NodeFlags::UnknownObj})
-    if (node->hasFlags(flag)) {
-      std::string out = getFlagName(flag).str();
-      if (const Reason *why = node->getReason(flag))
-        if (const Reason *root = getRootReason(why))
-          out += ": " + formatReason(root) + " at " + formatReasonSite(root);
-      return out;
-    }
-  return "complete";
-}
-
-static Verdict compareIdentities(const FieldIdentity &a,
-                                 const FieldIdentity &b) {
-  if (a.kind == FieldIdentity::Skipped || b.kind == FieldIdentity::Skipped)
-    return Verdict::Distinct; // Not a candidate: never blocks a pair.
-  if (!a.node || !b.node)
-    return Verdict::Unknown;
-  if (a.node == b.node)
-    return Verdict::Same;
-  if (!a.complete || !b.complete)
-    return Verdict::Unknown;
-  // The memory the device may access through each field: an accessor's host
-  // memory, else its fresh storage; a pointer's target.
-  const Node *ma = a.kind == FieldIdentity::Storage && a.host ? a.host : a.node;
-  const Node *mb = b.kind == FieldIdentity::Storage && b.host ? b.host : b.node;
-  return ma == mb ? Verdict::Same : Verdict::Distinct;
-}
-
 void TestCIRPointsToPass::printLaunches(raw_ostream &os, ModuleOp module,
                                         const PointsToAnalysis &analysis) {
   if (analysis.getLaunches().empty())
     return;
   os << "=== launches\n";
-  const Graph &graph = analysis.getGraph();
-  mlir::DataLayout layout(module);
-  // The no-alias fields of each kernel, ANDed over its launches.
-  llvm::MapVector<StringAttr, std::optional<llvm::SmallVector<std::string>>>
-      perKernel;
+  cir::SYCLHostFacts facts(analysis, getOperation());
+  auto printNode = [&](const Node *node) {
+    os << "n" << node->getId() << "+0 [" << toString(node->getFlags()) << "]";
+  };
+  // The kernels in launch order, for the per-kernel verdicts.
+  llvm::SetVector<StringAttr> kernels;
   for (const LaunchRecord &launch : analysis.getLaunches()) {
     auto func = launch.call->getParentOfType<cir::FuncOp>();
     os << "launch @" << (func ? func.getSymName() : StringRef("?")) << " "
@@ -576,164 +522,74 @@ void TestCIRPointsToPass::printLaunches(raw_ostream &os, ModuleOp module,
     Graph::printCell(os, launch.geometry ? *launch.geometry : Cell());
     os << "\n";
     for (StringAttr name : launch.kernelNames) {
-      cir::FuncOp kernel;
-      getOperation()->walk([&](cir::FuncOp f) {
-        if (f.getSymName() == name.getValue() && !f.isDeclaration() &&
-            f.getNumArguments() && cir::getSYCLKernelParam(f, 0))
-          kernel = f;
-      });
+      kernels.insert(name);
       os << "  kernel " << name.getValue();
-      if (!kernel) {
+      ArrayRef<cir::FuncOp> device = facts.getDeviceKernels(name.getValue());
+      if (device.empty()) {
         os << " (no device function)\n";
-        perKernel[name] = llvm::SmallVector<std::string>();
         continue;
       }
       os << "\n";
-      SmallVector<FieldIdentity> fields;
-      std::string blocked;
-      for (unsigned i = 0, e = kernel.getNumArguments(); i != e; ++i) {
-        std::optional<cir::SYCLKernelParam> param =
-            cir::getSYCLKernelParam(kernel, i);
-        if (!param)
-          continue;
-        Type argType = kernel.getArgumentTypes()[i];
-        std::string path;
-        for (Attribute elem : param->path)
-          path += (path.empty() ? "" : ".") +
-                  cast<StringAttr>(elem).getValue().str();
-        if (param->kind == "std_layout") {
-          Type held = argType;
-          if (auto byval = kernel.getArgAttrOfType<TypeAttr>(i, "llvm.byval"))
-            held = byval.getValue();
-          if (!getPointerSlotOffsets(held, layout).empty() && blocked.empty())
-            blocked = "captured struct '" + path + "' holds a pointer";
-          continue;
-        }
-        if (param->kind == "local_accessor") {
-          if (param->accessorPart == "ptr")
-            os << "    field " << path << " local accessor\n";
-          continue;
-        }
-        bool isAccessor = param->kind == "accessor";
-        if (!isAccessor && param->kind != "pointer")
-          continue;
-        if (isAccessor && param->accessorPart != "ptr")
-          continue;
-        if (isAccessor && !param->isTopLevel() && blocked.empty())
-          blocked = "captured '" + param->field.str() +
-                    "' holds a nested accessor";
-        FieldIdentity field;
-        field.path = path;
-        auto ptrTy = dyn_cast<cir::PointerType>(argType);
-        auto as = ptrTy ? dyn_cast_if_present<cir::TargetAddressSpaceAttr>(
-                              ptrTy.getAddrSpace())
-                        : nullptr;
-        os << "    field " << path << " ";
-        if (as && as.getValue() == 3) {
-          os << "local accessor\n";
-          continue;
-        }
-        std::optional<int64_t> offset;
-        if (launch.closure && launch.closureType)
-          offset = cir::getSYCLClosureFieldOffset(module, launch.closureType,
-                                                  param->path, layout);
-        if (!offset) {
-          os << "not in closure\n";
-          field.kind = FieldIdentity::Pointer;
-          field.why = "not in closure";
-          fields.push_back(field);
-          continue;
-        }
-        Cell at(launch.closure->getNode(), launch.closure->getOffset() + *offset);
-        if (isAccessor) {
-          field.kind = FieldIdentity::Storage;
-          std::optional<Cell> storage =
-              graph.lookupGhostLink(at, cir::getSYCLStorageField());
+      cir::SYCLNoAliasCandidates candidates =
+          cir::getSYCLNoAliasCandidates(device);
+      cir::SYCLHostFacts::LaunchFacts here =
+          facts.factsOfLaunch(launch, candidates);
+      for (const auto &[field, id] : here.fields) {
+        os << "    field " << field << " ";
+        if (id.kind == cir::SYCLHostFacts::MemIdentity::Kind::Storage) {
           os << "accessor storage=";
-          Graph::printCell(os, storage ? *storage : Cell());
-          if (storage) {
-            field.node = storage->getNode();
-            os << " [" << toString(field.node->getFlags()) << "] origins="
-               << field.node->getOrigins().size();
-            std::optional<Cell> host =
-                graph.lookupGhostLink(*storage, cir::getSYCLHostField());
-            os << " host=";
-            if (host) {
-              field.host = host->getNode();
-              Graph::printCell(os, *host);
-              os << " [" << toString(field.host->getFlags()) << "]";
-            } else {
+          if (id.node) {
+            printNode(id.node);
+            os << " origins=" << id.node->getOrigins().size() << " host=";
+            if (id.host)
+              printNode(id.host);
+            else
               os << "none";
-            }
-            field.complete = isCompleteNode(field.node) &&
-                             !field.node->getOrigins().empty() &&
-                             (!field.host || isCompleteNode(field.host));
-            if (!field.complete)
-              field.why = field.node->getOrigins().empty()
-                              ? std::string("storage made by no model")
-                              : incompleteWhy(isCompleteNode(field.node)
-                                                  ? field.host
-                                                  : field.node);
           } else {
-            field.why = "no storage";
+            os << "null";
           }
         } else {
-          field.kind = FieldIdentity::Pointer;
-          std::optional<Cell> target = graph.lookupLink(at);
           os << "pointer target=";
-          Graph::printCell(os, target ? *target : Cell());
-          if (target) {
-            field.node = target->getNode();
-            os << " [" << toString(field.node->getFlags()) << "]";
-            field.complete = isCompleteNode(field.node);
-            if (!field.complete)
-              field.why = incompleteWhy(field.node);
-          } else {
-            field.why = "nothing stored";
-          }
+          if (id.node)
+            printNode(id.node);
+          else
+            os << "null";
         }
-        os << (field.complete ? " complete" : " unknown (" + field.why + ")")
+        os << (id.complete ? " complete" : " unknown (" + id.what + ")")
            << "\n";
-        fields.push_back(field);
       }
-      if (!blocked.empty())
-        os << "    blocked: " << blocked << "\n";
-      SmallVector<std::string> noAlias;
-      for (size_t a = 0; a < fields.size(); ++a) {
-        bool distinct = blocked.empty() && fields[a].complete;
-        for (size_t b = 0; b < fields.size(); ++b) {
-          if (a == b)
-            continue;
-          Verdict v = compareIdentities(fields[a], fields[b]);
-          if (v == Verdict::Same && a < b)
-            os << "    same " << fields[a].path << " " << fields[b].path
-               << "\n";
-          distinct &= v == Verdict::Distinct;
-        }
-        if (distinct)
-          noAlias.push_back(fields[a].path);
-      }
+      if (!candidates.poison.empty())
+        os << "    blocked: " << candidates.poison << "\n";
+      for (size_t a = 0; a < here.fields.size(); ++a)
+        for (size_t b = a + 1; b < here.fields.size(); ++b)
+          if (cir::SYCLHostFacts::sameMemory(here.fields[a].second,
+                                             here.fields[b].second))
+            os << "    same " << here.fields[a].first << " "
+               << here.fields[b].first << "\n";
       os << "    no-alias";
-      for (const std::string &f : noAlias)
-        os << " " << f;
+      for (const auto &field : here.fields)
+        if (here.decisions.lookup(field.first).ok)
+          os << " " << field.first;
       os << "\n";
-      auto &all = perKernel[name];
-      if (!all) {
-        all = noAlias;
-      } else {
-        llvm::SmallVector<std::string> kept;
-        for (const std::string &f : *all)
-          if (llvm::is_contained(noAlias, f))
-            kept.push_back(f);
-        all = kept;
-      }
     }
   }
-  for (auto &[name, fields] : perKernel) {
+  for (StringAttr name : kernels) {
+    if (facts.getDeviceKernels(name.getValue()).empty())
+      continue;
+    llvm::StringMap<cir::NoAliasDecision> decisions =
+        facts.noAliasFields(name.getValue());
+    SmallVector<StringRef> names;
+    for (const auto &d : decisions)
+      names.push_back(d.first());
+    llvm::sort(names);
     os << "kernel " << name.getValue() << ": no-alias";
-    for (const std::string &f : *fields)
-      os << " " << f;
+    for (StringRef f : names)
+      if (decisions.lookup(f).ok)
+        os << " " << f;
     os << "\n";
+    if (explainSets)
+      for (StringRef f : names)
+        os << "  note " << f << ": " << decisions.lookup(f).note << "\n";
   }
 }
 
