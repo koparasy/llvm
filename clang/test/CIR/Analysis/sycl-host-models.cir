@@ -218,7 +218,9 @@ module {
 // CHECK-NEXT:     field D accessor storage=[[A]]+0
 // CHECK-NEXT:     field E accessor storage=[[B]]+0
 // CHECK-NEXT:     field F accessor storage=[[C]]+0
-// CHECK-NEXT:     field G accessor storage=[[G]]+0 [Ghost|External|Summary|Ref] origins=2 host=none unknown (accessor 'G': [[G]] merges 2 allocations (sycl-host-models.cir:{{[0-9]+}}, sycl-host-models.cir:{{[0-9]+}}))
+// G and H share one storage made at two allocation sites: complete, but the
+// same memory.
+// CHECK-NEXT:     field G accessor storage=[[G]]+0 [Ghost|External|Summary|Ref] origins=2 host=none complete
 // CHECK-NEXT:     field H accessor storage=[[G]]+0
 // CHECK-NEXT:     field O accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none unknown (accessor 'O': the storage {{n[0-9]+}} is made by buffer.other, which the analysis cannot place)
 // CHECK-NEXT:     field P accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none unknown (accessor 'P': the storage {{n[0-9]+}} is made by accessor.other, which the analysis cannot place)
@@ -695,3 +697,189 @@ module {
 // MODREF-DAG: wait -> hb#0: NoModRef
 // MODREF-DAG: dtor_h -> hb#0: ModRef
 // MODREF-DAG: dtor_a -> hb#0: NoModRef
+
+// -----
+// BUFFER MEMBERS. set_write_back, the queries (get_range through sret, size,
+// has_property) and set_final_data are replaced: their bodies call the
+// runtime with the handle, which would make the storage escape. A buffer
+// whose write-back destination set_final_data(fd) set has `$final` = fd on
+// its storage (Mod at the call; its destructor may write it back, MODREF);
+// set_final_data(nullptr) has no pointer effect. get_host_access returns a
+// host_accessor (through sret) over the buffer's storage, and may read and
+// write its `$host` memory. All three buffers stay complete and distinct.
+
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!void = !cir.void
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_hacc = !cir.struct<class "sycl::_V1::host_accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !u64i}>
+!rec_handler = !cir.struct<class "sycl::_V1::handler" {data !cir.ptr<!s8i>}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !rec_acc, data !rec_acc}>
+
+module {
+  cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTS1B" : !cir.array<!s8i x 6>, trailing_zeros> : !cir.array<!s8i x 7>
+  cir.global "private" constant internal @kinfo = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<6> : !u64i}> : !rec_sv}> : !rec_ctki
+  cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @runtime(!cir.ptr<!rec_buf>)
+  cir.func private @runtime_dest(!cir.ptr<!rec_buf>, !cir.ptr<!f32>)
+  // The bodies hand the handle to the runtime; the models replace them.
+  cir.func internal @set_write_back(%this: !cir.ptr<!rec_buf>, %flag: !cir.bool) attributes {cir.sycl_host_api = "buffer.set_write_back", cir.sycl_host_api_arg = 0 : i32} {
+    cir.call @runtime(%this) : (!cir.ptr<!rec_buf>) -> ()
+    cir.return
+  }
+  cir.func internal @set_final_data(%this: !cir.ptr<!rec_buf>, %dest: !cir.ptr<!f32>) attributes {cir.sycl_host_api = "buffer.set_final_data", cir.sycl_host_api_arg = 0 : i32} {
+    cir.call @runtime_dest(%this, %dest) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>) -> ()
+    cir.return
+  }
+  cir.func internal @get_range(%ret: !cir.ptr<!rec_range> {llvm.sret = !rec_range}, %this: !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.query", cir.sycl_host_api_arg = 0 : i32} {
+    cir.call @runtime(%this) : (!cir.ptr<!rec_buf>) -> ()
+    cir.return
+  }
+  cir.func internal @size(%this: !cir.ptr<!rec_buf>) -> !u64i attributes {cir.sycl_host_api = "buffer.query", cir.sycl_host_api_arg = 0 : i32} {
+    cir.call @runtime(%this) : (!cir.ptr<!rec_buf>) -> ()
+    %0 = cir.const #cir.int<16> : !u64i
+    cir.return %0 : !u64i
+  }
+  cir.func internal @has_property(%this: !cir.ptr<!rec_buf>) -> !cir.bool attributes {cir.sycl_host_api = "buffer.query", cir.sycl_host_api_arg = 0 : i32} {
+    cir.call @runtime(%this) : (!cir.ptr<!rec_buf>) -> ()
+    %0 = cir.const #cir.bool<false> : !cir.bool
+    cir.return %0 : !cir.bool
+  }
+  cir.func internal @get_host_access(%ret: !cir.ptr<!rec_hacc> {llvm.sret = !rec_hacc}, %this: !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.host_access", cir.sycl_host_api_arg = 0 : i32} {
+    cir.call @runtime(%this) : (!cir.ptr<!rec_buf>) -> ()
+    cir.return
+  }
+  cir.func internal @buffer_dtor(%this: !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.dtor", cir.sycl_host_api_arg = 0 : i32} {
+    cir.call @runtime(%this) : (!cir.ptr<!rec_buf>) -> ()
+    cir.return
+  }
+  cir.func internal @kernel_info() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+    %0 = cir.get_global @kinfo : !cir.ptr<!rec_ctki>
+    %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+    cir.return %1 : !cir.ptr<!s8i>
+  }
+  cir.func internal @parallel_for(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+    %info = cir.call @kernel_info() : () -> !cir.ptr<!s8i>
+    cir.return
+  }
+  cir.func @main(%h: !cir.ptr<!rec_handler>, %r: !cir.ptr<!rec_range>) {
+    %x = cir.alloca "x" align(4) : !cir.ptr<!f32> {test.ptr = "x"}
+    %hb = cir.alloca "hb" align(4) : !cir.ptr<!cir.array<!f32 x 16>> {test.ptr = "hb"}
+    %hbp = cir.cast array_to_ptrdecay %hb : !cir.ptr<!cir.array<!f32 x 16>> -> !cir.ptr<!f32>
+    %fd = cir.alloca "fd" align(4) : !cir.ptr<!cir.array<!f32 x 16>> {test.ptr = "fd"}
+    %fdp = cir.cast array_to_ptrdecay %fd : !cir.ptr<!cir.array<!f32 x 16>> -> !cir.ptr<!f32>
+    %ba = cir.alloca "ba" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_alloc(%ba, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+    %bh = cir.alloca "bh" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_host_ptr(%bh, %hbp, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+    %bf = cir.alloca "bf" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_alloc(%bf, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+    %true = cir.const #cir.bool<true> : !cir.bool
+    // Two buffers the kernel does not reach (the device-write rule would make
+    // their host memory External): bk over hk, bg with the destination gd.
+    %hk = cir.alloca "hk" align(4) : !cir.ptr<!cir.array<!f32 x 16>> {test.ptr = "hk"}
+    %hkp = cir.cast array_to_ptrdecay %hk : !cir.ptr<!cir.array<!f32 x 16>> -> !cir.ptr<!f32>
+    %gd = cir.alloca "gd" align(4) : !cir.ptr<!cir.array<!f32 x 16>> {test.ptr = "gd"}
+    %gdp = cir.cast array_to_ptrdecay %gd : !cir.ptr<!cir.array<!f32 x 16>> -> !cir.ptr<!f32>
+    %bk = cir.alloca "bk" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_host_ptr(%bk, %hkp, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+    %bg = cir.alloca "bg" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_alloc(%bg, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+    cir.call @set_final_data(%bg, %gdp) {test.ptr = "final_g"} : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>) -> ()
+    cir.call @set_write_back(%bk, %true) {test.ptr = "write_back"} : (!cir.ptr<!rec_buf>, !cir.bool) -> ()
+    cir.call @set_write_back(%bh, %true) : (!cir.ptr<!rec_buf>, !cir.bool) -> ()
+    cir.call @set_final_data(%bf, %fdp) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>) -> ()
+    %null = cir.const #cir.ptr<null> : !cir.ptr<!f32>
+    cir.call @set_final_data(%ba, %null) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>) -> ()
+    %rg = cir.alloca "rg" align(8) : !cir.ptr<!rec_range> {test.ptr = "rg"}
+    cir.call @get_range(%rg, %ba) {test.ptr = "range"} : (!cir.ptr<!rec_range>, !cir.ptr<!rec_buf>) -> ()
+    %n = cir.call @size(%bh) : (!cir.ptr<!rec_buf>) -> !u64i
+    %p = cir.call @has_property(%bf) : (!cir.ptr<!rec_buf>) -> !cir.bool
+    %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+    %fA = cir.get_member %lam[0] {name = "A"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+    cir.call @accessor_from_buffer(%fA, %ba, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+    %fH = cir.get_member %lam[1] {name = "H"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+    cir.call @accessor_from_buffer(%fH, %bh, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+    %fF = cir.get_member %lam[2] {name = "F"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+    cir.call @accessor_from_buffer(%fF, %bf, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+    cir.call @parallel_for(%h, %lam) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+    %ha = cir.alloca "ha" align(8) : !cir.ptr<!rec_hacc>
+    cir.call @get_host_access(%ha, %bh) : (!cir.ptr<!rec_hacc>, !cir.ptr<!rec_buf>) -> ()
+    %hk2 = cir.alloca "hk2" align(8) : !cir.ptr<!rec_hacc>
+    cir.call @get_host_access(%hk2, %bk) {test.ptr = "host_access"} : (!cir.ptr<!rec_hacc>, !cir.ptr<!rec_buf>) -> ()
+    cir.call @buffer_dtor(%bg) {test.ptr = "dtor_g"} : (!cir.ptr<!rec_buf>) -> ()
+    cir.call @buffer_dtor(%bk) : (!cir.ptr<!rec_buf>) -> ()
+    cir.call @buffer_dtor(%bf) : (!cir.ptr<!rec_buf>) -> ()
+    cir.call @buffer_dtor(%bh) : (!cir.ptr<!rec_buf>) -> ()
+    cir.call @buffer_dtor(%ba) : (!cir.ptr<!rec_buf>) -> ()
+    cir.return
+  }
+  cir.func @_ZTS1B(%a: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}},
+                   %hh: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "H", init_arg = 0 : i32, kind = "accessor", path = ["H"]}},
+                   %ff: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "F", init_arg = 0 : i32, kind = "accessor", path = ["F"]}}) cc(spir_kernel) {
+    cir.return
+  }
+}
+
+// The storages keep their ghost links; the host_accessors (ha, hk2) share
+// their buffers' storage.
+// CHECK-LABEL: === TU graph
+// CHECK: [[FD:n[0-9]+]] [Stack|External|Mod|Ref] size=64 origins={stack(cir.alloca 'fd'
+// CHECK: origins={stack(cir.alloca 'bh'{{.*}} ghost={0:$storage->[[SH:n[0-9]+]]+0}
+// CHECK: [[SH]] [Ghost|External|Summary|Mod|Ref] size=0 origins={ghost(cir.call{{.*}} ghost={0:$host->
+// CHECK: [[SF:n[0-9]+]] [Ghost|External|Summary|Ref] size=0 origins={ghost(cir.call{{.*}} ghost={0:$final->[[FD]]+0}
+// CHECK: [[GD:n[0-9]+]] [Stack|Mod|Ref] size=64 origins={stack(cir.alloca 'gd'
+// CHECK: origins={stack(cir.alloca 'bk'{{.*}} ghost={0:$storage->[[SK:n[0-9]+]]+0}
+// CHECK: [Ghost|Summary|Ref] size=0 origins={ghost(cir.call{{.*}} ghost={0:$final->[[GD]]+0}
+// CHECK: [Stack|Mod] size=16 origins={stack(cir.alloca 'ha'{{.*}} ghost={0:$storage->[[SH]]+0}
+// CHECK: [Stack|Mod] size=16 origins={stack(cir.alloca 'hk2'{{.*}} ghost={0:$storage->[[SK]]+0}
+// CHECK-NOT: === @set_write_back
+// CHECK-NOT: === @set_final_data
+// CHECK-NOT: === @get_range
+// CHECK-NOT: === @get_host_access
+// CHECK-LABEL: === calls
+// CHECK: @main cir.call @set_final_data -> model buffer.set_final_data
+// CHECK: @main cir.call @set_write_back -> model buffer.set_write_back
+// CHECK: @main cir.call @set_final_data -> model buffer.set_final_data
+// CHECK: @main cir.call @set_final_data -> model buffer.set_final_data
+// CHECK: @main cir.call @get_range -> model buffer.query
+// CHECK: @main cir.call @size -> model buffer.query
+// CHECK: @main cir.call @has_property -> model buffer.query
+// CHECK: @main cir.call @get_host_access -> model buffer.host_access
+// CHECK-NOT: -> unknown
+// CHECK-LABEL: === launches
+// CHECK-NEXT: launch @main handler.kernel kernels={_ZTS1B}
+// CHECK-NEXT:   kernel _ZTS1B
+// CHECK-NEXT:     field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field F accessor storage=[[SF]]+0 [Ghost|External|Summary|Ref] origins=1 host=none complete
+// CHECK-NEXT:     field H accessor storage=[[SH]]+0 [Ghost|External|Summary|Mod|Ref] origins=1 host={{n[0-9]+}}+0 [Stack|External|Mod|Ref] complete
+// CHECK-NEXT:     no-alias A F H
+// CHECK-NEXT: kernel _ZTS1B: no-alias A F H
+
+// CLOSED: launch @main handler.kernel kernels={_ZTS1B}
+// CLOSED:      no-alias A F H
+// CLOSED-NEXT: kernel _ZTS1B: no-alias A F H
+
+// None of the members touches x. A host accessor may read and write its
+// buffer's host memory (hk), and the destructor of a buffer may write the
+// set_final_data destination (gd) back. get_range writes its result only.
+// MODREF-LABEL: Testing : "main"
+// MODREF-DAG: write_back -> x#0: NoModRef
+// MODREF-DAG: range -> x#0: NoModRef
+// MODREF-DAG: host_access -> x#0: NoModRef
+// MODREF-DAG: final_g -> x#0: NoModRef
+// MODREF-DAG: dtor_g -> x#0: NoModRef
+// MODREF-DAG: host_access -> hk#0: ModRef
+// MODREF-DAG: host_access -> gd#0: NoModRef
+// MODREF-DAG: range -> hk#0: NoModRef
+// MODREF-DAG: range -> rg#0: Mod
+// MODREF-DAG: final_g -> gd#0: ModRef
+// MODREF-DAG: dtor_g -> gd#0: ModRef
+// MODREF-DAG: dtor_g -> hk#0: NoModRef

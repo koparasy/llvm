@@ -29,11 +29,21 @@
 //  4. inserts before the check point
 //       cir.call @__cir_pt_check(p, sizeA, q, sizeB, id)
 //     with the pointers cast to !cir.ptr<!void> and the sizes and id as
-//     !u64i, and declares __cir_pt_check once in the module.
+//     !u64i, and declares __cir_pt_check once in the module;
+//  5. with must=1 (the default), does the same for the MustAlias answers,
+//     sampled the same way, with
+//       cir.call @__cir_pt_check_must(p, q, id)
+//     but only for a pair whose later access is the check point and whose
+//     earlier one dominates it (or one op with both addresses), both of a
+//     constant non-zero size: on every path through the check both accesses
+//     run, so the claim is about these two values.
 //
 // The runtime (clang/test/CIR/Analysis/points-to/Inputs/pt_check_runtime.c)
-// aborts with "PT-VIOLATION <id>" if the two byte ranges overlap. A
-// violation is an unsound NoAlias, and the side table names the pair.
+// aborts with "PT-VIOLATION <id>" if the two byte ranges of a NoAlias pair
+// overlap, and with "PT-MUST-VIOLATION <id>" if the two addresses of a
+// MustAlias pair differ. A violation is an unsound answer, and the side
+// table names the pair; its MustAlias lines read "<id> @<func> must <rule>
+// ...".
 //
 // Options:
 //   closed-tu=1               PointsToAnalysisOptions::assumeClosedTU
@@ -49,6 +59,7 @@
 //                             and why is explainAlias; then the totals
 //   print-candidates=1        also write every candidate that is not
 //                             checked, prefixed with "cand", with its answer
+//   must=0                    do not check the MustAlias answers
 //   inject-false-noalias=<id> test only: treat candidate <id> as NoAlias
 //                             (and always check it), whatever the analysis
 //                             says. A negative control: when the pair
@@ -83,6 +94,7 @@ using namespace cir::pointsto;
 namespace {
 
 constexpr llvm::StringLiteral kCheckName = "__cir_pt_check";
+constexpr llvm::StringLiteral kMustCheckName = "__cir_pt_check_must";
 constexpr uint64_t kNoInjection = std::numeric_limits<uint64_t>::max();
 
 /// One address operand of a memory access.
@@ -106,6 +118,8 @@ struct Candidate {
   Operation *point;
   AliasAnswer answer;
   bool injected = false;
+  /// A MustAlias check (p == q) rather than an overlap check.
+  bool must = false;
 };
 
 /// splitmix64: a hash that is the same in every run (llvm::hash_combine is
@@ -200,6 +214,10 @@ struct TestCIRPointsToInstrumentPass
   Option<std::string> tablePath{
       *this, "table", llvm::cl::desc("Write the side table to this file"),
       llvm::cl::init("")};
+  Option<bool> checkMust{
+      *this, "must",
+      llvm::cl::desc("Also check the MustAlias answers (p == q)"),
+      llvm::cl::init(true)};
   Option<bool> printCandidates{
       *this, "print-candidates",
       llvm::cl::desc("Also write the candidates that are not checked"),
@@ -314,7 +332,7 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
     SmallVector<Candidate> checks;
   };
   SmallVector<FunctionPlan> plans;
-  uint64_t nextId = 0, numCandidates = 0, numNoAlias = 0;
+  uint64_t nextId = 0, numCandidates = 0, numNoAlias = 0, numMust = 0;
   llvm::StringMap<unsigned> checkedRules;
 
   auto describeAccess = [](const Access &access) {
@@ -339,7 +357,7 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
         return false;
       return !access.dynSize || dom.properlyDominates(access.dynSize, point);
     };
-    SmallVector<Candidate> noAlias;
+    SmallVector<Candidate> noAlias, mustAlias;
     for (unsigned j = 0; j < accesses.size(); ++j)
       for (unsigned i = 0; i < j; ++i) {
         const Access &a = accesses[i], &b = accesses[j];
@@ -364,8 +382,20 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
           candidate.injected = true;
         if (candidate.answer.result.isNo())
           ++numNoAlias;
+        // A MustAlias pair is checked only where both accesses run: the
+        // check point is the later access, which the earlier one dominates.
+        bool ordered = a.op == b.op || (point == b.op && dom.dominates(a.op, b.op)) ||
+                       (point == a.op && dom.dominates(b.op, a.op));
+        bool sized = a.constSize && *a.constSize && b.constSize &&
+                     *b.constSize;
+        if (candidate.answer.result.isMust())
+          ++numMust;
         if (candidate.answer.result.isNo() || candidate.injected) {
           noAlias.push_back(candidate);
+        } else if (checkMust && candidate.answer.result.isMust() && ordered &&
+                   sized) {
+          candidate.must = true;
+          mustAlias.push_back(candidate);
         } else if (table && printCandidates) {
           *table << "cand " << candidate.id << " @" << func.getSymName()
                  << " " << candidate.answer.result << " "
@@ -375,34 +405,39 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
       }
 
     // Sample: the injected pair, then the first ones by hash.
-    if (maxPairs && noAlias.size() > maxPairs) {
+    auto sample = [&](SmallVector<Candidate> &list) {
+      if (!maxPairs || list.size() <= maxPairs)
+        return;
       auto key = [&](const Candidate &c) {
         return c.injected ? 0 : mix(mix(seed) ^ c.id) | 1;
       };
-      llvm::stable_sort(noAlias, [&](const Candidate &x, const Candidate &y) {
+      llvm::stable_sort(list, [&](const Candidate &x, const Candidate &y) {
         return key(x) < key(y);
       });
       if (table && printCandidates)
-        for (const Candidate &c :
-             llvm::ArrayRef(noAlias).drop_front(maxPairs))
-          *table << "cand " << c.id << " @" << func.getSymName()
-                 << " NoAlias(not sampled) "
+        for (const Candidate &c : llvm::ArrayRef(list).drop_front(maxPairs))
+          *table << "cand " << c.id << " @" << func.getSymName() << " "
+                 << (c.must ? "MustAlias" : "NoAlias") << "(not sampled) "
                  << getAliasRuleName(c.answer.rule) << " "
                  << describeAccess(accesses[c.a]) << " | "
                  << describeAccess(accesses[c.b]) << "\n";
-      noAlias.truncate(maxPairs);
-      llvm::sort(noAlias, [](const Candidate &x, const Candidate &y) {
-        return x.id < y.id;
-      });
-    }
+      list.truncate(maxPairs);
+    };
+    sample(noAlias);
+    sample(mustAlias);
+    noAlias.append(mustAlias.begin(), mustAlias.end());
+    llvm::sort(noAlias, [](const Candidate &x, const Candidate &y) {
+      return x.id < y.id;
+    });
     for (const Candidate &c : noAlias) {
       const Access &a = accesses[c.a], &b = accesses[c.b];
       StringRef rule =
           c.injected ? StringRef("injected") : getAliasRuleName(c.answer.rule);
-      ++checkedRules[rule];
+      ++checkedRules[c.must ? ("must " + rule).str() : rule.str()];
       if (!table)
         continue;
-      *table << c.id << " @" << func.getSymName() << " " << rule;
+      *table << c.id << " @" << func.getSymName() << " "
+             << (c.must ? "must " : "") << rule;
       if (c.injected)
         *table << "(really " << c.answer.result << " "
                << getAliasRuleName(c.answer.rule) << ")";
@@ -420,20 +455,30 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
   cir::CIRBaseBuilderTy builder(*ctx);
   cir::PointerType voidPtrTy = builder.getVoidPtrTy();
   cir::IntType u64Ty = builder.getUIntNTy(64);
-  uint64_t numChecks = 0;
+  uint64_t numChecks = 0, numMustChecks = 0;
   for (const FunctionPlan &plan : plans)
-    numChecks += plan.checks.size();
-  if (numChecks) {
-    auto check = module.lookupSymbol<cir::FuncOp>(kCheckName);
-    if (!check) {
-      builder.setInsertionPointToStart(module.getBody());
-      auto fnTy = cir::FuncType::get({voidPtrTy, u64Ty, voidPtrTy, u64Ty, u64Ty},
-                                     cir::VoidType::get(ctx));
-      check = cir::FuncOp::create(builder, module.getLoc(), kCheckName, fnTy);
-      check.setLinkageAttr(cir::GlobalLinkageKindAttr::get(
-          ctx, cir::GlobalLinkageKind::ExternalLinkage));
-      SymbolTable::setSymbolVisibility(check, SymbolTable::Visibility::Private);
-    }
+    for (const Candidate &c : plan.checks)
+      ++(c.must ? numMustChecks : numChecks);
+  // The runtime function \p name of type (\p params) -> void, declared once.
+  auto declare = [&](StringRef name, ArrayRef<Type> params) {
+    auto check = module.lookupSymbol<cir::FuncOp>(name);
+    if (check)
+      return check;
+    builder.setInsertionPointToStart(module.getBody());
+    auto fnTy = cir::FuncType::get(params, cir::VoidType::get(ctx));
+    check = cir::FuncOp::create(builder, module.getLoc(), name, fnTy);
+    check.setLinkageAttr(cir::GlobalLinkageKindAttr::get(
+        ctx, cir::GlobalLinkageKind::ExternalLinkage));
+    SymbolTable::setSymbolVisibility(check, SymbolTable::Visibility::Private);
+    return check;
+  };
+  if (numChecks || numMustChecks) {
+    cir::FuncOp check, mustCheck;
+    if (numChecks)
+      check =
+          declare(kCheckName, {voidPtrTy, u64Ty, voidPtrTy, u64Ty, u64Ty});
+    if (numMustChecks)
+      mustCheck = declare(kMustCheckName, {voidPtrTy, voidPtrTy, u64Ty});
     for (const FunctionPlan &plan : plans)
       for (const Candidate &c : plan.checks) {
         builder.setInsertionPoint(c.point);
@@ -451,16 +496,24 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
           return builder.createIntCast(access.dynSize, u64Ty);
         };
         const Access &a = plan.accesses[c.a], &b = plan.accesses[c.b];
-        SmallVector<Value, 5> args{pointer(a), size(a), pointer(b), size(b),
-                                   builder.getConstantInt(loc, u64Ty, c.id)};
-        cir::CallOp call = builder.createCallOp(loc, check, args);
+        cir::CallOp call;
+        if (c.must) {
+          SmallVector<Value, 3> args{pointer(a), pointer(b),
+                                     builder.getConstantInt(loc, u64Ty, c.id)};
+          call = builder.createCallOp(loc, mustCheck, args);
+        } else {
+          SmallVector<Value, 5> args{pointer(a), size(a), pointer(b), size(b),
+                                     builder.getConstantInt(loc, u64Ty, c.id)};
+          call = builder.createCallOp(loc, check, args);
+        }
         call.setNothrow(true);
       }
   }
 
   if (table) {
     *table << "# functions " << plans.size() << " candidates " << numCandidates
-           << " noalias " << numNoAlias << " checks " << numChecks << "\n";
+           << " noalias " << numNoAlias << " checks " << numChecks << " must "
+           << numMust << " must-checks " << numMustChecks << "\n";
     SmallVector<std::pair<StringRef, unsigned>> rules;
     for (const auto &entry : checkedRules)
       rules.emplace_back(entry.getKey(), entry.getValue());

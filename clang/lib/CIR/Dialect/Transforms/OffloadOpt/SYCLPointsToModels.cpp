@@ -65,6 +65,11 @@ GhostField cir::getSYCLHostField() {
   return field;
 }
 
+GhostField cir::getSYCLFinalField() {
+  static GhostField field = GhostField::get("$final");
+  return field;
+}
+
 GhostField cir::getSYCLKernelField() {
   static GhostField field = GhostField::get("$kernel");
   return field;
@@ -390,6 +395,19 @@ cir::getSYCLClosureFieldOffset(ModuleOp module, Type closure, ArrayAttr path,
 // Models
 //===----------------------------------------------------------------------===//
 
+/// Mod and Ref on the host memory a buffer's runtime may write the storage
+/// \p storage back to, where the graph knows it here: the `$host` memory of
+/// buffer(hostData, ...) and the `$final` destination of set_final_data. The
+/// models that make these links already set Mod and Ref on the memory, so a
+/// call that reaches the storage through its ghost links is ModRef on it
+/// wherever the storage is only known after binding; this only makes the
+/// local graph say so too.
+static void modRefHostMemory(Graph &graph, ModelContext &ctx, Cell storage) {
+  for (GhostField field : {getSYCLHostField(), getSYCLFinalField()})
+    if (std::optional<Cell> host = graph.lookupGhostLink(storage, field))
+      ctx.modRef(host, /*mod=*/true, /*ref=*/true);
+}
+
 namespace {
 
 /// A model keyed on a role. It replaces the body, and falls back to the
@@ -500,8 +518,9 @@ public:
     ResultFromThis,
   };
   ShareStorageModel(StringRef role, StringRef citation, Shape shape,
-                    bool returnsThis = false)
-      : RoleModel(role, citation), shape(shape), returnsThis(returnsThis) {}
+                    bool returnsThis = false, bool syncsHost = false)
+      : RoleModel(role, citation), shape(shape), returnsThis(returnsThis),
+        syncsHost(syncsHost) {}
 
 protected:
   bool applyRole(CallSiteRecord &site, ModelContext &ctx,
@@ -537,9 +556,10 @@ protected:
     Graph &graph = ctx.getGraph();
     const Reason *why = ctx.makeReason(site, Reason::Kind::MergedAt,
                                        (role + ": same storage").str());
-    graph.setGhostLink(*to, getSYCLStorageField(),
-                       graph.getGhostLink(*from, getSYCLStorageField(), why),
-                       why);
+    Cell storage = graph.getGhostLink(*from, getSYCLStorageField(), why);
+    graph.setGhostLink(*to, getSYCLStorageField(), storage, why);
+    if (syncsHost)
+      modRefHostMemory(graph, ctx, storage);
     setRuntimeInternals(site, ctx, dst, *to);
     ctx.modRef(to, /*mod=*/true, /*ref=*/false);
     refOperands(site, ctx, {dst});
@@ -551,6 +571,9 @@ protected:
 private:
   Shape shape;
   bool returnsThis;
+  /// A host accessor: its construction makes the buffer's data available in
+  /// the host memory, which the runtime may then read and write.
+  bool syncsHost;
 };
 
 /// accessor.other: an accessor whose storage the analysis cannot place (a
@@ -837,8 +860,10 @@ protected:
 /// constructor already set Mod and Ref on that memory and related its
 /// contents to the storage's (see BufferCtorModel), so the effect holds even
 /// where the storage is only known after binding; the call reaches it through
-/// the handle's `$storage` and `$host` ghost links. A buffer whose write-back
-/// target set_final_data changed has escaped to that (unmodelled) call.
+/// the handle's `$storage` and `$host` ghost links. A write-back destination
+/// set_final_data(T *) set is the storage's `$final` (SetFinalDataModel),
+/// treated the same way; the other set_final_data forms are untagged, so the
+/// buffer escapes to their bodies' runtime calls.
 class HandleDtorModel : public RoleModel {
 public:
   HandleDtorModel(StringRef role, StringRef citation, bool isBuffer)
@@ -855,15 +880,96 @@ protected:
     if (isBuffer)
       if (std::optional<Cell> storage =
               graph.lookupGhostLink(*handle, getSYCLStorageField()))
-        if (std::optional<Cell> host =
-                graph.lookupGhostLink(*storage, getSYCLHostField()))
-          ctx.modRef(host, /*mod=*/true, /*ref=*/true);
+        modRefHostMemory(graph, ctx, *storage);
     refOperands(site, ctx);
     return true;
   }
 
 private:
   bool isBuffer;
+};
+
+/// buffer.set_write_back, buffer.query: buffer members with no pointer
+/// effect.
+///
+/// SPEC: set_write_back "dynamically forces or cancels the write-back of the
+/// data of a buffer on destruction" (PI 5789-5799, api:buffer-set-write-back):
+/// it changes only whether the destructor writes the storage back to the host
+/// memory. The buffer.dtor model already assumes it may (the write-back is
+/// Mod on the `$host` memory), which is the conservative case for both
+/// values of the flag. The queries get_range, size, byte_size (and the
+/// deprecated get_count, get_size), is_sub_buffer and has_property
+/// (sec:buffer-member-funcs, PI 5638-5810; common has_property, PI 577-690)
+/// return a range, a size or a bool, computed from the buffer: they read the
+/// handle and nothing else. get_property is not one of them: a property
+/// object may hold a pointer the user gave the constructor (use_mutex).
+class NoPointerEffectModel : public RoleModel {
+public:
+  using RoleModel::RoleModel;
+
+protected:
+  bool applyRole(CallSiteRecord &site, ModelContext &ctx,
+                 cir::FuncOp callee) const override {
+    // None of these functions returns a pointer or an aggregate holding one.
+    if (site.result || site.resultSlots)
+      return false;
+    SmallVector<unsigned, 1> written;
+    if (hasSRet(callee))
+      if (std::optional<Cell> result = ModelContext::getArg(site, 0)) {
+        // A range: no pointer slots (getPointerSlotOffsets is empty); were
+        // there any, they would get fresh runtime objects.
+        setRuntimeInternals(site, ctx, 0, *result);
+        ctx.modRef(result, /*mod=*/true, /*ref=*/false);
+        written.push_back(0);
+      }
+    refOperands(site, ctx, written);
+    return true;
+  }
+};
+
+/// buffer.set_final_data: set_final_data(T *finalData) or (nullptr).
+///
+/// SPEC (api:buffer-set-final-data, PI 5770-5786): "finalData points to where
+/// the outcome of all the buffer processing is going to be copied to at
+/// destruction time"; "a raw pointer is a special case of output iterator and
+/// thus defines the host memory to which the result is to be copied"; with
+/// std::nullptr_t "the copy back will not happen". So the runtime keeps the
+/// pointer only to write the storage's contents through it when the buffer
+/// is destroyed (sec:buf-sync-rules, PI 6086). That is modelled, not an
+/// escape: the destination becomes the storage's `$final` ghost, gets Mod
+/// (the write-back), and its contents are related to the storage's (a copy,
+/// like the host_ptr constructor's); the buffer.dtor call reaches it through
+/// the ghost links. nullptr only cancels a write-back: no pointer effect (the
+/// destructor model keeps assuming the `$host` write-back, conservatively).
+class SetFinalDataModel : public RoleModel {
+public:
+  using RoleModel::RoleModel;
+
+protected:
+  bool applyRole(CallSiteRecord &site, ModelContext &ctx,
+                 cir::FuncOp callee) const override {
+    if (site.result || site.resultSlots)
+      return false;
+    unsigned self = hasSRet(callee) ? 1 : 0;
+    std::optional<Cell> handle = ModelContext::getArg(site, self);
+    if (!handle)
+      return false;
+    SmallVector<unsigned, 2> done;
+    if (std::optional<Cell> dest = ModelContext::getArg(site, self + 1)) {
+      Graph &graph = ctx.getGraph();
+      const Reason *why =
+          ctx.makeReason(site, Reason::Kind::MergedAt,
+                         (role + ": the write-back destination").str());
+      Cell storage = graph.getGhostLink(*handle, getSYCLStorageField(), why);
+      graph.setGhostLink(storage, getSYCLFinalField(), *dest, why);
+      ctx.modRef(dest, /*mod=*/true, /*ref=*/false);
+      ctx.addMemTransfer(site, *dest, storage, std::nullopt,
+                         /*ghosts=*/false);
+      done.push_back(self + 1);
+    }
+    refOperands(site, ctx, done);
+    return true;
+  }
 };
 
 /// The explicit memory commands of the queue and the handler.
@@ -1133,6 +1239,27 @@ void cir::registerSYCLPointsToModels(PointsToModelRegistry &registry) {
                             "accessor.dtor",
                             "SYCL 2020 sec:reference-semantics (PI 295-330)",
                             /*isBuffer=*/false));
+  registry.addRoleModel(
+      "buffer.host_access",
+      std::make_unique<ShareStorageModel>(
+          "buffer.host_access",
+          "SYCL 2020 api:buffer-get-access (4) (PI 5734-5735), "
+          "table.accessors.host.buffer.constructors (PI 9089ff)",
+          Shape::ResultFromThis, /*returnsThis=*/false, /*syncsHost=*/true));
+  registry.addRoleModel(
+      "buffer.set_write_back",
+      std::make_unique<NoPointerEffectModel>(
+          "buffer.set_write_back",
+          "SYCL 2020 api:buffer-set-write-back (PI 5789-5799)"));
+  registry.addRoleModel(
+      "buffer.set_final_data",
+      std::make_unique<SetFinalDataModel>(
+          "buffer.set_final_data",
+          "SYCL 2020 api:buffer-set-final-data (PI 5770-5786)"));
+  registry.addRoleModel(
+      "buffer.query",
+      std::make_unique<NoPointerEffectModel>(
+          "buffer.query", "SYCL 2020 sec:buffer-member-funcs (PI 5638-5810)"));
   // vector.data is not modelled: its body is analysed, so a host pointer
   // reaches the vector's storage.
 

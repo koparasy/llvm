@@ -1408,9 +1408,25 @@ void LocalBuilder::visitAtomic(Operation *op, Value addrValue, Value stored,
 void LocalBuilder::visitCall(CIRCallOpInterface op) {
   CallSiteRecord site;
   site.call = op;
-  if (op.isIndirect())
+  if (op.isIndirect()) {
     site.calleePtr = cellFor(op.getIndirectCall());
-  else
+    // A virtual call: the callee is a slot of the vtable an object's vptr
+    // points to.
+    auto slot = op.getIndirectCall().getDefiningOp<cir::LoadOp>();
+    auto fnAddr =
+        slot ? slot.getAddr().getDefiningOp<cir::VTableGetVirtualFnAddrOp>()
+             : cir::VTableGetVirtualFnAddrOp();
+    auto vptr =
+        fnAddr ? fnAddr.getVptr().getDefiningOp<cir::LoadOp>() : cir::LoadOp();
+    auto getVPtr = vptr ? vptr.getAddr().getDefiningOp<cir::VTableGetVPtrOp>()
+                        : cir::VTableGetVPtrOp();
+    if (getVPtr)
+      if (std::optional<Cell> holder = cellFor(getVPtr.getSrc())) {
+        site.vptrHolder = holder;
+        site.vtableSlot = static_cast<int64_t>(fnAddr.getIndex()) *
+                          fg->getGraph().getPointerSize();
+      }
+  } else
     site.callee = op->getAttrOfType<FlatSymbolRefAttr>("callee");
   for (unsigned i = 0, e = op.getNumArgOperands(); i != e; ++i) {
     Value arg = op.getArgOperand(i);

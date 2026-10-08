@@ -45,7 +45,11 @@
 //       only function origins and is neither External, Incomplete nor
 //       UnknownObj calls exactly those functions: each new target with a
 //       body is bound like a direct call, each declaration gets its model or
-//       the unknown-call rule. Any other callee node gets the unknown-call
+//       the unknown-call rule. A virtual call on an object no unknown code
+//       reached (neither External, Incomplete nor UnknownObj) whose vptr
+//       points only into constant vtables defined here calls the functions
+//       of their slot, whatever the slot node's flags
+//       (getVirtualCallTargets). Any other callee node gets the unknown-call
 //       rule (Reason IndirectUnresolved). Binding merges nodes and so can
 //       give other callee nodes more targets; the copy closure reruns after
 //       every round that bound something. A round is one pass over the
@@ -616,6 +620,14 @@ public:
   /// Whether \p func is in a recursive call-graph SCC.
   bool isRecursive(cir::FuncOp func) const;
 
+  /// The targets of the virtual call \p site (CallSiteRecord::vptrHolder)
+  /// read from the vtables its object's vptr may point to, or std::nullopt
+  /// if that rule does not apply: the object is not one only analysed code
+  /// accessed, or its vptr may point to something but a vtable defined here
+  /// (see resolveIndirectRound for the soundness argument).
+  std::optional<llvm::SmallVector<mlir::FlatSymbolRefAttr, 2>>
+  getVirtualCallTargets(const CallSiteRecord &site) const;
+
   /// The kernel launches the models recorded, their cells in the TU graph,
   /// in function processing order. BU mode: the records that together stand
   /// for every execution of each launch: a record in the graph of a
@@ -867,6 +879,9 @@ private:
   std::unique_ptr<PointsToModelRegistry> ownedModels;
   PointsToAnalysisOptions options;
   mlir::SymbolTableCollection symbols;
+  /// Whether a global is a constant with a #cir.vtable initializer, by name
+  /// (getVirtualCallTargets).
+  mutable llvm::DenseMap<mlir::Attribute, bool> constantVTables;
   ReasonTable reasons;
   std::unique_ptr<Graph> graph;
   std::unique_ptr<mlir::DataLayout> dataLayout;

@@ -180,6 +180,13 @@ struct CallSiteRecord {
   /// The cell of the callee pointer of an indirect call; std::nullopt for a
   /// direct call (or an indirect call through a null pointer).
   std::optional<Cell> calleePtr;
+  /// A virtual call: the callee was loaded from the slot `vtableSlot` bytes
+  /// past the address point the vptr of an object holds (cir.vtable.get_vptr,
+  /// load, cir.vtable.get_virtual_fn_addr, load). The cell of that object;
+  /// PointsToAnalysis::getVirtualCallTargets resolves the call from the
+  /// vtables it may point to.
+  std::optional<Cell> vptrHolder;
+  int64_t vtableSlot = 0;
   /// One entry per argument operand (the indirect callee excluded): the cell
   /// of a pointer argument, std::nullopt for a non-pointer or null argument.
   llvm::SmallVector<std::optional<Cell>, 4> args;

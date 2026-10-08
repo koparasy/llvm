@@ -984,9 +984,10 @@ module attributes {cir.offload.container} {
 // CHECK: no-alias-note B: buffer 'b2' is not constructed exactly once
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// The assignment unifies the two storages: one node, two allocations.
+// The assignment unifies the two storages: one node, two allocations, so A
+// and B are the same memory.
 // IPO-NOT: no-alias A
-// IPO: no-alias-note B: accessor 'B': {{n[0-9]+}} merges 2 allocations
+// IPO: no-alias-note B: 'B' and 'A' use the same memory, memory {{n[0-9]+}} [2 objects merged into one node]
 
 // -----
 // LOCAL ACCESSOR: work-group local memory is not a candidate.

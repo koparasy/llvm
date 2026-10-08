@@ -426,6 +426,8 @@ void PointsToAnalysis::cloneCallee(TUCallSite &call, TUFunction &owner,
   auto addSite = [&](const CallSiteRecord &site) {
     if (site.calleePtr)
       roots.push_back(*site.calleePtr);
+    if (site.vptrHolder)
+      roots.push_back(*site.vptrHolder);
     for (const std::optional<Cell> &arg : site.args)
       if (arg)
         roots.push_back(*arg);
@@ -515,6 +517,7 @@ void PointsToAnalysis::cloneCallee(TUCallSite &call, TUFunction &owner,
     auto copy = std::make_unique<TUCallSite>(*site);
     CallSiteRecord &rec = copy->site;
     mapOpt(rec.calleePtr);
+    mapOpt(rec.vptrHolder);
     for (std::optional<Cell> &arg : rec.args)
       mapOpt(arg);
     mapOpt(rec.result);

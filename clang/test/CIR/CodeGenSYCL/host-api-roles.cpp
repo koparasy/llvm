@@ -37,6 +37,13 @@ public:
   template <typename U> buffer<U, D> reinterpret(range<D> r) const;
   accessor<T, D> get_access(handler &h);
   range<D> get_range() const;
+  unsigned long size() const noexcept;
+  template <typename P> bool has_property() const noexcept;
+  template <typename P> P get_property() const;
+  void set_write_back(bool flag = true);
+  template <typename Dest> void set_final_data(Dest finalData);
+  void set_final_data(decltype(nullptr));
+  template <typename... Ts> int get_host_access(Ts... args);
   ~buffer();
 };
 template <typename T, int D> class accessor {
@@ -85,11 +92,22 @@ public:
 // CHECK-DAG: cir.func {{.*}}@_ZN4sycl3_V18accessorIfLi1EEaSERKS2_({{.*}} attributes {cir.sycl_host_api = "accessor.assign", cir.sycl_host_api_arg = 0 : i32
 // CHECK-DAG: cir.func {{.*}}@_ZNSt6vectorIfE4dataEv({{.*}} attributes {cir.sycl_host_api = "vector.data", cir.sycl_host_api_arg = 0 : i32
 
-// Neither another class's methods nor a same-named class elsewhere are tagged.
+// The buffer members with no pointer effect, the set_final_data forms with a
+// pointer or nullptr destination, and get_host_access.
+// CHECK-DAG: cir.func {{.*}}@_ZNK4sycl3_V16bufferIfLi1EE9get_rangeEv({{.*}} attributes {cir.sycl_host_api = "buffer.query", cir.sycl_host_api_arg = 0 : i32
+// CHECK-DAG: cir.func {{.*}}@_ZNK4sycl3_V16bufferIfLi1EE4sizeEv({{.*}} attributes {cir.sycl_host_api = "buffer.query", cir.sycl_host_api_arg = 0 : i32
+// CHECK-DAG: cir.func {{.*}}@_ZNK4sycl3_V16bufferIfLi1EE12has_propertyIiEEbv({{.*}} attributes {cir.sycl_host_api = "buffer.query", cir.sycl_host_api_arg = 0 : i32
+// CHECK-DAG: cir.func {{.*}}@_ZN4sycl3_V16bufferIfLi1EE14set_write_backEb({{.*}} attributes {cir.sycl_host_api = "buffer.set_write_back", cir.sycl_host_api_arg = 0 : i32
+// CHECK-DAG: cir.func {{.*}}@_ZN4sycl3_V16bufferIfLi1EE14set_final_dataIPfEEvT_({{.*}} attributes {cir.sycl_host_api = "buffer.set_final_data", cir.sycl_host_api_arg = 0 : i32
+// CHECK-DAG: cir.func {{.*}}@_ZN4sycl3_V16bufferIfLi1EE14set_final_dataEDn({{.*}} attributes {cir.sycl_host_api = "buffer.set_final_data", cir.sycl_host_api_arg = 0 : i32
+// CHECK-DAG: cir.func {{.*}}@_ZN4sycl3_V16bufferIfLi1EE15get_host_accessIJEEEiDpT_({{.*}} attributes {cir.sycl_host_api = "buffer.host_access", cir.sycl_host_api_arg = 0 : i32
+// Neither another class's methods nor a same-named class elsewhere are tagged,
+// nor get_property (a property may hold a pointer the constructor was given),
+// nor set_final_data with another destination (it keeps a copy of it).
+// CHECK-DAG: cir.func {{.*}}@_ZNK4sycl3_V16bufferIfLi1EE12get_propertyIiEET_v({{.*}}) attributes {"cir.target-features"
+// CHECK-DAG: cir.func {{.*}}@_ZN4sycl3_V16bufferIfLi1EE14set_final_dataIiEEvT_({{.*}}) attributes {"cir.target-features"
 // CHECK-DAG: cir.func {{.*}}@_ZNSt6vectorIfE5beginEv(
 // CHECK-NOT: @_ZNSt6vectorIfE5beginEv(
-// CHECK-DAG: cir.func {{.*}}@_ZNK4sycl3_V16bufferIfLi1EE9get_rangeEv(
-// CHECK-NOT: @_ZNK4sycl3_V16bufferIfLi1EE9get_rangeEv(
 // CHECK-DAG: cir.func {{.*}}@_ZN5other6bufferIfLi1EEC1ERKN4sycl3_V15rangeILi1EEE(
 // CHECK-NOT: @_ZN5other6bufferIfLi1EEC1ERKN4sycl3_V15rangeILi1EEE(
 // The destructors are declared last; another class's is not tagged.
@@ -119,6 +137,14 @@ void use(sycl::handler &h, std::vector<float> &v, int n) {
   sycl::local_accessor<float, 1> la(r, h);
   (void)v.begin();
   (void)a.get_range();
+  (void)a.size();
+  (void)a.has_property<int>();
+  (void)a.get_property<int>();
+  a.set_write_back(false);
+  a.set_final_data(v.data());
+  a.set_final_data(nullptr);
+  a.set_final_data(n);
+  (void)a.get_host_access();
   other::buffer<float, 1> ob(r);
 }
 

@@ -647,6 +647,7 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
     call.site = local;
     CallSiteRecord &site = call.site;
     site.calleePtr = mapOpt(local.calleePtr);
+    site.vptrHolder = mapOpt(local.vptrHolder);
     for (std::optional<Cell> &arg : site.args)
       arg = mapOpt(arg);
     site.result = mapOpt(local.result);
@@ -857,6 +858,7 @@ bool PointsToAnalysis::resolveIndirectRound(
     // nothing an unknown caller could have passed in (Incomplete).
     const Node *callee = call.site.calleePtr->getNode();
     NodeFlags flags = callee->getFlags();
+    SmallVector<FlatSymbolRefAttr, 2> candidates;
     if (hasAny(flags, NodeFlags::UnknownObj))
       decision.unresolved = "callee may be an unknown object";
     else if (hasAny(flags, NodeFlags::External))
@@ -868,7 +870,19 @@ bool PointsToAnalysis::resolveIndirectRound(
                       isa_and_present<FlatSymbolRefAttr>(origin.sym);
              }))
       decision.unresolved = "callee may point to something not a function";
-    else if (callee->getOrigins().empty()) {
+    else
+      for (const Origin &origin : callee->getOrigins())
+        candidates.push_back(cast<FlatSymbolRefAttr>(origin.sym));
+    // A virtual call on an object only analysed code accessed: its targets
+    // are in the vtables it may point to, whatever the slot node stands for
+    // in other graphs (see getVirtualCallTargets).
+    if (!decision.unresolved.empty())
+      if (std::optional<SmallVector<FlatSymbolRefAttr, 2>> virtualTargets =
+              getVirtualCallTargets(call.site)) {
+        decision.unresolved = StringRef();
+        candidates = std::move(*virtualTargets);
+      }
+    if (decision.unresolved.empty() && candidates.empty()) {
       // Nothing seen yet: a later round may store a function there. When
       // nothing else changes any more, it never will.
       if (!finalize)
@@ -876,8 +890,7 @@ bool PointsToAnalysis::resolveIndirectRound(
       decision.unresolved = "no target seen";
     }
     if (decision.unresolved.empty()) {
-      for (const Origin &origin : callee->getOrigins()) {
-        auto sym = cast<FlatSymbolRefAttr>(origin.sym);
+      for (FlatSymbolRefAttr sym : candidates) {
         if (!llvm::is_contained(call.targets, sym) &&
             !llvm::is_contained(decision.newTargets, sym))
           decision.newTargets.push_back(sym);
@@ -953,6 +966,90 @@ bool PointsToAnalysis::resolveIndirectRound(
   if (bindsThisRound)
     bound = true;
   return true;
+}
+
+std::optional<SmallVector<FlatSymbolRefAttr, 2>>
+PointsToAnalysis::getVirtualCallTargets(const CallSiteRecord &site) const {
+  // SOUNDNESS (T20a). The callee of a virtual call is the function in slot
+  // `vtableSlot` of the vtable the vptr of the object `vptrHolder` points
+  // into. The callee node itself may stand for more than that object's
+  // targets: the slot node of a vtable is shared by every graph (globals are
+  // shared nodes in BU), and a graph in which an unknown object's vptr was
+  // unified with it (an object an unknown caller passed in, whose vptr may
+  // point to any vtable) makes it Incomplete for every graph. When the
+  // object itself is one only analysed code accessed, its vptr is known
+  // without that node's flags:
+  //  - the object is not UnknownObj, External (code we don't see may have
+  //    written it) or Incomplete (an unknown caller may have passed it, or
+  //    it is reachable from such an object), so every value stored in it was
+  //    stored by analysed code, which this graph sees (for a copy, in this
+  //    calling context);
+  //  - by the C++ object model the vptr of a polymorphic object is written
+  //    only by the constructors and destructors of its class and its bases,
+  //    with the address points of the vtables (cir.vtable.address_point, or
+  //    an entry of a VTT, itself constant) of those classes; it is never
+  //    copied from another object (a polymorphic class is not trivially
+  //    copyable, so a byte copy of one is undefined). Each such store
+  //    unifies the stored cell with the vptr's target, so that node's
+  //    origins include every vtable the vptr may point into;
+  //  - if all of its origins are constant globals with a #cir.vtable
+  //    initializer, the vptr points into one of them, at an address point
+  //    (the stores unified those, so a slot is at the same offset from the
+  //    cell in each);
+  //  - a vtable is constant (writing it is undefined), so its slot holds the
+  //    function its initializer names, which GlobalNodes linked to the slot,
+  //    and unification only adds origins: the FuncSym origins of the slot
+  //    node include the callee.
+  // Anything else (another origin, an unknown object, a slot that may hold
+  // something not a function) and the rule does not apply.
+  if (!site.vptrHolder)
+    return std::nullopt;
+  const Node *holder = site.vptrHolder->getNode();
+  if (hasAny(holder->getFlags(), NodeFlags::UnknownObj | NodeFlags::External |
+                                     NodeFlags::Incomplete))
+    return std::nullopt;
+  std::optional<Cell> vptr = graph->lookupLink(*site.vptrHolder);
+  if (!vptr)
+    return std::nullopt;
+  const Node *vtable = vptr->getNode();
+  if (hasAny(vtable->getFlags(), NodeFlags::UnknownObj) ||
+      vtable->getOrigins().empty())
+    return std::nullopt;
+  for (const Origin &origin : vtable->getOrigins()) {
+    auto sym = dyn_cast_if_present<FlatSymbolRefAttr>(origin.sym);
+    if (origin.kind != Origin::Kind::GlobalSym || !sym)
+      return std::nullopt;
+    auto [it, inserted] = constantVTables.try_emplace(sym.getAttr(), false);
+    if (inserted) {
+      ModuleOp scope = module;
+      auto global = SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
+          scope.getOperation(), sym);
+      std::optional<Attribute> init = global && !global.isDeclaration()
+                                          ? global.getInitialValue()
+                                          : std::nullopt;
+      it->second =
+          global && global.getConstant() && init && isa<cir::VTableAttr>(*init);
+    }
+    if (!it->second)
+      return std::nullopt;
+  }
+  SmallVector<FlatSymbolRefAttr, 2> targets;
+  Cell at = vptr->resolve();
+  std::optional<Cell> slot = graph->lookupLink(
+      Cell(at.getRawNode(), at.getRawOffset() + site.vtableSlot));
+  if (!slot)
+    return targets; // A pure virtual or deleted slot: calling it is UB.
+  const Node *function = slot->getNode();
+  if (hasAny(function->getFlags(), NodeFlags::UnknownObj))
+    return std::nullopt;
+  for (const Origin &origin : function->getOrigins()) {
+    auto sym = dyn_cast_if_present<FlatSymbolRefAttr>(origin.sym);
+    if (origin.kind != Origin::Kind::FuncSym || !sym)
+      return std::nullopt;
+    if (!llvm::is_contained(targets, sym))
+      targets.push_back(sym);
+  }
+  return targets;
 }
 
 void PointsToAnalysis::applyDeclarationTarget(TUCallSite &call,

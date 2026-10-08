@@ -1,0 +1,155 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// The gemm shape of virtual-shared-ptr.cir (make_shared's control block,
+// released through the vtable) in the bottom-up mode, with code we don't
+// see in the TU: @main also calls a function pointer @get_callback returns,
+// an unresolved call whose target is unknown. That call may reach every
+// function in a vtable another TU can name (an object built in another TU
+// may point to our copy of it), so T13b's third rule in markEscapedFunctions
+// gives those functions Incomplete formals, rightly, under closed-TU too.
+// Among them is the destructor, which stores its vtable's address point into
+// `this`'s vptr (as CIRGen's implicit destructors do), so in its own graph
+// the Incomplete `this` links to the vtable, and the one (shared) vtable node
+// and its slots become Incomplete in every graph. Before T20a every virtual
+// call through that vtable was then unresolved, also in main's copy of
+// _M_release, where the control block is main's own object, and the control
+// block (gemm: with the buffer in it) escaped through those calls. Now a
+// virtual call on an object only analysed code accessed is resolved from the
+// vtables its vptr may point into (getVirtualCallTargets): main's copies
+// resolve, and the control block stays complete. The vtable's functions keep
+// their Incomplete formals, and a function pointer in an ordinary global
+// another TU can name (@callbacks) still makes its target (@leaf) escape.
+
+// The control block is not External.
+// CHECK-LABEL: === TU graph
+// CHECK: [[CB:n[0-9]+]] [Heap|Mod|Ref] size=64 origins={heap(cir.call
+// CHECK: === @[[DISPOSE:_ZNSt23_Sp_counted_ptr_inplace.*10_M_disposeEv]] formals=incomplete
+// CHECK: === @[[DESTROY:_ZNSt23_Sp_counted_ptr_inplace.*10_M_destroyEv]] formals=incomplete
+// CHECK: === @leaf formals=incomplete
+// CHECK: @main cb -> [[CB]]+0 complete
+// CHECK-LABEL: === inherited calls
+// CHECK-NOT: indirect-unresolved
+// CHECK: @main cir.call in @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_releaseEv prefix=#{{[0-9]+}} -> indirect -> {@[[DISPOSE]]}
+// CHECK-NOT: indirect-unresolved
+// CHECK: @main cir.call in @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_releaseEv prefix=#{{[0-9]+}} -> indirect -> {@_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_destroyEv, @[[DESTROY]]}
+// CHECK-NOT: indirect-unresolved
+// CHECK: @main cir.call in @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_destroyEv prefix=#{{[0-9]+}} -> indirect -> {@_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EED0Ev}
+// CHECK-LABEL: === contexts
+
+!s32i = !cir.int<s, 32>
+!u8i = !cir.int<u, 8>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_base = !cir.struct<class "std::_Sp_counted_base<__gnu_cxx::_S_atomic>" {data !cir.vptr, data !s32i, data !s32i}>
+!rec_impl = !cir.struct<class "std::_Sp_counted_ptr_inplace<...>::_Impl" {data !cir.array<!u8i x 48>}>
+!rec_inplace = !cir.struct<class "std::_Sp_counted_ptr_inplace<...>" {data !rec_base, data !rec_impl}>
+!rec_vt = !cir.struct<{data !cir.array<!cir.ptr<!u8i> x 7>}>
+!vfn = !cir.func<(!cir.ptr<!rec_base>)>
+
+module {
+cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+cir.func private @_ZdlPv(!cir.ptr<!void>)
+cir.func private @__cxa_pure_virtual()
+// The base destructors are defined here, as in gemm.
+cir.func linkonce_odr @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EED2Ev(%this: !cir.ptr<!rec_base>) {
+  cir.return
+}
+cir.func linkonce_odr @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EED0Ev(%this: !cir.ptr<!rec_base>) {
+  cir.call @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EED2Ev(%this) : (!cir.ptr<!rec_base>) -> ()
+  %p = cir.cast bitcast %this : !cir.ptr<!rec_base> -> !cir.ptr<!void>
+  cir.call @_ZdlPv(%p) : (!cir.ptr<!void>) -> ()
+  cir.return
+}
+
+cir.global "private" constant linkonce_odr @_ZTVSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE = #cir.vtable<{#cir.const_array<[#cir.ptr<null> : !cir.ptr<!u8i>, #cir.ptr<null> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EED2Ev> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EED0Ev> : !cir.ptr<!u8i>, #cir.global_view<@__cxa_pure_virtual> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_destroyEv> : !cir.ptr<!u8i>, #cir.global_view<@__cxa_pure_virtual> : !cir.ptr<!u8i>]> : !cir.array<!cir.ptr<!u8i> x 7>}> : !rec_vt
+cir.global "private" constant linkonce_odr @_ZTVSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE = #cir.vtable<{#cir.const_array<[#cir.ptr<null> : !cir.ptr<!u8i>, #cir.ptr<null> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EED2Ev> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EED0Ev> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE10_M_disposeEv> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE10_M_destroyEv> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE14_M_get_deleterERKSt9type_info> : !cir.ptr<!u8i>]> : !cir.array<!cir.ptr<!u8i> x 7>}> : !rec_vt
+
+// _Sp_counted_base::_Sp_counted_base(): vptr = base vtable, counts = 1.
+cir.func linkonce_odr @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EEC2Ev(%this: !cir.ptr<!rec_base>) {
+  %vp = cir.vtable.address_point(@_ZTVSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE, address_point = <index = 0, offset = 2>) : !cir.vptr
+  %slot = cir.vtable.get_vptr %this : !cir.ptr<!rec_base> -> !cir.ptr<!cir.vptr>
+  cir.store %vp, %slot : !cir.vptr, !cir.ptr<!cir.vptr>
+  %one = cir.const #cir.int<1> : !s32i
+  %use = cir.get_member %this[1] {name = "_M_use_count"} : !cir.ptr<!rec_base> -> !cir.ptr<!s32i>
+  cir.store %one, %use : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+// _Sp_counted_base::_M_destroy(): delete this, through the virtual deleting
+// destructor (slot 1 after the address point).
+cir.func linkonce_odr @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_destroyEv(%this: !cir.ptr<!rec_base>) {
+  %s = cir.vtable.get_vptr %this : !cir.ptr<!rec_base> -> !cir.ptr<!cir.vptr>
+  %v = cir.load %s : !cir.ptr<!cir.vptr>, !cir.vptr
+  %a = cir.vtable.get_virtual_fn_addr %v[1] : !cir.vptr -> !cir.ptr<!cir.ptr<!vfn>>
+  %f = cir.load %a : !cir.ptr<!cir.ptr<!vfn>>, !cir.ptr<!vfn>
+  cir.call %f(%this) : (!cir.ptr<!vfn>, !cir.ptr<!rec_base>) -> ()
+  cir.return
+}
+// _Sp_counted_base::_M_release(): the two virtual calls.
+cir.func linkonce_odr @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_releaseEv(%this: !cir.ptr<!rec_base>) {
+  %s1 = cir.vtable.get_vptr %this : !cir.ptr<!rec_base> -> !cir.ptr<!cir.vptr>
+  %v1 = cir.load %s1 : !cir.ptr<!cir.vptr>, !cir.vptr
+  %a1 = cir.vtable.get_virtual_fn_addr %v1[2] : !cir.vptr -> !cir.ptr<!cir.ptr<!vfn>>
+  %f1 = cir.load %a1 : !cir.ptr<!cir.ptr<!vfn>>, !cir.ptr<!vfn>
+  cir.call %f1(%this) : (!cir.ptr<!vfn>, !cir.ptr<!rec_base>) -> ()
+  %s2 = cir.vtable.get_vptr %this : !cir.ptr<!rec_base> -> !cir.ptr<!cir.vptr>
+  %v2 = cir.load %s2 : !cir.ptr<!cir.vptr>, !cir.vptr
+  %a2 = cir.vtable.get_virtual_fn_addr %v2[3] : !cir.vptr -> !cir.ptr<!cir.ptr<!vfn>>
+  %f2 = cir.load %a2 : !cir.ptr<!cir.ptr<!vfn>>, !cir.ptr<!vfn>
+  cir.call %f2(%this) : (!cir.ptr<!vfn>, !cir.ptr<!rec_base>) -> ()
+  cir.return
+}
+// _Sp_counted_ptr_inplace::_Sp_counted_ptr_inplace(...): base ctor, then
+// its own vptr.
+cir.func linkonce_odr @_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EEC2Ev(%this: !cir.ptr<!rec_inplace>) {
+  %base = cir.base_class_addr nonnull %this [0] : !cir.ptr<!rec_inplace> -> !cir.ptr<!rec_base>
+  cir.call @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EEC2Ev(%base) : (!cir.ptr<!rec_base>) -> ()
+  %vp = cir.vtable.address_point(@_ZTVSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE, address_point = <index = 0, offset = 2>) : !cir.vptr
+  %slot = cir.vtable.get_vptr %this : !cir.ptr<!rec_inplace> -> !cir.ptr<!cir.vptr>
+  cir.store %vp, %slot : !cir.vptr, !cir.ptr<!cir.vptr>
+  cir.return
+}
+// _Sp_counted_ptr_inplace::~_Sp_counted_ptr_inplace(): like CIRGen's
+// implicit destructors, it stores its own vtable's address point into the
+// vptr first, so its `this` links to the vtable in its own graph.
+cir.func linkonce_odr @_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EED2Ev(%this: !cir.ptr<!rec_base>) {
+  %vp = cir.vtable.address_point(@_ZTVSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE, address_point = <index = 0, offset = 2>) : !cir.vptr
+  %slot = cir.vtable.get_vptr %this : !cir.ptr<!rec_base> -> !cir.ptr<!cir.vptr>
+  cir.store %vp, %slot : !cir.vptr, !cir.ptr<!cir.vptr>
+  cir.call @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EED2Ev(%this) : (!cir.ptr<!rec_base>) -> ()
+  cir.return
+}
+// _Sp_counted_ptr_inplace::_M_dispose(): reads the stored object.
+cir.func linkonce_odr @_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE10_M_disposeEv(%this: !cir.ptr<!rec_base>) {
+  %d = cir.cast bitcast %this : !cir.ptr<!rec_base> -> !cir.ptr<!rec_inplace>
+  %impl = cir.get_member %d[1] {name = "_M_impl"} : !cir.ptr<!rec_inplace> -> !cir.ptr<!rec_impl>
+  %b = cir.cast bitcast %impl : !cir.ptr<!rec_impl> -> !cir.ptr<!u8i>
+  %v = cir.load %b : !cir.ptr<!u8i>, !u8i
+  cir.return
+}
+// _Sp_counted_ptr_inplace::_M_get_deleter(const type_info&) (reduced).
+cir.func linkonce_odr @_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE14_M_get_deleterERKSt9type_info(%this: !cir.ptr<!rec_base>) {
+  cir.return
+}
+// _Sp_counted_ptr_inplace::_M_destroy(): delete this.
+cir.func linkonce_odr @_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EE10_M_destroyEv(%this: !cir.ptr<!rec_base>) {
+  %p = cir.cast bitcast %this : !cir.ptr<!rec_base> -> !cir.ptr<!void>
+  cir.call @_ZdlPv(%p) : (!cir.ptr<!void>) -> ()
+  cir.return
+}
+cir.func private @_Z12get_callbackv() -> !cir.ptr<!cir.func<()>>
+cir.func linkonce_odr @leaf(%p: !cir.ptr<!u8i>) {
+  cir.return
+}
+cir.global external @callbacks = #cir.global_view<@leaf> : !cir.ptr<!cir.func<(!cir.ptr<!u8i>)>>
+cir.func @main() {
+  %size = cir.const #cir.int<64> : !u64i
+  %mem = cir.call @_Znwm(%size) : (!u64i) -> !cir.ptr<!void>
+  %cb = cir.cast bitcast %mem : !cir.ptr<!void> -> !cir.ptr<!rec_inplace> {test.ptr = "cb"}
+  cir.call @_ZNSt23_Sp_counted_ptr_inplaceIN4sycl3_V16bufferIfLi2ENS1_6detail17aligned_allocatorIfEEvEESaIvELN9__gnu_cxx12_Lock_policyE2EEC2Ev(%cb) : (!cir.ptr<!rec_inplace>) -> ()
+  %base = cir.base_class_addr nonnull %cb [0] : !cir.ptr<!rec_inplace> -> !cir.ptr<!rec_base>
+  cir.call @_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_releaseEv(%base) : (!cir.ptr<!rec_base>) -> ()
+  %f = cir.call @_Z12get_callbackv() : () -> !cir.ptr<!cir.func<()>>
+  cir.call %f() : (!cir.ptr<!cir.func<()>>) -> ()
+  cir.return
+}
+}

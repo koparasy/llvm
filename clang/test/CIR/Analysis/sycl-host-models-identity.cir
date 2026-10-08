@@ -1011,11 +1011,11 @@ module attributes {cir.offload.container} {
 // LEGACY-NOT: no-alias A
 // LEGACY: no-alias-note B: buffer 'b2' is not constructed exactly once
 // Agree (not no-alias). Points-to: the assignment unifies b2's storage with
-// b1's (two allocations in one node); legacy: b2 is not constructed exactly
-// once.
+// b1's (two allocations in one node, so A and B are the same memory);
+// legacy: b2 is not constructed exactly once.
 // PT-LABEL: === launches
-// PT: field A accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=2 host=none unknown (accessor 'A': {{n[0-9]+}} merges 2 allocations (sycl-host-models-identity.cir:{{[0-9]+}}, sycl-host-models-identity.cir:{{[0-9]+}}))
-// PT-NEXT: field B accessor storage={{n[0-9]+}}+0 [Ghost|External|Summary|Ref] origins=2 host=none unknown (accessor 'B': {{n[0-9]+}} merges 2 allocations (sycl-host-models-identity.cir:{{[0-9]+}}, sycl-host-models-identity.cir:{{[0-9]+}}))
+// PT: field A accessor storage=[[AB:n[0-9]+]]+0 [Ghost|External|Summary|Ref] origins=2 host=none complete
+// PT-NEXT: field B accessor storage=[[AB]]+0 [Ghost|External|Summary|Ref] origins=2 host=none complete
 // PT-NEXT: same A B
 // PT-NEXT: no-alias{{$}}
 // PT-NEXT: kernel _ZTSZ4mainEUlvE_: no-alias{{$}}

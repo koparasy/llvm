@@ -20,6 +20,8 @@
 //    node has no origin, was not built by a model: its storage is unknown.
 //  - `$host` on a storage node: the host memory the runtime may use for it
 //    (buffer(hostData, ...)).
+//  - `$final` on a storage node: the memory buffer::set_final_data(T *) made
+//    the destructor's write-back destination.
 //  - `$kernel` on a detail::HostKernel(Ref) object: the kernel function
 //    object it wraps.
 //
@@ -51,6 +53,9 @@ namespace cir {
 pointsto::GhostField getSYCLStorageField();
 /// The ghost field a storage node's host memory is reached through.
 pointsto::GhostField getSYCLHostField();
+/// The ghost field a storage node's set_final_data destination is reached
+/// through.
+pointsto::GhostField getSYCLFinalField();
 /// The ghost field a HostKernel(Ref) object's kernel object is reached
 /// through.
 pointsto::GhostField getSYCLKernelField();

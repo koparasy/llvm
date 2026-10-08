@@ -1,5 +1,7 @@
 // RUN: cir-opt %s -test-cir-points-to-instrument='table=%t.table print-candidates=1' | FileCheck %s
 // RUN: FileCheck %s --check-prefix=TABLE --input-file=%t.table
+// RUN: FileCheck %s --check-prefix=MUST --input-file=%t.table
+// RUN: cir-opt %s -test-cir-points-to-instrument='must=0' | FileCheck %s --check-prefix=NOMUST
 
 // -test-cir-points-to-instrument inserts a call to __cir_pt_check before the
 // later access of every pair of accesses the points-to analysis calls
@@ -91,8 +93,8 @@ cir.func @memcpy_dyn(%src: !cir.ptr<!void>, %n: !u32i) {
 // TABLE: 5 @branches distinct-objects store(cir.alloca 'a'@{{.*}}) 4 | store(cir.alloca 'c'@{{.*}}) 4
 // TABLE: 6 @branches distinct-objects store(cir.alloca 'x'@{{.*}}) 4 | store(cir.alloca 'c'@{{.*}}) 4
 // TABLE: 7 @branches distinct-objects store(cir.alloca 'y'@{{.*}}) 4 | store(cir.alloca 'c'@{{.*}}) 4
-// TABLE: # functions 4 candidates 8 noalias 7 checks 7
-// TABLE: # rule distinct-objects 5
+// TABLE: # functions 5 candidates 24 noalias 19 checks 19 must 4 must-checks 3
+// TABLE: # rule distinct-objects 17
 // TABLE: # rule unescaped-object 2
 cir.func @branches(%cond: !cir.bool) {
   %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
@@ -107,6 +109,49 @@ cir.func @branches(%cond: !cir.bool) {
     cir.store %one, %y : !s32i, !cir.ptr<!s32i>
   }
   cir.store %one, %c : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+
+
+// MustAlias (must=1, the default): p and q are two loads of one pointer to
+// a. A later store through one gets cir.call @__cir_pt_check_must(p, q, id)
+// before it when an access through the other dominates it (pairs 14, 18,
+// 22). The two stores in the branches are MustAlias too, but neither
+// dominates the other: no check (candidate 23).
+// CHECK-LABEL: cir.func @must(
+// CHECK: cir.store %{{.*}}, %[[P:[0-9]+]] : !s32i
+// CHECK: %[[VP:.*]] = cir.cast bitcast %[[P]] : !cir.ptr<!s32i> -> !cir.ptr<!void>
+// CHECK-NEXT: %[[VQ:.*]] = cir.cast bitcast %[[Q:[0-9]+]] : !cir.ptr<!s32i> -> !cir.ptr<!void>
+// CHECK-NEXT: %[[ID:.*]] = cir.const #cir.int<14> : !u64i
+// CHECK-NEXT: cir.call @__cir_pt_check_must(%[[VP]], %[[VQ]], %[[ID]]) nothrow
+// CHECK-NEXT: cir.store %{{.*}}, %[[Q]] : !s32i
+// CHECK: cir.if
+// CHECK: cir.call @__cir_pt_check_must
+// CHECK-NEXT: cir.store
+// CHECK: } else {
+// CHECK: cir.call @__cir_pt_check_must
+// CHECK-NEXT: cir.store
+// CHECK: cir.return
+// MUST: cand 23 @must MustAlias same-address store(cir.load@{{.*}}) 4 | store(cir.load@{{.*}}) 4
+// MUST: 14 @must must same-address store(cir.load@{{.*}}) 4 | store(cir.load@{{.*}}) 4 at cir.store@{{.*}} | a, b: the same address of one object
+// MUST: # functions 5 candidates 24 noalias 19 checks 19 must 4 must-checks 3
+// MUST: # rule must same-address 3
+// With must=0, only the NoAlias pairs are checked.
+// NOMUST-NOT: __cir_pt_check_must
+cir.func @must(%cond: !cir.bool) {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %pa = cir.alloca "pa" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %pa : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %p = cir.load %pa : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %q = cir.load %pa : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %one = cir.const #cir.int<1> : !s32i
+  cir.store %one, %p : !s32i, !cir.ptr<!s32i>
+  cir.store %one, %q : !s32i, !cir.ptr<!s32i>
+  cir.if %cond {
+    cir.store %one, %p : !s32i, !cir.ptr<!s32i>
+  } else {
+    cir.store %one, %q : !s32i, !cir.ptr<!s32i>
+  }
   cir.return
 }
 

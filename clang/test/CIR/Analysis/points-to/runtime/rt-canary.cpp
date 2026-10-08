@@ -1,6 +1,7 @@
 // Negative control of the run-time points-to checks: p and q both point to
-// x. The analysis gets it right (MustAlias, so no check), and
-// inject-false-noalias forces a check on that pair as if it were NoAlias.
+// x. The analysis gets it right (MustAlias, checked as p == q), and
+// inject-false-noalias forces an overlap check on that pair as if it were
+// NoAlias.
 // The run must abort with PT-VIOLATION, which shows the harness catches a
 // wrong NoAlias. Without the injection the same program runs clean.
 //
@@ -11,8 +12,8 @@
 // Candidate 24 is the pair of stores *p = 1 and *q = 2.
 // RUN: cir-opt %t.cir -test-cir-points-to-instrument='table=%t.cand print-candidates=1' -o %t.plain.cir
 // RUN: FileCheck %s --check-prefix=CAND --input-file=%t.cand
-// CAND: cand 24 @main MustAlias same-address store(cir.load@rt-canary.cpp:{{[0-9]+}}:4) 4 | store(cir.load@rt-canary.cpp:{{[0-9]+}}:4) 4
-// CAND: # functions 1 candidates 49 noalias 44 checks 44
+// CAND: 24 @main must same-address store(cir.load@rt-canary.cpp:{{[0-9]+}}:4) 4 | store(cir.load@rt-canary.cpp:{{[0-9]+}}:4) 4
+// CAND: # functions 1 candidates 49 noalias 44 checks 44 must {{[0-9]+}} must-checks {{[1-9][0-9]*}}
 //
 // RUN: cir-translate --cir-to-llvmir %t.plain.cir -o %t.plain.ll
 // RUN: grep -v '^target datalayout' %t.plain.ll > %t.plain.fixed.ll
@@ -20,6 +21,7 @@
 // RUN: %t.plain.exe 2>&1 | FileCheck %s --check-prefix=CLEAN
 // CLEAN-NOT: PT-VIOLATION
 // CLEAN: PT-CHECKS 44
+// CLEAN: PT-MUST-CHECKS
 //
 // RUN: cir-opt %t.cir -test-cir-points-to-instrument='table=%t.table inject-false-noalias=24' -o %t.inject.cir
 // RUN: FileCheck %s --check-prefix=TABLE --input-file=%t.table

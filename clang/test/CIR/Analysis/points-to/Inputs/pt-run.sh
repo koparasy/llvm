@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run a C++ program with its points-to NoAlias facts checked at run time.
+# Run a C++ program with its points-to NoAlias (and MustAlias) facts checked
+# at run time.
 #
 #   pt-run.sh <file.cpp> <out-prefix> [instrument options...]
 #
@@ -46,7 +47,7 @@ fi
 "$out.exe" 2> "$out.stderr" > "$out.stdout"
 status=$?
 cat "$out.stderr" >&2
-id=$(sed -n 's/^PT-VIOLATION \([0-9]*\)$/\1/p' "$out.stderr")
+id=$(sed -n 's/^PT-\(MUST-\)\{0,1\}VIOLATION \([0-9]*\)$/\2/p' "$out.stderr")
 if [ -n "$id" ]; then
   echo "violated pair:" >&2
   grep "^$id " "$out.table" >&2

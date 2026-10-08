@@ -15,12 +15,16 @@
 //  - a pointer: the node the closure's pointer slot links to.
 //
 // Its identity is complete when:
-//  (a) every node of it is ONE allocation: exactly one origin, no UnknownObj
-//      flag. A storage must be made by buffer(range) or buffer(hostData,
-//      range) (buffer.alloc, buffer.host_ptr), whose model gives every call
-//      a fresh storage; buffer.other and accessor.other storage is not
-//      placed. A pointer target must be a heap or USM allocation. Host
-//      memory may also be a stack object or a global;
+//  (a) every node of it is made only by allocations of the right kind: at
+//      least one origin, each of that kind, and no UnknownObj flag. A
+//      storage must be made by buffer(range) or buffer(hostData, range)
+//      (buffer.alloc, buffer.host_ptr), whose model gives every call a fresh
+//      storage; buffer.other and accessor.other storage is not placed. A
+//      pointer target must be a heap or USM allocation. Host memory may also
+//      be a stack object or a global. A node with several origins (an
+//      allocation function that allocates at one of two sites, such as
+//      std::allocator's aligned and plain operator new) stands for objects
+//      made at any of them;
 //  (b) the pointer value the field holds can only be one the analysed code
 //      computed. With unification, the target of a slot stands for every
 //      value stored in any slot that links to it, so this holds if no slot
@@ -40,10 +44,12 @@
 // SOUNDNESS. Take two candidate fields f and g of a launch with complete,
 // distinct identities. By (b), the pointer values in the closure at the
 // launch are values the analysed code computed, and the analysis is sound
-// for those: the runtime value of f points into an object whose allocation
-// site is in f's node, and by (a) that is one site, Sf; likewise Sg for g.
-// The sites differ (the nodes differ, each site is one node), so the objects
-// are distinct allocations, whatever happened to their contents. In
+// for those: the runtime value of f points into an object allocated at one
+// of the sites of f's node, which by (a) are all allocations, the set Sf;
+// likewise Sg for g. The sets are disjoint (the nodes differ, and each site,
+// an origin with its calling context, is in one node; sameMemory also checks
+// the origins), so the objects are distinct allocations, whatever happened
+// to their contents. In
 // particular the device writes of other kernels, and of this one, do not
 // matter: the device cannot create allocations or change which allocation a
 // captured pointer value points into; the host fixed both values when it
@@ -320,7 +326,33 @@ std::optional<std::string> SYCLHostFacts::notOneAllocationWhy(const Node *node,
   ArrayRef<Origin> origins = node->getOrigins();
   if (origins.empty())
     return id + " has no allocation site the analysis sees";
-  if (origins.size() > 1) {
+  // Each origin must be an allocation of the kind the field needs. Several
+  // are fine (rule (a)): an allocation function that allocates at one of two
+  // sites, for instance std::allocator's aligned and plain operator new.
+  auto originWhy = [&](const Origin &origin) -> std::optional<std::string> {
+    if (storage) {
+      StringRef role = getRole(getDirectCallee(origin.site));
+      if (origin.kind != Origin::Kind::GhostSite ||
+          (role != "buffer.alloc" && role != "buffer.host_ptr"))
+        return ("the storage " + id + " is made by " +
+                (role.empty() ? StringRef("no buffer constructor") : role) +
+                ", which the analysis cannot place")
+            .str();
+      return std::nullopt;
+    }
+    if (origin.kind == Origin::Kind::HeapCall)
+      return std::nullopt;
+    if (host && (origin.kind == Origin::Kind::Alloca ||
+                 origin.kind == Origin::Kind::GlobalSym))
+      return std::nullopt;
+    return id + " is not a heap or USM allocation";
+  };
+  for (const Origin &origin : origins) {
+    std::optional<std::string> why = originWhy(origin);
+    if (!why)
+      continue;
+    if (origins.size() == 1)
+      return why;
     std::string out =
         id + " merges " + std::to_string(origins.size()) + " allocations (";
     for (auto [i, origin] : llvm::enumerate(origins.take_front(3))) {
@@ -330,25 +362,9 @@ std::optional<std::string> SYCLHostFacts::notOneAllocationWhy(const Node *node,
     }
     if (origins.size() > 3)
       out += ", ...";
-    return out + ")";
+    return out + "), not all of which it can place: " + *why;
   }
-  const Origin &origin = origins.front();
-  if (storage) {
-    StringRef role = getRole(getDirectCallee(origin.site));
-    if (origin.kind != Origin::Kind::GhostSite ||
-        (role != "buffer.alloc" && role != "buffer.host_ptr"))
-      return ("the storage " + id + " is made by " +
-              (role.empty() ? StringRef("no buffer constructor") : role) +
-              ", which the analysis cannot place")
-          .str();
-    return std::nullopt;
-  }
-  if (origin.kind == Origin::Kind::HeapCall)
-    return std::nullopt;
-  if (host && (origin.kind == Origin::Kind::Alloca ||
-               origin.kind == Origin::Kind::GlobalSym))
-    return std::nullopt;
-  return id + " is not a heap or USM allocation";
+  return std::nullopt;
 }
 
 std::optional<std::string> SYCLHostFacts::unknownValueWhy(const Node *node,
@@ -456,10 +472,10 @@ bool SYCLHostFacts::sameMemory(const MemIdentity &a, const MemIdentity &b) {
         continue;
       if (x == y)
         return true;
-      // One origin each (complete identities): equal origins are one site.
-      if (x->getOrigins().size() == 1 && y->getOrigins().size() == 1 &&
-          x->getOrigins()[0] == y->getOrigins()[0])
-        return true;
+      // Complete identities: a shared origin is a shared site.
+      for (const Origin &origin : x->getOrigins())
+        if (llvm::is_contained(y->getOrigins(), origin))
+          return true;
     }
   return false;
 }

@@ -164,6 +164,8 @@ cir::pointsto::verifyPointsToAnalysis(const PointsToAnalysis &analysis) {
     for (const TUCallSite &call : fn->callSites) {
       if (call.site.calleePtr)
         checkCell(*call.site.calleePtr);
+      if (call.site.vptrHolder)
+        checkCell(*call.site.vptrHolder);
       for (const std::optional<Cell> &arg : call.site.args)
         if (arg)
           checkCell(*arg);
@@ -239,6 +241,18 @@ cir::pointsto::verifyPointsToAnalysis(const PointsToAnalysis &analysis) {
       };
       if (!call.site.calleePtr) {
         report() << "has no callee cell";
+        continue;
+      }
+      // Resolved from the vtables of a complete object
+      // (PointsToAnalysis::getVirtualCallTargets): its targets must be bound.
+      if (std::optional<SmallVector<FlatSymbolRefAttr, 2>> targets =
+              analysis.getVirtualCallTargets(call.site)) {
+        for (FlatSymbolRefAttr sym : *targets)
+          if (!llvm::is_contained(call.targets, sym)) {
+            report() << "has the vtable target " << sym
+                     << ", which is not among its targets";
+            break;
+          }
         continue;
       }
       const Node *callee = call.site.calleePtr->getNode();

@@ -4030,6 +4030,13 @@ getSYCLMemoryCommandRole(const CXXMethodDecl *md, bool isHandler,
 ///   buffer.reinterpret  buffer::reinterpret: the source's storage
 ///   buffer.assign       buffer::operator=
 ///   buffer.get_access   buffer::get_access(handler &, ...): a device accessor
+///   buffer.host_access  buffer::get_host_access(...): a host_accessor
+///   buffer.set_write_back  buffer::set_write_back(bool)
+///   buffer.set_final_data  buffer::set_final_data(T *) and
+///                       set_final_data(nullptr); arg 0 (the weak_ptr,
+///                       shared_ptr and output-iterator forms are untagged)
+///   buffer.query        buffer::get_range, size, byte_size, get_count,
+///                       get_size, is_sub_buffer, has_property
 ///   buffer.dtor         buffer destructor: drops a reference; the last one
 ///                       may write the storage back to the host memory
 ///   accessor.from_buffer  accessor(buffer &, ...)
@@ -4269,6 +4276,24 @@ CIRGenModule::getSYCLHostAPIRole(const FunctionDecl *fd, unsigned &argIndex,
         isClassInNamespace(paramRecord(md->getParamDecl(0)->getType()), "sycl",
                            "handler"))
       return "buffer.get_access";
+    if (isNamed(md, "get_host_access"))
+      return "buffer.host_access";
+    if (isNamed(md, "set_write_back"))
+      return "buffer.set_write_back";
+    if (isNamed(md, "set_final_data")) {
+      // A pointer or nullptr; the weak_ptr, shared_ptr and output-iterator
+      // forms keep a copy of their destination and are untagged.
+      QualType dest =
+          md->getNumParams() == 1 ? md->getParamDecl(0)->getType() : QualType();
+      if (!dest.isNull() && (dest->isPointerType() || dest->isNullPtrType()))
+        return "buffer.set_final_data";
+      return {};
+    }
+    // Not get_property: a property may hold a pointer the constructor was
+    // given (use_mutex).
+    if (isNamedOneOf(md, {"get_range", "size", "byte_size", "get_count",
+                          "get_size", "is_sub_buffer", "has_property"}))
+      return "buffer.query";
     return {};
   }
 
