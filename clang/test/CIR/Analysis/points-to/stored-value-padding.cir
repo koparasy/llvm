@@ -1,0 +1,41 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Stored values: the padding of a stored aggregate value (G2, Csmith seed
+// 309470). ClangIR passes a `struct S0 { int8_t f0; uint32_t f1; }` argument
+// coerced to an i64: it loads the struct as a value, stores it into a
+// "coerce" slot and reloads the slot as a u64. A cir.store of an aggregate
+// value (an LLVM first-class aggregate store) writes the members only, so
+// bytes 1-3 of the slot are not defined, while the source l, a byte copy
+// (cir.copy) of a zero constant, has zeros there. The u64 was claimed
+// constant 0 (PT-VALUE-VIOLATION at run time). Now a read that covers
+// padding of a stored aggregate value is incomplete; a member still is not.
+// CHECK-LABEL: === values
+// CHECK-NEXT: coerced: {} defs=0 incomplete (UnhandledOp{{.*}}"the read covers padding of a stored aggregate value")
+// CHECK-NEXT: member: {#cir.int<0> : !cir.int<u, 32>} defs=0 complete
+// CHECK-NEXT: copied: {#cir.int<0> : !cir.int<u, 64>} defs=0 complete
+
+!s8i = !cir.int<s, 8>
+!u32i = !cir.int<u, 32>
+!u64i = !cir.int<u, 64>
+!rec_S0 = !cir.struct<"S0" {data !s8i, data !u32i}>
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.global "private" constant internal @zero = #cir.zero : !rec_S0
+cir.func @f() -> !u64i {
+  %l = cir.alloca "l" align(4) init : !cir.ptr<!rec_S0>
+  %c = cir.alloca "coerce" align(8) : !cir.ptr<!rec_S0>
+  %d = cir.alloca "d" align(8) : !cir.ptr<!rec_S0>
+  %z = cir.get_global @zero : !cir.ptr<!rec_S0>
+  cir.copy %z to %l : !cir.ptr<!rec_S0>
+  %v = cir.load %l : !cir.ptr<!rec_S0>, !rec_S0
+  cir.store %v, %c : !rec_S0, !cir.ptr<!rec_S0>
+  %cu = cir.cast bitcast %c : !cir.ptr<!rec_S0> -> !cir.ptr<!u64i>
+  %w = cir.load %cu : !cir.ptr<!u64i>, !u64i {test.load = "coerced"}
+  %m = cir.get_member %c[1] {name = "f1"} : !cir.ptr<!rec_S0> -> !cir.ptr<!u32i>
+  %x = cir.load %m : !cir.ptr<!u32i>, !u32i {test.load = "member"}
+  cir.copy %l to %d : !cir.ptr<!rec_S0>
+  %du = cir.cast bitcast %d : !cir.ptr<!rec_S0> -> !cir.ptr<!u64i>
+  %y = cir.load %du : !cir.ptr<!u64i>, !u64i {test.load = "copied"}
+  cir.return %w : !u64i
+}
+}

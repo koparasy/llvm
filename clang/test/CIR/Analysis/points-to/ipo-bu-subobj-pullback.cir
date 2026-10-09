@@ -1,0 +1,128 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu subobjects=1 explain=1 td=0' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefixes=ALL,BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 subobjects=1 explain=1 td=0' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefixes=ALL,BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 subobjects=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefixes=ALL,TD
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1 subobjects=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefixes=ALL,TD
+
+// The subobject pull-back of projectClones (G2, Csmith seed 200566). The
+// reduced program
+//   struct S2 l; int *q = &l.f4.f0; struct S2 *pl = &l; *pl = g(q);
+// makes ClangIR pass &l itself as g's sret destination (classic codegen uses
+// a temporary; that is a ClangIR bug of its own), so g's writes through the
+// sret slot overwrite what it reads through p. Bottom-up with subobjects,
+// @main's copy of g's graph binds the sret formal to l's node and p to l's
+// grandchild f4.f0: two different nodes of one tree, so the pull-back, which
+// only merged sources whose copies are one node, merged nothing, and in g's
+// own graph the two formals were "distinct-objects" (NoAlias). Now two
+// sources whose copies overlap in a common ancestor get MayOverlap (with
+// their ancestors in the callee's graph), which keeps them apart from no
+// other MayOverlap node. The top-down queries (and CI, which binds the
+// formals to the actuals) see the offsets of the one context.
+// ALL-LABEL: Testing : "g"
+// ALL-NOT: sret#0 <-> p#0: NoAlias
+// BU: sret#0 <-> p#0: MayAlias
+// BU-NEXT: why: a, b: both may overlap another object in a caller's context (its copy overlaps another formal's object at this call to @g)
+// TD: sret#0 <-> p#0: PartialAlias
+//
+// The same with the member also merged with a global's node (the full seed:
+// q = pick(q) may also point to g153, so @main's node for l2.f4.f0 is the
+// shared node of g153, while l2 itself is not shared). The pull-back used to
+// skip a copy that is a shared node (p's source gets MayBeShared for being a
+// global's object), but the sret destination is no global: only the tree
+// relation flags it.
+// ALL-LABEL: Testing : "g2"
+// ALL-NOT: sret#0 <-> p#0: NoAlias
+// ALL: sret#0 <-> p#0: MayAlias
+//
+// Disjoint members stay apart: @h gets &l3.f2 and &l3.f4.f0, different bytes
+// of one object (the source's extent, 2 bytes, bounds its place in l3).
+// ALL-LABEL: Testing : "h"
+// ALL: a#0 <-> b#0: NoAlias
+//
+// A formal and a member the callee itself takes of it are already placed
+// alike in the callee's graph: not flagged.
+// ALL-LABEL: Testing : "k"
+// BU: whole#0 <-> f2#0: MayAlias
+// TD: whole#0 <-> f2#0: MustAlias
+// ALL: f2#0 <-> f4#0: NoAlias
+
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_S0 = !cir.struct<"S0" {data !s32i, data !s16i}>
+!rec_S2 = !cir.struct<"S2" {data !s16i, data !rec_S0, data !u64i}>
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.global "private" internal dso_local @g153 = #cir.int<3> : !s32i
+cir.global "private" constant internal @zero = #cir.zero : !rec_S2
+cir.func internal @g(%arg0: !cir.ptr<!rec_S2> {llvm.align = 8 : i64, llvm.noalias, llvm.sret = !rec_S2}, %arg1: !cir.ptr<!s32i>) {
+  %sret = cir.cast bitcast %arg0 : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S2> {test.ptr = "sret"}
+  %z = cir.get_global @zero : !cir.ptr<!rec_S2>
+  cir.copy %z to %arg0 : !cir.ptr<!rec_S2>
+  %p = cir.cast bitcast %arg1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p"}
+  %v = cir.load %arg1 : !cir.ptr<!s32i>, !s32i
+  %t = cir.cast integral %v : !s32i -> !s16i
+  %m = cir.get_member %arg0[0] {name = "f2"} : !cir.ptr<!rec_S2> -> !cir.ptr<!s16i>
+  cir.store %t, %m : !s16i, !cir.ptr<!s16i>
+  cir.return
+}
+cir.func internal @g2(%arg0: !cir.ptr<!rec_S2> {llvm.align = 8 : i64, llvm.noalias, llvm.sret = !rec_S2}, %arg1: !cir.ptr<!s32i>) {
+  %sret = cir.cast bitcast %arg0 : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S2> {test.ptr = "sret"}
+  %z = cir.get_global @zero : !cir.ptr<!rec_S2>
+  cir.copy %z to %arg0 : !cir.ptr<!rec_S2>
+  %p = cir.cast bitcast %arg1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p"}
+  %v = cir.load %arg1 : !cir.ptr<!s32i>, !s32i
+  %t = cir.cast integral %v : !s32i -> !s16i
+  %m = cir.get_member %arg0[0] {name = "f2"} : !cir.ptr<!rec_S2> -> !cir.ptr<!s16i>
+  cir.store %t, %m : !s16i, !cir.ptr<!s16i>
+  cir.return
+}
+cir.func internal @pick(%arg0: !cir.ptr<!s32i>) -> !cir.ptr<!s32i> {
+  %r = cir.alloca "r" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %arg0, %r : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %gp = cir.get_global @g153 : !cir.ptr<!s32i>
+  cir.store %gp, %r : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %v = cir.load %r : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  cir.return %v : !cir.ptr<!s32i>
+}
+cir.func internal @h(%arg0: !cir.ptr<!s16i>, %arg1: !cir.ptr<!s32i>) {
+  %a = cir.cast bitcast %arg0 : !cir.ptr<!s16i> -> !cir.ptr<!s16i> {test.ptr = "a"}
+  %b = cir.cast bitcast %arg1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  %v = cir.load %arg1 : !cir.ptr<!s32i>, !s32i
+  %t = cir.cast integral %v : !s32i -> !s16i
+  cir.store %t, %arg0 : !s16i, !cir.ptr<!s16i>
+  cir.return
+}
+cir.func internal @k(%arg0: !cir.ptr<!rec_S2>) {
+  %whole = cir.cast bitcast %arg0 : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S2> {test.ptr = "whole"}
+  %m = cir.get_member %arg0[0] {name = "f2"} : !cir.ptr<!rec_S2> -> !cir.ptr<!s16i>
+  %f2 = cir.cast bitcast %m : !cir.ptr<!s16i> -> !cir.ptr<!s16i> {test.ptr = "f2"}
+  %n = cir.get_member %arg0[1] {name = "f4"} : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S0>
+  %f4 = cir.cast bitcast %n : !cir.ptr<!rec_S0> -> !cir.ptr<!rec_S0> {test.ptr = "f4"}
+  %z = cir.const #cir.int<0> : !s16i
+  cir.store %z, %m : !s16i, !cir.ptr<!s16i>
+  cir.return
+}
+cir.func @main() {
+  %l = cir.alloca "l" align(8) init : !cir.ptr<!rec_S2>
+  %f4 = cir.get_member %l[1] {name = "f4"} : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S0>
+  %f0 = cir.get_member %f4[0] {name = "f0"} : !cir.ptr<!rec_S0> -> !cir.ptr<!s32i>
+  cir.call @g(%l, %f0) : (!cir.ptr<!rec_S2> {llvm.sret = !rec_S2}, !cir.ptr<!s32i>) -> ()
+  %l2 = cir.alloca "l2" align(8) init : !cir.ptr<!rec_S2>
+  %q = cir.alloca "q" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+  %f4b = cir.get_member %l2[1] {name = "f4"} : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S0>
+  %f0b = cir.get_member %f4b[0] {name = "f0"} : !cir.ptr<!rec_S0> -> !cir.ptr<!s32i>
+  cir.store %f0b, %q : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %qv = cir.load %q : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  cir.call @g2(%l2, %qv) : (!cir.ptr<!rec_S2> {llvm.sret = !rec_S2}, !cir.ptr<!s32i>) -> ()
+  %qw = cir.load %q : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %picked = cir.call @pick(%qw) : (!cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  cir.store %picked, %q : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %l3 = cir.alloca "l3" align(8) init : !cir.ptr<!rec_S2>
+  %f2c = cir.get_member %l3[0] {name = "f2"} : !cir.ptr<!rec_S2> -> !cir.ptr<!s16i>
+  %f4c = cir.get_member %l3[1] {name = "f4"} : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S0>
+  %f0c = cir.get_member %f4c[0] {name = "f0"} : !cir.ptr<!rec_S0> -> !cir.ptr<!s32i>
+  cir.call @h(%f2c, %f0c) : (!cir.ptr<!s16i>, !cir.ptr<!s32i>) -> ()
+  %l4 = cir.alloca "l4" align(8) init : !cir.ptr<!rec_S2>
+  cir.call @k(%l4) : (!cir.ptr<!rec_S2>) -> ()
+  cir.return
+}
+}

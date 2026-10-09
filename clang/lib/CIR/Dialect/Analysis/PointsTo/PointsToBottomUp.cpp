@@ -89,6 +89,11 @@
 //    formals) are merged in the callee's graph too, at the same relative
 //    offset (collapsing on a conflict, or as an array of the element size
 //    of an array copy);
+//  - with subobjects, two nodes whose copies are different nodes of one tree
+//    of subobjects whose slots overlap in a common ancestor (a formal given
+//    &l and another &l.a.x; G2) get MayOverlap (with their ancestors), unless
+//    the callee's graph already places them that way; copies in disjoint
+//    slots are disjoint bytes of the object and stay apart;
 //  - a node of the callee whose copy is a shared node in the caller's graph
 //    (the caller passed a pointer to a global's object; shared nodes are
 //    never copied, so the copy was unified with the shared node itself) gets
@@ -106,7 +111,11 @@
 // and B' are one node, they are copies (A and B were merged by the pull-back)
 // or one of them is shared (A or B has MayBeShared, and the queries keep a
 // MayBeShared node apart from no shared or MayBeShared node). If A' and B'
-// are distinct, the objects are distinct in that context. Without the
+// are distinct nodes of one tree of subobjects, they are one object where
+// their slots overlap (A and B have MayOverlap, or the callee's graph places
+// them alike) and disjoint bytes elsewhere. If
+// they are otherwise distinct, the objects are distinct in that context.
+// Without the
 // MayBeShared rule a shared image was the hole: A' merged with g's node, B
 // the shared node of g itself in the callee's graph (V4 F2). The objects a
 // node stands for besides its own origins are the callers' objects reached
@@ -535,10 +544,12 @@ void PointsToAnalysis::cloneCallee(TUCallSite &call, TUFunction &owner,
   auto rewrite = [&](Origin &origin) { origin.ctx = rebase(origin.ctx); };
   cloneOptions.isShared = isShared;
   cloneOptions.rewriteOrigin = rewrite;
-  auto record = std::make_unique<TUClone>(TUClone{
-      &owner, &callee, call.site.call, rebase(0),
-      graph->cloneInto(*graph, roots, NodeFlags::All & ~NodeFlags::MayBeShared,
-                       cloneOptions)});
+  auto record = std::make_unique<TUClone>(
+      TUClone{&owner, &callee, call.site.call, rebase(0),
+              graph->cloneInto(*graph, roots,
+                               NodeFlags::All & ~(NodeFlags::MayBeShared |
+                                                  NodeFlags::MayOverlap),
+                               cloneOptions)});
   const CloneMap &map = record->map;
   size_t copied = 0;
   for (const auto &[src, dst] : map.entries())
@@ -762,11 +773,72 @@ void PointsToAnalysis::computeRelevance(
 // Projection
 //===----------------------------------------------------------------------===//
 
+namespace {
+/// A node a walked node is in, through subobject links (or the walked node
+/// itself), for the subobject part of the pull-back.
+struct TreePlace {
+  const Node *node;
+  /// Where the walked node's offset 0 is in `node`.
+  int64_t start;
+  /// The bytes [lo, hi) of `node` the walked node is: its slot. Not bounded
+  /// for the walked node itself (all of it).
+  int64_t lo, hi;
+  bool bounded;
+  /// No array or collapsed node on the way loses the positions.
+  bool exact;
+};
+} // namespace
+
+/// \p node (resolved) and the nodes it is a subobject of, transitively, with
+/// its place in each; \p range, if given, bounds the bytes of \p node itself
+/// that are meant. Past \p maxPlaces entries the walk stops and sets
+/// \p truncated: some ancestors may be missing.
+static SmallVector<TreePlace, 4>
+placesInTree(const Graph &graph, const Node *node, size_t maxPlaces,
+             bool &truncated,
+             std::optional<std::pair<int64_t, int64_t>> range = std::nullopt) {
+  SmallVector<TreePlace, 4> out;
+  out.push_back({node, 0, range ? range->first : 0, range ? range->second : 0,
+                 /*bounded=*/range.has_value(),
+                 !node->isCollapsed() && !node->isArray()});
+  size_t i = 0;
+  for (; i < out.size() && out.size() < maxPlaces; ++i) {
+    TreePlace at = out[i];
+    for (const ParentLink &parent : graph.getParents(at.node)) {
+      // The child's offset x is parent.offset + (x - childOffset).
+      int64_t shift = parent.offset - parent.childOffset;
+      TreePlace up{parent.parent,
+                   at.start + shift,
+                   at.bounded ? at.lo + shift : parent.offset,
+                   at.bounded
+                       ? at.hi + shift
+                       : parent.offset + static_cast<int64_t>(parent.size),
+                   /*bounded=*/true,
+                   at.exact && !parent.parent->isArray() &&
+                       !parent.parent->isCollapsed()};
+      if (llvm::any_of(out, [&](const TreePlace &p) {
+            return p.node == up.node && p.start == up.start && p.lo == up.lo &&
+                   p.hi == up.hi && p.exact == up.exact;
+          }))
+        continue;
+      out.push_back(up);
+    }
+  }
+  truncated = i < out.size();
+  return out;
+}
+
+/// Whether two places in one node may share bytes.
+static bool mayOverlap(const TreePlace &a, const TreePlace &b) {
+  return !a.exact || !b.exact || !a.bounded || !b.bounded ||
+         (a.lo < b.hi && b.lo < a.hi);
+}
+
 bool PointsToAnalysis::projectClones() {
   constexpr NodeFlags projected =
       NodeFlags::External | NodeFlags::Incomplete | NodeFlags::UnknownObj |
       NodeFlags::Mod | NodeFlags::Ref | NodeFlags::HasUSM |
-      NodeFlags::AsyncAccess | NodeFlags::MayBeShared;
+      NodeFlags::AsyncAccess | NodeFlags::MayBeShared | NodeFlags::MayOverlap;
   bool changed = false;
   // isShared is as of the last flush: merges since (the fixpoint's) may
   // have made more nodes shared.
@@ -792,6 +864,15 @@ bool PointsToAnalysis::projectClones() {
     // The source cells (resolved now) whose copies share a node, with the
     // offset of the copy's cell minus the source cell's.
     llvm::MapVector<Node *, SmallVector<std::pair<Node *, int64_t>, 2>> groups;
+    // The entries whose copy is in a tree of subobjects (a child, or a
+    // parent): the source, its copy's node, and the offset of the copy's
+    // cell minus the source cell's.
+    struct InTree {
+      Node *from;
+      Node *to;
+      int64_t delta;
+    };
+    SmallVector<InTree, 0> inTrees;
     for (auto [src, dst] : entries) {
       Cell from = Cell(const_cast<Node *>(src)).resolve();
       Cell to = dst.resolve();
@@ -841,6 +922,14 @@ bool PointsToAnalysis::projectClones() {
       }
       // Two sources whose copies are one shared object are both
       // MayBeShared: the queries keep them apart from nothing shared.
+      // A shared copy too: a member of a caller's object may be merged with
+      // a global's node (it may point to either) while the object is not
+      // (G2, seed 200566: the sret destination l and &l.f4.f0, merged with
+      // the node of g_153).
+      if (graph->hasSubobjects() && !graph->isShared(fromNode) &&
+          (toNode->getNumSubobjects() || !graph->getParents(toNode).empty()))
+        inTrees.push_back(
+            {fromNode, toNode, to.getRawOffset() - from.getRawOffset()});
       if (sharedImage)
         continue;
       groups[toNode].emplace_back(fromNode,
@@ -897,6 +986,180 @@ bool PointsToAnalysis::projectClones() {
       }
       for (auto [node, delta] : llvm::drop_begin(sources))
         merge(Cell(first), Cell(node, firstDelta - delta));
+    }
+    if (inTrees.size() < 2)
+      continue;
+    // SOUNDNESS (G2, Csmith seed 200566): with subobjects, two different
+    // nodes of the caller's graph are still one object when one is a
+    // subobject of the other, or both are subobjects of a common ancestor,
+    // and their slots there overlap (rule 2b of the queries). For example
+    // `*pl = f(&l.a.x)` with pl == &l: the sret destination is l's node, the
+    // other actual its grandchild, so the same-node grouping above sees two
+    // objects, and in f's own graph the two formals stayed distinct nodes
+    // ("distinct-objects") while f's writes through the sret slot overwrite
+    // what it reads through the other formal. Two such sources get
+    // MayOverlap, and so do their ancestors in the callee's graph (an object
+    // holding one overlaps the other); the flag flows down to their members.
+    // The queries keep a MayOverlap node apart from no other MayOverlap node
+    // and reads through one are incomplete (StoredValues): in f's own graph
+    // the two may be one object, whatever its layout, which holds for this
+    // context. The flag need not follow links: where the two objects overlap
+    // at a pointer slot, the caller's two copies of that slot are one cell,
+    // so the targets' copies are one node and the grouping above merges the
+    // targets here. Pointers are therefore where they would be had the
+    // sources been merged; only the identity of the two objects and the
+    // values stored in them are in doubt, and those the flag covers. (The
+    // node identities SYCLHostFacts relies on, accessor storage, are link
+    // targets.) Merging the sources instead was sound but held in every
+    // context: with libstdc++'s strings (the small-string buffer is a member
+    // the object points to) the merges cascaded through every caller and
+    // collapsed gemm's buffers (census 104 -> 0/106); MayBeShared, which
+    // follows links, cost the same. Not
+    // flagged:
+    //  - two sources the callee's graph already places alike in a common
+    //    ancestor of its own (a formal and a member of it: the copy keeps the
+    //    callee's layout, and rule 2b answers in the callee as in the
+    //    caller);
+    //  - copies whose slots are disjoint in every common ancestor: the
+    //    absorption of overflowing children (in every round of the fixpoint)
+    //    keeps each child's bytes in its slot, so an access through one never
+    //    reaches the other's bytes;
+    //  - two copies that are shared nodes: both sources have MayBeShared
+    //    already (above), which keeps them apart from nothing shared or
+    //    MayBeShared.
+    // A place through an array or a collapsed node loses the positions
+    // (flagged); a walk past maxAncestors may miss a common ancestor: its
+    // entry is flagged with every other entry in a tree.
+    size_t maxPlaces = std::max<size_t>(options.maxAncestors, 1);
+    SmallVector<SmallVector<TreePlace, 4>, 0> placesOf;
+    SmallVector<bool, 0> truncatedAt;
+    llvm::MapVector<const Node *, SmallVector<std::pair<unsigned, unsigned>, 2>>
+        byNode;
+    for (unsigned i = 0; i != inTrees.size(); ++i) {
+      bool truncated = false;
+      // The bytes of the copy's node the source is: [delta, delta + size)
+      // if the source's extent is known (the extent the absorption of
+      // overflowing children relies on too); else all of it.
+      const Node *from = inTrees[i].from;
+      std::optional<std::pair<int64_t, int64_t>> range;
+      if (from->getSize() && !from->isCollapsed() && !from->isArray() &&
+          !hasAny(from->getFlags(), NodeFlags::External |
+                                        NodeFlags::Incomplete |
+                                        NodeFlags::UnknownObj))
+        range = {inTrees[i].delta,
+                 inTrees[i].delta + static_cast<int64_t>(from->getSize())};
+      placesOf.push_back(
+          placesInTree(*graph, inTrees[i].to, maxPlaces, truncated, range));
+      truncatedAt.push_back(truncated);
+      for (unsigned k = 0; k != placesOf.back().size(); ++k)
+        byNode[placesOf.back()[k].node].push_back({i, k});
+    }
+    // (i, j, position of i's source offset 0 in the common ancestor, j's,
+    // exact).
+    SmallVector<std::tuple<unsigned, unsigned, int64_t, int64_t, bool>, 0>
+        overlapping;
+    // Each relative placement once (a child with several parents may have
+    // several).
+    llvm::DenseSet<std::tuple<unsigned, unsigned, int64_t, unsigned>> paired;
+    auto addPair = [&](unsigned i, unsigned j, int64_t posI, int64_t posJ,
+                       bool exact) {
+      if (i > j) {
+        std::swap(i, j);
+        std::swap(posI, posJ);
+      }
+      // Both shared: both sources are MayBeShared already.
+      if (graph->isShared(inTrees[i].to) && graph->isShared(inTrees[j].to))
+        return;
+      if (paired.insert({i, j, exact ? posJ - posI : 0, unsigned(exact)})
+              .second)
+        overlapping.emplace_back(i, j, posI, posJ, exact);
+    };
+    for (unsigned i = 0; i != inTrees.size(); ++i)
+      if (truncatedAt[i])
+        for (unsigned j = 0; j != inTrees.size(); ++j)
+          if (j != i)
+            addPair(i, j, 0, 0, /*exact=*/false);
+    for (auto &[node, at] : byNode)
+      for (size_t x = 0; x < at.size(); ++x)
+        for (size_t y = x + 1; y < at.size(); ++y) {
+          auto [i, k] = at[x];
+          auto [j, l] = at[y];
+          // The same node: the grouping above relates them.
+          if (i == j || inTrees[i].to == inTrees[j].to)
+            continue;
+          const TreePlace &pi = placesOf[i][k];
+          const TreePlace &pj = placesOf[j][l];
+          if (mayOverlap(pi, pj))
+            addPair(i, j, pi.start + inTrees[i].delta,
+                    pj.start + inTrees[j].delta, pi.exact && pj.exact);
+        }
+    if (overlapping.empty())
+      continue;
+    // The callee's places, by resolved node; a truncated walk is empty.
+    llvm::DenseMap<const Node *, SmallVector<TreePlace, 4>> calleePlaces;
+    auto placesOfSource = [&](const Node *node) -> ArrayRef<TreePlace> {
+      auto [it, inserted] = calleePlaces.try_emplace(node);
+      if (inserted) {
+        bool truncated = false;
+        it->second = placesInTree(*graph, node, maxPlaces, truncated);
+        if (truncated)
+          it->second.clear();
+      }
+      return it->second;
+    };
+    // Whether the callee's graph places b's offset 0 at \p rel from a's, at
+    // exact positions of a common ancestor (or in one node at that shift).
+    auto placedAlike = [&](Node *fromA, Node *fromB, int64_t rel) {
+      Cell a = Cell(fromA).resolve();
+      Cell b = Cell(fromB).resolve();
+      if (a.getRawNode() == b.getRawNode())
+        return !a.getRawNode()->isCollapsed() && !a.getRawNode()->isArray() &&
+               b.getRawOffset() - a.getRawOffset() == rel;
+      ArrayRef<TreePlace> upA = placesOfSource(a.getRawNode());
+      ArrayRef<TreePlace> upB = placesOfSource(b.getRawNode());
+      for (const TreePlace &pa : upA)
+        for (const TreePlace &pb : upB)
+          if (pa.node == pb.node && pa.exact && pb.exact &&
+              (pb.start + b.getRawOffset()) - (pa.start + a.getRawOffset()) ==
+                  rel)
+            return true;
+      return false;
+    };
+    const Reason *overlapWhy = nullptr;
+    auto flag = [&](Node *source) {
+      Node *node = Cell(source).getNode();
+      if (graph->isShared(node) || node->hasFlags(NodeFlags::MayOverlap))
+        return;
+      if (!overlapWhy)
+        overlapWhy = graph->makeReason(
+            Reason::Kind::MergedAt, clone->call,
+            "its copy overlaps another formal's object at this call to @" +
+                cir::FuncOp(clone->callee->func).getSymName().str());
+      graph->addFlags(Cell(node), NodeFlags::MayOverlap, overlapWhy);
+      ++stats.numProjectedFlags;
+      changed = true;
+    };
+    llvm::SmallPtrSet<Node *, 8> flagged;
+    for (auto [i, j, posI, posJ, exact] : overlapping) {
+      Node *fromI = inTrees[i].from;
+      Node *fromJ = inTrees[j].from;
+      if (exact && placedAlike(fromI, fromJ, posJ - posI))
+        continue;
+      for (Node *source : {fromI, fromJ}) {
+        if (!flagged.insert(source).second)
+          continue;
+        // The source and every object of the callee's graph that holds it
+        // (all its ancestors: a node walk, without offsets, so no budget).
+        SmallVector<Node *, 8> up{Cell(source).getNode()};
+        llvm::SmallPtrSet<Node *, 8> seen{up.front()};
+        while (!up.empty()) {
+          Node *node = up.pop_back_val();
+          flag(node);
+          for (const ParentLink &parent : graph->getParents(node))
+            if (seen.insert(parent.parent).second)
+              up.push_back(parent.parent);
+        }
+      }
     }
   }
   return changed;

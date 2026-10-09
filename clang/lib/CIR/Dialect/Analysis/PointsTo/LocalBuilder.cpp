@@ -2124,6 +2124,9 @@ struct SubobjectTransfers {
   llvm::DenseSet<
       std::tuple<const Node *, int64_t, const Node *, int64_t, uint64_t>>
       seen;
+  /// The most records (given and derived) before giving up.
+  size_t maxRecords = 0;
+  bool overBudget = false;
 
   /// Add the copy of \p length bytes from \p src to \p dst made for
   /// \p record, unless it is there. Return whether it was added.
@@ -2146,6 +2149,13 @@ struct SubobjectTransfers {
   bool expand() {
     bool grew = false;
     for (size_t i = 0; i < records.size(); ++i) {
+      // SOUNDNESS (budget): the derived copies are bounded by the copies'
+      // children, but a bug that makes children without end must not hang
+      // the analysis: past the cap the caller smashes every copy instead.
+      if (records.size() > maxRecords) {
+        overBudget = true;
+        return true;
+      }
       MemTransferRecord record = records[i];
       int64_t length = static_cast<int64_t>(std::min<uint64_t>(
           record.length, std::numeric_limits<int64_t>::max()));
@@ -2211,6 +2221,9 @@ bool cir::pointsto::closeMemTransfers(Graph &graph,
   if (graph.hasSubobjects()) {
     subobjects.emplace(SubobjectTransfers{graph, {}, {}});
     subobjects->records.assign(transfers.begin(), transfers.end());
+    subobjects->maxRecords =
+        (transfers.size() + 1) *
+        std::max<size_t>(graph.getBudgets().maxTransferSlots, 1);
   }
   // Unification is symmetric, so this treats dst and src alike: it only
   // ever adds links and merges targets, which over-approximates the
@@ -2221,6 +2234,8 @@ bool cir::pointsto::closeMemTransfers(Graph &graph,
     if (subobjects) {
       changed |= subobjects->expand();
       transfers = subobjects->records;
+      if (subobjects->overBudget)
+        break;
     }
     for (const MemTransferRecord &record : transfers)
       changed |= TransferApplier{graph, record}.apply();

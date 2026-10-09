@@ -78,6 +78,8 @@ StringRef cir::pointsto::getAliasRuleName(AliasRule rule) {
     return "calling-contexts";
   case AliasRule::MayBeShared:
     return "may-be-shared";
+  case AliasRule::MayOverlap:
+    return "may-overlap";
   }
   llvm_unreachable("unknown alias rule");
 }
@@ -370,6 +372,12 @@ AliasAnswer PointsToAnalysis::aliasCells(Cell cellA, Cell cellB, uint64_t sizeA,
          (graph->isShared(nodeB) || mayBeShared(nodeB))) ||
         (mayBeShared(nodeB) && graph->isShared(nodeA)))
       return {AliasResult::MayAlias, AliasRule::MayBeShared};
+    // SOUNDNESS (BU, G2): two MayOverlap nodes may be parts of one object in
+    // a caller's context (projectClones' subobject pull-back), whatever this
+    // graph's nodes say.
+    if (nodeA->hasFlags(NodeFlags::MayOverlap) &&
+        nodeB->hasFlags(NodeFlags::MayOverlap))
+      return {AliasResult::MayAlias, AliasRule::MayOverlap};
     // SOUNDNESS: with unification every pointer the analysed code may hold
     // to an object points into that object's node, so two different nodes
     // that unknown code cannot reach denote different objects.
@@ -622,6 +630,14 @@ std::string PointsToAnalysis::explainAnswer(const AliasAnswer &answer, Value a,
     return "a, b: one may be a global's object" +
            (why ? " (" + why->detail.str() + ")" : std::string()) +
            ", the other is or may be one";
+  }
+  case AliasRule::MayOverlap: {
+    const Reason *why = nodeA->getReason(NodeFlags::MayOverlap);
+    if (!why || why->detail.empty())
+      why = nodeB->getReason(NodeFlags::MayOverlap);
+    return "a, b: both may overlap another object in a caller's context" +
+           (why && !why->detail.empty() ? " (" + why->detail.str() + ")"
+                                        : std::string());
   }
   case AliasRule::CallingContexts: {
     std::string out;

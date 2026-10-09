@@ -72,6 +72,8 @@
 // RUN: cir-opt %S/ipo-bu-self-unify.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-bu-shared-pullback.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-bu-shared-pullback.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-bu-subobj-pullback.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-bu-subobj-pullback.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-bu-may-be-shared.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-bu-may-be-shared.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-byval.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
@@ -126,6 +128,8 @@
 // RUN: cir-opt %S/subobj-basic.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-copy.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-copy.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/subobj-copy-whole-slot.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/subobj-copy-whole-slot.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-escape.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-escape.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-gemm.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
@@ -221,6 +225,8 @@
 // RUN: cir-opt %S/ipo-bu-self-unify.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-bu-shared-pullback.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-bu-shared-pullback.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-bu-subobj-pullback.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-bu-subobj-pullback.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-bu-may-be-shared.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-bu-may-be-shared.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-byval.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
@@ -275,6 +281,8 @@
 // RUN: cir-opt %S/subobj-basic.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-copy.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-copy.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/subobj-copy-whole-slot.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/subobj-copy-whole-slot.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-escape.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-escape.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-gemm.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
@@ -321,6 +329,10 @@
 // RUN: cir-opt %S/subobj-copy.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-copy.cir -test-cir-alias-analysis='use-points-to=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-copy.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/subobj-copy-whole-slot.cir -test-cir-alias-analysis='use-points-to=1 subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/subobj-copy-whole-slot.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/subobj-copy-whole-slot.cir -test-cir-alias-analysis='use-points-to=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/subobj-copy-whole-slot.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-escape.cir -test-cir-alias-analysis='use-points-to=1 subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-escape.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/subobj-escape.cir -test-cir-alias-analysis='use-points-to=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
@@ -343,5 +355,11 @@
 // RUN: cir-opt %S/td-uncovered.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-bu-may-be-shared.cir -test-cir-alias-analysis='use-points-to=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-bu-may-be-shared.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-bu-subobj-pullback.cir -test-cir-alias-analysis='use-points-to=1 subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-bu-subobj-pullback.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-bu-subobj-pullback.cir -test-cir-alias-analysis='use-points-to=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-bu-subobj-pullback.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/stored-value-merged-global.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/stored-value-merged-global.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-padding.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/stored-value-padding.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null

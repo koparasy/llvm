@@ -592,6 +592,70 @@ static TypedAttr makePattern(Type type, uint8_t byte) {
   return {};
 }
 
+/// Whether the bytes [offset, offset + size) of a value of type \p type may
+/// include bytes that are no member's (padding), or it can't be told. An SSA
+/// value of aggregate type has no padding bytes: a cir.store of it (an LLVM
+/// first-class aggregate store) leaves them undefined, unlike cir.copy, a
+/// byte copy (G2, Csmith seed 309470).
+static bool mayCoverPadding(Type type, int64_t offset, uint64_t size,
+                            const DataLayout &dataLayout, unsigned depth = 0) {
+  if (size == 0)
+    return false;
+  if (depth > 16)
+    return true;
+  std::optional<int64_t> whole = getTypeSizeInBytes(type, dataLayout);
+  if (!whole || offset < 0 || offset + static_cast<int64_t>(size) > *whole)
+    return true;
+  int64_t end = offset + static_cast<int64_t>(size);
+  if (auto rec = dyn_cast<cir::RecordType>(type)) {
+    if (rec.isUnion())
+      return true;
+    // The members in offset order cover the range without a gap.
+    int64_t at = offset;
+    for (auto [i, member] : llvm::enumerate(rec.getMembers())) {
+      int64_t start = rec.getElementOffset(dataLayout, i);
+      std::optional<int64_t> len = getTypeSizeInBytes(member, dataLayout);
+      if (!len)
+        return true;
+      int64_t stop = start + *len;
+      if (stop <= at)
+        continue;
+      if (start >= end)
+        break;
+      if (start > at)
+        return true; // A gap before this member.
+      int64_t lo = std::max(at, start), hi = std::min(end, stop);
+      if (mayCoverPadding(member, lo - start, static_cast<uint64_t>(hi - lo),
+                          dataLayout, depth + 1))
+        return true;
+      at = hi;
+      if (at >= end)
+        return false;
+    }
+    return at < end;
+  }
+  if (auto arr = dyn_cast<cir::ArrayType>(type)) {
+    Type elem = arr.getElementType();
+    std::optional<int64_t> e = getTypeSizeInBytes(elem, dataLayout);
+    if (!e || *e <= 0)
+      return true;
+    // Every element is laid out alike: an element's padding, if any part of
+    // the range covers one, is covered whole or in part in some element.
+    int64_t first = offset / *e, last = (end - 1) / *e;
+    if (last - first >= 2)
+      return mayCoverPadding(elem, 0, static_cast<uint64_t>(*e), dataLayout,
+                             depth + 1);
+    for (int64_t k = first; k <= last; ++k) {
+      int64_t lo = std::max(offset, k * *e), hi = std::min(end, (k + 1) * *e);
+      if (mayCoverPadding(elem, lo - k * *e, static_cast<uint64_t>(hi - lo),
+                          dataLayout, depth + 1))
+        return true;
+    }
+    return false;
+  }
+  return false; // A scalar: all its bytes are its value.
+}
+
 /// The part of the constant \p init, of type \p initType, that holds the
 /// \p size bytes at \p offset, read as \p type; null if it can't be told.
 static TypedAttr extractConstant(Attribute init, Type initType, int64_t offset,
@@ -837,6 +901,10 @@ StoredValues StoredValueQuery::cellValues(Cell cell, uint64_t size, Type type,
     if (node->hasFlags(NodeFlags::MayBeShared) &&
         !analysis.getGraph().isShared(node))
       out.setIncomplete(node->getReason(NodeFlags::MayBeShared));
+    // MayOverlap (BU, G2): in a caller's context the node may be a part of
+    // another node's object, whose writes are indexed on that node.
+    if (node->hasFlags(NodeFlags::MayOverlap))
+      out.setIncomplete(node->getReason(NodeFlags::MayOverlap));
     if (index->isCopiedShared(node))
       out.setIncomplete(reason(Reason::Kind::MergedAt, nullptr,
                                "shared node copied before it was shared"));
@@ -977,6 +1045,11 @@ void StoredValueQuery::applyWrite(const WriteRecord &write, int rel,
     return out.setIncomplete(reason(Reason::Kind::EscapedTo, write.op,
                                     "written with an unknown value"));
   case WriteRecord::Kind::Store: {
+    // SOUNDNESS: the padding of a stored aggregate value is not written.
+    if (isa<cir::RecordType, cir::ArrayType>(write.value.getType()) &&
+        mayCoverPadding(write.value.getType(), rel == Equal ? 0 : delta, size,
+                        dataLayout))
+      return partial("the read covers padding of a stored aggregate value");
     if (rel == Equal)
       return resolveValue(write.value, size, type, chain, out);
     // The read is a part of a stored aggregate.

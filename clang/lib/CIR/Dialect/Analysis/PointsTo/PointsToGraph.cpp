@@ -58,7 +58,7 @@ using namespace cir::pointsto;
 // NodeFlags
 //===----------------------------------------------------------------------===//
 
-static constexpr unsigned numFlagBits = 15;
+static constexpr unsigned numFlagBits = 16;
 
 StringRef cir::pointsto::getFlagName(NodeFlags bit) {
   switch (bit) {
@@ -92,6 +92,8 @@ StringRef cir::pointsto::getFlagName(NodeFlags bit) {
     return "AsyncAccess";
   case NodeFlags::MayBeShared:
     return "MayBeShared";
+  case NodeFlags::MayOverlap:
+    return "MayOverlap";
   default:
     return "?";
   }
@@ -358,13 +360,20 @@ static constexpr NodeFlags kDownFlags = NodeFlags::All & ~NodeFlags::Collapsed;
 /// MayBeShared flows down (a member of a global's object is global memory)
 /// but not up. SOUNDNESS: it is set by projectClones on a node whose copy is
 /// a shared node, and Graph::flushShared makes a tree of subobjects shared
-/// as a whole; a copy of a graph copies whole trees too (cloneInto), so the
-/// copy of the node's parent is shared as well, and projectClones flags the
-/// parent itself. The propagation along links (propagateStatus) reaches a
-/// member only through a pointer to it, held by a node that may be a
-/// global's object: in that context the member's copy is what the global
-/// holds, a shared node, and its parent's copy then is shared too. Moving
-/// it up as well would flag a whole object for one member, and every other
+/// as a whole; a copy of a graph copies whole trees too (cloneInto), so if
+/// the parent's copy is a global's object it is shared as well, and
+/// projectClones flags the parent itself. The member's copy may also be
+/// shared while its parent's is not (G2, seed 200566): the member of a
+/// caller's local was merged with a global's node because a pointer may
+/// point to either. The flag says the member may be the global; the parent
+/// still is only the local, whose bytes the global's are not, and the
+/// accesses that reach the member's bytes are in the member's node (descend).
+/// That the parent and the member's node are one object in that context
+/// projectClones' subobject pull-back brings back. The propagation along
+/// links (propagateStatus) reaches a member only through a pointer to it,
+/// held by a node that may be a global's object: in that context the
+/// member's copy is what the global holds, a shared node. Moving the flag
+/// up as well would flag a whole object for one member, and every other
 /// member with it.
 static constexpr NodeFlags kUpFlags = NodeFlags::Mod | NodeFlags::Ref |
                                       NodeFlags::HasUSM |
@@ -1246,6 +1255,15 @@ Cell Graph::getSubobject(Cell at, uint64_t size, const Reason *why) {
       break;
     cur = next;
   }
+  // The range is all of the node's slot in a parent: those bytes are the
+  // node itself (G2, Csmith seed 202245). A child for it would be one more
+  // node for the same bytes, and closeMemTransfers, which makes the children
+  // of a copied range on the other side, would then make such a child below
+  // each new one without end (a copy between a member and a node holding
+  // it as its whole first field: x.f -> y and y -> x.f).
+  for (const ParentLink &parent : getParents(start.getRawNode()))
+    if (parent.childOffset == start.getRawOffset() && parent.size == size)
+      return start;
   Node *child = newNode();
   child->size = size;
   Worklist worklist;

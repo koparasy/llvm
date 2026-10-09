@@ -453,6 +453,9 @@ enum class AliasRule : uint8_t {
   /// (NodeFlags::MayBeShared) and the other is shared or may be one too:
   /// MayAlias.
   MayBeShared,
+  /// BU, with subobjects: both nodes may overlap another node in a caller's
+  /// context (NodeFlags::MayOverlap): MayAlias.
+  MayOverlap,
 };
 
 llvm::StringRef getAliasRuleName(AliasRule rule);

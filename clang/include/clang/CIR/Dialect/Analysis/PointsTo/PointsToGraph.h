@@ -166,13 +166,22 @@ enum class NodeFlags : uint32_t {
   /// to that caller's context); spread along links in the own graph; never
   /// on a shared node itself (ignored there). See PointsToBottomUp.cpp.
   MayBeShared = 1u << 14,
+  /// Bottom-up, with subobjects: a node of a function's own graph that may
+  /// overlap another node of it marked so: in some caller's graph the copies
+  /// of the two are different nodes of one tree of subobjects whose slots
+  /// overlap (one object, or parts of one; projectClones), while here they
+  /// are apart. Like MayBeShared, never copied with a graph and set on the
+  /// sources' ancestors too; it flows down to members but not along links
+  /// (the caller unifies the targets of the overlapping pointer slots, so
+  /// the pull-back merges their sources here). See PointsToBottomUp.cpp.
+  MayOverlap = 1u << 15,
 
   KindMask = Stack | Heap | Global | Ghost | Function | UnknownObj,
   StatusMask = Incomplete | External | Collapsed | Summary | Mod | Ref |
-      HasUSM | AsyncAccess | MayBeShared,
+      HasUSM | AsyncAccess | MayBeShared | MayOverlap,
   All = KindMask | StatusMask,
 
-  LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/MayBeShared)
+  LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/MayOverlap)
 };
 
 /// Return true if any bit of \p mask is set in \p flags.

@@ -1,0 +1,56 @@
+// RUN: cir-opt %s -test-cir-points-to='subobjects=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=VALUES
+
+// A copy between a member and a node that holds it as its whole first field
+// (G2, the 4 skip-instr Csmith seeds 202245, 203995, 205699 and 208275). The
+// reduced program
+//   struct S0 { short f1; }; struct S1 { struct S0 f2; } g;
+//   static struct S0 *gp = &g.f2;
+//   struct S0 f(int c) { if (c) return g.f2; return *gp; }
+// copies g.f2 (g's child n2, the bytes [0, 2) of g) and *gp (g itself, at
+// offset 0, 2 bytes) into the return slot. closeMemTransfers makes the
+// children of a copied range on the other side too: g -> r gives r a child
+// for [0, 2), then r's child -> g.f2 asked g.f2 for a child of its own whole
+// slot, Graph::getSubobject made one, and so on: a new node below each new
+// one, without end (cir-opt grew to tens of GB). A range that is all of a
+// node's slot in its parent is now that node itself.
+// CHECK-LABEL: === @f
+// CHECK-NEXT: n0 [Stack|Mod|Ref] size=2 origins={stack(cir.alloca '__retval' {{.*}})} links={} sub={0:2->n4+0}
+// CHECK-NEXT: n1 [Global|Ref] size=2 origins={global(@g)} links={} sub={0:2->n2+0}
+// CHECK-NEXT: n2 [Global|Ref] size=2 origins={} links={}{{$}}
+// CHECK-NEXT: n3 [Global|Ref] size=8 origins={global(@gp)} links={0->n1+0}
+// CHECK-NEXT: n4 [Stack|Mod|Ref] size=2 origins={} links={}{{$}}
+// CHECK-LABEL: === @main
+//
+// VALUES-LABEL: === values
+// VALUES-NEXT: ret: {#cir.int<0> : !cir.int<s, 16>} defs=0 complete
+
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!rec_S0 = !cir.struct<"S0" {data !s16i}>
+!rec_S1 = !cir.struct<"S1" {data !rec_S0}>
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.global "private" internal dso_local @g = #cir.zero : !rec_S1
+cir.global "private" internal dso_local @gp = #cir.global_view<@g> : !cir.ptr<!rec_S0>
+cir.func internal @f(%arg0: !s32i) -> !s16i {
+  %r = cir.alloca "__retval" align(2) : !cir.ptr<!rec_S0>
+  %c = cir.cast int_to_bool %arg0 : !s32i -> !cir.bool
+  cir.if %c {
+    %g = cir.get_global @g : !cir.ptr<!rec_S1>
+    %m = cir.get_member %g[0] {name = "f2"} : !cir.ptr<!rec_S1> -> !cir.ptr<!rec_S0>
+    cir.copy %m to %r : !cir.ptr<!rec_S0>
+  }
+  %gpp = cir.get_global @gp : !cir.ptr<!cir.ptr<!rec_S0>>
+  %p = cir.load %gpp : !cir.ptr<!cir.ptr<!rec_S0>>, !cir.ptr<!rec_S0>
+  cir.copy %p to %r : !cir.ptr<!rec_S0>
+  %rs = cir.cast bitcast %r : !cir.ptr<!rec_S0> -> !cir.ptr<!s16i>
+  %v = cir.load %rs : !cir.ptr<!s16i>, !s16i {test.load = "ret"}
+  cir.return %v : !s16i
+}
+cir.func @main() -> !s32i {
+  %one = cir.const #cir.int<1> : !s32i
+  %v = cir.call @f(%one) : (!s32i) -> !s16i
+  %w = cir.cast integral %v : !s16i -> !s32i
+  cir.return %w : !s32i
+}
+}
