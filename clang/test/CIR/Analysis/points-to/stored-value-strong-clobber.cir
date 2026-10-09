@@ -1,0 +1,107 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefixes=CHECK,CI
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefixes=CHECK,BU
+
+// Stored values at a load, strong updates (T24), where they do not apply:
+//  - a call between the store and the load whose callee may write the local
+//    (a body bound to it: its write is not an op of the function): weak;
+//  - a call that does not touch the local: strong;
+//  - a memset between the store and the load: weak (it is the last write);
+//  - a store through a pointer that may point to the local or to another
+//    object (two origins, a summary): weak;
+//  - the local escaped to code we don't see: weak (and incomplete);
+//  - a local of a recursive function (a summary: two activations' objects
+//    live at once): weak;
+//  - a parameter spilled to its slot, read back: strong, a def; in bu mode
+//    the calling context gives the constant.
+
+// CHECK-LABEL: === values
+// CHECK-NEXT: call.writes: {{{.*}}#cir.int<2>{{.*}}} defs=0 {{.*}} weak
+// CHECK-NEXT: call.other: {#cir.int<1> : !cir.int<s, 32>} defs=0 complete strong
+// CHECK-NEXT: memset: {#cir.int<1> : !cir.int<s, 32>, #cir.int<0> : !cir.int<s, 32>} defs=0 complete weak
+// CHECK-NEXT: two.origins: {#cir.int<5> : !cir.int<s, 32>, #cir.int<4> : !cir.int<s, 32>} defs=0 complete weak
+// CHECK-NEXT: escaped: {#cir.int<1> : !cir.int<s, 32>} defs=0 incomplete (EscapedTo, "@ext") weak
+// CHECK-NEXT: recursion: {#cir.int<1> : !cir.int<s, 32>} defs=0 complete weak
+// CI-NEXT: spill: {} defs=1 complete strong
+// BU-NEXT: spill: {#cir.int<7> : !cir.int<s, 32>} defs=0 complete contexts=1 strong
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!u8i = !cir.int<u, 8>
+!void = !cir.void
+
+module {
+cir.func private @ext(!cir.ptr<!s32i>)
+cir.func @set2(%p: !cir.ptr<!s32i>) {
+  %c2 = cir.const #cir.int<2> : !s32i
+  cir.store %c2, %p : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func @nothing() {
+  cir.return
+}
+cir.func @call_writes() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %c1 = cir.const #cir.int<1> : !s32i
+  cir.store %c1, %x : !s32i, !cir.ptr<!s32i>
+  cir.call @set2(%x) : (!cir.ptr<!s32i>) -> ()
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "call.writes"}
+  cir.return %v : !s32i
+}
+cir.func @call_other() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %c1 = cir.const #cir.int<1> : !s32i
+  cir.store %c1, %x : !s32i, !cir.ptr<!s32i>
+  cir.call @nothing() : () -> ()
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "call.other"}
+  cir.return %v : !s32i
+}
+cir.func @memset() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %c1 = cir.const #cir.int<1> : !s32i
+  cir.store %c1, %x : !s32i, !cir.ptr<!s32i>
+  %vp = cir.cast bitcast %x : !cir.ptr<!s32i> -> !cir.ptr<!void>
+  %b = cir.const #cir.int<0> : !u8i
+  %n = cir.const #cir.int<4> : !u64i
+  cir.libc.memset %n bytes at %vp to %b : !cir.ptr<!void>, !u8i, !u64i
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "memset"}
+  cir.return %v : !s32i
+}
+cir.func @two_origins(%cond: !cir.bool) -> !s32i {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %p = cir.select if %cond then %a else %b : (!cir.bool, !cir.ptr<!s32i>, !cir.ptr<!s32i>) -> !cir.ptr<!s32i>
+  %c4 = cir.const #cir.int<4> : !s32i
+  %c5 = cir.const #cir.int<5> : !s32i
+  cir.store %c5, %p : !s32i, !cir.ptr<!s32i>
+  cir.store %c4, %a : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %a : !cir.ptr<!s32i>, !s32i {test.load = "two.origins"}
+  cir.return %v : !s32i
+}
+cir.func @escaped() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  cir.call @ext(%x) : (!cir.ptr<!s32i>) -> ()
+  %c1 = cir.const #cir.int<1> : !s32i
+  cir.store %c1, %x : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "escaped"}
+  cir.return %v : !s32i
+}
+cir.func @recursion(%n: !s32i) -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %c1 = cir.const #cir.int<1> : !s32i
+  cir.store %c1, %x : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "recursion"}
+  %r = cir.call @recursion(%v) : (!s32i) -> !s32i
+  cir.return %r : !s32i
+}
+cir.func @spilled(%n: !s32i) -> !s32i {
+  %slot = cir.alloca "n" align(4) : !cir.ptr<!s32i>
+  cir.store %n, %slot : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %slot : !cir.ptr<!s32i>, !s32i {test.load = "spill"}
+  cir.return %v : !s32i
+}
+cir.func @main() -> !s32i {
+  %c7 = cir.const #cir.int<7> : !s32i
+  %r = cir.call @spilled(%c7) : (!s32i) -> !s32i
+  cir.return %r : !s32i
+}
+}

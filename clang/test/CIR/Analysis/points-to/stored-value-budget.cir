@@ -2,20 +2,23 @@
 // RUN: cir-opt %s -test-cir-points-to='mode=bu values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=FULL
 // RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 max-query-visits=4 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CUT
 // RUN: cir-opt %s -test-cir-points-to='mode=bu values=1 max-query-visits=4 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CUT
-// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CYCLE
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 strong-updates=0 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CYCLE
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=STRONG
 
 // Stored values (T22), the budget: a value copied through eight objects
 // (cir.copy) is read back through the chain of copies, one cell visited per
 // copy. With the default budget (maxQueryVisits, 4096) that is the constant;
 // with 4 visits the query stops, incomplete for Reason Budget. Two objects
 // copied into each other form a cycle: the cell in progress reads as
-// incomplete rather than as nothing.
+// incomplete rather than as nothing (without strong updates; with them, x
+// at the first copy holds the 1 stored just before it, T24).
 
 // FULL-LABEL: === values
 // FULL-NEXT: chain: {#cir.int<42> : !cir.int<s, 32>} defs=0 complete
 // CUT-LABEL: === values
 // CUT-NEXT: chain: {} defs=0 incomplete (Budget, "stored-value query visits")
 // CYCLE: cycle: {#cir.int<1> : !cir.int<s, 32>} defs=0 incomplete (MergedAt, "a cycle of copies")
+// STRONG: cycle: {#cir.int<1> : !cir.int<s, 32>} defs=0 complete weak
 
 !s32i = !cir.int<s, 32>
 

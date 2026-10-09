@@ -80,6 +80,7 @@ static PointsToAnalysisOptions applyBudgetScale(PointsToAnalysisOptions o) {
   scale(o.maxContextDepth);
   scale(o.maxAncestors);
   scale(o.maxReadHolders);
+  scale(o.maxStrongScanOps);
   scale(o.graphBudgets.maxTransferSlots);
   scale(o.graphBudgets.maxTransferRounds);
   return o;

@@ -205,6 +205,25 @@ struct PointsToAnalysisOptions {
   /// The most nodes (a node and its subobjects) a stored-value read
   /// gathers; past it, the read is incomplete (Reason Budget).
   unsigned maxReadHolders = 256;
+  /// Stored-value queries at a query point: answer with the one write that
+  /// must have stored the bytes last (a strong update, T24) when the rule
+  /// of StoredValues.cpp applies. Off: always the union of every write.
+  bool strongUpdates = true;
+  /// The most ops one strong-update search looks at; past it, the read
+  /// gets the union of every write.
+  unsigned maxStrongScanOps = 16384;
+  /// The indeterminate-value rule (N41): reading a stack or heap object
+  /// before any write is UB (C++ up to C++23 [basic.indet]), so "never
+  /// written" adds no value. False: the initial value of a stack or heap
+  /// object is a possible value (unknown, so the answer is incomplete)
+  /// unless a strong update kills it; the sound rule for C (an indeterminate
+  /// value may be copied, and reading one of an object whose address is
+  /// taken is unspecified, not UB) and for C++26 (erroneous behaviour).
+  bool assumeIndeterminateReadsUB = true;
+  /// Test only (the negative control of the run-time value check): a
+  /// strong-update search skips the writes between the query point and the
+  /// store it finds, which makes the rule wrong.
+  bool testIgnoreStrongClobbers = false;
   /// The caps of the copy closure (GraphBudgets).
   GraphBudgets graphBudgets;
   /// Multiply every budget above (and the clone budgets, maxIndirectRounds
@@ -709,15 +728,20 @@ public:
   /// counted incomplete); complete only if every context is.
   /// \p numContexts, if given, is set to the number of contexts used (0 for
   /// the own graph's answer).
+  /// \p at, if given, is the op that reads the memory (a load of addr):
+  /// the answer then holds just before it and may be a strong update
+  /// (StoredValueQuery::valuesAt).
   StoredValues valuesAtInContexts(mlir::Value addr,
                                   std::optional<uint64_t> size = std::nullopt,
                                   mlir::Type type = {},
-                                  unsigned *numContexts = nullptr) const;
-  /// The one constant the memory \p addr points to holds, if
-  /// valuesAtInContexts is complete with exactly one constant and no def.
+                                  unsigned *numContexts = nullptr,
+                                  mlir::Operation *at = nullptr) const;
+  /// The one constant the memory \p addr points to holds (just before
+  /// \p at, if given), if valuesAtInContexts is complete with exactly one
+  /// constant and no def.
   std::optional<mlir::TypedAttr>
   isConstantAt(mlir::Value addr, std::optional<uint64_t> size = std::nullopt,
-               mlir::Type type = {}) const;
+               mlir::Type type = {}, mlir::Operation *at = nullptr) const;
   /// The stored-value query engine (built on first use).
   StoredValueQuery &getStoredValueQuery() const;
 

@@ -210,6 +210,16 @@ struct TestCIRPointsToPass
       *this, "values",
       llvm::cl::desc("Print what each cir.load tagged test.load may read"),
       llvm::cl::init(false)};
+  Option<bool> strongUpdates{
+      *this, "strong-updates",
+      llvm::cl::desc("Answer stored-value reads at a load with strong "
+                     "updates where they apply"),
+      llvm::cl::init(true)};
+  Option<bool> indeterminateUB{
+      *this, "indeterminate-ub",
+      llvm::cl::desc("Assume reading an indeterminate value is UB (the "
+                     "initial value of a stack or heap object is no value)"),
+      llvm::cl::init(true)};
   Option<unsigned> maxQueryVisits{
       *this, "max-query-visits",
       llvm::cl::desc("The stored-value query budget"), llvm::cl::init(4096)};
@@ -516,6 +526,8 @@ void TestCIRPointsToPass::runCI() {
     options.maxTotalCloneNodes = maxTotalCloneNodes;
   }
   options.maxQueryVisits = maxQueryVisits;
+  options.strongUpdates = strongUpdates;
+  options.assumeIndeterminateReadsUB = indeterminateUB;
   options.maxQueryContexts = maxQueryContexts;
   options.graphBudgets.maxTransferSlots = maxTransferSlots;
   options.graphBudgets.maxTransferRounds = maxTransferRounds;
@@ -640,7 +652,7 @@ void TestCIRPointsToPass::runCI() {
           return;
         unsigned numContexts = 0;
         StoredValues values = analysis.valuesAtInContexts(
-            load.getAddr(), std::nullopt, load.getType(), &numContexts);
+            load.getAddr(), std::nullopt, load.getType(), &numContexts, load);
         os << name.getValue() << ": {";
         llvm::interleaveComma(values.consts, os,
                               [&](TypedAttr c) { os << c; });
@@ -650,6 +662,7 @@ void TestCIRPointsToPass::runCI() {
           os << " (" << (values.why ? formatReason(values.why) : "-") << ")";
         if (numContexts)
           os << " contexts=" << numContexts;
+        os << (values.strong ? " strong" : " weak");
         if (explainSets && !values.complete)
           for (const std::string &link : explainChain(values.why))
             os << "\n    <- " << link;
@@ -665,7 +678,7 @@ void TestCIRPointsToPass::runCI() {
             ++numLoads;
             unsigned contexts = 0;
             StoredValues values = analysis.valuesAtInContexts(
-                load.getAddr(), std::nullopt, load.getType(), &contexts);
+                load.getAddr(), std::nullopt, load.getType(), &contexts, load);
             numCtx += contexts > 0;
             if (!values.complete) {
               ++whyIncomplete[values.why ? formatReason(values.why) : "-"];
@@ -691,6 +704,9 @@ void TestCIRPointsToPass::runCI() {
            << ")\n"
            << "queries: " << qs.numQueries << " visits: " << qs.numVisits
            << " budget hits: " << qs.numBudgetHits << "\n"
+           << "strong updates: " << qs.numStrong
+           << " strong-update scan budget hits: " << qs.numStrongBudgetHits
+           << "\n"
            << "value query time (wall, s): " << end.getWallTime() << "\n";
         SmallVector<std::pair<unsigned, StringRef>> sorted;
         for (const auto &entry : whyIncomplete)

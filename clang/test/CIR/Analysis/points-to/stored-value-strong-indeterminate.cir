@@ -1,0 +1,85 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 indeterminate-ub=0 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 indeterminate-ub=0 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=UB
+
+// Stored values with the indeterminate-value rule off (T24, N41, option
+// assumeIndeterminateReadsUB = false; the sound rule for C and C++26): the
+// initial value of a stack or heap object is a possible value, unknown,
+// unless a strong update kills it.
+//  - a load of a never-written alloca: incomplete (with the rule: complete
+//    and empty);
+//  - written first: strong;
+//  - written on one path only: incomplete (with the rule: the one value);
+//  - written in a loop body, read after the loop: incomplete;
+//  - malloc'd storage written: still incomplete (strong updates are for
+//    allocas only);
+//  - a global is unaffected: its initializer is a write.
+
+// CHECK-LABEL: === values
+// CHECK-NEXT: never: {} defs=0 incomplete (UnhandledOp, "the initial value of a stack or heap object (indeterminate reads are not assumed UB)") weak
+// CHECK-NEXT: written: {#cir.int<5> : !cir.int<s, 32>} defs=0 complete strong
+// CHECK-NEXT: one.path: {#cir.int<5> : !cir.int<s, 32>} defs=0 incomplete (UnhandledOp, "the initial value {{.*}}") weak
+// CHECK-NEXT: loop: {#cir.int<5> : !cir.int<s, 32>} defs=0 incomplete (UnhandledOp, "the initial value {{.*}}") weak
+// CHECK-NEXT: heap: {#cir.int<5> : !cir.int<s, 32>} defs=0 incomplete (UnhandledOp, "the initial value {{.*}}") weak
+// CHECK-NEXT: global: {#cir.int<3> : !cir.int<s, 32>} defs=0 complete weak
+//
+// UB-LABEL: === values
+// UB-NEXT: never: {} defs=0 complete weak
+// UB-NEXT: written: {#cir.int<5> : !cir.int<s, 32>} defs=0 complete strong
+// UB-NEXT: one.path: {#cir.int<5> : !cir.int<s, 32>} defs=0 complete weak
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+
+module {
+cir.global "private" internal @g = #cir.int<3> : !s32i
+cir.func private @malloc(!u64i) -> !cir.ptr<!void>
+cir.func @never() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "never"}
+  cir.return %v : !s32i
+}
+cir.func @written() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %five = cir.const #cir.int<5> : !s32i
+  cir.store %five, %x : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "written"}
+  cir.return %v : !s32i
+}
+cir.func @one_path(%c: !cir.bool) -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  cir.if %c {
+    %five = cir.const #cir.int<5> : !s32i
+    cir.store %five, %x : !s32i, !cir.ptr<!s32i>
+  }
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "one.path"}
+  cir.return %v : !s32i
+}
+cir.func @loop(%c: !cir.bool) -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  cir.while {
+    cir.condition(%c)
+  } do {
+    %five = cir.const #cir.int<5> : !s32i
+    cir.store %five, %x : !s32i, !cir.ptr<!s32i>
+    cir.yield
+  }
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "loop"}
+  cir.return %v : !s32i
+}
+cir.func @heap() -> !s32i {
+  %n = cir.const #cir.int<4> : !u64i
+  %m = cir.call @malloc(%n) : (!u64i) -> !cir.ptr<!void>
+  %mp = cir.cast bitcast %m : !cir.ptr<!void> -> !cir.ptr<!s32i>
+  %five = cir.const #cir.int<5> : !s32i
+  cir.store %five, %mp : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %mp : !cir.ptr<!s32i>, !s32i {test.load = "heap"}
+  cir.return %v : !s32i
+}
+cir.func @global() -> !s32i {
+  %p = cir.get_global @g : !cir.ptr<!s32i>
+  %v = cir.load %p : !cir.ptr<!s32i>, !s32i {test.load = "global"}
+  cir.return %v : !s32i
+}
+}

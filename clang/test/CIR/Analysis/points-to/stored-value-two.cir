@@ -1,5 +1,6 @@
-// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
-// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 strong-updates=0 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 strong-updates=0 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=STRONG
 
 // Stored values (T22): the union of every write. Two different stores give
 // both constants (flow-insensitive: the one before the load included); the
@@ -10,6 +11,9 @@
 // queries don't split scalars into bytes). Writes to an array element
 // count for every element (element-relative offsets): a[i] = 5 for every i,
 // then a[3], is 5; a write to the other field of the element does not count.
+// (These are the flow-insensitive answers, strong-updates=0. With strong
+// updates, T24, the load between the two stores reads the first one.)
+// STRONG: two: {#cir.int<1> : !cir.int<s, 32>} defs=0 complete strong
 
 // CHECK-LABEL: === values
 // CHECK-NEXT: two: {#cir.int<1> : !cir.int<s, 32>, #cir.int<2> : !cir.int<s, 32>} defs=0 complete

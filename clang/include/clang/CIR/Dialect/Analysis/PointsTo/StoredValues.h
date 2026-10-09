@@ -19,10 +19,9 @@
 //    cell of a caller's graph finds the writes of the callees whose graphs
 //    were copied into it.
 //  - StoredValueQuery::valuesAt: the union of the writes that may reach a
-//    cell (see StoredValues.cpp for the rules and their soundness).
-//
-// Queries are flow-insensitive: the `at` operation is reserved for strong
-// updates (T24) and ignored.
+//    cell (see StoredValues.cpp for the rules and their soundness), or, at a
+//    query point `at` where one write must have stored the bytes read last
+//    (a strong update, T24), that write's value alone.
 //
 //===----------------------------------------------------------------------===//
 
@@ -63,6 +62,10 @@ struct StoredValues {
   /// Why the first def that is a load was not resolved to what it reads,
   /// if it was asked (an explanation only).
   const Reason *defWhy = nullptr;
+  /// Whether the answer is a strong update: the value of the one write that
+  /// must have stored the bytes last before the query point (T24), not the
+  /// union of every write. Not merged.
+  bool strong = false;
 
   void addConst(mlir::TypedAttr value);
   void addDef(mlir::Value value);
@@ -196,8 +199,11 @@ public:
 
   /// What the \p size bytes at \p cell (a cell of the TU graph) may hold,
   /// read as \p type (null: constants keep the type they were written
-  /// with, and a zero write gives no constant). \p at is reserved for flow
-  /// sensitivity (T24) and ignored: the answer holds at every point.
+  /// with, and a zero write gives no constant). \p at, if given, is the op
+  /// that reads them (a load, a copy, a call reading through an operand): the
+  /// answer holds just before it, and is a strong update if one write must
+  /// have stored the bytes last (StoredValues.cpp, "Strong updates");
+  /// without it the answer holds at every point.
   StoredValues valuesAt(Cell cell, uint64_t size, mlir::Operation *at,
                         mlir::Type type = {});
 
@@ -207,7 +213,8 @@ public:
   /// far as its images are faithful, and the formals the writes store name
   /// the operands of those calls.
   StoredValues valuesInContext(Cell cell, uint64_t size, mlir::Type type,
-                               llvm::ArrayRef<const TUClone *> context);
+                               llvm::ArrayRef<const TUClone *> context,
+                               mlir::Operation *at = nullptr);
 
   const StoredValueIndex &getIndex() const { return *index; }
   /// The most cells one query may visit; past it, Reason Budget.
@@ -222,6 +229,10 @@ public:
     size_t numDepthHits = 0;
     size_t numAncestorHits = 0;
     size_t numHolderHits = 0;
+    /// Reads answered by a strong update, and the strong-update searches
+    /// that ran out of PointsToAnalysisOptions::maxStrongScanOps.
+    size_t numStrong = 0;
+    size_t numStrongBudgetHits = 0;
   };
   const Stats &getStats() const { return stats; }
 
@@ -231,7 +242,27 @@ private:
   /// see StoredValues.cpp): memoized per cell, size and type for an empty
   /// chain.
   StoredValues cellValues(Cell cell, uint64_t size, mlir::Type type,
-                          llvm::ArrayRef<const TUClone *> chain);
+                          llvm::ArrayRef<const TUClone *> chain,
+                          mlir::Operation *at,
+                          llvm::ArrayRef<const TUClone *> lift = {});
+  /// The strong update of a read of \p size bytes at \p cell (resolved) by
+  /// \p at, in the context \p chain, or std::nullopt if the rule does not
+  /// apply (StoredValues.cpp, "Strong updates"). \p lift: the copies the
+  /// cell was mapped out through (readOut), outermost first: the read by
+  /// \p at happens during the call of the first one.
+  std::optional<StoredValues>
+  strongValues(Cell cell, uint64_t size, mlir::Type type,
+               llvm::ArrayRef<const TUClone *> chain, mlir::Operation *at,
+               llvm::ArrayRef<const TUClone *> lift);
+  /// Whether the graph \p clone copied into \p nodes (the nodes of a read,
+  /// located) or a graph copied into it, recursively, writes the read
+  /// (true past the budget).
+  bool
+  calleeWrites(const TUClone *clone,
+               llvm::ArrayRef<std::pair<const Node *, WriteLocation>> nodes,
+               size_t depth);
+  /// Whether strong updates may be found in \p func at all (memoized).
+  bool allowsStrongUpdates(mlir::Operation *func);
   /// Give \p out what \p write contributes to a read it relates to by
   /// \p relation (StoredValues.cpp), \p chain the copies the walk came
   /// through from the read's graph down to the write's.
@@ -246,8 +277,11 @@ private:
   size_t mapOut(Cell cell, llvm::ArrayRef<const TUClone *> chain,
                 llvm::SmallVectorImpl<Cell> &out) const;
   /// Read \p cell of the innermost graph of \p chain as far out as it maps.
+  /// \p at: the op reading it, or null; \p allStrong, if given, is set to
+  /// whether every cell read had a strong update.
   void readOut(Cell cell, uint64_t size, mlir::Type type,
-               llvm::ArrayRef<const TUClone *> chain, StoredValues &out);
+               llvm::ArrayRef<const TUClone *> chain, StoredValues &out,
+               mlir::Operation *at, bool *allStrong = nullptr);
   const Reason *reason(Reason::Kind kind, mlir::Operation *op,
                        llvm::StringRef detail);
 
@@ -260,6 +294,7 @@ private:
   bool overBudget = false;
   llvm::DenseMap<Key, StoredValues> memo;
   llvm::DenseSet<Key> inProgress;
+  llvm::DenseMap<mlir::Operation *, bool> strongFunctions;
   Stats stats;
 };
 

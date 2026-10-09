@@ -144,6 +144,7 @@
 #include "clang/CIR/Interfaces/CIROpInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -226,6 +227,14 @@ std::string mergedSuffix(const Node *node) {
 
 } // namespace
 
+// A measurement knob (T24): PointsToAnalysisOptions::assumeIndeterminateReadsUB
+// for the host facts. Off is the sound rule for C and C++26 input.
+static llvm::cl::opt<bool> clIndeterminateReadsUB(
+    "cir-offload-host-facts-indeterminate-ub",
+    llvm::cl::desc("Host facts: assume reading an indeterminate value of a "
+                   "stack or heap object is UB"),
+    llvm::cl::init(true), llvm::cl::Hidden);
+
 SYCLHostFacts::SYCLHostFacts(ModuleOp container,
                              const HostFactsOptions &options) {
   ModuleOp host = getOffloadContainerHostModule(container);
@@ -240,6 +249,7 @@ SYCLHostFacts::SYCLHostFacts(ModuleOp container,
   ptOptions.relevanceSlice = options.relevanceSlice;
   ptOptions.maxSeconds = options.maxSeconds;
   ptOptions.maxMemoryMB = options.maxMemoryMB;
+  ptOptions.assumeIndeterminateReadsUB = clIndeterminateReadsUB;
   addSYCLPointsToPlugin(ptOptions);
   ownedAnalysis =
       std::make_unique<PointsToAnalysis>(host, ownedRegistry.get(), ptOptions);
@@ -828,9 +838,10 @@ SYCLHostFacts::getConstCandidates(StringRef kernel) const {
 }
 
 SYCLHostFacts::ConstFact SYCLHostFacts::constantAt(Cell cell, uint64_t size,
-                                                   Type type) const {
+                                                   Type type,
+                                                   Operation *at) const {
   StoredValues values =
-      analysis->getStoredValueQuery().valuesAt(cell, size, nullptr, type);
+      analysis->getStoredValueQuery().valuesAt(cell, size, at, type);
   if (!values.complete)
     return {nullptr, "it may hold a value the analysis does not know: " +
                          explain(values.why)};
@@ -877,7 +888,7 @@ SYCLHostFacts::constantOfLaunch(const LaunchRecord &launch, StringRef field,
   Cell at(launch.closure->getNode(),
           launch.closure->getOffset() + member->first);
   ConstFact fact = constantAt(at, static_cast<uint64_t>(*size),
-                              type ? type : member->second);
+                              type ? type : member->second, launch.call);
   if (!fact.value)
     fact.note = ("'" + field + "' at the launch at " +
                  formatLocation(launch.call) + ": " + fact.note)
@@ -981,7 +992,7 @@ SYCLHostFacts::geometryOfLaunch(const LaunchRecord &launch) const {
     for (unsigned i = 0; i < shape.dims; ++i) {
       Cell at(cell.getNode(),
               cell.getOffset() + static_cast<int64_t>(i * shape.elemSize));
-      ConstFact c = constantAt(at, shape.elemSize, shape.elem);
+      ConstFact c = constantAt(at, shape.elemSize, shape.elem, launch.call);
       auto value = dyn_cast_if_present<cir::IntAttr>(c.value);
       if (!value)
         note("component " + std::to_string(i) + ": " + c.note);
@@ -1008,8 +1019,8 @@ SYCLHostFacts::geometryOfLaunch(const LaunchRecord &launch) const {
         !isa<cir::IntType>(rec.getElementType(3)))
       return fail("the nd_range_view has an unexpected layout");
     auto dimsTy = cast<cir::IntType>(rec.getElementType(3));
-    ConstFact dims =
-        constantAt(memberCell(3), dimsTy.getWidth() / 8, rec.getElementType(3));
+    ConstFact dims = constantAt(memberCell(3), dimsTy.getWidth() / 8,
+                                rec.getElementType(3), launch.call);
     auto d = dyn_cast_if_present<cir::IntAttr>(dims.value);
     if (!d || asInt64(d) < 1 || asInt64(d) > 3)
       return fail("the nd_range_view's MDims: " +
@@ -1023,7 +1034,7 @@ SYCLHostFacts::geometryOfLaunch(const LaunchRecord &launch) const {
       auto elem = dyn_cast<cir::IntType>(ptrTy.getPointee());
       Cell slot = memberCell(index);
       StoredValues values = analysis->getStoredValueQuery().valuesAt(
-          slot, layout->getTypeSize(ptrTy).getFixedValue(), nullptr, ptrTy);
+          slot, layout->getTypeSize(ptrTy).getFixedValue(), launch.call, ptrTy);
       bool onlyNull = values.complete && values.defs.empty() &&
                       !values.consts.empty() &&
                       llvm::all_of(values.consts, [](TypedAttr c) {

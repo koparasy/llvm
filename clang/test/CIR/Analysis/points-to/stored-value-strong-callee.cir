@@ -1,0 +1,64 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefixes=CHECK,BU
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 indeterminate-ub=0 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefixes=CHECK,BU
+// RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefixes=CHECK,CI
+
+// Strong updates (T24) and callees, bottom-up:
+//  - a callee reading the caller's local through a pointer, in the calling
+//    context (top-down): the read happens during the call, so the strong
+//    update is found from the call in the caller ("lifted"): x = 5; read(&x);
+//    x = 6 gives {5} (the flow-insensitive answer is {5, 6}). The same holds
+//    with the indeterminate-value rule off. Two levels down (main calls
+//    mid(7), which spills its parameter and passes the slot to a reader):
+//    the slot is mid's local, so the strong update is found from mid's call
+//    of the reader, and the stored parameter is 7 in main's context.
+//  - a callee that only reads the local does not stop a strong update in the
+//    caller after the call; one that writes it does (call.writes).
+// In ci mode the callee's read is weak: its function holds none of the writes.
+
+// CHECK-LABEL: === values
+// BU-NEXT: lifted: {#cir.int<5> : !cir.int<s, 32>} defs=0 complete contexts=1 strong
+// CI-NEXT: lifted: {#cir.int<5> : !cir.int<s, 32>, #cir.int<6> : !cir.int<s, 32>} defs=0 complete weak
+// BU-NEXT: lifted.deep: {#cir.int<7> : !cir.int<s, 32>} defs=0 complete contexts=1 strong
+// CI-NEXT: lifted.deep: {} defs=1 complete weak
+// CHECK-NEXT: after.reader: {#cir.int<6> : !cir.int<s, 32>} defs=0 complete strong
+// CHECK-NEXT: after.writer: {{{.*}}#cir.int<9>{{.*}}} defs=0 {{.*}}weak
+
+!s32i = !cir.int<s, 32>
+
+module {
+cir.func internal @reader(%p: !cir.ptr<!s32i>) -> !s32i {
+  %v = cir.load %p : !cir.ptr<!s32i>, !s32i {test.load = "lifted"}
+  cir.return %v : !s32i
+}
+cir.func internal @writer(%p: !cir.ptr<!s32i>) {
+  %c9 = cir.const #cir.int<9> : !s32i
+  cir.store %c9, %p : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func internal @reader2(%p: !cir.ptr<!s32i>) -> !s32i {
+  %v = cir.load %p : !cir.ptr<!s32i>, !s32i {test.load = "lifted.deep"}
+  cir.return %v : !s32i
+}
+cir.func internal @mid(%n: !s32i) -> !s32i {
+  %slot = cir.alloca "n" align(4) : !cir.ptr<!s32i>
+  cir.store %n, %slot : !s32i, !cir.ptr<!s32i>
+  %r = cir.call @reader2(%slot) : (!cir.ptr<!s32i>) -> !s32i
+  cir.return %r : !s32i
+}
+cir.func @main() -> !s32i {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %y = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+  %c5 = cir.const #cir.int<5> : !s32i
+  %c6 = cir.const #cir.int<6> : !s32i
+  cir.store %c5, %x : !s32i, !cir.ptr<!s32i>
+  %r = cir.call @reader(%x) : (!cir.ptr<!s32i>) -> !s32i
+  cir.store %c6, %x : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %x : !cir.ptr<!s32i>, !s32i {test.load = "after.reader"}
+  cir.store %c6, %y : !s32i, !cir.ptr<!s32i>
+  cir.call @writer(%y) : (!cir.ptr<!s32i>) -> ()
+  %w = cir.load %y : !cir.ptr<!s32i>, !s32i {test.load = "after.writer"}
+  %c7 = cir.const #cir.int<7> : !s32i
+  %m = cir.call @mid(%c7) : (!s32i) -> !s32i
+  cir.return %r : !s32i
+}
+}

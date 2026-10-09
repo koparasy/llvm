@@ -1,0 +1,41 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci subobjects=1 values=1 strong-updates=0 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s
+
+// Stored values, a read at several places of a write (T24/G3, Csmith seed
+// 407679, reduced). With subobject nodes, a pointer that may point to l.f1
+// or to l.f3.a merges the two S0 members into one node with two parents, so
+// a read of l.f3.a.y is at offset 8 of l.f1 or at offset 24 + 8 of l (in the
+// ancestor l). The whole-object copy from the constant contains the read at
+// both places: the answer is the union of the two (1 and 2). The index used
+// to keep one place per ancestor and the first delta, and claimed 1, the
+// value of l.f1.y.
+
+// CHECK-LABEL: === values
+// CHECK-NEXT: f3.a.y: {#cir.int<1> : !cir.int<u, 32>, #cir.int<2> : !cir.int<u, 32>} defs=0 complete weak
+// CHECK-NEXT: f1.y: {#cir.int<1> : !cir.int<u, 32>, #cir.int<2> : !cir.int<u, 32>} defs=0 complete weak
+
+!s64i = !cir.int<s, 64>
+!u32i = !cir.int<u, 32>
+!rec_S0 = !cir.struct<"S0" {data !s64i, data !u32i}>
+!rec_S1 = !cir.struct<"S1" {data !rec_S0, data !u32i}>
+!rec_S2 = !cir.struct<"S2" {data !rec_S0, data !rec_S1}>
+
+module {
+cir.global "private" constant internal @init = #cir.const_record<{#cir.const_record<{#cir.int<7> : !s64i, #cir.int<1> : !u32i}> : !rec_S0, #cir.const_record<{#cir.const_record<{#cir.int<8> : !s64i, #cir.int<2> : !u32i}> : !rec_S0, #cir.int<9> : !u32i}> : !rec_S1}> : !rec_S2
+cir.func @f(%c: !cir.bool) -> !u32i {
+  %l = cir.alloca "l" align(8) : !cir.ptr<!rec_S2>
+  %g = cir.get_global @init : !cir.ptr<!rec_S2>
+  cir.copy %g to %l : !cir.ptr<!rec_S2>
+  %f1 = cir.get_member %l[0] {name = "f1"} : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S0>
+  %f3 = cir.get_member %l[1] {name = "f3"} : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S1>
+  %f3a = cir.get_member %f3[0] {name = "a"} : !cir.ptr<!rec_S1> -> !cir.ptr<!rec_S0>
+  %p = cir.select if %c then %f1 else %f3a : (!cir.bool, !cir.ptr<!rec_S0>, !cir.ptr<!rec_S0>) -> !cir.ptr<!rec_S0>
+  %py = cir.get_member %p[1] {name = "y"} : !cir.ptr<!rec_S0> -> !cir.ptr<!u32i>
+  %y3 = cir.get_member %f3a[1] {name = "y"} : !cir.ptr<!rec_S0> -> !cir.ptr<!u32i>
+  %v = cir.load %y3 : !cir.ptr<!u32i>, !u32i {test.load = "f3.a.y"}
+  %y1 = cir.get_member %f1[1] {name = "y"} : !cir.ptr<!rec_S0> -> !cir.ptr<!u32i>
+  %w = cir.load %y1 : !cir.ptr<!u32i>, !u32i {test.load = "f1.y"}
+  cir.return %v : !u32i
+}
+}

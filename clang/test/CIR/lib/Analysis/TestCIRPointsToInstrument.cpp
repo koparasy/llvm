@@ -254,6 +254,19 @@ struct TestCIRPointsToInstrumentPass
       *this, "values",
       llvm::cl::desc("Also check the constants of the loads (isConstantAt)"),
       llvm::cl::init(false)};
+  Option<bool> strongUpdates{
+      *this, "strong-updates",
+      llvm::cl::desc("Strong updates in the value queries"),
+      llvm::cl::init(true)};
+  Option<bool> indeterminateUB{
+      *this, "indeterminate-ub",
+      llvm::cl::desc("Assume reading an indeterminate value is UB"),
+      llvm::cl::init(true)};
+  Option<bool> injectWrongStrong{
+      *this, "inject-wrong-strong",
+      llvm::cl::desc("Test only: strong updates ignore the writes between "
+                     "the store they find and the load"),
+      llvm::cl::init(false)};
   Option<uint64_t> injectWrongValue{
       *this, "inject-wrong-value",
       llvm::cl::desc("Test only: check this value against a wrong constant"),
@@ -346,6 +359,9 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
   options.maxQueryContexts = maxQueryContexts;
   options.budgetScale = budgetScale;
   options.relevanceSlice = slice;
+  options.strongUpdates = strongUpdates;
+  options.assumeIndeterminateReadsUB = indeterminateUB;
+  options.testIgnoreStrongClobbers = injectWrongStrong;
   PointsToAnalysis pt(module, &registry, options);
   DataLayout dataLayout(module);
 
@@ -581,7 +597,7 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
         if (!ptrTy || ptrTy.getAddrSpace() || !checkable(load.getType()))
           return;
         std::optional<TypedAttr> c =
-            pt.isConstantAt(load.getAddr(), std::nullopt, load.getType());
+            pt.isConstantAt(load.getAddr(), std::nullopt, load.getType(), load);
         if (!c)
           return;
         // A pointer constant: only null is checkable as bits.

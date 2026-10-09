@@ -203,10 +203,10 @@ private:
   /// parameters of \p kernels name.
   bool isClosureOf(const pointsto::LaunchRecord &launch,
                    llvm::ArrayRef<cir::FuncOp> kernels) const;
-  /// The one constant of type \p type the \p size bytes at \p cell hold,
-  /// or why not.
-  ConstFact constantAt(pointsto::Cell cell, uint64_t size,
-                       mlir::Type type) const;
+  /// The one constant of type \p type the \p size bytes at \p cell hold
+  /// when \p at (the launch reading them) runs, or why not.
+  ConstFact constantAt(pointsto::Cell cell, uint64_t size, mlir::Type type,
+                       mlir::Operation *at) const;
 
   std::unique_ptr<pointsto::PointsToModelRegistry> ownedRegistry;
   std::unique_ptr<pointsto::PointsToAnalysis> ownedAnalysis;
