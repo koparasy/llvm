@@ -76,6 +76,8 @@ StringRef cir::pointsto::getAliasRuleName(AliasRule rule) {
     return "subobject-overlap";
   case AliasRule::CallingContexts:
     return "calling-contexts";
+  case AliasRule::MayBeShared:
+    return "may-be-shared";
   }
   llvm_unreachable("unknown alias rule");
 }
@@ -94,7 +96,8 @@ static bool isUnknownReachable(const Node *node) {
 /// node may give MustAlias or PartialAlias (N2).
 static bool isSingleton(const Node *node) {
   return node->getOrigins().size() == 1 &&
-         !hasAny(node->getFlags(), NodeFlags::Summary) &&
+         !hasAny(node->getFlags(),
+                 NodeFlags::Summary | NodeFlags::MayBeShared) &&
          !isUnknownReachable(node);
 }
 
@@ -116,7 +119,10 @@ static const ParentLink *getOnlyParent(const Graph &graph, const Node *node,
 /// isSingleton, where a child that is only a member of its parent
 /// (getOnlyParent) stands for one object if its parent does.
 static bool isSingleton(const Graph &graph, const Node *node) {
-  if (hasAny(node->getFlags(), NodeFlags::Summary) || isUnknownReachable(node))
+  // MayBeShared: the node may also be a global's object, which is not among
+  // its origins.
+  if (hasAny(node->getFlags(), NodeFlags::Summary | NodeFlags::MayBeShared) ||
+      isUnknownReachable(node))
     return false;
   for (unsigned depth = 0; depth < 64; ++depth) {
     if (node->getOrigins().size() == 1)
@@ -126,7 +132,7 @@ static bool isSingleton(const Graph &graph, const Node *node) {
     if (!parent)
       return false;
     node = parent->parent;
-    if (hasAny(node->getFlags(), NodeFlags::Summary) ||
+    if (hasAny(node->getFlags(), NodeFlags::Summary | NodeFlags::MayBeShared) ||
         isUnknownReachable(node))
       return false;
   }
@@ -278,6 +284,9 @@ AliasAnswer PointsToAnalysis::aliasCells(Cell cellA, Cell cellB, uint64_t sizeA,
   const Node *nodeB = cellB.getNode();
   bool unknownA = isUnknownReachable(nodeA);
   bool unknownB = isUnknownReachable(nodeB);
+  auto mayBeShared = [&](const Node *node) {
+    return node->hasFlags(NodeFlags::MayBeShared) && !graph->isShared(node);
+  };
 
   // Rule 2b: different nodes of one tree of subobjects.
   // SOUNDNESS: a child is the bytes [o, o + size) of each of its parents, so
@@ -332,6 +341,17 @@ AliasAnswer PointsToAnalysis::aliasCells(Cell cellA, Cell cellB, uint64_t sizeA,
 
   // Rule 2: different nodes.
   if (nodeA != nodeB) {
+    // SOUNDNESS (BU, V4 F2): a MayBeShared node may be the object of any
+    // shared node (a caller passed a global's object, see projectClones), so
+    // it may be the object of the other node if that one is shared, or if it
+    // may be one too. This comes before the escape argument below: a global
+    // that never escaped is the same object as the formal its caller gives
+    // it to. Inside one tree of subobjects (rule 2b above) the layout holds
+    // whichever object the tree is.
+    if ((mayBeShared(nodeA) &&
+         (graph->isShared(nodeB) || mayBeShared(nodeB))) ||
+        (mayBeShared(nodeB) && graph->isShared(nodeA)))
+      return {AliasResult::MayAlias, AliasRule::MayBeShared};
     // SOUNDNESS: with unification every pointer the analysed code may hold
     // to an object points into that object's node, so two different nodes
     // that unknown code cannot reach denote different objects.
@@ -577,6 +597,14 @@ std::string PointsToAnalysis::explainAnswer(const AliasAnswer &answer, Value a,
     return "a, b: disjoint ranges of one object, in different subobjects";
   case AliasRule::SubobjectOverlap:
     return "a, b: subobjects of one object whose ranges may overlap";
+  case AliasRule::MayBeShared: {
+    const Node *flagged =
+        nodeA->hasFlags(NodeFlags::MayBeShared) ? nodeA : nodeB;
+    const Reason *why = flagged->getReason(NodeFlags::MayBeShared);
+    return "a, b: one may be a global's object" +
+           (why ? " (" + why->detail.str() + ")" : std::string()) +
+           ", the other is or may be one";
+  }
   case AliasRule::CallingContexts: {
     std::string out;
     llvm::raw_string_ostream os(out);
@@ -914,8 +942,11 @@ ModRefResult PointsToAnalysis::callModRefOf(
       // event, the next command) whose arguments need not reach the
       // allocation. So is the memory an asynchronous command reads or writes
       // (AsyncAccess).
+      // MayBeShared (BU): the node may be a global's object, which the call
+      // may reach by the global's name.
       if (isUnknownReachable(part) || part->hasFlags(NodeFlags::HasUSM) ||
-          part->hasFlags(NodeFlags::AsyncAccess))
+          part->hasFlags(NodeFlags::AsyncAccess) ||
+          (part->hasFlags(NodeFlags::MayBeShared) && !graph->isShared(part)))
         return ModRefResult::getModAndRef();
       // SOUNDNESS: a call (and everything it calls) reaches an existing
       // object only through a pointer: one it is passed, one it loads from

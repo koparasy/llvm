@@ -429,12 +429,17 @@ void StoredValueIndex::indexWrites() {
   }
 
   // The globals: their initial values.
-  for (auto [sym, node] : analysis.getSymbolNodes()) {
+  // SOUNDNESS: at the cell where the symbol's storage starts. A global
+  // unified into another one's node (a pointer that may point to either)
+  // is at an offset in it; at offset 0 its initializer would be read for
+  // the other global's bytes, and missing from its own (V4fix, Csmith seed
+  // 100570).
+  for (auto [sym, cell] : analysis.getSymbolCells()) {
     auto global = dyn_cast_if_present<cir::GlobalOp>(
         SymbolTable::lookupNearestSymbolFrom(analysis.getModule(), sym));
     if (!global)
       continue;
-    WriteRecord write{WriteRecord::Kind::GlobalInit, global, Cell(node)};
+    WriteRecord write{WriteRecord::Kind::GlobalInit, global, cell};
     write.size = sizeOf(global.getSymType());
     if (global.isDeclaration()) {
       // Another TU defines it (External anyway).
@@ -794,6 +799,12 @@ StoredValues StoredValueQuery::cellValues(Cell cell, uint64_t size, Type type,
     }
     if (const Reason *why = index->getCallerWriter(node))
       out.setIncomplete(why);
+    // MayBeShared (BU): the node may be a global's object, which every
+    // function may write through the global; those writes are indexed on
+    // the shared node, not on this one.
+    if (node->hasFlags(NodeFlags::MayBeShared) &&
+        !analysis.getGraph().isShared(node))
+      out.setIncomplete(node->getReason(NodeFlags::MayBeShared));
     if (index->isCopiedShared(node))
       out.setIncomplete(reason(Reason::Kind::MergedAt, nullptr,
                                "shared node copied before it was shared"));
@@ -1041,6 +1052,10 @@ void StoredValueQuery::resolveValue(Value value, uint64_t size, Type type,
       if (!call || clone->callee->func != func ||
           call->getParentOfType<cir::FuncOp>() != clone->caller->func ||
           arg.getArgNumber() >= call.getNumArgOperands())
+        return out.addDef(value);
+      // SOUNDNESS: a byval formal is the address of the callee's copy, not
+      // the actual (LocalBuilder::build).
+      if (func.getArgAttr(arg.getArgNumber(), "llvm.byval"))
         return out.addDef(value);
       value = call.getArgOperand(arg.getArgNumber());
       chain = chain.drop_back();

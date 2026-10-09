@@ -508,8 +508,27 @@ std::unique_ptr<FunctionGraph> LocalBuilder::build() {
       continue;
     }
     Cell cell = fresh();
-    define(arg, cell);
     fg->formals.push_back(cell);
+    // SOUNDNESS: a byval formal does not point to the caller's object but to
+    // a copy of it the call makes, which the callee owns (LLVM LangRef,
+    // byval: "a hidden copy of the pointee is made between the caller and
+    // the callee"). The formal cell (what callers bind their actual to) is
+    // the caller's object; the argument names a fresh stack object holding a
+    // byte copy of it. Unifying the two would claim the copy and the
+    // original are one address (MustAlias), and would make the callee's
+    // writes to its copy writes to the caller's object.
+    if (auto byval =
+            func.getArgAttrOfType<TypeAttr>(arg.getArgNumber(), "llvm.byval")) {
+      Cell copy(graph.makeNode(NodeFlags::Stack));
+      std::optional<int64_t> size =
+          getTypeSizeInBytes(byval.getValue(), dataLayout);
+      if (size)
+        graph.growSize(copy.getNode(), *size);
+      recordMemTransfer(*fg, func, copy, cell, size);
+      define(arg, copy);
+      continue;
+    }
+    define(arg, cell);
   }
 
   func.walk<WalkOrder::PreOrder>([&](Operation *op) {

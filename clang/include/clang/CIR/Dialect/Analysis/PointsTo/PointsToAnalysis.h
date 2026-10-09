@@ -417,6 +417,10 @@ enum class AliasRule : uint8_t {
   /// its calling contexts, get this answer in every one of them (the meet;
   /// AliasAnswer::contexts says how many).
   CallingContexts,
+  /// BU: one node may be a global's object in a caller's context
+  /// (NodeFlags::MayBeShared) and the other is shared or may be one too:
+  /// MayAlias.
+  MayBeShared,
 };
 
 llvm::StringRef getAliasRuleName(AliasRule rule);
@@ -647,6 +651,10 @@ public:
   /// sorted by name.
   llvm::SmallVector<std::pair<mlir::FlatSymbolRefAttr, Node *>, 0>
   getSymbolNodes() const;
+  /// The same, as the cell where each symbol's storage starts: a global
+  /// unified into another one's node sits at an offset in it.
+  llvm::SmallVector<std::pair<mlir::FlatSymbolRefAttr, Cell>, 0>
+  getSymbolCells() const;
 
   /// Whether \p func is in a recursive call-graph SCC.
   bool isRecursive(cir::FuncOp func) const;

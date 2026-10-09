@@ -372,14 +372,79 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
     FunctionPlan plan{func, collectAccesses(func, dataLayout), {}};
     DominanceInfo dom(func);
     const SmallVector<Access> &accesses = plan.accesses;
+    // A cir.goto names its label; it has no successor until the goto
+    // solver runs. So the CFG DominanceInfo sees lacks the edges into the
+    // labels, and a block or region a goto enters looks dominated by code
+    // the goto bypasses (`goto L; p = &g; { L: *p; }`). In a function with a
+    // goto, trust the order of \p point after a value defined in
+    // \p defBlock only along structured nesting (each block above \p point
+    // the entry of its region, up to \p defBlock), and only if no label is
+    // between them: none in the ops of \p defBlock from the definition up to
+    // the one holding \p point, nor in the nested blocks before \p point.
+    bool hasGoto = false;
+    func.walk([&](cir::GotoOp) { hasGoto = true; });
+    // For each op: whether it holds a label (is one, or has one in a region),
+    // and how many ops of its block before it do.
+    llvm::DenseMap<Operation *, bool> holdsLabel;
+    llvm::DenseMap<Operation *, unsigned> labelsBefore;
+    if (hasGoto) {
+      func.walk<WalkOrder::PostOrder>([&](Operation *op) {
+        bool held = isa<cir::LabelOp>(op);
+        for (Region &region : op->getRegions())
+          for (Block &block : region)
+            for (Operation &inner : block)
+              held |= holdsLabel.lookup(&inner);
+        holdsLabel[op] = held;
+      });
+      func.walk([&](Block *block) {
+        unsigned count = 0;
+        for (Operation &op : *block) {
+          labelsBefore[&op] = count;
+          count += holdsLabel.lookup(&op);
+        }
+      });
+    }
+    auto hasLabel = [&](Operation *op) { return holdsLabel.lookup(op); };
+    // Whether an op of \p op's block before \p op (after \p from, or from
+    // the start) holds a label.
+    auto labelBefore = [&](Operation *op, Operation *from) {
+      unsigned upTo = labelsBefore.lookup(op);
+      unsigned skip = from ? labelsBefore.lookup(from) + hasLabel(from) : 0;
+      return upTo > skip;
+    };
+    // Whether \p point runs after \p def (null: the start of \p defBlock)
+    // on every path, given that DominanceInfo says so.
+    auto reliable = [&](Block *defBlock, Operation *def, Operation *point) {
+      if (!hasGoto)
+        return true;
+      for (Operation *op = point; op && op != func.getOperation();
+           op = op->getParentOp()) {
+        Block *block = op->getBlock();
+        if (block == defBlock)
+          return !labelBefore(op, def) && (op == point || !hasLabel(op));
+        if (!block->isEntryBlock() || labelBefore(op, nullptr))
+          return false;
+      }
+      return false;
+    };
+    auto opDominates = [&](Operation *a, Operation *b) {
+      return dom.properlyDominates(a, b) && reliable(a->getBlock(), a, b);
+    };
+    auto valueDominates = [&](Value value, Operation *point) {
+      if (!dom.properlyDominates(value, point))
+        return false;
+      if (Operation *def = value.getDefiningOp())
+        return reliable(def->getBlock(), def, point);
+      return reliable(cast<BlockArgument>(value).getOwner(), nullptr, point);
+    };
     // Whether the operands a check of \p access needs are available at
     // \p point.
     auto available = [&](const Access &access, Operation *point) {
       if (access.op == point)
         return true;
-      if (!dom.properlyDominates(access.addr, point))
+      if (!valueDominates(access.addr, point))
         return false;
-      return !access.dynSize || dom.properlyDominates(access.dynSize, point);
+      return !access.dynSize || valueDominates(access.dynSize, point);
     };
     SmallVector<Candidate> noAlias, mustAlias;
     for (unsigned j = 0; j < accesses.size(); ++j)
@@ -388,9 +453,9 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
         if (a.addr == b.addr)
           continue;
         Operation *point = nullptr;
-        if (a.op == b.op || dom.properlyDominates(a.op, b.op))
+        if (a.op == b.op || opDominates(a.op, b.op))
           point = b.op;
-        else if (dom.properlyDominates(b.op, a.op))
+        else if (opDominates(b.op, a.op))
           point = a.op;
         else if (available(a, b.op))
           point = b.op;
@@ -408,8 +473,9 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
           ++numNoAlias;
         // A MustAlias pair is checked only where both accesses run: the
         // check point is the later access, which the earlier one dominates.
-        bool ordered = a.op == b.op || (point == b.op && dom.dominates(a.op, b.op)) ||
-                       (point == a.op && dom.dominates(b.op, a.op));
+        bool ordered = a.op == b.op ||
+                       (point == b.op && opDominates(a.op, b.op)) ||
+                       (point == a.op && opDominates(b.op, a.op));
         bool sized = a.constSize && *a.constSize && b.constSize &&
                      *b.constSize;
         if (candidate.answer.result.isMust())

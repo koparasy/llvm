@@ -1,0 +1,89 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu explain=1 td=0' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 subobjects=1 explain=1 td=0' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1 subobjects=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CI
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1 print-graphs=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=VALUES
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=GRAPH
+
+// NodeFlags::MayBeShared (V4fix). @g is internal and its address never
+// escapes; @f is internal and its one caller passes &g. Bottom-up, @main's
+// copy of @f's graph unifies the copy of p's pointee with g's node, a shared
+// node (never copied). @f's own graph keeps p's pointee apart from g (a
+// merge would hold in every context and spread to all @f's callers), but
+// marks it MayBeShared: it may be the object of any shared node. So in @f
+// p and &g are MayAlias, although g never escaped: the escape argument
+// (unescaped-object) does not apply to a global's object passed in.
+// BU-LABEL: Testing : "f"
+// BU: local#0 <-> p#0: NoAlias
+// BU: local#0 <-> g#0: NoAlias
+// BU: p#0 <-> g#0: MayAlias
+// BU-NEXT: why: a, b: one may be a global's object (its copy is a global's object at this call to @f), the other is or may be one
+// CI-LABEL: Testing : "f"
+// CI: p#0 <-> g#0: MustAlias
+//
+// A member: @fs gets &G of a struct global. p->b and G.b are one address;
+// the other cross pairs are MayAlias too (a MayBeShared node is kept apart
+// from no shared node).
+// BU-LABEL: Testing : "fs"
+// BU: pb#0 <-> gb#0: MayAlias
+// BU-NEXT: why: a, b: one may be a global's object
+// CI-LABEL: Testing : "fs"
+// CI: pb#0 <-> gb#0: MustAlias
+//
+// What @f loads through p, asked over @f's calling contexts (its one copy,
+// in @main, where p is &g): g's initializer and @main's store.
+// VALUES-LABEL: === values
+// VALUES-NEXT: via.p: {#cir.int<6> : !cir.int<s, 32>, #cir.int<5> : !cir.int<s, 32>} defs=0 complete contexts=1
+//
+// The flag is on @f's (@fs's) own node for p's pointee only; @main's copies
+// are g's (G's) node itself, which has no flag.
+// GRAPH-LABEL: === TU graph
+// GRAPH-NEXT: n0 [Mod|Ref|MayBeShared] {{.*}}"its copy is a global's object at this call to @f")}
+// GRAPH-NEXT: n1 [Stack|Mod]
+// GRAPH-NEXT: n2 [Global|Mod|Ref] size=4 origins={global(@g)} links={}
+// GRAPH-NEXT: n4 [Mod|Ref|MayBeShared] {{.*}}"its copy is a global's object at this call to @fs")}
+// GRAPH-NEXT: n5 [Global|Mod|Ref] size=8 origins={global(@G)} links={}
+// GRAPH-LABEL: === @f formals=complete
+
+!s32i = !cir.int<s, 32>
+!rec_G = !cir.struct<"G" {data !s32i, data !s32i}>
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.global "private" internal dso_local @g = #cir.int<5> : !s32i
+cir.global "private" internal dso_local @G = #cir.zero : !rec_G
+cir.func internal @f(%arg0: !cir.ptr<!s32i>) -> !s32i {
+  %local = cir.alloca "local" align(4) : !cir.ptr<!s32i>
+  %l_tag = cir.cast bitcast %local : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "local"}
+  %p_tag = cir.cast bitcast %arg0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p"}
+  %0 = cir.get_global @g : !cir.ptr<!s32i>
+  %g_tag = cir.cast bitcast %0 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "g"}
+  %1 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+  %2 = cir.load %arg0 : !cir.ptr<!s32i>, !s32i {test.load = "via.p"}
+  %3 = cir.add %1, %2 : !s32i
+  cir.store %3, %local : !s32i, !cir.ptr<!s32i>
+  cir.return %3 : !s32i
+}
+cir.func internal @fs(%arg0: !cir.ptr<!rec_G>) {
+  %pa = cir.get_member %arg0[0] {name = "a"} : !cir.ptr<!rec_G> -> !cir.ptr<!s32i>
+  %pa_tag = cir.cast bitcast %pa : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "pa"}
+  %pb = cir.get_member %arg0[1] {name = "b"} : !cir.ptr<!rec_G> -> !cir.ptr<!s32i>
+  %pb_tag = cir.cast bitcast %pb : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "pb"}
+  %G = cir.get_global @G : !cir.ptr<!rec_G>
+  %ga = cir.get_member %G[0] {name = "a"} : !cir.ptr<!rec_G> -> !cir.ptr<!s32i>
+  %ga_tag = cir.cast bitcast %ga : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "ga"}
+  %gb = cir.get_member %G[1] {name = "b"} : !cir.ptr<!rec_G> -> !cir.ptr<!s32i>
+  %gb_tag = cir.cast bitcast %gb : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "gb"}
+  %one = cir.const #cir.int<1> : !s32i
+  cir.store %one, %pb : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %gb : !cir.ptr<!s32i>, !s32i
+  cir.store %v, %pa : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func @main() -> !s32i {
+  %0 = cir.get_global @g : !cir.ptr<!s32i>
+  %c6 = cir.const #cir.int<6> : !s32i
+  cir.store %c6, %0 : !s32i, !cir.ptr<!s32i>
+  %r = cir.call @f(%0) : (!cir.ptr<!s32i>) -> !s32i
+  %G = cir.get_global @G : !cir.ptr<!rec_G>
+  cir.call @fs(%G) : (!cir.ptr<!rec_G>) -> ()
+  cir.return %r : !s32i
+}
+}

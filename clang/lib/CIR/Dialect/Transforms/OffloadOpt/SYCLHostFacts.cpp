@@ -145,14 +145,21 @@ StringRef allocaName(Value value) {
 }
 
 bool isUnknownWritable(const Node *node) {
-  return hasAny(node->getFlags(), NodeFlags::External | NodeFlags::Incomplete);
+  // MayBeShared (BU): a node that may be a global's object, which any
+  // function may write through the global (only set on nodes that are not
+  // shared themselves).
+  return hasAny(node->getFlags(), NodeFlags::External | NodeFlags::Incomplete |
+                                      NodeFlags::MayBeShared);
 }
 
-/// The External (else Incomplete) reason of \p node, as explain() words it.
+/// The External (else Incomplete, else MayBeShared) reason of \p node, as
+/// explain() words it.
 std::string explainStatus(const Node *node) {
   const Reason *why = node->getReason(NodeFlags::External);
   if (!why)
     why = node->getReason(NodeFlags::Incomplete);
+  if (!why)
+    why = node->getReason(NodeFlags::MayBeShared);
   return explain(why);
 }
 
@@ -370,6 +377,10 @@ std::optional<std::string> SYCLHostFacts::notOneAllocationWhy(const Node *node,
 std::optional<std::string> SYCLHostFacts::unknownValueWhy(const Node *node,
                                                           bool storage) const {
   std::string id = ("n" + Twine(node->getId())).str();
+  if (node->hasFlags(NodeFlags::MayBeShared) &&
+      !analysis->getGraph().isShared(node))
+    return id + " may be a global's object: " +
+           explain(node->getReason(NodeFlags::MayBeShared));
   if (auto it = formalTargets.find(node); it != formalTargets.end())
     return id + " may be passed in by a caller of @" +
            cast<cir::FuncOp>(it->second).getSymName().str() +

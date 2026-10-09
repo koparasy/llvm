@@ -58,7 +58,7 @@ using namespace cir::pointsto;
 // NodeFlags
 //===----------------------------------------------------------------------===//
 
-static constexpr unsigned numFlagBits = 14;
+static constexpr unsigned numFlagBits = 15;
 
 StringRef cir::pointsto::getFlagName(NodeFlags bit) {
   switch (bit) {
@@ -90,6 +90,8 @@ StringRef cir::pointsto::getFlagName(NodeFlags bit) {
     return "HasUSM";
   case NodeFlags::AsyncAccess:
     return "AsyncAccess";
+  case NodeFlags::MayBeShared:
+    return "MayBeShared";
   default:
     return "?";
   }
@@ -353,6 +355,17 @@ static int64_t normalizeOffset(const Node *node, int64_t offset) {
 /// parents, and from a child at offset 0 to its parents (see the file comment
 /// of PointsToGraph.h).
 static constexpr NodeFlags kDownFlags = NodeFlags::All & ~NodeFlags::Collapsed;
+/// MayBeShared flows down (a member of a global's object is global memory)
+/// but not up. SOUNDNESS: it is set by projectClones on a node whose copy is
+/// a shared node, and Graph::flushShared makes a tree of subobjects shared
+/// as a whole; a copy of a graph copies whole trees too (cloneInto), so the
+/// copy of the node's parent is shared as well, and projectClones flags the
+/// parent itself. The propagation along links (propagateStatus) reaches a
+/// member only through a pointer to it, held by a node that may be a
+/// global's object: in that context the member's copy is what the global
+/// holds, a shared node, and its parent's copy then is shared too. Moving
+/// it up as well would flag a whole object for one member, and every other
+/// member with it.
 static constexpr NodeFlags kUpFlags = NodeFlags::Mod | NodeFlags::Ref |
                                       NodeFlags::HasUSM |
                                       NodeFlags::AsyncAccess;

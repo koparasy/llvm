@@ -1,0 +1,70 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefixes=ALL,CI
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefixes=ALL,CI
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1 td=0' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=ALL
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=ALL
+
+// A byval formal (the V4 Csmith finding s1121, V4fix). C passes a struct by
+// value as a pointer with llvm.byval: the call makes a hidden copy of the
+// pointee, which the callee owns, and the formal points to that copy. The
+// reduced program
+//   struct S2 l; struct S2 *p = &l; *p = byval(0, 0, l);
+// passes &l as the sret destination and as the byval argument. The formal
+// used to be bound to the caller's object itself, so the copy and the sret
+// destination were one node with one origin: MustAlias, in every mode,
+// though they are two objects. Now the formal names a fresh stack object
+// that is a byte copy (a MemTransferRecord) of the caller's object.
+// ALL-LABEL: Testing : "byval"
+// ALL-NEXT: copy#0 <-> sret#0: NoAlias
+//
+// The copy holds what the caller's object holds: a pointer loaded from it is
+// the caller's pointer.
+// ALL-LABEL: Testing : "use_ptr"
+// ALL-DAG: bv#0 <-> x#0: NoAlias
+// CI-DAG: x#0 <-> q#0: MustAlias
+// ALL-NOT: x#0 <-> q#0: NoAlias
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_S2 = !cir.struct<"S2" {data !u64i, data !s64i, data !u16i}>
+!rec_P = !cir.struct<"P" {data !cir.ptr<!s32i>}>
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.global "private" internal dso_local @s2g = #cir.zero : !rec_S2
+cir.func internal @byval(%arg0: !cir.ptr<!rec_S2> {llvm.align = 8 : i64, llvm.noalias, llvm.sret = !rec_S2}, %arg1: !cir.ptr<!rec_S2> {llvm.align = 8 : i64, llvm.byval = !rec_S2}) {
+  %c = cir.alloca "c" align(8) init : !cir.ptr<!rec_S2>
+  %copy = cir.cast bitcast %arg1 : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S2> {test.ptr = "copy"}
+  cir.copy %arg1 to %c : !cir.ptr<!rec_S2>
+  %g = cir.get_global @s2g : !cir.ptr<!rec_S2>
+  %sret = cir.cast bitcast %arg0 : !cir.ptr<!rec_S2> -> !cir.ptr<!rec_S2> {test.ptr = "sret"}
+  cir.copy %g to %arg0 : !cir.ptr<!rec_S2>
+  cir.return
+}
+cir.func internal @caller() {
+  %l = cir.alloca "l" align(8) init : !cir.ptr<!rec_S2>
+  %pl = cir.alloca "p" align(8) init : !cir.ptr<!cir.ptr<!rec_S2>>
+  cir.store %l, %pl : !cir.ptr<!rec_S2>, !cir.ptr<!cir.ptr<!rec_S2>>
+  %d = cir.load deref %pl : !cir.ptr<!cir.ptr<!rec_S2>>, !cir.ptr<!rec_S2>
+  cir.call @byval(%d, %l) : (!cir.ptr<!rec_S2> {llvm.sret = !rec_S2}, !cir.ptr<!rec_S2> {llvm.byval = !rec_S2}) -> ()
+  cir.return
+}
+cir.func internal @use_ptr(%arg0: !cir.ptr<!rec_P> {llvm.align = 8 : i64, llvm.byval = !rec_P}, %arg1: !cir.ptr<!s32i>) {
+  %bv = cir.cast bitcast %arg0 : !cir.ptr<!rec_P> -> !cir.ptr<!rec_P> {test.ptr = "bv"}
+  %x = cir.cast bitcast %arg1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x"}
+  %m = cir.get_member %arg0[0] {name = "q"} : !cir.ptr<!rec_P> -> !cir.ptr<!cir.ptr<!s32i>>
+  %q = cir.load %m : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %q_tag = cir.cast bitcast %q : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "q"}
+  %one = cir.const #cir.int<1> : !s32i
+  cir.store %one, %q : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func @main() {
+  %y = cir.alloca "y" align(4) init : !cir.ptr<!s32i>
+  %pv = cir.alloca "pv" align(8) init : !cir.ptr<!rec_P>
+  %m = cir.get_member %pv[0] {name = "q"} : !cir.ptr<!rec_P> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %y, %m : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.call @use_ptr(%pv, %y) : (!cir.ptr<!rec_P> {llvm.byval = !rec_P}, !cir.ptr<!s32i>) -> ()
+  cir.call @caller() : () -> ()
+  cir.return
+}
+}

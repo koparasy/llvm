@@ -88,13 +88,34 @@
 //    object in that context, for example the same pointer passed for two
 //    formals) are merged in the callee's graph too, at the same relative
 //    offset (collapsing on a conflict, or as an array of the element size
-//    of an array copy).
+//    of an array copy);
+//  - a node of the callee whose copy is a shared node in the caller's graph
+//    (the caller passed a pointer to a global's object; shared nodes are
+//    never copied, so the copy was unified with the shared node itself) gets
+//    MayBeShared, and so does the source of a copy that has it (a copy of a
+//    copy). Its source is not merged with the shared node: that would hold
+//    in every context (a shared node is one for all graphs), make the source
+//    and all it reaches shared, and make every later copy of the callee's
+//    graph refer to the shared node, merging every caller's object with the
+//    global's. MayBeShared is not copied with a graph and spreads along the
+//    links of the own graph (propagateStatus), never onto a shared node.
 // By induction from the functions without analysed callers, each function's
-// own graph is then sound for every context it runs in: distinct nodes are
-// distinct objects in each activation, and the flags cover what every
-// caller does. That is why queries may use a function's own graph (values of
-// two functions are MayAlias, see PointsToQueries.cpp). The projection only
-// adds flags and merges nodes, so the fixpoint stays monotone. It
+// own graph is then sound for every context it runs in. Take two pointers in
+// one activation, at nodes A and B of its function's own graph, and the
+// caller's graph, sound by induction, where the copies A' and B' are. If A'
+// and B' are one node, they are copies (A and B were merged by the pull-back)
+// or one of them is shared (A or B has MayBeShared, and the queries keep a
+// MayBeShared node apart from no shared or MayBeShared node). If A' and B'
+// are distinct, the objects are distinct in that context. Without the
+// MayBeShared rule a shared image was the hole: A' merged with g's node, B
+// the shared node of g itself in the callee's graph (V4 F2). The objects a
+// node stands for besides its own origins are the callers' objects reached
+// through formals; markSummaries makes a node with an origin that a formal
+// reaches a Summary, so that it is never MustAlias (V4 F1). The flags cover
+// what every caller does. That is why queries may use a function's own graph
+// (values of two functions are MayAlias, see PointsToQueries.cpp). The
+// projection only adds flags and merges nodes, so the fixpoint stays
+// monotone. It
 // terminates: the graph is finite but for the copies the fixpoint makes when
 // it binds an indirect target, and those are bounded: each (call site,
 // target) pair is bound once, an inherited site is a copy of a site along an
@@ -480,9 +501,10 @@ void PointsToAnalysis::cloneCallee(TUCallSite &call, TUFunction &owner,
   auto rewrite = [&](Origin &origin) { origin.ctx = rebase(origin.ctx); };
   cloneOptions.isShared = isShared;
   cloneOptions.rewriteOrigin = rewrite;
-  auto record = std::make_unique<TUClone>(
-      TUClone{&owner, &callee, call.site.call, rebase(0),
-              graph->cloneInto(*graph, roots, NodeFlags::All, cloneOptions)});
+  auto record = std::make_unique<TUClone>(TUClone{
+      &owner, &callee, call.site.call, rebase(0),
+      graph->cloneInto(*graph, roots, NodeFlags::All & ~NodeFlags::MayBeShared,
+                       cloneOptions)});
   const CloneMap &map = record->map;
   size_t copied = 0;
   for (const auto &[src, dst] : map.entries())
@@ -569,15 +591,19 @@ void PointsToAnalysis::cloneCallee(TUCallSite &call, TUFunction &owner,
 //===----------------------------------------------------------------------===//
 
 bool PointsToAnalysis::projectClones() {
-  constexpr NodeFlags projected = NodeFlags::External | NodeFlags::Incomplete |
-                                  NodeFlags::UnknownObj | NodeFlags::Mod |
-                                  NodeFlags::Ref | NodeFlags::HasUSM |
-                                  NodeFlags::AsyncAccess;
+  constexpr NodeFlags projected =
+      NodeFlags::External | NodeFlags::Incomplete | NodeFlags::UnknownObj |
+      NodeFlags::Mod | NodeFlags::Ref | NodeFlags::HasUSM |
+      NodeFlags::AsyncAccess | NodeFlags::MayBeShared;
   bool changed = false;
+  // isShared is as of the last flush: merges since (the fixpoint's) may
+  // have made more nodes shared.
+  graph->flushShared();
   // The latest copies first: a caller's copy is made after the copies in
   // the callee's graph, so what a root learns reaches the leaves in one
   // pass.
   for (const std::unique_ptr<TUClone> &clone : llvm::reverse(clones)) {
+    const Reason *sharedWhy = nullptr;
     // Deterministic order: by the id of the source node.
     SmallVector<std::pair<const Node *, Cell>, 0> entries(
         clone->map.entries().begin(), clone->map.entries().end());
@@ -598,6 +624,22 @@ bool PointsToAnalysis::projectClones() {
       // the object, the callee's view of it must allow too; Mod and Ref
       // keep "no code writes (reads) it" true over every context.
       NodeFlags add = toNode->getFlags() & projected & ~fromNode->getFlags();
+      // SOUNDNESS (V4 F2): a shared node is one node for its objects in
+      // every graph and is never copied, so a copy unified with one in the
+      // caller's graph (the caller passed a pointer to a global's object) is
+      // that object in this context: the source may be it too. Unifying the
+      // source with the shared node would say so, but it would hold in every
+      // context: the source would become shared, so would all it reaches
+      // (flushShared), and every later copy of the callee's graph would
+      // refer to the shared node, merging every caller's object with the
+      // global's. MayBeShared says it for the callee's own graph only: it is
+      // not copied, and the queries treat the node as possibly any shared
+      // object (PointsToQueries.cpp, StoredValues.cpp, SYCLHostFacts).
+      bool sharedImage = graph->isShared(toNode);
+      if (sharedImage)
+        add |= NodeFlags::MayBeShared & ~fromNode->getFlags();
+      if (graph->isShared(fromNode))
+        add &= ~NodeFlags::MayBeShared; // Exact already.
       for (unsigned bit = 0;
            add != NodeFlags::None &&
            (1u << bit) <= static_cast<uint32_t>(NodeFlags::All);
@@ -605,10 +647,23 @@ bool PointsToAnalysis::projectClones() {
         auto flag = static_cast<NodeFlags>(1u << bit);
         if (!hasAny(add, flag))
           continue;
-        graph->addFlags(Cell(fromNode), flag, toNode->getReason(flag));
+        const Reason *why = toNode->getReason(flag);
+        if (!why && flag == NodeFlags::MayBeShared) {
+          if (!sharedWhy)
+            sharedWhy = graph->makeReason(
+                Reason::Kind::MergedAt, clone->call,
+                "its copy is a global's object at this call to @" +
+                    cir::FuncOp(clone->callee->func).getSymName().str());
+          why = sharedWhy;
+        }
+        graph->addFlags(Cell(fromNode), flag, why);
         ++stats.numProjectedFlags;
         changed = true;
       }
+      // Two sources whose copies are one shared object are both
+      // MayBeShared: the queries keep them apart from nothing shared.
+      if (sharedImage)
+        continue;
       groups[toNode].emplace_back(fromNode,
                                   to.getRawOffset() - from.getRawOffset());
     }

@@ -148,6 +148,14 @@ PointsToAnalysis::getSymbolNodes() const {
   return result;
 }
 
+SmallVector<std::pair<FlatSymbolRefAttr, Cell>, 0>
+PointsToAnalysis::getSymbolCells() const {
+  SmallVector<std::pair<FlatSymbolRefAttr, Cell>, 0> result;
+  for (auto [sym, node] : globals->getSymbolNodes())
+    result.emplace_back(sym, Cell(node).resolve());
+  return result;
+}
+
 bool PointsToAnalysis::isRecursive(cir::FuncOp func) const {
   return recursive.contains(func.getOperation());
 }
@@ -618,8 +626,9 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
       partition->transfers.push_back(memTransfers.size());
     memTransfers.push_back({record.op, map(record.dst), map(record.src),
                             record.length, record.ghosts});
-    // The copies a model made (the ops' own copies are read from the IR).
-    if (isa_and_present<CIRCallOpInterface>(record.op))
+    // The copies a model made, and the copy of a byval formal (the
+    // function itself is the op); the ops' own copies are read from the IR.
+    if (isa_and_present<CIRCallOpInterface, cir::FuncOp>(record.op))
       fn->modelTransfers.push_back(memTransfers.back());
   }
   for (const ModelWrite &write : fg->modelWrites)
@@ -1271,6 +1280,30 @@ void PointsToAnalysis::propagateStatus() {
       graph->markReachable(Cell(node), flag, node->getReason(flag),
                            /*stopAtFlagged=*/true);
   }
+  // BU: what a node that may be a global's object points to may be what
+  // any function stored in that global (MayBeShared). Shared nodes are
+  // exact: the walk neither flags them nor goes past them.
+  if (options.mode != PointsToMode::BU)
+    return;
+  graph->flushShared();
+  SmallVector<Node *, 0> worklist;
+  for (Node *node : graph->nodes())
+    if (node->hasFlags(NodeFlags::MayBeShared) && !graph->isShared(node))
+      worklist.push_back(node);
+  const Reason *why = nullptr;
+  while (!worklist.empty()) {
+    Node *node = worklist.pop_back_val();
+    graph->forEachSuccessor(node, [&](Node *next) {
+      if (next->hasFlags(NodeFlags::MayBeShared) || graph->isShared(next))
+        return;
+      if (!why)
+        why = reasons.make(Reason::Kind::MergedAt, nullptr,
+                           "reachable from a node that may be a global's "
+                           "object");
+      graph->addFlags(Cell(next), NodeFlags::MayBeShared, why);
+      worklist.push_back(next);
+    });
+  }
 }
 
 bool PointsToAnalysis::clobberGlobals() {
@@ -1650,9 +1683,47 @@ void PointsToAnalysis::markSummaries() {
     return nullptr;
   };
 
+  // BU: the nodes a function's formals reach, in its own graph and in the
+  // copies it holds, stand for its callers' objects too, and those are not
+  // among their origins: a caller's object is merged with the copy of the
+  // node in the caller's graph, and projectClones brings back only merges
+  // between two copies (two formals given one object) and MayBeShared (the
+  // copy is a shared node), never "this copy is also the caller's own object
+  // y". So a node holding the local x and, through a slot (q = &x; q = p),
+  // the formal's pointee has the one origin x but is x or the caller's
+  // object (V4 F1). The context-insensitive binding unifies the formal with
+  // the actual, so the origins are there in CI. Shared nodes are bound to
+  // the actuals directly (they are never copied), so their origins are
+  // complete too.
+  llvm::DenseSet<const Node *> callerReach;
+  if (options.mode == PointsToMode::BU) {
+    graph->flushShared();
+    SmallVector<Cell, 0> roots;
+    for (const std::unique_ptr<TUFunction> &fn : functions) {
+      for (const std::optional<Cell> &formal : fn->formals)
+        if (formal)
+          roots.push_back(*formal);
+      for (const std::optional<AggregateSlots> &slots : fn->formalSlots)
+        if (slots)
+          for (auto [off, cell] : *slots)
+            if (cell)
+              roots.push_back(cell);
+    }
+    closeReach(roots, callerReach);
+  }
+  const Reason *callerWhy = nullptr;
+
   stats.numSummaryNodes = 0;
   for (Node *node : graph->nodes()) {
     const Reason *why = summaryReason(node);
+    if (!why && !node->getOrigins().empty() && callerReach.contains(node) &&
+        !graph->isShared(node)) {
+      if (!callerWhy)
+        callerWhy = reasons.make(Reason::Kind::SummaryObject, nullptr,
+                                 "reachable from a formal: may also be a "
+                                 "caller's object");
+      why = callerWhy;
+    }
     if (!why)
       continue;
     graph->addFlags(Cell(node), NodeFlags::Summary, why);

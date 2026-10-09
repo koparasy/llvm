@@ -1,0 +1,134 @@
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu explain=1 td=0' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefixes=BU,OWN
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1 td=0' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefixes=BU,OWN
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefixes=BU,TD
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 explain=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=CI
+
+// The V4 Csmith findings F2 and F1 (V4fix), reduced from C by hand.
+//
+// @f2: `static unsigned g; static int f2(unsigned *p) { *p = g + 1; }` called
+// as f2(&g). Bottom-up, @main's copy of @f2's graph unifies the copy of the
+// formal's pointee with g's node, which is shared (never copied). The
+// projection (projectClones) brought back only merges of two copies, so
+// @f2's own graph kept p's pointee apart from g: NoAlias, though p == &g.
+// Now the source of a copy that is a shared node gets MayBeShared (see
+// ipo-bu-may-be-shared.cir): MayAlias in @f2's own graph. The top-down
+// query answers in @f2's one context, where p is g's node: MustAlias.
+// OWN-LABEL: Testing : "f2"
+// OWN-NEXT: g#0 <-> p#0: MayAlias
+// OWN-NEXT: why: a, b: one may be a global's object (its copy is a global's object at this call to @f2), the other is or may be one
+// TD-LABEL: Testing : "f2"
+// TD-NEXT: g#0 <-> p#0: MustAlias
+// CI-LABEL: Testing : "f2"
+// CI-NEXT: g#0 <-> p#0: MustAlias
+//
+// @inner through @outer: the same through a copy of a copy. @main passes &g2
+// to @outer, which passes its formal on to @inner. The copy that is g2's
+// node is in @main's copy of @outer's graph: its source, @outer's copy of
+// @inner's node, gets MayBeShared, which the projection of @outer's copy of
+// @inner then brings into @inner's own graph.
+// OWN-LABEL: Testing : "inner"
+// OWN-NEXT: g2#0 <-> q#0: MayAlias
+// OWN-NEXT: why: a, b: one may be a global's object (its copy is a global's object at this call to @outer), the other is or may be one
+// TD-LABEL: Testing : "inner"
+// TD-NEXT: g2#0 <-> q#0: MustAlias
+//
+// @f1: `int l = 1; int *s = &l; s = p; *p = l;` called as f1(&g5). The slot
+// s unifies l with p's pointee: one node, whose one origin is the alloca l,
+// so bottom-up claimed l MustAlias *p. The node is reachable from a formal
+// (and MayBeShared): not a singleton.
+// BU-LABEL: Testing : "f1"
+// BU-NEXT: l#0 <-> p1#0: MayAlias
+// BU-NEXT: why: {{.*}}"reachable from a formal: may also be a caller's object"
+//
+// @hole: the same body, called with the caller's local y. No shared node is
+// involved: the node a formal reaches stands for the caller's objects too,
+// which are not among its origins. markSummaries makes such a node (with an
+// origin) a Summary in bottom-up mode.
+// BU-LABEL: Testing : "hole"
+// BU-NEXT: x#0 <-> p2#0: MayAlias
+// BU-NEXT: why: {{.*}}"reachable from a formal: may also be a caller's object"
+// CI-LABEL: Testing : "f1"
+// CI-NEXT: l#0 <-> p1#0: MayAlias
+// CI-LABEL: Testing : "hole"
+// CI-NEXT: x#0 <-> p2#0: MayAlias
+
+!s32i = !cir.int<s, 32>
+!u32i = !cir.int<u, 32>
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.global "private" internal dso_local @g = #cir.int<5> : !u32i
+cir.global "private" internal dso_local @g2 = #cir.int<5> : !u32i
+cir.global "private" internal dso_local @g5 = #cir.int<0> : !s32i
+cir.func internal @f2(%arg0: !cir.ptr<!u32i>) {
+  %0 = cir.alloca "p" align(8) init : !cir.ptr<!cir.ptr<!u32i>>
+  cir.store %arg0, %0 : !cir.ptr<!u32i>, !cir.ptr<!cir.ptr<!u32i>>
+  %1 = cir.get_global @g : !cir.ptr<!u32i>
+  %g_tag = cir.cast bitcast %1 : !cir.ptr<!u32i> -> !cir.ptr<!u32i> {test.ptr = "g"}
+  %2 = cir.load %1 : !cir.ptr<!u32i>, !u32i
+  %3 = cir.const #cir.int<1> : !u32i
+  %4 = cir.add %2, %3 : !u32i
+  %5 = cir.load deref %0 : !cir.ptr<!cir.ptr<!u32i>>, !cir.ptr<!u32i>
+  %p_tag = cir.cast bitcast %5 : !cir.ptr<!u32i> -> !cir.ptr<!u32i> {test.ptr = "p"}
+  cir.store %4, %5 : !u32i, !cir.ptr<!u32i>
+  cir.return
+}
+cir.func internal @inner(%arg0: !cir.ptr<!u32i>) {
+  %1 = cir.get_global @g2 : !cir.ptr<!u32i>
+  %g_tag = cir.cast bitcast %1 : !cir.ptr<!u32i> -> !cir.ptr<!u32i> {test.ptr = "g2"}
+  %2 = cir.load %1 : !cir.ptr<!u32i>, !u32i
+  %q_tag = cir.cast bitcast %arg0 : !cir.ptr<!u32i> -> !cir.ptr<!u32i> {test.ptr = "q"}
+  cir.store %2, %arg0 : !u32i, !cir.ptr<!u32i>
+  cir.return
+}
+cir.func internal @outer(%arg0: !cir.ptr<!u32i>) {
+  cir.call @inner(%arg0) : (!cir.ptr<!u32i>) -> ()
+  cir.return
+}
+cir.func internal @f1(%arg0: !cir.ptr<!s32i>) {
+  %0 = cir.alloca "p" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+  %1 = cir.alloca "l" align(4) init : !cir.ptr<!s32i>
+  %2 = cir.alloca "s" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %arg0, %0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %l_tag = cir.cast bitcast %1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "l"}
+  %3 = cir.const #cir.int<1> : !s32i
+  cir.store %3, %1 : !s32i, !cir.ptr<!s32i>
+  cir.store %1, %2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %4 = cir.load %0 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  cir.store %4, %2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %5 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+  %6 = cir.load deref %0 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %p_tag = cir.cast bitcast %6 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p1"}
+  cir.store %5, %6 : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func internal @hole(%arg0: !cir.ptr<!s32i>) {
+  %0 = cir.alloca "p" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+  %1 = cir.alloca "x" align(4) init : !cir.ptr<!s32i>
+  %2 = cir.alloca "q" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %arg0, %0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %x_tag = cir.cast bitcast %1 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x"}
+  %3 = cir.const #cir.int<1> : !s32i
+  cir.store %3, %1 : !s32i, !cir.ptr<!s32i>
+  cir.store %1, %2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %4 = cir.load %0 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  cir.store %4, %2 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %5 = cir.load %1 : !cir.ptr<!s32i>, !s32i
+  %6 = cir.load deref %0 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %p_tag = cir.cast bitcast %6 : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "p2"}
+  cir.store %5, %6 : !s32i, !cir.ptr<!s32i>
+  cir.return
+}
+cir.func @main() -> !s32i {
+  %y = cir.alloca "y" align(4) init : !cir.ptr<!s32i>
+  %0 = cir.get_global @g : !cir.ptr<!u32i>
+  cir.call @f2(%0) : (!cir.ptr<!u32i>) -> ()
+  %1 = cir.get_global @g2 : !cir.ptr<!u32i>
+  cir.call @outer(%1) : (!cir.ptr<!u32i>) -> ()
+  %2 = cir.get_global @g5 : !cir.ptr<!s32i>
+  cir.call @f1(%2) : (!cir.ptr<!s32i>) -> ()
+  %c0 = cir.const #cir.int<0> : !s32i
+  cir.store %c0, %y : !s32i, !cir.ptr<!s32i>
+  cir.call @hole(%y) : (!cir.ptr<!s32i>) -> ()
+  %r = cir.load %y : !cir.ptr<!s32i>, !s32i
+  cir.return %r : !s32i
+}
+}

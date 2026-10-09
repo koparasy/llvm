@@ -158,13 +158,21 @@ enum class NodeFlags : uint32_t {
   /// synchronizes with it (the host memory of an asynchronous SYCL memory
   /// command). Not spread along links: the access is to the node's bytes.
   AsyncAccess = 1u << 13,
+  /// Bottom-up: a node of a function's own graph that may be the object of
+  /// a shared node (one reachable from a global): in some caller's graph the
+  /// copy of this node was unified with a shared node (projectClones). The
+  /// shared node's contents are what every function stores there, which this
+  /// graph's links do not show. Never copied with a graph (the fact belongs
+  /// to that caller's context); spread along links in the own graph; never
+  /// on a shared node itself (ignored there). See PointsToBottomUp.cpp.
+  MayBeShared = 1u << 14,
 
   KindMask = Stack | Heap | Global | Ghost | Function | UnknownObj,
   StatusMask = Incomplete | External | Collapsed | Summary | Mod | Ref |
-      HasUSM | AsyncAccess,
+      HasUSM | AsyncAccess | MayBeShared,
   All = KindMask | StatusMask,
 
-  LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/AsyncAccess)
+  LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/MayBeShared)
 };
 
 /// Return true if any bit of \p mask is set in \p flags.
