@@ -218,11 +218,10 @@ struct HostFactsOptions {
   // cir-offload-internalize-launch-paths); meaningful only without
   // assumeClosedTU. The points-to analysis counts a local function whose
   // address only analysed code takes as having only visible callers
-  // (PointsToAnalysisOptions::localFunctionsClosed), and the bindings use the
-  // open-mode TU-local rule (KernelBinding::isTULocalOptimizable). Off by
-  // default; cir-offload-merge sets it under ipo|both without closed-tu.
+  // (PointsToAnalysisOptions::localFunctionsClosed). Off by default;
+  // cir-offload-merge sets it without closed-tu.
   bool internalize = false;
-  // Whether the open-mode rules of internalize apply.
+  // Whether the open-mode analysis rules of internalize apply (ipo|both).
   bool internalizedOpenMode() const {
     return internalize && !assumeClosedTU && mode != HostFactsMode::Legacy;
   }
@@ -347,20 +346,34 @@ struct KernelBinding {
   // for CUDA.
   cir::GlobalOp hostNameString;
 
-  // SYCL only: true iff the kernel's CLOSURE is a lambda (a compiler-generated,
-  // TU-unique, unspellable type) and it is not by-name/bundle-exposed (absent
-  // from sycl_registered_kernels), so its launches are fully TU-local and the
-  // combine may optimize/eliminate it. With HostFactsOptions::internalize
-  // (open mode), instead: the kernel is a copy made for an internalized launch
-  // path, or no other TU can launch it (isTUUniqueSYCLKernel); a lambda in an
-  // inline function has the same closure type in every TU, so "a lambda" is
-  // not enough there. This keys on the closure type, not the
-  // kernel-name tag: `parallel_for<class Tag>(lambda)` has a named `_ZTS<Tag>`
-  // symbol but a lambda closure, and is still TU-local. A genuine functor
-  // (named struct with operator()), a free function, or a registered kernel is
-  // cross-TU/by-name reachable and stays conservative (false). Always false for
-  // CUDA (stub-anchored).
+  // SYCL only: the closed-TU rule (-cir-offload-assume-closed-tu): true iff
+  // the kernel's CLOSURE is a lambda (a compiler-generated, unspellable type)
+  // and it is not by-name/bundle-exposed (absent from
+  // sycl_registered_kernels), so, if every caller is in this TU, its launches
+  // are this TU's and the combine may stamp it in place. This keys on the
+  // closure type, not the kernel-name tag: `parallel_for<class Tag>(lambda)`
+  // has a named `_ZTS<Tag>` symbol but a lambda closure. A genuine functor
+  // (named struct with operator()), a free function, or a registered kernel
+  // is by-name reachable and stays conservative (false). Without closed-TU
+  // the passes use isTUUnique instead (stampsInPlace). Always false for CUDA
+  // (stub-anchored).
   bool isTULocalOptimizable = false;
+
+  // SYCL only: the open rule: no other TU can launch the kernel
+  // (isTUUniqueSYCLKernel: an internalized copy, a closure whose call
+  // operator has local linkage, or a kernel-name type with internal linkage)
+  // and it is not by-name/bundle-exposed. A lambda in an inline function (an
+  // in-class member, a header template, an inline variable) has the same
+  // closure type in every TU ([basic.def.odr]p14-15) and its device kernel
+  // is one weak_odr definition for the program, so "a lambda" is not enough:
+  // this TU's facts are an AND over this TU's launches only.
+  bool isTUUnique = false;
+
+  // Whether the facts of this TU's launches may be stamped on the kernel in
+  // place: isTULocalOptimizable under closed-TU, else isTUUnique.
+  bool stampsInPlace(bool assumeClosedTU) const {
+    return assumeClosedTU ? isTULocalOptimizable : isTUUnique;
+  }
 
   // SYCL only: names of closure capture fields -- captured USM pointers and
   // global-memory accessors -- whose memory is, at EVERY visible launch site,
@@ -379,6 +392,18 @@ struct KernelBinding {
   // SYCL only: why noalias is off for every parameter of the kernel (e.g. a
   // pointer or accessor nested in a captured struct), or empty.
   std::string syclNoAliasBlocked;
+
+  // SYCL only, from the legacy trace: the user functions (in module order of
+  // the launches) holding a launch of the kernel that, on its own, gives a
+  // fact (a pairwise-distinct field, a constant capture, a constant local
+  // size). The trace is intraprocedural (the function holding the launch,
+  // after inlining the launch shims and the command group), so a launch in
+  // a copy of a function gives what the launch it was copied from gives: a
+  // kernel without such a launch gets no legacy fact through an internalized
+  // launch path either, and the facts of these launches hold for every
+  // caller of their functions (InternalizeLaunchPaths uses them as roots
+  // under legacy).
+  llvm::SmallVector<std::string, 1> syclLegacyFactSites;
 
   // SYCL only: closure capture fields whose stored SCALAR value is, at EVERY
   // visible launch site, the SAME compile-time constant. Maps the field name to
@@ -455,6 +480,10 @@ void noteInternalizedSYCLKernelUse(cir::FuncOp kernel);
 // For an internalized copy: " through the internalized launch path from
 // root @main[, @...]" (for the remarks), else empty.
 std::string describeInternalizedSYCLKernel(cir::FuncOp kernel);
+// Why a fact of a kernel another TU can launch (not isTUUnique) is not
+// stamped on it without -cir-offload-assume-closed-tu, for the remarks;
+// `internalized`: the launch paths were internalized.
+std::string getSharedSYCLKernelNote(bool internalized);
 // Whether no other TU can launch the device kernel `kernel` (named `name`):
 // it is an internalized copy, its closure's call operator has local linkage
 // (a lambda in a non-inline function, a functor in an unnamed namespace), or

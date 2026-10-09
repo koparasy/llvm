@@ -1,6 +1,15 @@
+// The closed-TU rule (-cir-offload-assume-closed-tu): these fixtures'
+// kernels are stamped in place as lambdas, or specialized by clone.
 // RUN: cir-opt %s -split-input-file \
-// RUN:   -pass-pipeline="builtin.module(cir-offload-propagate-sycl-kernel-args,builtin.module(mem2reg,sccp,cir-simplify))" \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-propagate-sycl-kernel-args{host-facts-closed-tu=1},builtin.module(mem2reg,sccp,cir-simplify))" \
 // RUN:   | FileCheck %s
+// Without it (T26b), only a kernel no other TU can launch is stamped,
+// in place, and nothing is specialized by clone.
+// RUN: cir-opt %s -split-input-file -cir-offload-propagate-sycl-kernel-args -o /dev/null 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=OPEN
+// OPEN: remark: kernel-arg-constant: kernel @_ZTSZ4mainEUlvE_ arg 0 ('flag'): #cir.int<1> : !cir.int<s, 32> not propagated (the kernel is visible to other TUs; facts this TU derives hold only through an internalized launch path, and launch-path internalization is off)
+// OPEN: remark: kernel-arg-constant: kernel @_ZTS9MyFunctor arg 0 ('flag'): #cir.int<1> : !cir.int<s, 32> not propagated (the kernel is visible to other TUs;
+// OPEN-NOT: .spec.
 
 // A SYCL captured SCALAR that is the SAME compile-time constant at every visible
 // launch is propagated into the device kernel body. The propagation pass maps

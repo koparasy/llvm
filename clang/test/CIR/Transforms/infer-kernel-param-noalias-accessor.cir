@@ -1,16 +1,23 @@
-// RUN: cir-opt %s -split-input-file -cir-offload-infer-kernel-param-noalias \
-// RUN:   2>/dev/null | FileCheck %s
-// RUN: cir-opt %s -split-input-file -cir-offload-infer-kernel-param-noalias \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
+// The closed-TU rule (-cir-offload-assume-closed-tu): a lambda in place, a
+// kernel by clone. Without it (T26b), a kernel no other TU can launch in
+// place and the others not at all (OPEN).
 // RUN: cir-opt %s -split-input-file \
-// RUN:   -cir-offload-infer-kernel-param-noalias='host-facts=ipo' \
+// RUN:   -cir-offload-infer-kernel-param-noalias='host-facts-closed-tu=1' \
 // RUN:   2>/dev/null | FileCheck %s
 // RUN: cir-opt %s -split-input-file \
-// RUN:   -cir-offload-infer-kernel-param-noalias='host-facts=ipo' \
+// RUN:   -cir-offload-infer-kernel-param-noalias='host-facts-closed-tu=1' \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
 // RUN: cir-opt %s -split-input-file \
 // RUN:   -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1' \
 // RUN:   2>/dev/null | FileCheck %s
+// RUN: cir-opt %s -split-input-file \
+// RUN:   -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1' \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
+// RUN: cir-opt %s -split-input-file -cir-offload-infer-kernel-param-noalias \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
+// RUN: cir-opt %s -split-input-file \
+// RUN:   -cir-offload-infer-kernel-param-noalias='host-facts=ipo' \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
 
 // llvm.noalias on SYCL accessor pointer parameters. The host proves that the
 // accessors a kernel captures are backed by pairwise-distinct buffers (legacy
@@ -221,6 +228,11 @@ module attributes {cir.offload.container} {
     // REMARK: remark: kernel-param-noalias: kernel @_Z9accKernelv.spec.noalias.0 arg 2 (accessor 'B'): noalias (buffer 'bb'{{.*}})
     // REMARK: remark: kernel-param-noalias: kernel @_Z9accKernelv.spec.noalias.0 arg 4 (accessor 'C'): already noalias
     // CHECK: cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv_{{[0-9]+}}()
+    // The kernel.info getter naming _Z9accKernelv is internal: no other TU
+    // can launch it, so open mode stamps it in place.
+    // OPEN: remark: kernel-param-noalias: kernel @_Z9accKernelv arg 0 (accessor 'A'): noalias (buffer 'ba'{{.*}})
+    // OPEN: remark: kernel-param-noalias: kernel @_Z9accKernelv arg 2 (accessor 'B'): noalias (buffer 'bb'{{.*}})
+    // OPEN-NOT: .spec.
     // CHECK-LABEL: cir.func @_Z9accKernelv(
     // CHECK-SAME: field = "A"{{[^}]*}}}}, %arg1
     // CHECK-SAME: field = "B"{{[^}]*}}}, llvm.readonly}, %arg3

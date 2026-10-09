@@ -23,14 +23,22 @@
 // alone. One `kernel-param-noalias:` remark per candidate parameter reports
 // the decision and its reason.
 //
-// Two paths. For a TU-local/optimizable binding (every launch visible, closure
-// is a lambda) it annotates the shared device kernel in place. For the residual
-// -- a cross-TU functor or a by-name-reachable kernel whose shared body another
-// TU could launch with aliasing pointers -- it specializes by clone: mint a
-// fresh kernel (copyKernel), redirect this TU's launches to it, and annotate
-// the clone, leaving the generic original untouched. syclNoAliasFields already
-// ANDs the distinctness across every launch this TU sees, so it holds at all
-// the redirected sites.
+// Where the facts go. The device kernel is one weak_odr definition for the
+// whole program, and syclNoAliasFields ANDs the distinctness over this TU's
+// launches only, so the shared kernel is annotated in place only when no
+// other TU can launch it (KernelBinding::stampsInPlace: isTUUnique, which
+// includes the kernel copies of internalized launch paths, T26). Otherwise:
+//  - without -cir-offload-assume-closed-tu, nothing is stamped (remark: the
+//    kernel is visible to other TUs); the facts reach the kernel copy of an
+//    internalized launch path instead (cir-offload-internalize-launch-paths,
+//    which runs before this pass in every host-facts mode);
+//  - under -cir-offload-assume-closed-tu (this TU is the program), the closed
+//    rule applies: a lambda closure is stamped in place, and the residual --
+//    a functor or a by-name-reachable kernel -- is specialized by clone: mint
+//    a fresh kernel (copyKernel), redirect this TU's launches to it, and
+//    annotate the clone. The clone's names are unique only in this TU and the
+//    redirect rewrites markers inside shared linkonce launch functions, which
+//    is sound only under that assumption.
 //
 //===----------------------------------------------------------------------===//
 
@@ -218,8 +226,9 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
     return did;
   };
 
-  bool internalizedOpenMode = *mode != cir::HostFactsMode::Legacy &&
-                              hostFactsInternalize && !hostFactsClosedTU;
+  // Without closed-TU the remark names whether the launch paths were
+  // internalized (in every host-facts mode, T26b).
+  std::string sharedNote = cir::getSharedSYCLKernelNote(hostFactsInternalize);
   unsigned specTag = 0;
   for (const auto &entry : table) {
     const cir::KernelBinding &binding = entry.second;
@@ -233,23 +242,23 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
       continue;
     }
 
-    if (binding.isTULocalOptimizable) {
-      // Every launch is visible and the kernel is TU-local: safe to annotate
-      // the shared device kernel in place.
+    if (binding.stampsInPlace(hostFactsClosedTU)) {
+      // No other TU launches the kernel (or closed-TU is assumed): safe to
+      // annotate the shared device kernel in place.
       changed |= decide(binding.deviceKernels, binding, /*stamp=*/true, "");
-    } else if (internalizedOpenMode) {
-      // Open mode with internalized launch paths (T26): the clone path
-      // would repoint the markers inside the shared launch functions, which
-      // other TUs' launches run too, under names unique only in this TU.
-      // This TU's facts hold for the kernel copies of the internalized paths.
-      decide(binding.deviceKernels, binding, /*stamp=*/false,
-             "the kernel is visible to other TUs; facts this TU derives hold "
-             "only through an internalized launch path");
+    } else if (!hostFactsClosedTU) {
+      // Another TU can launch the kernel, with other pointers: this TU's
+      // facts do not hold for it. Not by clone either: the clone path would
+      // repoint the markers inside the shared launch functions, which other
+      // TUs' launches run too, under names unique only in this TU. This TU's
+      // facts hold for the kernel copies of the internalized paths.
+      decide(binding.deviceKernels, binding, /*stamp=*/false, sharedNote);
     } else {
-      // Residual: the shared kernel is cross-TU / by-name reachable, so another
-      // TU could launch it with aliasing pointers. Specialize by clone --
-      // redirect this TU's launches to a fresh kernel and annotate only the
-      // clone, leaving the generic original for unseen launches.
+      // Closed-TU residual: the shared kernel is a functor / by-name
+      // reachable, so a launch this table does not describe could pass
+      // aliasing pointers. Specialize by clone -- redirect this TU's launches
+      // to a fresh kernel and annotate only the clone, leaving the generic
+      // original for unseen launches.
       auto spec = cir::specializeSYCLKernelForLaunches(
           container, binding, binding.launchSites,
           "noalias." + std::to_string(specTag++));

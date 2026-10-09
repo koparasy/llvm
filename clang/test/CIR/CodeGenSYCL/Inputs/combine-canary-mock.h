@@ -55,6 +55,15 @@ public:
   T &operator*() const { return *_M_ptr; }
 };
 
+#ifdef COMBINE_MOCK_HOST_KERNEL_RESET
+template <typename T> class unique_ptr {
+  T *_M_ptr = nullptr;
+
+public:
+  void reset(T *p);
+};
+#endif
+
 template <typename T, typename A, typename B>
 shared_ptr<T> make_shared(A a, B b) {
   return shared_ptr<T>(new T(a, b));
@@ -223,9 +232,19 @@ class handler {
     setKernelFunc(p);
     setDeviceKernelInfoPtr(&detail::getDeviceKernelInfo<Kn>());
   }
+#ifdef COMBINE_MOCK_HOST_KERNEL_RESET
+  // The real handler's shape, which the legacy host trace (KernelBindingTable
+  // findHandlerClosure) follows: MHostKernel.reset(new HostKernel<K>(k)).
+  std::unique_ptr<detail::HostKernelBase> MHostKernel;
+  template <class Kn, class K> void StoreLambda(const K &k) {
+    MHostKernel.reset(new detail::HostKernel<K>(k));
+    setDeviceKernelInfoPtr(&detail::getDeviceKernelInfo<Kn>());
+  }
+#else
   template <class Kn, class K> void StoreLambda(const K &k) {
     setDeviceKernelInfo<Kn>(new detail::HostKernel<K>(k));
   }
+#endif
 
 public:
   template <class Kn, class K> void parallel_for(range<1> r, const K &k) {
@@ -257,11 +276,15 @@ public:
 
 void *malloc_shared(unsigned long bytes, const queue &q);
 void *malloc_host(unsigned long bytes, const queue &q);
+void *malloc_device(unsigned long bytes, const queue &q);
 template <typename T> T *malloc_shared(unsigned long count, const queue &q) {
   return (T *)malloc_shared(count * sizeof(T), q);
 }
 template <typename T> T *malloc_host(unsigned long count, const queue &q) {
   return (T *)malloc_host(count * sizeof(T), q);
+}
+template <typename T> T *malloc_device(unsigned long count, const queue &q) {
+  return (T *)malloc_device(count * sizeof(T), q);
 }
 void free(void *p, const queue &q);
 } // namespace _V1

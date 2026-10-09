@@ -10,7 +10,9 @@
 // RUN: FileCheck %s --check-prefix=PRUNED --input-file=%t.out.cir
 //
 // Without internalization (open mode as before T26) nothing is proven; the
-// budget; closed-TU and legacy (the pass does nothing).
+// budget; closed-TU (the pass does nothing); legacy host facts (T26b: only
+// kernels with a launch the legacy trace gives a fact for, none here: the
+// fixture's reduced headers do not have the shapes the trace reads).
 // RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo' \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
 // RUN: cir-opt %s -pass-pipeline="builtin.module(cir-offload-internalize-launch-paths{host-facts=ipo max-functions=5},cir-offload-infer-kernel-param-noalias{host-facts=ipo host-facts-internalize=1},cir-offload-prune-internalized-launch-paths)" \
@@ -18,7 +20,7 @@
 // RUN: cir-opt %s -cir-offload-internalize-launch-paths='host-facts=ipo host-facts-closed-tu=1' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=NONE
 // RUN: cir-opt %s -cir-offload-internalize-launch-paths 2>&1 \
-// RUN:   | FileCheck %s --check-prefix=NONE
+// RUN:   | FileCheck %s --check-prefixes=LEGACY,NONE
 
 // Launch-path internalization (T26, plan 2.8). Every launch below sits in a
 // function another TU can call (inline, so linkonce_odr: run1, R3::go,
@@ -194,6 +196,7 @@
 // BUDGET: remark: launch-path-internalization: 0 kernels specialized, 0 function copies (0 ops), 0 clean in place, 0 guarded calls, 0 vtable copies; 4 kernels over budget
 // BUDGET-NOT: ): noalias
 
+// LEGACY: remark: launch-path-internalization: 6 kernels skipped: no launch gives a legacy host fact
 // NONE-NOT: remark
 // NONE-NOT: {{[a-zA-Z0-9_]}}.int{{[.(]}}
 

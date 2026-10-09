@@ -78,7 +78,8 @@ public:
     numOps.resize(funcs.size(), 0);
     root.resize(funcs.size(), false);
     for (auto [i, func] : llvm::enumerate(funcs)) {
-      root[i] = isClosedRoot(func);
+      root[i] =
+          isClosedRoot(func) || (options.extraRoot && options.extraRoot(func));
       func.walk([&](Operation *) { ++numOps[i]; });
     }
     collectVTableSlots();

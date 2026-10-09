@@ -425,6 +425,14 @@ std::string cir::describeInternalizedSYCLKernel(cir::FuncOp kernel) {
   return out;
 }
 
+std::string cir::getSharedSYCLKernelNote(bool internalized) {
+  std::string note = "the kernel is visible to other TUs; facts this TU "
+                     "derives hold only through an internalized launch path";
+  if (!internalized)
+    note += ", and launch-path internalization is off";
+  return note;
+}
+
 llvm::StringMap<bool> cir::getSYCLKernelInfoLocality(mlir::ModuleOp container) {
   llvm::StringMap<bool> local;
   mlir::ModuleOp host = cir::getOffloadContainerHostModule(container);
@@ -2384,7 +2392,8 @@ static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
     const llvm::StringMap<NoAliasCandidates> &noAliasCandidates,
     llvm::StringMap<llvm::StringSet<>> &noAliasFields,
     llvm::StringMap<llvm::StringMap<std::string>> &noAliasNotes,
-    llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> &constArgs) {
+    llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> &constArgs,
+    llvm::StringMap<llvm::SmallVector<std::string, 1>> &factSites) {
   llvm::StringMap<SyclGeometry> result;
   // Per-kernel running noalias verdicts, ANDed across the kernel's sites.
   llvm::StringMap<bool> seenSite;
@@ -2443,6 +2452,14 @@ static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
       return;
     SyclGeometry geom = traceNDRange(reader, launch->geometry);
     result[kernel] = geom;
+    // Whether this launch in user code alone gives a fact (a constant local
+    // size, a distinct field or a constant capture): the user function
+    // holding it, for launch-path internalization.
+    bool factHere =
+        inUserCode && geom.valid && !geom.local.empty() &&
+        llvm::all_of(geom.local, [](const std::optional<int64_t> &d) {
+          return d.has_value();
+        });
     // Fold this launch's closure into the kernel's noalias eligibility, but
     // only for the collapsed launch sites in user code. Inlining leaves a copy
     // of each marker inside the still-present launch-shim bodies too, where the
@@ -2461,6 +2478,26 @@ static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
       foldClosureConstArgs(reader, launch->closure, constSeen,
                            constEligible[kernel]);
       constSeenSite[kernel] = constSeen;
+      if (!factHere) {
+        bool first = false;
+        llvm::StringMap<mlir::TypedAttr> consts;
+        foldClosureConstArgs(reader, launch->closure, first, consts);
+        bool any = llvm::any_of(
+            consts, [](const auto &c) { return static_cast<bool>(c.second); });
+        if (!any && cands != noAliasCandidates.end()) {
+          first = false;
+          llvm::StringMap<NoAliasDecision> here;
+          foldClosureNoAlias(reader, launch->closure, cands->second, first,
+                             here);
+          any = llvm::any_of(here, [](const auto &d) { return d.second.ok; });
+        }
+        factHere = any;
+      }
+    }
+    if (factHere) {
+      llvm::SmallVector<std::string, 1> &roots = factSites[kernel];
+      if (!llvm::is_contained(roots, enclosing.getSymName()))
+        roots.push_back(enclosing.getSymName().str());
     }
   });
 
@@ -2521,11 +2558,9 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
     return hostUses->contains(global.getSymNameAttr());
   };
 
-  // Open mode with internalized launch paths: which kernel names only local
-  // getters name (isTUUniqueSYCLKernel), computed once.
+  // Which kernel names only local getters name (isTUUniqueSYCLKernel),
+  // computed once, on the first SYCL binding.
   std::optional<llvm::StringMap<bool>> getterLocality;
-  if (hostFactsOptions.internalizedOpenMode())
-    getterLocality = getSYCLKernelInfoLocality(container);
   for (mlir::ModuleOp deviceMod :
        cir::getOffloadContainerDeviceModules(container)) {
     deviceMod.walk([&](cir::FuncOp kernel) {
@@ -2550,14 +2585,16 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
       if (binding.deviceKernels.empty()) {
         binding.kind = BindingKind::SYCLName;
         binding.hostNameString = nameString;
-        // Open mode with internalized launch paths (T26): TU-local means
-        // that no other TU can launch the kernel.
+        bool registered = isRegisteredKernel(container, name);
+        // The closed-TU rule, and the open one: no other TU can launch the
+        // kernel (T26b).
         binding.isTULocalOptimizable =
-            (hostFactsOptions.internalizedOpenMode()
-                 ? isTUUniqueSYCLKernel(container, kernel, name,
-                                        &*getterLocality)
-                 : isLambdaClosureKernel(kernel, name)) &&
-            !isRegisteredKernel(container, name);
+            isLambdaClosureKernel(kernel, name) && !registered;
+        if (!getterLocality)
+          getterLocality = getSYCLKernelInfoLocality(container);
+        binding.isTUUnique =
+            isTUUniqueSYCLKernel(container, kernel, name, &*getterLocality) &&
+            !registered;
       }
       binding.deviceKernels.push_back(kernel);
     });
@@ -2601,6 +2638,7 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
   llvm::StringMap<llvm::StringSet<>> noAliasFields;
   llvm::StringMap<llvm::StringMap<std::string>> noAliasNotes;
   llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> constArgs;
+  llvm::StringMap<llvm::SmallVector<std::string, 1>> factSites;
   // Under HostFactsMode::IPO, applyHostFacts replaces everything the trace
   // gives (the noalias fields and notes of every kernel with candidates, the
   // constants and every site's geometry), so the trace is not run: it is the
@@ -2609,7 +2647,7 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
   llvm::StringMap<SyclGeometry> geometry;
   if (hostFactsOptions.mode != HostFactsMode::IPO)
     geometry = computeSYCLGeometry(container, noAliasCandidates, noAliasFields,
-                                   noAliasNotes, constArgs);
+                                   noAliasNotes, constArgs, factSites);
 
   for (auto &binding : bindings) {
     if (binding.second.kind != BindingKind::SYCLName)
@@ -2626,6 +2664,9 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
     auto cit = constArgs.find(binding.first);
     if (cit != constArgs.end())
       binding.second.syclConstArgs = std::move(cit->second);
+    auto fit = factSites.find(binding.first);
+    if (fit != factSites.end())
+      binding.second.syclLegacyFactSites = std::move(fit->second);
   }
 
   hostModule.walk([&](cir::CallOp call) {

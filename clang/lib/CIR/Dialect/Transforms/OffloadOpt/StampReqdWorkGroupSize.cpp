@@ -9,11 +9,16 @@
 // Stamps `cir.reqd_work_group_size` on SYCL device kernels from the host-side
 // constant nd_range local work-group size recovered by KernelBindingTable.
 //
-// When every launch of a TU-local kernel uses the same compile-time-constant
-// nd_range local size, that size is a required work-group size for the device
-// kernel. The attribute records the sizes in natural {X,Y,Z} order (length ==
-// number of dims); the SYCL-shaped reversal/padding is applied later at LLVM
-// lowering (see LowerToLLVMIR.cpp amendReqdWorkGroupSize).
+// When every launch of a kernel uses the same compile-time-constant nd_range
+// local size and no other TU launches it (KernelBinding::stampsInPlace: a
+// TU-unique kernel or the kernel copy of an internalized launch path; under
+// -cir-offload-assume-closed-tu, a lambda closure), that size is a required
+// work-group size for the device kernel. A kernel other TUs can launch (a
+// lambda in an inline function has one closure type and one weak_odr device
+// kernel for the program) is not stamped: another TU may launch it with
+// another local size. The attribute records the sizes in natural {X,Y,Z} order
+// (length == number of dims); the SYCL-shaped reversal/padding is applied later
+// at LLVM lowering (see LowerToLLVMIR.cpp amendReqdWorkGroupSize).
 //
 //===----------------------------------------------------------------------===//
 
@@ -99,13 +104,22 @@ struct OffloadStampReqdWorkGroupSizePass
   void runOnOperation() override;
 };
 
-// The required work-group size the pass stamps on `binding`'s kernels, if
-// any: every launch is visible and they agree on a constant local size.
+// The required work-group size the launches of `binding` agree on, if any.
 static std::optional<llvm::SmallVector<int32_t, 3>>
-stampedLocal(const cir::KernelBinding &binding) {
-  if (!binding.isTULocalOptimizable || binding.launchSites.empty())
+recoveredLocal(const cir::KernelBinding &binding) {
+  if (binding.launchSites.empty())
     return std::nullopt;
   return commonConstantLocal(binding);
+}
+
+// The required work-group size the pass stamps on `binding`'s kernels, if
+// any: they agree on a constant local size and no other TU launches the
+// kernel (or closed-TU is assumed).
+static std::optional<llvm::SmallVector<int32_t, 3>>
+stampedLocal(const cir::KernelBinding &binding, bool assumeClosedTU) {
+  if (!binding.stampsInPlace(assumeClosedTU))
+    return std::nullopt;
+  return recoveredLocal(binding);
 }
 
 static std::string
@@ -178,10 +192,11 @@ void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
         cir::KernelBinding ipo = *binding;
         for (cir::LaunchSite &site : ipo.launchSites)
           site.syclNDRange = cmp.ipo;
-        mlir::emitRemark(loc) << "host-facts: kernel " << cmp.kernel
-                              << " reqd-work-group-size legacy="
-                              << formatLocal(stampedLocal(*binding))
-                              << " ipo=" << formatLocal(stampedLocal(ipo));
+        mlir::emitRemark(loc)
+            << "host-facts: kernel " << cmp.kernel
+            << " reqd-work-group-size legacy="
+            << formatLocal(stampedLocal(*binding, hostFactsClosedTU))
+            << " ipo=" << formatLocal(stampedLocal(ipo, hostFactsClosedTU));
       }
     }
     mlir::emitRemark(container.getLoc())
@@ -195,12 +210,25 @@ void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
   for (const auto &entry : table) {
     const cir::KernelBinding &binding = entry.second;
 
-    // Only SYCL, TU-local kernels whose every launch this TU can see may be
-    // specialized: another TU could launch a cross-TU kernel with a different
-    // geometry.
-    std::optional<llvm::SmallVector<int32_t, 3>> local = stampedLocal(binding);
-    if (!local)
+    // Only SYCL kernels no other TU launches may be specialized: another TU
+    // could launch a shared kernel with a different geometry.
+    std::optional<llvm::SmallVector<int32_t, 3>> local =
+        stampedLocal(binding, hostFactsClosedTU);
+    if (!local) {
+      // A kernel other TUs can launch (no closed-TU): say why not.
+      if (binding.kind != cir::BindingKind::SYCLName || hostFactsClosedTU ||
+          binding.stampsInPlace(false) || binding.deviceKernels.empty())
+        continue;
+      if (std::optional<llvm::SmallVector<int32_t, 3>> recovered =
+              recoveredLocal(binding)) {
+        cir::FuncOp kernel = binding.deviceKernels.front();
+        mlir::emitRemark(kernel.getLoc())
+            << "reqd-work-group-size: kernel @" << kernel.getName() << " "
+            << formatLocal(recovered) << " not stamped ("
+            << cir::getSharedSYCLKernelNote(hostFactsInternalize) << ")";
+      }
       continue;
+    }
 
     mlir::ArrayAttr attr = builder.getI32ArrayAttr(*local);
 

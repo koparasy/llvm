@@ -1,6 +1,14 @@
+// The closed-TU rule (-cir-offload-assume-closed-tu): these fixtures'
+// kernels are stamped in place as lambdas, or specialized by clone.
 // RUN: cir-opt %s -split-input-file \
-// RUN:   -pass-pipeline="builtin.module(cir-offload-stamp-reqd-work-group-size)" \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-stamp-reqd-work-group-size{host-facts-closed-tu=1})" \
 // RUN:   | FileCheck %s
+// Without it (T26b), only a kernel no other TU can launch is stamped,
+// in place, and nothing is specialized by clone.
+// RUN: cir-opt %s -split-input-file -cir-offload-stamp-reqd-work-group-size -o /dev/null 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=OPEN
+// OPEN: remark: reqd-work-group-size: kernel @_ZTSZ4mainEUlvE_ [256] not stamped (the kernel is visible to other TUs; facts this TU derives hold only through an internalized launch path, and launch-path internalization is off)
+// OPEN: remark: reqd-work-group-size: kernel @_Z9addKernelv [256] not stamped (the kernel is visible to other TUs;
 
 // A TU-local SYCL kernel launched only through a constant nd_range gets its
 // local work-group size stamped onto the device spir_kernel as a natural-order

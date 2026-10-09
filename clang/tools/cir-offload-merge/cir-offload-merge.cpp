@@ -120,13 +120,14 @@ llvm::cl::alias
 // kernels are internalized first (cir-offload-internalize-launch-paths): the
 // functions other TUs could call on a path from main to a launch are cloned
 // as internal copies that launch a specialized copy of the kernel, which the
-// facts this TU derives then hold for. On by default; with
+// facts this TU derives then hold for. Without closed-TU a kernel other TUs
+// can launch gets no fact in place, so this is how such a kernel gets one,
+// in every host-facts mode (T26b). On by default; with
 // -cir-offload-assume-closed-tu nothing changes.
 llvm::cl::opt<bool> InternalizeLaunchPaths(
     "cir-offload-internalize-launch-paths",
-    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both without "
-                   "-cir-offload-assume-closed-tu, internalize the host "
-                   "launch paths of the kernels (the default)"),
+    llvm::cl::desc("Without -cir-offload-assume-closed-tu, internalize the "
+                   "host launch paths of the kernels (the default)"),
     llvm::cl::init(true), llvm::cl::cat(CIROffloadMergeCategory));
 llvm::cl::opt<unsigned> InternalizeMaxFunctions(
     "cir-offload-internalize-max-functions",
@@ -496,7 +497,7 @@ combineInputs(llvm::ArrayRef<InputTarget> inputTargets,
 // unit attribute.
 // Whether the launch paths are internalized (T26).
 static bool internalizesLaunchPaths() {
-  return InternalizeLaunchPaths && HostFacts != "legacy" && !AssumeClosedTU;
+  return InternalizeLaunchPaths && !AssumeClosedTU;
 }
 
 // The --cir-offload-host-facts options of the container passes that read

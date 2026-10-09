@@ -39,6 +39,15 @@
 // all clean already needs no copy (isTUUniqueSYCLKernel lets the passes
 // stamp it in place).
 //
+// Legacy host facts (T26b). Without closed-TU a kernel other TUs can launch
+// gets no fact in place, in every host-facts mode, so this pass runs under
+// legacy too. The legacy trace reads only the body of the function holding a
+// launch (after inlining the launch shims and the command group), so its
+// facts do not depend on that function's callers: a kernel with no launch
+// that gives a fact is skipped, and the functions holding one are roots of
+// their own paths (KernelBinding::syclLegacyFactSites), which recovers the
+// launches of a library TU without main.
+//
 // Ordering. This runs before the host-facts passes: the analysis they share
 // (SYCLHostFactsCache) is built on the internalized module, so its soundness
 // argument is the analysis' own (the module is equivalent to the original)
@@ -170,8 +179,10 @@ struct OffloadInternalizeLaunchPathsPass
 void OffloadInternalizeLaunchPathsPass::runOnOperation() {
   ModuleOp container = getOperation();
   std::optional<cir::HostFactsMode> mode = cir::parseHostFactsMode(hostFacts);
-  if (!cir::isOffloadContainer(container) || !mode ||
-      *mode == cir::HostFactsMode::Legacy || hostFactsClosedTU)
+  // Every host-facts mode: the legacy trace reads the copies' launches as it
+  // reads the originals' (it inlines the launch shims by name, and a copy
+  // keeps its original's name with a suffix).
+  if (!cir::isOffloadContainer(container) || !mode || hostFactsClosedTU)
     return markAllAnalysesPreserved();
   ModuleOp host = cir::getOffloadContainerHostModule(container);
   if (!host)
@@ -193,6 +204,44 @@ void OffloadInternalizeLaunchPathsPass::runOnOperation() {
     else
       ++numNoFact;
   }
+  // Legacy host facts: the trace is intraprocedural (it reads the function
+  // holding a launch, after inlining the launch shims and the command
+  // group), so a launch in a copy gives exactly what the launch it was copied
+  // from gives, whoever calls it. So:
+  //  - a kernel none of whose launches gives a fact on its own gets none
+  //    through a copy either: skip it;
+  //  - the functions holding a launch that does are roots too, kept in place
+  //    (an external one included): the kernel copy they then launch has
+  //    facts that hold at each of its launches for any caller, and no other
+  //    TU names it. (An external root that the linker replaces by another
+  //    TU's copy launches the original kernel, unstamped.)
+  //  - a kernel no other TU can launch (KernelBinding::isTUUnique) is
+  //    stamped in place over all its launches, as before: no copy (no
+  //    duplicate device kernel).
+  // The legacy table is the shared analysis, usually already built.
+  unsigned numNoLegacyFact = 0, numTUUnique = 0;
+  llvm::StringSet<> legacyRoots;
+  if (*mode == cir::HostFactsMode::Legacy) {
+    const cir::KernelBindingTable &table =
+        getAnalysis<cir::KernelBindingTable>();
+    for (auto &[name, kernels] : deviceKernels) {
+      if (!possible.contains(name))
+        continue;
+      const cir::KernelBinding *binding = table.lookup(name);
+      if (binding && binding->isTUUnique) {
+        possible.erase(name);
+        ++numTUUnique;
+        continue;
+      }
+      if (binding && !binding->syclLegacyFactSites.empty()) {
+        for (const std::string &root : binding->syclLegacyFactSites)
+          legacyRoots.insert(root);
+        continue;
+      }
+      possible.erase(name);
+      ++numNoLegacyFact;
+    }
+  }
   // The kernel each getter names (looked up once, with symbol tables).
   SymbolTableCollection symbols;
   llvm::DenseMap<Operation *, std::string> kernelOf;
@@ -213,6 +262,17 @@ void OffloadInternalizeLaunchPathsPass::runOnOperation() {
         << (numNoFact == 1 ? "" : "s")
         << " skipped: no fact is possible (no noalias candidate, scalar "
            "capture or nd_range launch)";
+  if (numNoLegacyFact)
+    emitRemark(container.getLoc())
+        << "launch-path-internalization: " << numNoLegacyFact << " kernel"
+        << (numNoLegacyFact == 1 ? "" : "s")
+        << " skipped: no launch gives a legacy host fact";
+  if (numTUUnique)
+    emitRemark(container.getLoc())
+        << "launch-path-internalization: " << numTUUnique << " kernel"
+        << (numTUUnique == 1 ? "" : "s")
+        << " skipped: stamped in place (no other TU can launch "
+        << (numTUUnique == 1 ? "it" : "them") << ")";
   if (sinks.empty())
     return markAllAnalysesPreserved();
 
@@ -229,6 +289,10 @@ void OffloadInternalizeLaunchPathsPass::runOnOperation() {
   options.vouchAddress = isVouchedInvokerAddress;
   options.maxFunctions = maxFunctions;
   options.maxOps = maxOps;
+  if (!legacyRoots.empty())
+    options.extraRoot = [&](cir::FuncOp func) {
+      return legacyRoots.contains(func.getSymName());
+    };
   cir::InternalizationResult result =
       cir::internalizeLaunchPaths(host, sinks, options);
   numCopies += result.numCloned;

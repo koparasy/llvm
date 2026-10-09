@@ -102,6 +102,11 @@ struct InternalizationOptions {
   /// a copy: only code the client vouches for uses it, and only to call it.
   /// Null: none.
   std::function<bool(cir::GetGlobalOp addr, cir::FuncOp holder)> vouchAddress;
+  /// More roots than the closed ones (isClosedRoot), kept in place like
+  /// them. Null: none. Only for a client whose facts about a path do not
+  /// depend on the root's callers (the legacy SYCL host trace, which reads
+  /// only the body of the function holding a launch).
+  std::function<bool(cir::FuncOp)> extraRoot;
   /// Clone the sinks too (otherwise they are the ends of the paths, kept as
   /// they are; the client redirects the calls to them).
   bool cloneSinks = false;

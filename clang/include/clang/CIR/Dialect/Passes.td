@@ -293,13 +293,12 @@ defvar OffloadHostFactsBudgetOptions = [
          "allocate, with the same fallback (0: no limit).">,
   Option<"hostFactsInternalize", "host-facts-internalize", "bool",
          /*default=*/"false",
-         "Under ipo/both without closed-tu: the launch paths were "
-         "internalized (cir-offload-internalize-launch-paths). The points-to "
-         "analysis then counts local functions whose address only analysed "
-         "code takes as having visible callers "
-         "(PointsToAnalysisOptions::localFunctionsClosed), a kernel is "
-         "specialized in place only if no other TU can launch it, and a "
-         "kernel other TUs can launch is not specialized by clone.">,
+         "Without closed-tu: the launch paths were internalized "
+         "(cir-offload-internalize-launch-paths). Under ipo/both the "
+         "points-to analysis then counts local functions whose address only "
+         "analysed code takes as having visible callers "
+         "(PointsToAnalysisOptions::localFunctionsClosed); in every mode the "
+         "remarks of a kernel other TUs can launch say so.">,
 ];
 
 defvar OffloadHostFactsOptions = !listconcat(OffloadHostFactsBudgetOptions, [
@@ -310,8 +309,12 @@ defvar OffloadHostFactsOptions = !listconcat(OffloadHostFactsBudgetOptions, [
          "host-facts-disagreement remark).">,
   Option<"hostFactsClosedTU", "host-facts-closed-tu", "bool",
          /*default=*/"false",
-         "Under ipo/both, assume the module holds every caller of every "
-         "function (PointsToAnalysisOptions::assumeClosedTU).">,
+         "Assume the module holds every caller of every function "
+         "(PointsToAnalysisOptions::assumeClosedTU under ipo/both). In every "
+         "mode, without it a kernel is specialized in place only if no other "
+         "TU can launch it (KernelBinding::isTUUnique) and never by clone; "
+         "with it a lambda kernel is specialized in place and the rest by "
+         "clone.">,
   Option<"hostFactsBottomUp", "host-facts-bu", "bool", /*default=*/"true",
          "Under ipo/both, run the points-to analysis bottom-up (the "
          "default); false runs it context-insensitively.">,
@@ -525,8 +528,8 @@ def OffloadInternalizeLaunchPaths
     : Pass<"cir-offload-internalize-launch-paths", "mlir::ModuleOp"> {
   let summary = "Clone the host launch paths of SYCL kernels from closed roots";
   let description = [{
-    Runs over a `cir.offload.container` under `host-facts=ipo|both` without
-    `host-facts-closed-tu` (T26, plan 2.8). Every host function on a path
+    Runs over a `cir.offload.container` without `host-facts-closed-tu`, in
+    every host-facts mode (T26, plan 2.8; legacy since T26b). Every host function on a path
     from a closed root (`main`, the dynamic initializers) to a
     `kernel.info` marker that another TU could call (external, linkonce_odr,
     weak) is cloned as an `internal` copy and the path's edges are redirected
@@ -537,13 +540,17 @@ def OffloadInternalizeLaunchPaths
     so the facts the host-facts passes derive from this TU's callers apply to
     it and not to the original kernel, which the originals keep launching.
     Runs before the passes that read the host facts; the analysis they share
-    (SYCLHostFactsCache) is built on the internalized module.
+    (SYCLHostFactsCache) is built on the internalized module. Under
+    `host-facts=legacy` (T26b), whose trace reads only the body of the
+    function holding a launch, a kernel none of whose launches gives a
+    legacy fact is skipped, and the functions holding a launch that gives
+    one are roots too (kept in place).
   }];
   let constructor = "mlir::createOffloadInternalizeLaunchPathsPass()";
   let dependentDialects = ["cir::CIRDialect"];
   let options = [
     Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"legacy\"",
-           "The host-facts mode: the pass runs under ipo and both.">,
+           "The host-facts mode (legacy, ipo or both; checked only).">,
     Option<"hostFactsClosedTU", "host-facts-closed-tu", "bool",
            /*default=*/"false",
            "Closed-TU assumption: if set, the pass does nothing.">,

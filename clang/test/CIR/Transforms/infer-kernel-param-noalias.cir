@@ -1,6 +1,18 @@
+// The closed-TU rule (-cir-offload-assume-closed-tu): these fixtures'
+// kernels are stamped in place as lambdas, or specialized by clone.
 // RUN: cir-opt %s -split-input-file \
-// RUN:   -pass-pipeline="builtin.module(cir-offload-infer-kernel-param-noalias)" \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-infer-kernel-param-noalias{host-facts-closed-tu=1})" \
 // RUN:   | FileCheck %s
+// Without it (T26b), only a kernel no other TU can launch is stamped,
+// in place, and nothing is specialized by clone.
+// RUN: cir-opt %s -split-input-file -cir-offload-infer-kernel-param-noalias -o /dev/null 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=OPEN
+// The fixtures' kernels carry no evidence of TU-uniqueness (no closure call
+// operator with local linkage, no local kernel.info getter).
+// OPEN: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (pointer 'a'): not stamped (the kernel is visible to other TUs; facts this TU derives hold only through an internalized launch path, and launch-path internalization is off)
+// OPEN: remark: kernel-param-noalias: kernel @_Z9addKernelv arg 0 (pointer 'a'): not stamped (the kernel is visible to other TUs;
+// OPEN-NOT: ): noalias
+// OPEN-NOT: .spec.
 
 // A TU-local SYCL kernel whose captured pointers come from DISTINCT USM
 // allocations gets `llvm.noalias` on the corresponding device parameters. The

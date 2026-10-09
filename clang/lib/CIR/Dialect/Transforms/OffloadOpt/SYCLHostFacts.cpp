@@ -123,8 +123,8 @@
 // it names. This matches the legacy trace, which folds every launch it
 // recovers in user code and rejects a kernel with a user-code launch whose
 // closure it does not recover; like it, the launches are this TU's: the
-// consumer specializes a kernel by clone unless it is TU-local
-// (KernelBinding::isTULocalOptimizable). Facts that depend on the callers of
+// consumer stamps a kernel in place only if no other TU launches it
+// (KernelBinding::stampsInPlace). Facts that depend on the callers of
 // an externally callable function are Incomplete unless closed-TU is
 // assumed (D2), and (b) rejects them.
 //
