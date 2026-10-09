@@ -291,6 +291,15 @@ defvar OffloadHostFactsBudgetOptions = [
          /*default=*/"8192",
          "Under ipo/both, the memory (MB) the points-to analysis may "
          "allocate, with the same fallback (0: no limit).">,
+  Option<"hostFactsInternalize", "host-facts-internalize", "bool",
+         /*default=*/"false",
+         "Under ipo/both without closed-tu: the launch paths were "
+         "internalized (cir-offload-internalize-launch-paths). The points-to "
+         "analysis then counts local functions whose address only analysed "
+         "code takes as having visible callers "
+         "(PointsToAnalysisOptions::localFunctionsClosed), a kernel is "
+         "specialized in place only if no other TU can launch it, and a "
+         "kernel other TUs can launch is not specialized by clone.">,
 ];
 
 defvar OffloadHostFactsOptions = !listconcat(OffloadHostFactsBudgetOptions, [
@@ -510,6 +519,62 @@ def OffloadInferKernelParamNoAlias
               "Points-to analyses built for the host facts (0 when an "
               "earlier container pass built the shared one)">
   ];
+}
+
+def OffloadInternalizeLaunchPaths
+    : Pass<"cir-offload-internalize-launch-paths", "mlir::ModuleOp"> {
+  let summary = "Clone the host launch paths of SYCL kernels from closed roots";
+  let description = [{
+    Runs over a `cir.offload.container` under `host-facts=ipo|both` without
+    `host-facts-closed-tu` (T26, plan 2.8). Every host function on a path
+    from a closed root (`main`, the dynamic initializers) to a
+    `kernel.info` marker that another TU could call (external, linkonce_odr,
+    weak) is cloned as an `internal` copy and the path's edges are redirected
+    to the copies (LaunchPathInternalization.h: direct calls, the CGF
+    invoker a `cgfo.ctor` stores, guarded direct calls for indirect calls,
+    std::thread state vtables). The markers of the copies name a new kernel
+    `<K>.int.<module id>` with local host artifacts (copySYCLKernelLocally),
+    so the facts the host-facts passes derive from this TU's callers apply to
+    it and not to the original kernel, which the originals keep launching.
+    Runs before the passes that read the host facts; the analysis they share
+    (SYCLHostFactsCache) is built on the internalized module.
+  }];
+  let constructor = "mlir::createOffloadInternalizeLaunchPathsPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+  let options = [
+    Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"legacy\"",
+           "The host-facts mode: the pass runs under ipo and both.">,
+    Option<"hostFactsClosedTU", "host-facts-closed-tu", "bool",
+           /*default=*/"false",
+           "Closed-TU assumption: if set, the pass does nothing.">,
+    Option<"maxFunctions", "max-functions", "unsigned", /*default=*/"2000",
+           "The most function copies per TU (the budget; a kernel whose "
+           "paths would exceed it is not internalized, with a remark).">,
+    Option<"maxOps", "max-ops", "uint64_t", /*default=*/"400000",
+           "The most ops in the function copies per TU.">,
+  ];
+  let statistics = [
+    Statistic<"numCopies", "function-copies", "Host function copies made">,
+    Statistic<"numKernelCopies", "kernel-copies",
+              "Kernels specialized for an internalized path">,
+  ];
+}
+
+def OffloadPruneInternalizedLaunchPaths
+    : Pass<"cir-offload-prune-internalized-launch-paths", "mlir::ModuleOp"> {
+  let summary = "Undo the internalized launch paths that got no fact";
+  let description = [{
+    Runs over a `cir.offload.container` after the passes that read the host
+    facts. A kernel copy made by `cir-offload-internalize-launch-paths` that
+    none of them changed (no noalias, no required work-group size, no
+    constant; they tag the kernels they change) is erased with its host
+    artifacts, its launches go back to the original kernel, every redirected
+    edge into a host copy that no longer leads to a kept kernel copy is
+    restored, and the unused copies are erased. The internalization tags are
+    then removed.
+  }];
+  let constructor = "mlir::createOffloadPruneInternalizedLaunchPathsPass()";
+  let dependentDialects = ["cir::CIRDialect"];
 }
 
 def OffloadPropagateSYCLKernelArgs

@@ -116,6 +116,30 @@ llvm::cl::alias
                       llvm::cl::desc("Alias for "
                                      "-cir-offload-assume-closed-tu"),
                       llvm::cl::aliasopt(AssumeClosedTU), llvm::cl::Hidden);
+// T26: without the closed-TU assumption, the host launch paths of the
+// kernels are internalized first (cir-offload-internalize-launch-paths): the
+// functions other TUs could call on a path from main to a launch are cloned
+// as internal copies that launch a specialized copy of the kernel, which the
+// facts this TU derives then hold for. On by default; with
+// -cir-offload-assume-closed-tu nothing changes.
+llvm::cl::opt<bool> InternalizeLaunchPaths(
+    "cir-offload-internalize-launch-paths",
+    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both without "
+                   "-cir-offload-assume-closed-tu, internalize the host "
+                   "launch paths of the kernels (the default)"),
+    llvm::cl::init(true), llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<unsigned> InternalizeMaxFunctions(
+    "cir-offload-internalize-max-functions",
+    llvm::cl::desc("The most host function copies launch-path "
+                   "internalization makes per TU"),
+    llvm::cl::init(2000), llvm::cl::Hidden,
+    llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<uint64_t> InternalizeMaxOps(
+    "cir-offload-internalize-max-ops",
+    llvm::cl::desc("The most ops in the host function copies launch-path "
+                   "internalization makes per TU"),
+    llvm::cl::init(400000), llvm::cl::Hidden,
+    llvm::cl::cat(CIROffloadMergeCategory));
 // The points-to analysis of --cir-offload-host-facts=ipo|both is the
 // bottom-up mode (T17) with subobject nodes (T17b) and top-down queries
 // (T18). --cir-offload-host-facts-ci is the escape hatch to the
@@ -470,6 +494,11 @@ combineInputs(llvm::ArrayRef<InputTarget> inputTargets,
 // The container is a module, so passes are scheduled over the module; DKE and
 // KACP early-return on modules that do not carry the `cir.offload.container`
 // unit attribute.
+// Whether the launch paths are internalized (T26).
+static bool internalizesLaunchPaths() {
+  return InternalizeLaunchPaths && HostFacts != "legacy" && !AssumeClosedTU;
+}
+
 // The --cir-offload-host-facts options of the container passes that read
 // SYCL host facts, as a pass option string.
 static std::string getHostFactsPassOptions() {
@@ -485,6 +514,8 @@ static std::string getHostFactsPassOptions() {
   options += " host-facts-max-seconds=" + std::to_string(HostFactsMaxSeconds);
   options +=
       " host-facts-max-memory-mb=" + std::to_string(HostFactsMaxMemoryMB);
+  if (internalizesLaunchPaths())
+    options += " host-facts-internalize=true";
   return options;
 }
 
@@ -529,6 +560,24 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   if (!DisableCirInferLaunchBounds)
     pm.addPass(mlir::createOffloadLaunchBoundsPropagationPass());
 
+  // Without the closed-TU assumption, internalize the host launch paths
+  // (T26) before the passes that read the host facts build their shared
+  // analysis.
+  if (internalizesLaunchPaths()) {
+    std::unique_ptr<mlir::Pass> internalize =
+        mlir::createOffloadInternalizeLaunchPathsPass();
+    std::string options = "host-facts=" + HostFacts + " max-functions=" +
+                          std::to_string(InternalizeMaxFunctions) +
+                          " max-ops=" + std::to_string(InternalizeMaxOps);
+    if (mlir::failed(internalize->initializeOptions(
+            options, [](const llvm::Twine &message) {
+              reportError(message);
+              return mlir::failure();
+            })))
+      return reportError("bad launch-path internalization options");
+    pm.addPass(std::move(internalize));
+  }
+
   // Specialize SYCL device kernels with a required work-group size recovered
   // from their host-side constant nd_range local size. Runs at container level
   // (needs the host<->device binding table) after mem2reg/sccp have exposed the
@@ -564,6 +613,10 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
       return reportError("bad --cir-offload-host-facts options");
     pm.addPass(std::move(propagate));
   }
+
+  // Undo the internalized launch paths whose kernel copy got no fact.
+  if (internalizesLaunchPaths())
+    pm.addPass(mlir::createOffloadPruneInternalizedLaunchPathsPass());
 
   // Simplify the nested modules again after the propagation above: mem2reg/sccp
   // promote the scalar spill slots the substituted constant now feeds, folding

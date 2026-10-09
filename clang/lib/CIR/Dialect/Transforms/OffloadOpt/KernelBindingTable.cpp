@@ -23,6 +23,7 @@
 #include "clang/CIR/Dialect/Passes.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLHostFacts.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
@@ -360,6 +361,120 @@ static bool isLambdaClosureKernel(cir::FuncOp kernel,
   return hasAnonymousClosure(symbolName);
 }
 
+// The call of the closure's call operator in the SYCL device kernel `kernel`:
+// the call whose receiver is the closure alloca (getSYCLClosureRecord).
+static cir::CallOp findClosureCall(cir::FuncOp kernel) {
+  cir::CallOp found;
+  kernel.walk([&](cir::AllocaOp alloca) {
+    if (found)
+      return;
+    auto rec = mlir::dyn_cast<cir::RecordType>(alloca.getAllocaType());
+    if (!rec || !rec.getName())
+      return;
+    llvm::SmallVector<mlir::Value, 4> worklist{alloca.getResult()};
+    llvm::SmallPtrSet<mlir::Operation *, 8> seen;
+    while (!worklist.empty() && !found) {
+      mlir::Value cur = worklist.pop_back_val();
+      for (mlir::Operation *user : cur.getUsers()) {
+        if (auto call = mlir::dyn_cast<cir::CallOp>(user)) {
+          mlir::OperandRange args = call.getArgOperands();
+          if (!args.empty() && args[0] == cur && !call.isIndirect()) {
+            found = call;
+            break;
+          }
+          continue;
+        }
+        if (mlir::isa<cir::CastOp, cir::BaseClassAddrOp>(user))
+          if (seen.insert(user).second)
+            worklist.push_back(user->getResult(0));
+      }
+    }
+  });
+  return found;
+}
+
+cir::FuncOp cir::getSYCLClosureCallOperator(cir::FuncOp kernel) {
+  cir::CallOp call = findClosureCall(kernel);
+  return call ? lookupSymbol<cir::FuncOp>(call, call.getCalleeAttr())
+              : cir::FuncOp();
+}
+
+bool cir::isInternalizedSYCLKernel(cir::FuncOp kernel) {
+  return kernel && kernel->hasAttr(kInternalizedKernelAttr);
+}
+
+void cir::noteInternalizedSYCLKernelUse(cir::FuncOp kernel) {
+  if (isInternalizedSYCLKernel(kernel))
+    kernel->setAttr(kInternalizedUsedAttr,
+                    mlir::UnitAttr::get(kernel.getContext()));
+}
+
+std::string cir::describeInternalizedSYCLKernel(cir::FuncOp kernel) {
+  auto info =
+      kernel
+          ? kernel->getAttrOfType<mlir::DictionaryAttr>(kInternalizedKernelAttr)
+          : nullptr;
+  if (!info)
+    return "";
+  std::string out = " through the internalized launch path from root";
+  auto roots = info.getAs<mlir::ArrayAttr>("roots");
+  if (roots)
+    for (auto [i, root] : llvm::enumerate(roots))
+      if (auto name = mlir::dyn_cast<mlir::StringAttr>(root))
+        out += (i ? ", @" : " @") + name.getValue().str();
+  return out;
+}
+
+llvm::StringMap<bool> cir::getSYCLKernelInfoLocality(mlir::ModuleOp container) {
+  llvm::StringMap<bool> local;
+  mlir::ModuleOp host = cir::getOffloadContainerHostModule(container);
+  mlir::SymbolTableCollection symbols;
+  for (auto func : host.getOps<cir::FuncOp>()) {
+    auto role = func->getAttrOfType<mlir::StringAttr>(
+        cir::CIRDialect::getSYCLHostAPIAttrName());
+    if (!role || role.getValue() != "kernel.info" || func.isDeclaration())
+      continue;
+    std::string name = cir::getSYCLKernelInfoName(func, &symbols);
+    if (name.empty())
+      continue;
+    auto [it, inserted] =
+        local.try_emplace(name, cir::isLocalLinkage(func.getLinkage()));
+    if (!inserted)
+      it->second &= cir::isLocalLinkage(func.getLinkage());
+  }
+  return local;
+}
+
+bool cir::isTUUniqueSYCLKernel(mlir::ModuleOp container, cir::FuncOp kernel,
+                               llvm::StringRef name,
+                               const llvm::StringMap<bool> *getterLocality) {
+  if (isInternalizedSYCLKernel(kernel))
+    return true;
+  // The closure type: a local call operator means another TU cannot build
+  // the kernel's function object.
+  if (cir::CallOp call = findClosureCall(kernel))
+    if (auto op = lookupSymbol<cir::FuncOp>(call, call.getCalleeAttr()))
+      if (cir::isLocalLinkage(op.getLinkage()))
+        return true;
+  // The kernel-name type: every getDeviceKernelInfo<K> getter is local.
+  if (getterLocality)
+    return getterLocality->lookup(name);
+  mlir::ModuleOp host = cir::getOffloadContainerHostModule(container);
+  mlir::SymbolTableCollection symbols;
+  bool any = false;
+  for (auto func : host.getOps<cir::FuncOp>()) {
+    auto role = func->getAttrOfType<mlir::StringAttr>(
+        cir::CIRDialect::getSYCLHostAPIAttrName());
+    if (!role || role.getValue() != "kernel.info" || func.isDeclaration() ||
+        cir::getSYCLKernelInfoName(func, &symbols) != name)
+      continue;
+    if (!cir::isLocalLinkage(func.getLinkage()))
+      return false;
+    any = true;
+  }
+  return any;
+}
+
 // Whether `name` appears as a registered (by-name / bundle-exposed) kernel in
 // any module's `cir.sycl_registered_kernels` attribute -- an array of
 // [user-name, mangled-name] string pairs. Such a kernel is reachable by name
@@ -482,6 +597,8 @@ std::string cir::formatHostFactsOptions(const HostFactsOptions &options) {
   out += options.bottomUp ? ", bu" : ", ci";
   if (options.subobjects)
     out += ", subobjects";
+  if (options.internalizedOpenMode())
+    out += ", internalized";
   return out + ")";
 }
 
@@ -492,6 +609,8 @@ std::string cir::getHostFactsAnalysisKey(const HostFactsOptions &options) {
      << options.relevanceSlice << " " << options.budgetScale << " "
      << options.maxSeconds << " " << options.maxMemoryMB << " "
      << options.assumeSpecHostPtrUB;
+  if (options.internalizedOpenMode())
+    os << " internalized";
   return out;
 }
 
@@ -2402,6 +2521,11 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
     return hostUses->contains(global.getSymNameAttr());
   };
 
+  // Open mode with internalized launch paths: which kernel names only local
+  // getters name (isTUUniqueSYCLKernel), computed once.
+  std::optional<llvm::StringMap<bool>> getterLocality;
+  if (hostFactsOptions.internalizedOpenMode())
+    getterLocality = getSYCLKernelInfoLocality(container);
   for (mlir::ModuleOp deviceMod :
        cir::getOffloadContainerDeviceModules(container)) {
     deviceMod.walk([&](cir::FuncOp kernel) {
@@ -2426,8 +2550,14 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
       if (binding.deviceKernels.empty()) {
         binding.kind = BindingKind::SYCLName;
         binding.hostNameString = nameString;
-        binding.isTULocalOptimizable = isLambdaClosureKernel(kernel, name) &&
-                                       !isRegisteredKernel(container, name);
+        // Open mode with internalized launch paths (T26): TU-local means
+        // that no other TU can launch the kernel.
+        binding.isTULocalOptimizable =
+            (hostFactsOptions.internalizedOpenMode()
+                 ? isTUUniqueSYCLKernel(container, kernel, name,
+                                        &*getterLocality)
+                 : isLambdaClosureKernel(kernel, name)) &&
+            !isRegisteredKernel(container, name);
       }
       binding.deviceKernels.push_back(kernel);
     });
@@ -2871,6 +3001,166 @@ static mlir::Attribute repointCompileTimeInfo(mlir::Attribute init,
                                    mlir::ArrayAttr::get(ctx, members));
 }
 
+namespace {
+/// The kernel copy mintSYCLKernelCopy made: the device clones and the getter
+/// copy (H3) the launches are to call.
+struct MintedKernelCopy {
+  cir::SpecializedKernel spec;
+  cir::FuncOp getter;
+};
+} // namespace
+
+// Steps 1-6 of specializeSYCLKernelForLaunches (see there): the device
+// clones of `deviceKernels` under `cloneName`, the name string (H1), the
+// CompileTimeKernelInfo (H2), the getter's static-local cluster and the
+// getter copy (H3). `getter` may be null (then nothing past H1 is made, as
+// specializeSYCLKernelForLaunches always did). With `local`, the host
+// artifacts are internal, named `<original><suffix>` and tagged with
+// cir.offload.internalized (launch-path internalization, T26).
+// `hostTable` (optional) is a symbol table of the host module to insert
+// into, and `onlyInGetter` (optional) tells whether every use of a global is
+// in the getter (both computed once by a caller that copies many kernels;
+// by default they are computed here).
+static std::optional<MintedKernelCopy> mintSYCLKernelCopy(
+    mlir::ModuleOp container, llvm::ArrayRef<cir::FuncOp> deviceKernels,
+    cir::GlobalOp nameStr, cir::FuncOp getter, llvm::StringRef cloneName,
+    bool local, llvm::StringRef suffix, mlir::SymbolTable *hostTable = nullptr,
+    llvm::function_ref<bool(cir::GlobalOp, cir::FuncOp)> onlyInGetter = {}) {
+  mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
+  mlir::MLIRContext *ctx = container.getContext();
+  MintedKernelCopy minted;
+  cir::SpecializedKernel &spec = minted.spec;
+  spec.name = cloneName.str();
+  // A host artifact of a local copy: internal, renamed, tagged.
+  auto localize = [&](mlir::Operation *op) {
+    if (!local)
+      return;
+    mlir::StringAttr original = mlir::SymbolTable::getSymbolName(op);
+    mlir::SymbolTable::setSymbolName(op, (original.getValue() + suffix).str());
+    if (auto func = mlir::dyn_cast<cir::FuncOp>(op)) {
+      func.setLinkage(cir::GlobalLinkageKind::InternalLinkage);
+      func.removeComdatAttr();
+    } else if (auto global = mlir::dyn_cast<cir::GlobalOp>(op)) {
+      global.setLinkage(cir::GlobalLinkageKind::InternalLinkage);
+      global.setComdat(false);
+    }
+    mlir::SymbolTable::setSymbolVisibility(
+        op, mlir::SymbolTable::Visibility::Private);
+    op->setAttr("cir.offload.internalized", original);
+  };
+
+  // 1. Device clone(s): one per arch module, external linkage inherited from
+  // the original (an internal clone is dead-stripped at sycl-post-link), tagged
+  // with the combine-private single-caller provenance marker.
+  auto specPrivate = mlir::UnitAttr::get(ctx);
+  for (cir::FuncOp kernel : deviceKernels) {
+    auto clone = mlir::cast<cir::FuncOp>(kernel->clone());
+    mlir::SymbolTable::setSymbolName(clone, cloneName);
+    clone->setAttr("cir.specialization_private", specPrivate);
+    mlir::OpBuilder b(kernel.getOperation());
+    b.setInsertionPointAfter(kernel.getOperation());
+    b.insert(clone);
+    spec.deviceKernels.push_back(clone);
+  }
+
+  std::optional<mlir::SymbolTable> ownHostSyms;
+  if (!hostTable)
+    ownHostSyms.emplace(hostModule);
+  mlir::SymbolTable &hostSyms = hostTable ? *hostTable : *ownHostSyms;
+
+  // 2. H1: a mangled-name string global holding the clone name. Cloned from the
+  // original name-string so linkage/visibility match, then retyped and
+  // re-inited for the (different-length) clone name.
+  cir::GlobalOp h1 = mlir::cast<cir::GlobalOp>(nameStr->clone());
+  auto origArrTy = mlir::cast<cir::ArrayType>(nameStr.getSymType());
+  mlir::Type eltTy = origArrTy.getElementType();
+  uint64_t nameLen = cloneName.size();
+  auto fullTy = cir::ArrayType::get(eltTy, nameLen + 1);
+  auto strAttr =
+      mlir::StringAttr::get(cloneName, cir::ArrayType::get(eltTy, nameLen));
+  h1.setSymType(fullTy);
+  h1.setInitialValueAttr(cir::ConstArrayAttr::get(fullTy, strAttr));
+  localize(h1);
+  mlir::StringAttr h1Name = hostSyms.insert(h1);
+
+  // 3. The getter this launch marker calls and the CompileTimeKernelInfo it
+  // names.
+  if (!getter)
+    return std::nullopt;
+  cir::GlobalOp ctki = findGetterCompileTimeInfo(getter);
+  if (!ctki || !ctki.getInitialValue())
+    return std::nullopt;
+
+  // 4. H2: a CompileTimeKernelInfo clone repointed at H1.
+  cir::GlobalOp h2 = mlir::cast<cir::GlobalOp>(ctki->clone());
+  mlir::Attribute h2Init =
+      repointCompileTimeInfo(*ctki.getInitialValue(), h1Name, nameLen, ctx);
+  if (!h2Init)
+    return std::nullopt;
+  h2.setInitialValueAttr(h2Init);
+  localize(h2);
+  mlir::StringAttr h2Name = hostSyms.insert(h2);
+
+  // 5. Clone the getter's per-instantiation private cluster (the static-local
+  // DeviceKernelInfo* singleton and its guard) so the clone lazily registers
+  // its OWN DeviceKernelInfo keyed to H2/H1 -- sharing the original's would
+  // cache the wrong (original-named) kernel. A cluster global is one the getter
+  // references by get_global, that is not the CompileTimeKernelInfo, and whose
+  // every use in the host module is inside the getter (i.e. a function-local
+  // static / guard).
+  llvm::DenseMap<mlir::StringAttr, mlir::StringAttr> remap;
+  remap[ctki.getSymNameAttr()] = h2Name;
+  llvm::SmallVector<cir::GlobalOp, 2> clonedCluster;
+  llvm::SmallPtrSet<mlir::Operation *, 4> seen;
+  getter.walk([&](cir::GetGlobalOp gg) {
+    auto g = hostTable
+                 ? hostTable->lookup<cir::GlobalOp>(gg.getNameAttr().getAttr())
+                 : lookupSymbol<cir::GlobalOp>(gg, gg.getNameAttr());
+    if (!g || g == ctki || !seen.insert(g).second)
+      return;
+    if (onlyInGetter) {
+      if (!onlyInGetter(g, getter))
+        return; // Referenced outside the getter: shared, do not clone.
+    } else {
+      auto uses = mlir::SymbolTable::getSymbolUses(g, hostModule);
+      if (!uses)
+        return;
+      for (const mlir::SymbolTable::SymbolUse &u : *uses)
+        if (!getter->isAncestor(u.getUser()))
+          return; // Referenced outside the getter: shared, do not clone.
+    }
+    auto c = mlir::cast<cir::GlobalOp>(g->clone());
+    localize(c);
+    mlir::StringAttr cName = hostSyms.insert(c);
+    remap[g.getSymNameAttr()] = cName;
+    clonedCluster.push_back(c);
+  });
+
+  // Repoint each cloned static-local's guard association to the cloned guard.
+  for (cir::GlobalOp c : clonedCluster) {
+    if (auto guard = c.getStaticLocalGuard()) {
+      auto it = remap.find(guard->getName());
+      if (it != remap.end())
+        c.setStaticLocalGuardAttr(
+            cir::StaticLocalGuardAttr::get(ctx, it->second));
+    }
+  }
+
+  // 6. H3: a getter clone whose get_global references are remapped onto H2 and
+  // the cloned cluster.
+  cir::FuncOp h3 = mlir::cast<cir::FuncOp>(getter->clone());
+  localize(h3);
+  mlir::StringAttr h3Name = hostSyms.insert(h3);
+  h3.walk([&](cir::GetGlobalOp gg) {
+    auto it = remap.find(gg.getNameAttr().getAttr());
+    if (it != remap.end())
+      gg.setNameAttr(mlir::FlatSymbolRefAttr::get(it->second));
+  });
+  (void)h3Name;
+  minted.getter = h3;
+  return minted;
+}
+
 std::optional<cir::SpecializedKernel> cir::specializeSYCLKernelForLaunches(
     mlir::ModuleOp container, const cir::KernelBinding &binding,
     llvm::ArrayRef<cir::LaunchSite> sites, llvm::StringRef uniqueTag) {
@@ -2883,9 +3173,6 @@ std::optional<cir::SpecializedKernel> cir::specializeSYCLKernelForLaunches(
       !binding.hostNameString)
     return std::nullopt;
   const cir::LaunchSite &site = sites.front();
-
-  mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
-  mlir::MLIRContext *ctx = container.getContext();
 
   // A fresh, unique clone name. The name is an arbitrary raw string key
   // downstream (sycl-post-link enumerates spir_kernels by calling-convention +
@@ -2905,114 +3192,100 @@ std::optional<cir::SpecializedKernel> cir::specializeSYCLKernelForLaunches(
         (firstKernel.getName() + ".spec." + uniqueTag + "." + llvm::Twine(n))
             .str();
 
-  cir::SpecializedKernel spec;
-  spec.name = cloneName;
-
-  // 1. Device clone(s): one per arch module, external linkage inherited from
-  // the original (an internal clone is dead-stripped at sycl-post-link), tagged
-  // with the combine-private single-caller provenance marker.
-  auto specPrivate = mlir::UnitAttr::get(ctx);
-  for (cir::FuncOp kernel : binding.deviceKernels) {
-    auto clone = mlir::cast<cir::FuncOp>(kernel->clone());
-    mlir::SymbolTable::setSymbolName(clone, cloneName);
-    clone->setAttr("cir.specialization_private", specPrivate);
-    mlir::OpBuilder b(kernel.getOperation());
-    b.setInsertionPointAfter(kernel.getOperation());
-    b.insert(clone);
-    spec.deviceKernels.push_back(clone);
-  }
-
-  mlir::SymbolTable hostSyms(hostModule);
-
-  // 2. H1: a mangled-name string global holding the clone name. Cloned from the
-  // original name-string so linkage/visibility match, then retyped and
-  // re-inited for the (different-length) clone name.
-  cir::GlobalOp nameStr = binding.hostNameString;
-  cir::GlobalOp h1 = mlir::cast<cir::GlobalOp>(nameStr->clone());
-  auto origArrTy = mlir::cast<cir::ArrayType>(nameStr.getSymType());
-  mlir::Type eltTy = origArrTy.getElementType();
-  uint64_t nameLen = cloneName.size();
-  auto fullTy = cir::ArrayType::get(eltTy, nameLen + 1);
-  auto strAttr =
-      mlir::StringAttr::get(cloneName, cir::ArrayType::get(eltTy, nameLen));
-  h1.setSymType(fullTy);
-  h1.setInitialValueAttr(cir::ConstArrayAttr::get(fullTy, strAttr));
-  mlir::StringAttr h1Name = hostSyms.insert(h1);
-
-  // 3. Resolve the getter this launch marker calls and the
-  // CompileTimeKernelInfo it names.
+  // Steps 1-6: the device clones and the host artifacts (H1-H3).
   cir::CallOp marker = site.syclMarkerCall;
   auto getter = lookupSymbol<cir::FuncOp>(marker, marker.getCalleeAttr());
-  if (!getter)
+  std::optional<MintedKernelCopy> minted = mintSYCLKernelCopy(
+      container, binding.deviceKernels, binding.hostNameString, getter,
+      cloneName, /*local=*/false, /*suffix=*/"");
+  if (!minted)
     return std::nullopt;
-  cir::GlobalOp ctki = findGetterCompileTimeInfo(getter);
-  if (!ctki || !ctki.getInitialValue())
-    return std::nullopt;
-
-  // 4. H2: a CompileTimeKernelInfo clone repointed at H1.
-  cir::GlobalOp h2 = mlir::cast<cir::GlobalOp>(ctki->clone());
-  mlir::Attribute h2Init =
-      repointCompileTimeInfo(*ctki.getInitialValue(), h1Name, nameLen, ctx);
-  if (!h2Init)
-    return std::nullopt;
-  h2.setInitialValueAttr(h2Init);
-  mlir::StringAttr h2Name = hostSyms.insert(h2);
-
-  // 5. Clone the getter's per-instantiation private cluster (the static-local
-  // DeviceKernelInfo* singleton and its guard) so the clone lazily registers
-  // its OWN DeviceKernelInfo keyed to H2/H1 -- sharing the original's would
-  // cache the wrong (original-named) kernel. A cluster global is one the getter
-  // references by get_global, that is not the CompileTimeKernelInfo, and whose
-  // every use in the host module is inside the getter (i.e. a function-local
-  // static / guard).
-  llvm::DenseMap<mlir::StringAttr, mlir::StringAttr> remap;
-  remap[ctki.getSymNameAttr()] = h2Name;
-  llvm::SmallVector<cir::GlobalOp, 2> clonedCluster;
-  llvm::SmallPtrSet<mlir::Operation *, 4> seen;
-  getter.walk([&](cir::GetGlobalOp gg) {
-    auto g = lookupSymbol<cir::GlobalOp>(gg, gg.getNameAttr());
-    if (!g || g == ctki || !seen.insert(g).second)
-      return;
-    auto uses = mlir::SymbolTable::getSymbolUses(g, hostModule);
-    if (!uses)
-      return;
-    for (const mlir::SymbolTable::SymbolUse &u : *uses)
-      if (!getter->isAncestor(u.getUser()))
-        return; // Referenced outside the getter: shared, do not clone.
-    auto c = mlir::cast<cir::GlobalOp>(g->clone());
-    mlir::StringAttr cName = hostSyms.insert(c);
-    remap[g.getSymNameAttr()] = cName;
-    clonedCluster.push_back(c);
-  });
-
-  // Repoint each cloned static-local's guard association to the cloned guard.
-  for (cir::GlobalOp c : clonedCluster) {
-    if (auto guard = c.getStaticLocalGuard()) {
-      auto it = remap.find(guard->getName());
-      if (it != remap.end())
-        c.setStaticLocalGuardAttr(
-            cir::StaticLocalGuardAttr::get(ctx, it->second));
-    }
-  }
-
-  // 6. H3: a getter clone whose get_global references are remapped onto H2 and
-  // the cloned cluster.
-  cir::FuncOp h3 = mlir::cast<cir::FuncOp>(getter->clone());
-  mlir::StringAttr h3Name = hostSyms.insert(h3);
-  h3.walk([&](cir::GetGlobalOp gg) {
-    auto it = remap.find(gg.getNameAttr().getAttr());
-    if (it != remap.end())
-      gg.setNameAttr(mlir::FlatSymbolRefAttr::get(it->second));
-  });
 
   // 7. H4: redirect every requested launch's marker call at the getter clone,
   // moving exactly those launches to the clone while every other launch (this
   // TU's or another's) keeps the original. All sites share the kernel's getter
   // instantiation, so they repoint to the one H3.
-  auto h3Ref = mlir::FlatSymbolRefAttr::get(h3Name);
+  auto h3Ref = mlir::FlatSymbolRefAttr::get(minted->getter.getSymNameAttr());
   for (const cir::LaunchSite &s : sites)
     if (cir::CallOp siteMarker = s.syclMarkerCall)
       siteMarker.setCalleeAttr(h3Ref);
 
-  return spec;
+  return std::move(minted->spec);
+}
+
+cir::LocalKernelCopier::LocalKernelCopier(mlir::ModuleOp container)
+    : container(container),
+      hostSyms(cir::getOffloadContainerHostModule(container)) {
+  for (mlir::ModuleOp dm : cir::getOffloadContainerDeviceModules(container))
+    deviceSyms.push_back(std::make_unique<mlir::SymbolTable>(dm));
+  // The top-level ops of the host module that refer to each symbol.
+  mlir::ModuleOp host = cir::getOffloadContainerHostModule(container);
+  if (std::optional<mlir::SymbolTable::UseRange> uses =
+          mlir::SymbolTable::getSymbolUses(&host.getBodyRegion()))
+    for (const mlir::SymbolTable::SymbolUse &use : *uses) {
+      mlir::Operation *holder = use.getUser();
+      while (holder && holder->getParentOp() != host.getOperation())
+        holder = holder->getParentOp();
+      auto &list = holders[use.getSymbolRef().getRootReference()];
+      if (holder && !llvm::is_contained(list, holder))
+        list.push_back(holder);
+    }
+}
+
+cir::LocalKernelCopier::~LocalKernelCopier() = default;
+
+std::optional<cir::LocalKernelCopy>
+cir::LocalKernelCopier::copy(cir::FuncOp getter, llvm::StringRef cloneName,
+                             llvm::StringRef suffix) {
+  cir::GlobalOp ctki = getter ? findGetterCompileTimeInfo(getter) : nullptr;
+  std::optional<mlir::Attribute> init =
+      ctki ? ctki.getInitialValue() : std::nullopt;
+  // The name string: the global the CompileTimeKernelInfo's string_view
+  // points to (repointCompileTimeInfo's shape, which needs the string_view's
+  // {pointer, length}).
+  auto outer = init ? mlir::dyn_cast<cir::ConstRecordAttr>(*init) : nullptr;
+  auto sv = outer && !outer.getMembers().empty()
+                ? mlir::dyn_cast<cir::ConstRecordAttr>(outer.getMembers()[0])
+                : nullptr;
+  auto view = sv && sv.getMembers().size() >= 2 &&
+                      mlir::isa<cir::IntAttr>(sv.getMembers()[1])
+                  ? mlir::dyn_cast<cir::GlobalViewAttr>(sv.getMembers()[0])
+                  : nullptr;
+  if (!view)
+    return std::nullopt;
+  auto nameStr =
+      hostSyms.lookup<cir::GlobalOp>(view.getSymbol().getRootReference());
+  llvm::StringRef kernelName =
+      nameStr ? getGlobalStringValue(nameStr) : llvm::StringRef();
+  if (kernelName.empty())
+    return std::nullopt;
+  llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
+  for (const std::unique_ptr<mlir::SymbolTable> &table : deviceSyms) {
+    if (table->lookup(cloneName))
+      return std::nullopt;
+    if (auto kernel = table->lookup<cir::FuncOp>(kernelName))
+      if (!kernel.isDeclaration() &&
+          kernel.getCallingConv() == cir::CallingConv::SpirKernel)
+        deviceKernels.push_back(kernel);
+  }
+  if (deviceKernels.empty())
+    return std::nullopt;
+  auto onlyInGetter = [&](cir::GlobalOp g, cir::FuncOp f) {
+    auto it = holders.find(g.getSymNameAttr());
+    return it != holders.end() &&
+           llvm::all_of(it->second, [&](mlir::Operation *holder) {
+             return holder == f.getOperation();
+           });
+  };
+  std::optional<MintedKernelCopy> minted =
+      mintSYCLKernelCopy(container, deviceKernels, nameStr, getter, cloneName,
+                         /*local=*/true, suffix, &hostSyms, onlyInGetter);
+  if (!minted)
+    return std::nullopt;
+  cir::LocalKernelCopy copy;
+  copy.original = kernelName.str();
+  copy.name = minted->spec.name;
+  copy.deviceKernels = std::move(minted->spec.deviceKernels);
+  copy.getter = minted->getter;
+  return copy;
 }

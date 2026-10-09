@@ -1,6 +1,7 @@
 // RUN: cir-opt %s -cir-points-to-verify -test-cir-points-to='mode=ci sycl=1 closed-tu=1' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CHECK
 // RUN: cir-opt %s -cir-points-to-verify -test-cir-points-to='mode=bu sycl=1 closed-tu=1 subobjects=1' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CHECK
 // RUN: cir-opt %s -cir-points-to-verify -test-cir-points-to='mode=ci sycl=1' -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
+// RUN: cir-opt %s -cir-points-to-verify -test-cir-points-to='mode=bu sycl=1 subobjects=1 local-closed=1' -o /dev/null 2>&1 | FileCheck %s --check-prefix=LOCAL
 //
 // Corpus T31 P/N (T27): a handler-submit launch inside a std::thread lambda,
 // ced's shape, and the same launch through an external thread pool.
@@ -56,6 +57,16 @@
 // CHECK: kernel _ZTS7KTHREAD: no-alias a b c
 // CHECK: kernel _ZTS5KPOOL: no-alias{{$}}
 //
+// local-closed=1 (PointsToAnalysisOptions::localFunctionsClosed, T26),
+// open: every function of run_thread's path is local (static, or a template
+// on its lambdas), and their addresses are only taken by analysed code (the
+// cgfo invoker the submit stores, the _State_impl vtable the state
+// constructor stores): their callers are all seen, as under closed-tu.
+// pool_body's address goes to pool_enqueue, code we don't see: escaped.
+// LOCAL-LABEL: === launches
+// LOCAL: kernel _ZTS7KTHREAD: no-alias a b c{{$}}
+// LOCAL: kernel _ZTS5KPOOL: no-alias{{$}}
+
 // OPEN-LABEL: === launches
 // OPEN: kernel _ZTS7KTHREAD: no-alias{{$}}
 // OPEN: kernel _ZTS5KPOOL: no-alias{{$}}

@@ -1,0 +1,53 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu skip-unused-odr=1 print-stats=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci skip-unused-odr=1 print-stats=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=bu print-stats=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=ALL
+
+// PointsToAnalysisOptions::skipUnusedODRFunctions (T26): an ODR function
+// (linkonce_odr, weak_odr) that nothing in the module uses, or that only
+// skipped functions use, is not analysed. No execution of this TU's code
+// runs it; another TU's call that the linker binds to this copy runs the
+// tokens that TU's own copy has, which can name no internal-linkage entity
+// of this TU (C++20 [basic.def.odr]p14), so it is code we don't see. A strong
+// external function stays analysed even if unused here: its body may
+// reference this TU's internal entities. Launch-path internalization leaves
+// the originals of the copied functions uncalled like @unusedInline.
+
+// CHECK-NOT: === @unusedInline
+// CHECK-NOT: === @onlyFromUnused
+// CHECK-DAG: === @usedInline formals=incomplete
+// CHECK-DAG: === @strongUnused formals=incomplete
+// CHECK-DAG: === @main formals=incomplete
+// CHECK: functions skipped (only replaced calls): 2
+
+// ALL-DAG: === @unusedInline formals=incomplete
+// ALL-DAG: === @onlyFromUnused formals=incomplete
+// ALL: functions skipped (only replaced calls): 0
+
+!s32i = !cir.int<s, 32>
+module {
+  cir.func linkonce_odr @unusedInline(%p: !cir.ptr<!s32i>) {
+    cir.call @onlyFromUnused(%p) : (!cir.ptr<!s32i>) -> ()
+    cir.return
+  }
+  cir.func linkonce_odr @onlyFromUnused(%p: !cir.ptr<!s32i>) {
+    %c = cir.const #cir.int<3> : !s32i
+    cir.store %c, %p : !s32i, !cir.ptr<!s32i>
+    cir.return
+  }
+  cir.func linkonce_odr @usedInline(%p: !cir.ptr<!s32i>) {
+    %c = cir.const #cir.int<2> : !s32i
+    cir.store %c, %p : !s32i, !cir.ptr<!s32i>
+    cir.return
+  }
+  cir.func @strongUnused(%p: !cir.ptr<!s32i>) {
+    %c = cir.const #cir.int<4> : !s32i
+    cir.store %c, %p : !s32i, !cir.ptr<!s32i>
+    cir.return
+  }
+  cir.func @main() -> !s32i {
+    %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+    cir.call @usedInline(%x) : (!cir.ptr<!s32i>) -> ()
+    %v = cir.load %x : !cir.ptr<!s32i>, !s32i
+    cir.return %v : !s32i
+  }
+}

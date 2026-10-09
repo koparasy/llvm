@@ -20,7 +20,9 @@
 // RUN:   %t/closed.dev.cir -o - | FileCheck %s --check-prefix=CLOSED
 //
 // ipo without closed-tu: setup() and run() may have callers in other TUs, so
-// nothing is proven.
+// nothing is proven for the kernel their callers in other TUs launch; the
+// path from main is internalized (T26), and the copy of the kernel it
+// launches gets A, B and C noalias.
 // RUN: cir-offload-merge -combine -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
 // RUN:   -input=%t/host.cir -input=%t/dev.cir --cir-offload-host-facts=ipo \
 // RUN:   -output=%t/open.cir
@@ -28,7 +30,9 @@
 // RUN:   -input=%t/open.cir -output=%t/open.host.cir -output=%t/open.dev.cir
 // RUN: %clang_cc1 -std=c++17 -fsycl-is-device -triple spir64-unknown-unknown \
 // RUN:   -aux-triple x86_64-unknown-linux-gnu -fclangir -O1 -emit-llvm -x cir \
-// RUN:   %t/open.dev.cir -o - | FileCheck %s --check-prefix=NONE
+// RUN:   %t/open.dev.cir -o %t/open.dev.ll
+// RUN: FileCheck %s --check-prefix=NONE --input-file=%t/open.dev.ll
+// RUN: FileCheck %s --check-prefix=OPEN-COPY --input-file=%t/open.dev.ll
 //
 // -DSAME: B's buffer is a copy of A's (one storage), so A and B may alias;
 // only C is noalias.
@@ -68,6 +72,11 @@
 // NONE: define {{.*}}spir_kernel void @_ZTS4Gemm(
 // NONE-NOT: noalias
 // NONE-SAME: {{$}}
+
+// OPEN-COPY: define {{.*}}spir_kernel void @_ZTS4Gemm.int.{{[0-9a-f]+}}(
+// OPEN-COPY-SAME: ptr addrspace(1) noalias {{[^,]*}}%{{[0-9]+}},
+// OPEN-COPY-SAME: ptr addrspace(1) noalias {{[^,]*}}%{{[0-9]+}},
+// OPEN-COPY-SAME: ptr addrspace(1) noalias {{[^,]*}}%{{[0-9]+}},
 
 // SAME-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'A'): not stamped ('A' and 'B' use the same memory{{.*}})
 // SAME-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'B'): not stamped ('B' and 'A' use the same memory{{.*}})

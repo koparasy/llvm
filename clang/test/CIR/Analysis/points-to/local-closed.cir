@@ -1,0 +1,98 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=bu local-closed=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to='mode=ci local-closed=1' -cir-points-to-verify -o /dev/null | FileCheck %s
+// RUN: cir-opt %s -test-cir-points-to=mode=bu -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=OPEN
+
+// PointsToAnalysisOptions::localFunctionsClosed (T26): a function with local
+// linkage whose symbol is used, besides direct calls from analysed
+// functions, only by address-of ops in analysed functions or by the
+// initializer of a local global used that way, has only callers the
+// analysis sees (no other TU can name it, and code we don't see gets its
+// address only through an External node or an unresolved indirect call,
+// which markEscapedFunctions turns into Incomplete formals). Without the
+// option such a function's formals are Incomplete (UnknownCaller).
+//
+// From clang -fclangir -emit-cir -O0 of:
+//   static void sink(int *p) { *p = 1; }
+//   static void viaTable(int *p) { *p = 2; }
+//   static void leaked(int *p) { *p = 3; }
+//   void ext(void (*)(int *));
+//   static void (*table[1])(int *) = {&viaTable};
+//   int main() {
+//     int x, y;
+//     void (*fp)(int *) = &sink;
+//     fp(&x);
+//     table[0](&y);
+//     ext(&leaked);
+//     return x + y;
+//   }
+//  - sink: its address is taken in main and only called through fp:
+//    complete;
+//  - viaTable: in the initializer of the internal `table`, which main reads:
+//    complete;
+//  - leaked: its address goes to ext, code we don't see: escaped.
+
+// CHECK-DAG: === @_ZL4sinkPi formals=complete
+// CHECK-DAG: === @_ZL8viaTablePi formals=complete
+// CHECK-DAG: === @_ZL6leakedPi formals=incomplete
+// CHECK-DAG: UnknownCaller(cir.func {{.*}}, "address escapes to unknown code") <- EscapedTo(cir.call {{.*}}, "@_Z3extPFvPiE")
+
+// OPEN-DAG: === @_ZL4sinkPi formals=incomplete
+// OPEN-DAG: === @_ZL8viaTablePi formals=incomplete
+// OPEN-DAG: === @_ZL6leakedPi formals=incomplete
+
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+module attributes {cir.default_tls_model = #cir.tls_model<tls_dyn>, cir.int_type_width = 32 : i32, cir.lang = #cir.lang<cxx>, cir.lowering_lang_options = #cir.lowering_lang_options<exceptions = true, threadsafe_statics = true, cuda = false, cuda_is_device = false, hip = false, gpu_rdc = false, openmp = false, openmp_is_target_device = false, clang_abi_compat = 16>, cir.module_asm = [], cir.size_type_width = 64 : i32, cir.target_abi = "", cir.triple = "x86_64-unknown-linux-gnu", dlti.dl_spec = #dlti.dl_spec<!llvm.ptr<270> = dense<32> : vector<4xi64>, !llvm.ptr<271> = dense<32> : vector<4xi64>, !llvm.ptr<272> = dense<64> : vector<4xi64>, i64 = dense<64> : vector<2xi64>, i128 = dense<128> : vector<2xi64>, f80 = dense<128> : vector<2xi64>, !llvm.ptr = dense<64> : vector<4xi64>, i1 = dense<8> : vector<2xi64>, i8 = dense<8> : vector<2xi64>, i16 = dense<16> : vector<2xi64>, i32 = dense<32> : vector<2xi64>, f16 = dense<16> : vector<2xi64>, f64 = dense<64> : vector<2xi64>, f128 = dense<128> : vector<2xi64>, "dlti.endianness" = "little", "dlti.mangling_mode" = "e", "dlti.legal_int_widths" = array<i32: 8, 16, 32, 64>, "dlti.stack_alignment" = 128 : i64, !cir.ptr<!cir.void> = #cir.ptr_spec<size = 64, abi = 64, preferred = 64, index = 64>>} {
+  cir.global "private" internal dso_local @_ZL5table = #cir.const_array<[#cir.global_view<@_ZL8viaTablePi> : !cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>]> : !cir.array<!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>> x 1> align(8)
+  cir.func no_inline dso_local @main() -> (!s32i {llvm.noundef}) attributes {"cir.target-cpu" = "x86-64", "cir.tune-cpu" = "generic"} {
+    %0 = cir.alloca "__retval" align(4) : !cir.ptr<!s32i>
+    %1 = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+    %2 = cir.alloca "y" align(4) : !cir.ptr<!s32i>
+    %3 = cir.alloca "fp" align(8) init : !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>>
+    %4 = cir.const #cir.int<0> : !s32i
+    cir.store %4, %0 : !s32i, !cir.ptr<!s32i>
+    %5 = cir.get_global @_ZL4sinkPi : !cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>
+    cir.store align(8) %5, %3 : !cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>, !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>>
+    %6 = cir.load align(8) %3 : !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>>, !cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>
+    cir.call %6(%1) : (!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>, !cir.ptr<!s32i> {llvm.noundef}) -> ()
+    %7 = cir.const #cir.int<0> : !s64i
+    %8 = cir.get_global @_ZL5table : !cir.ptr<!cir.array<!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>> x 1>>
+    %9 = cir.get_element %8[%7 : !s64i] : !cir.ptr<!cir.array<!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>> x 1>> -> !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>>
+    %10 = cir.load align(8) %9 : !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>>, !cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>
+    cir.call %10(%2) : (!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>, !cir.ptr<!s32i> {llvm.noundef}) -> ()
+    %11 = cir.get_global @_ZL6leakedPi : !cir.ptr<!cir.func<(!cir.ptr<!s32i>)>>
+    cir.call @_Z3extPFvPiE(%11) : (!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>> {llvm.noundef}) -> ()
+    %12 = cir.load align(4) %1 : !cir.ptr<!s32i>, !s32i
+    %13 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i
+    %14 = cir.add nsw %12, %13 : !s32i
+    cir.store %14, %0 : !s32i, !cir.ptr<!s32i>
+    %15 = cir.load %0 : !cir.ptr<!s32i>, !s32i
+    cir.return %15 : !s32i
+  }
+  cir.func no_inline internal private dso_local @_ZL4sinkPi(%arg0: !cir.ptr<!s32i> {llvm.noundef}) attributes {"cir.target-cpu" = "x86-64", "cir.tune-cpu" = "generic"} {
+    %0 = cir.alloca "p" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+    cir.store %arg0, %0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %1 = cir.const #cir.int<1> : !s32i
+    %2 = cir.load deref align(8) %0 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    cir.store align(4) %1, %2 : !s32i, !cir.ptr<!s32i>
+    cir.return
+  }
+  cir.func private @_Z3extPFvPiE(!cir.ptr<!cir.func<(!cir.ptr<!s32i>)>> {llvm.noundef}) attributes {"cir.target-cpu" = "x86-64", "cir.tune-cpu" = "generic"}
+  cir.func no_inline internal private dso_local @_ZL6leakedPi(%arg0: !cir.ptr<!s32i> {llvm.noundef}) attributes {"cir.target-cpu" = "x86-64", "cir.tune-cpu" = "generic"} {
+    %0 = cir.alloca "p" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+    cir.store %arg0, %0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %1 = cir.const #cir.int<3> : !s32i
+    %2 = cir.load deref align(8) %0 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    cir.store align(4) %1, %2 : !s32i, !cir.ptr<!s32i>
+    cir.return
+  }
+  cir.func no_inline internal private dso_local @_ZL8viaTablePi(%arg0: !cir.ptr<!s32i> {llvm.noundef}) attributes {"cir.target-cpu" = "x86-64", "cir.tune-cpu" = "generic"} {
+    %0 = cir.alloca "p" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+    cir.store %arg0, %0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %1 = cir.const #cir.int<2> : !s32i
+    %2 = cir.load deref align(8) %0 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    cir.store align(4) %1, %2 : !s32i, !cir.ptr<!s32i>
+    cir.return
+  }
+}
+

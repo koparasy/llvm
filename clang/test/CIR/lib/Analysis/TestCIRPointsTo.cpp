@@ -95,7 +95,8 @@
 // LocalBuilder::setSubobjects); the stats then count the subobject links and
 // the nodes with a parent.
 //
-// closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU and
+// closed-tu=1 sets PointsToAnalysisOptions::assumeClosedTU, local-closed=1
+// PointsToAnalysisOptions::localFunctionsClosed and
 // max-indirect-rounds=<n> PointsToAnalysisOptions::maxIndirectRounds.
 // values=1 (ci and bu modes) prints, even with print-graphs=0, what every
 // cir.load tagged with `test.load = "name"` may read (StoredValues.h:
@@ -171,6 +172,16 @@ struct TestCIRPointsToPass
                         llvm::cl::desc("In ci mode, assume every caller of "
                                        "every function is in the module"),
                         llvm::cl::init(false)};
+  Option<bool> skipUnusedODR{
+      *this, "skip-unused-odr",
+      llvm::cl::desc("PointsToAnalysisOptions::skipUnusedODRFunctions"),
+      llvm::cl::init(false)};
+  Option<bool> localClosed{
+      *this, "local-closed",
+      llvm::cl::desc("PointsToAnalysisOptions::localFunctionsClosed: a "
+                     "local function whose address only analysed code takes "
+                     "has only callers the analysis sees"),
+      llvm::cl::init(false)};
   Option<bool> explainSets{
       *this, "explain",
       llvm::cl::desc("In ci mode, explain the points-to set of each tagged "
@@ -517,6 +528,8 @@ void TestCIRPointsToPass::runCI() {
     registerGenericModels(registry);
   PointsToAnalysisOptions options;
   options.assumeClosedTU = closedTU;
+  options.localFunctionsClosed = localClosed;
+  options.skipUnusedODRFunctions = skipUnusedODR;
   options.maxIndirectRounds = maxIndirectRounds;
   options.subobjects = subobjects;
   bool bottomUp = mode == "bu";

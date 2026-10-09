@@ -107,15 +107,18 @@
 // Formals: a function's formals start Incomplete (Reason UnknownCaller)
 // unless all of its callers are visible: it has internal or private linkage
 // and every use of its symbol is a direct call from a function this
-// analysis walks, bound to the body. PointsToAnalysisOptions::assumeClosedTU
-// treats every function that way. The return cell of a function that may have
-// unknown callers is Incomplete too: what it returns reaches code we don't see.
-// Complete formals are revised in the fixpoint of step 5: a function whose
-// Function node turns External (its address escaped to code we don't see),
-// or that is a target of an unresolved indirect call, may be called by code
-// we don't see with anything, so its formals and return cell become
-// Incomplete, Reason{UnknownCaller, func, "address escapes to unknown code"}
-// chained to the cause, and TUFunction::formalsComplete becomes false.
+// analysis walks, bound to the body (with
+// PointsToAnalysisOptions::localFunctionsClosed, also an address-of in such
+// a function, or a reference from a local global used that way).
+// PointsToAnalysisOptions::assumeClosedTU treats every function that way. The
+// return cell of a function that may have unknown callers is Incomplete too:
+// what it returns reaches code we don't see. Complete formals are revised in
+// the fixpoint of step 5: a function whose Function node turns External (its
+// address escaped to code we don't see), or that is a target of an unresolved
+// indirect call, may be called by code we don't see with anything, so its
+// formals and return cell become Incomplete, Reason{UnknownCaller, func,
+// "address escapes to unknown code"} chained to the cause, and
+// TUFunction::formalsComplete becomes false.
 //
 //===----------------------------------------------------------------------===//
 
@@ -176,6 +179,29 @@ struct PointsToAnalysisOptions {
   /// formal starts Incomplete. Tests set it; the -cir-offload-assume-closed-tu
   /// flag of cir-offload-merge sets it for the SYCL host facts.
   bool assumeClosedTU = false;
+  /// Also count as having only callers the analysis sees a local-linkage
+  /// function whose symbol is used, besides direct calls from analysed
+  /// functions, by address-of ops (cir.get_global) in analysed functions or
+  /// by the initializer of a local-linkage global whose own uses are of these
+  /// kinds (a vtable of a local class). The closed-TU argument for the
+  /// functions no other TU can name: code we don't see gets their address
+  /// only through an External node or an unresolved indirect call, which
+  /// markEscapedFunctions turns into Incomplete formals. Off by default; the
+  /// SYCL host facts set it with launch-path internalization (T26), whose
+  /// clones are local and address-taken (the CGF invoker) or in a local
+  /// vtable (std::thread's _M_run).
+  bool localFunctionsClosed = false;
+  /// Do not analyse an ODR function (linkonce_odr or weak_odr) that nothing
+  /// in the module uses, or whose every use is in a function not analysed
+  /// (or a call a model replaces): no execution of this TU's code runs it,
+  /// and an execution another TU's call makes runs the same tokens as that
+  /// TU's own copy, which can name no internal-linkage entity of this TU
+  /// (C++20 [basic.def.odr]p14): code we don't see, which the analysis
+  /// already covers (nameable globals are External, what reaches unknown
+  /// code is External). Off by default; the SYCL host facts set it with
+  /// launch-path internalization (T26), which leaves the originals of the
+  /// copied functions uncalled.
+  bool skipUnusedODRFunctions = false;
   /// Subobject nodes (PointsToGraph.h): every member of class, union or
   /// array type a cir.get_member names gets its own child node, so that a
   /// collapse inside one member leaves its siblings field-sensitive. Off by

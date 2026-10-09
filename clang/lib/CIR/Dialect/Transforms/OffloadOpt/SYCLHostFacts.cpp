@@ -322,12 +322,20 @@ static llvm::cl::opt<bool> clHostPtrUB(
 
 SYCLHostFacts::SYCLHostFacts(ModuleOp container,
                              const HostFactsOptions &options)
-    : assumeSpecHostPtrUB(options.assumeSpecHostPtrUB && clHostPtrUB) {
+    : memoize(options.internalize && !options.assumeClosedTU),
+      assumeSpecHostPtrUB(options.assumeSpecHostPtrUB && clHostPtrUB) {
   ModuleOp host = getOffloadContainerHostModule(container);
   ownedRegistry = std::make_unique<PointsToModelRegistry>();
   registerGenericModels(*ownedRegistry);
   PointsToAnalysisOptions ptOptions;
   ptOptions.assumeClosedTU = options.assumeClosedTU;
+  // Launch-path internalization (T26): the copies are local functions whose
+  // addresses only analysed code takes (the CGF invoker a cgfo.ctor copy
+  // stores, a _M_run in a local vtable).
+  ptOptions.localFunctionsClosed =
+      options.internalize && !options.assumeClosedTU;
+  // The originals the copies replaced in this TU are no longer called here.
+  ptOptions.skipUnusedODRFunctions = ptOptions.localFunctionsClosed;
   if (options.bottomUp)
     ptOptions.mode = pointsto::PointsToMode::BU;
   ptOptions.subobjects = options.subobjects;
@@ -1132,9 +1140,34 @@ SYCLHostFacts::noAliasFields(StringRef kernel) const {
                        getSYCLNoAliasCandidates(getDeviceKernels(kernel)));
 }
 
+// The memoized queries: the container passes that share one SYCLHostFacts
+// (SYCLHostFactsCache) change nothing these answers depend on (see the
+// cache's invalidation argument), so a later pass's question has an earlier
+// pass's answer; each pass asks about every kernel (KernelBindingTable).
+// Only with internalized launch paths (T26), whose kernel copies double the
+// queries: elsewhere the budget-trip remarks, which count the queries each
+// pass runs, stay as they were.
 llvm::StringMap<NoAliasDecision>
 SYCLHostFacts::noAliasFields(StringRef kernel,
                              const SYCLNoAliasCandidates &candidates) const {
+  std::string key = kernel.str();
+  llvm::SmallVector<std::string, 4> fields;
+  for (const auto &c : candidates.fields)
+    fields.push_back((c.first() + (c.second ? ":a" : ":p")).str());
+  llvm::sort(fields);
+  for (const std::string &f : fields)
+    key += '\0' + f;
+  key += '\0' + candidates.poison;
+  if (!memoize)
+    return computeNoAliasFields(kernel, candidates);
+  auto it = noAliasMemo.find(key);
+  if (it != noAliasMemo.end())
+    return it->second;
+  return noAliasMemo[key] = computeNoAliasFields(kernel, candidates);
+}
+
+llvm::StringMap<NoAliasDecision> SYCLHostFacts::computeNoAliasFields(
+    StringRef kernel, const SYCLNoAliasCandidates &candidates) const {
   llvm::StringMap<NoAliasDecision> decisions;
   auto rejectAll = [&](const std::string &why) {
     for (const auto &c : candidates.fields)
@@ -1379,9 +1412,14 @@ SYCLHostFacts::ConstFact SYCLHostFacts::constantField(StringRef kernel,
 
 llvm::StringMap<SYCLHostFacts::ConstFact>
 SYCLHostFacts::constantFields(StringRef kernel) const {
+  auto it = memoize ? constantsMemo.find(kernel) : constantsMemo.end();
+  if (it != constantsMemo.end())
+    return it->second;
   llvm::StringMap<ConstFact> out;
   for (const auto &candidate : getConstCandidates(kernel))
     out[candidate.first()] = constantField(kernel, candidate.first());
+  if (memoize)
+    constantsMemo[kernel] = out;
   return out;
 }
 
@@ -1519,6 +1557,16 @@ SYCLHostFacts::geometryOfLaunch(const LaunchRecord &launch) const {
 }
 
 SYCLHostFacts::GeometryFact SYCLHostFacts::geometry(StringRef kernel) const {
+  if (!memoize)
+    return computeGeometry(kernel);
+  auto it = geometryMemo.find(kernel);
+  if (it != geometryMemo.end())
+    return it->second;
+  return geometryMemo[kernel] = computeGeometry(kernel);
+}
+
+SYCLHostFacts::GeometryFact
+SYCLHostFacts::computeGeometry(StringRef kernel) const {
   GeometryFact result;
   auto fail = [&](const std::string &why) {
     result.geometry = SyclGeometry();

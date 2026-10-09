@@ -198,6 +198,18 @@ public:
   std::optional<std::string> takeBudgetReport() const;
 
 private:
+  /// The uncached queries of noAliasFields and geometry.
+  llvm::StringMap<NoAliasDecision>
+  computeNoAliasFields(llvm::StringRef kernel,
+                       const SYCLNoAliasCandidates &candidates) const;
+  GeometryFact computeGeometry(llvm::StringRef kernel) const;
+  /// Whether the answers are memoized, and the memoized answers (see the
+  /// .cpp file).
+  bool memoize = false;
+  mutable std::map<std::string, llvm::StringMap<NoAliasDecision>> noAliasMemo;
+  mutable llvm::StringMap<llvm::StringMap<ConstFact>> constantsMemo;
+  mutable llvm::StringMap<GeometryFact> geometryMemo;
+
   void collectDeviceKernels(mlir::Operation *scope);
   /// Index the finished graph: holders, handles, formal targets, and the
   /// launch paths no model records.

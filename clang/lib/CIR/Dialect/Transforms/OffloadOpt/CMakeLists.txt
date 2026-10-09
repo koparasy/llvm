@@ -1,6 +1,8 @@
 add_clang_library(MLIRCIROffloadOpt
   KernelBindingTable.cpp
+  InternalizeLaunchPaths.cpp
   KernelCloning.cpp
+  LaunchPathInternalization.cpp
   SYCLKernelParams.cpp
   SYCLHostFacts.cpp
   SYCLPointsToModels.cpp

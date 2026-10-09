@@ -81,6 +81,7 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
   options.relevanceSlice = hostFactsSlice;
   options.maxSeconds = hostFactsMaxSeconds;
   options.maxMemoryMB = hostFactsMaxMemoryMB;
+  options.internalize = hostFactsInternalize;
   std::optional<cir::KernelBindingTable> ownTable;
   cir::SYCLHostFactsCache *factsCache = nullptr;
   if (*mode != cir::HostFactsMode::Legacy) {
@@ -156,6 +157,13 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
             cir::ConstantOp::create(builder, kernel.getLoc(), value);
         arg.replaceAllUsesWith(constant);
         did = true;
+        if (cir::isInternalizedSYCLKernel(kernel)) {
+          cir::noteInternalizedSYCLKernelUse(kernel);
+          mlir::emitRemark(kernel.getLoc())
+              << "kernel-arg-constant: kernel @" << kernel.getName() << " arg "
+              << arg.getArgNumber() << " ('" << field << "'): " << value
+              << cir::describeInternalizedSYCLKernel(kernel);
+        }
       }
     }
     return did;
@@ -175,6 +183,10 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
       // Every launch is visible and the kernel is TU-local: safe to fold the
       // constant into the shared device kernel in place.
       changed |= applyConstArgs(binding.deviceKernels, binding.syclConstArgs);
+    } else if (options.internalizedOpenMode()) {
+      // Open mode with internalized launch paths (T26): not by clone (see
+      // InferKernelParamNoAlias); the internalized copies get the facts.
+      continue;
     } else {
       // Residual: the shared kernel is cross-TU / by-name reachable, so another
       // TU could launch it with a different argument. Specialize by clone --

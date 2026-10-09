@@ -28,6 +28,7 @@
 #ifndef LLVM_CLANG_CIR_DIALECT_TRANSFORMS_OFFLOADOPT_KERNELBINDINGTABLE_H
 #define LLVM_CLANG_CIR_DIALECT_TRANSFORMS_OFFLOADOPT_KERNELBINDINGTABLE_H
 
+#include "mlir/IR/SymbolTable.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -35,6 +36,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <memory>
 #include <optional>
 
 namespace llvm {
@@ -212,6 +214,18 @@ struct HostFactsOptions {
   // undefined behavior (SYCL 2020 PI 5358-5359, plan D1). On by default; the
   // hidden -cir-offload-host-facts-host-ptr-ub=false turns it off.
   bool assumeSpecHostPtrUB = true;
+  // The launch paths were internalized (T26,
+  // cir-offload-internalize-launch-paths); meaningful only without
+  // assumeClosedTU. The points-to analysis counts a local function whose
+  // address only analysed code takes as having only visible callers
+  // (PointsToAnalysisOptions::localFunctionsClosed), and the bindings use the
+  // open-mode TU-local rule (KernelBinding::isTULocalOptimizable). Off by
+  // default; cir-offload-merge sets it under ipo|both without closed-tu.
+  bool internalize = false;
+  // Whether the open-mode rules of internalize apply.
+  bool internalizedOpenMode() const {
+    return internalize && !assumeClosedTU && mode != HostFactsMode::Legacy;
+  }
 };
 
 // The options that select one points-to analysis: every field but the mode,
@@ -336,7 +350,11 @@ struct KernelBinding {
   // SYCL only: true iff the kernel's CLOSURE is a lambda (a compiler-generated,
   // TU-unique, unspellable type) and it is not by-name/bundle-exposed (absent
   // from sycl_registered_kernels), so its launches are fully TU-local and the
-  // combine may optimize/eliminate it. This keys on the closure type, not the
+  // combine may optimize/eliminate it. With HostFactsOptions::internalize
+  // (open mode), instead: the kernel is a copy made for an internalized launch
+  // path, or no other TU can launch it (isTUUniqueSYCLKernel); a lambda in an
+  // inline function has the same closure type in every TU, so "a lambda" is
+  // not enough there. This keys on the closure type, not the
   // kernel-name tag: `parallel_for<class Tag>(lambda)` has a named `_ZTS<Tag>`
   // symbol but a lambda closure, and is still TU-local. A genuine functor
   // (named struct with operator()), a free function, or a registered kernel is
@@ -417,6 +435,79 @@ struct SpecializedKernel {
 std::optional<SpecializedKernel> specializeSYCLKernelForLaunches(
     mlir::ModuleOp container, const KernelBinding &binding,
     llvm::ArrayRef<LaunchSite> sites, llvm::StringRef uniqueTag);
+
+// On a device kernel copy made for an internalized launch path (T26): a
+// dictionary {original = "<K>", roots = ["main", ...]}.
+inline constexpr llvm::StringLiteral kInternalizedKernelAttr =
+    "cir.offload.internalized_kernel";
+// On such a copy, once a pass applied a host fact to it (a noalias, a
+// required work-group size, a constant); the prune pass keeps only these.
+inline constexpr llvm::StringLiteral kInternalizedUsedAttr =
+    "cir.offload.internalized_used";
+// The call operator of the closure the SYCL device kernel `kernel` invokes
+// (its closure alloca passed as the receiver), or null.
+cir::FuncOp getSYCLClosureCallOperator(cir::FuncOp kernel);
+// Whether `kernel` is a copy made for an internalized launch path.
+bool isInternalizedSYCLKernel(cir::FuncOp kernel);
+// Record that a pass applied a host fact to `kernel` (no-op for a kernel
+// that is not an internalized copy).
+void noteInternalizedSYCLKernelUse(cir::FuncOp kernel);
+// For an internalized copy: " through the internalized launch path from
+// root @main[, @...]" (for the remarks), else empty.
+std::string describeInternalizedSYCLKernel(cir::FuncOp kernel);
+// Whether no other TU can launch the device kernel `kernel` (named `name`):
+// it is an internalized copy, its closure's call operator has local linkage
+// (a lambda in a non-inline function, a functor in an unnamed namespace), or
+// every host kernel.info getter naming it has (the kernel-name type has
+// internal linkage). Another TU's kernel of that name would be another
+// kernel with the same name, which SYCL excludes ("the kernels have to be
+// uniquely identified by both host and device compiler",
+// sec:naming.kernels).
+// `getterLocality`, if given, is getSYCLKernelInfoLocality(container).
+bool isTUUniqueSYCLKernel(
+    mlir::ModuleOp container, cir::FuncOp kernel, llvm::StringRef name,
+    const llvm::StringMap<bool> *getterLocality = nullptr);
+// For each kernel name a host kernel.info getter names: whether every such
+// getter has local linkage.
+llvm::StringMap<bool> getSYCLKernelInfoLocality(mlir::ModuleOp container);
+
+// A copy of a SYCL kernel for launch-path internalization (T26), made by
+// copySYCLKernelLocally: the device clones under `name`, and the getter copy
+// (H3) whose callers launch them.
+struct LocalKernelCopy {
+  std::string original;
+  std::string name;
+  llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
+  cir::FuncOp getter;
+};
+
+// Makes the device clones and host artifacts of
+// specializeSYCLKernelForLaunches (H1-H3) for the kernel a kernel.info getter
+// names, with every host artifact local to this TU: internal linkage, named
+// `<original><suffix>`, tagged cir.offload.internalized (so that no other TU
+// can bind to them, unlike the copies of specializeSYCLKernelForLaunches,
+// whose names are unique only within the TU). The device clones keep the
+// original's linkage (sycl-post-link dead-strips an internal kernel): the
+// clone name must be unique in the program (the caller derives it from a
+// module id). Nothing is redirected: the caller repoints the marker calls it
+// chose at the getter copy. The symbol tables and the uses of the host
+// globals are computed once, for every copy of one container.
+class LocalKernelCopier {
+public:
+  explicit LocalKernelCopier(mlir::ModuleOp container);
+  ~LocalKernelCopier();
+  // nullopt (and no change) if `getter` does not name a device kernel of the
+  // container, or `cloneName` is taken.
+  std::optional<LocalKernelCopy>
+  copy(cir::FuncOp getter, llvm::StringRef cloneName, llvm::StringRef suffix);
+
+private:
+  mlir::ModuleOp container;
+  mlir::SymbolTable hostSyms;
+  llvm::SmallVector<std::unique_ptr<mlir::SymbolTable>, 1> deviceSyms;
+  llvm::DenseMap<mlir::StringAttr, llvm::SmallVector<mlir::Operation *, 1>>
+      holders;
+};
 
 // The kernel `op` launches, or a null attribute if it is not a launch site.
 // This is what the table records as a launch site, and what a pass must accept

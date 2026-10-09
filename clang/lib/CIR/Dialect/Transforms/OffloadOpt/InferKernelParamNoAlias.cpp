@@ -94,6 +94,7 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
     options.relevanceSlice = hostFactsSlice;
     options.maxSeconds = hostFactsMaxSeconds;
     options.maxMemoryMB = hostFactsMaxMemoryMB;
+    options.internalize = hostFactsInternalize;
     factsCache = &getAnalysis<cir::SYCLHostFactsCache>();
     unsigned builtBefore = factsCache->getNumBuilt();
     ownTable.emplace(container, options, factsCache);
@@ -132,7 +133,9 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
         << table.getHostFactsComparisons().size() << " candidate fields ("
         << (hostFactsClosedTU ? "closed-tu" : "open")
         << (hostFactsBottomUp ? ", bu" : ", ci")
-        << (hostFactsSubobjects ? ", subobjects" : "") << ")";
+        << (hostFactsSubobjects ? ", subobjects" : "")
+        << (hostFactsInternalize && !hostFactsClosedTU ? ", internalized" : "")
+        << ")";
   }
   mlir::MLIRContext *ctx = &getContext();
   llvm::StringRef noAliasName = mlir::LLVM::LLVMDialect::getNoAliasAttrName();
@@ -203,16 +206,20 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
           continue;
         }
         kernel.setArgAttr(argNo, noAliasName, mlir::UnitAttr::get(ctx));
+        cir::noteInternalizedSYCLKernelUse(kernel);
         did = true;
         mlir::InFlightDiagnostic diag = remark();
         diag << "noalias";
         if (!note.empty())
           diag << " (" << note << ")";
+        diag << cir::describeInternalizedSYCLKernel(kernel);
       }
     }
     return did;
   };
 
+  bool internalizedOpenMode = *mode != cir::HostFactsMode::Legacy &&
+                              hostFactsInternalize && !hostFactsClosedTU;
   unsigned specTag = 0;
   for (const auto &entry : table) {
     const cir::KernelBinding &binding = entry.second;
@@ -230,6 +237,14 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
       // Every launch is visible and the kernel is TU-local: safe to annotate
       // the shared device kernel in place.
       changed |= decide(binding.deviceKernels, binding, /*stamp=*/true, "");
+    } else if (internalizedOpenMode) {
+      // Open mode with internalized launch paths (T26): the clone path
+      // would repoint the markers inside the shared launch functions, which
+      // other TUs' launches run too, under names unique only in this TU.
+      // This TU's facts hold for the kernel copies of the internalized paths.
+      decide(binding.deviceKernels, binding, /*stamp=*/false,
+             "the kernel is visible to other TUs; facts this TU derives hold "
+             "only through an internalized launch path");
     } else {
       // Residual: the shared kernel is cross-TU / by-name reachable, so another
       // TU could launch it with aliasing pointers. Specialize by clone --

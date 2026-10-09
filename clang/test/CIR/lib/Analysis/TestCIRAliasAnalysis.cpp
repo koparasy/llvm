@@ -66,7 +66,7 @@ struct PointsToHolder {
                  bool bottomUp = false, bool subobjects = false,
                  bool topDown = true, unsigned maxQueryContexts = 64,
                  unsigned maxAncestors = 64, unsigned maxContextDepth = 256,
-                 double budgetScale = 1.0) {
+                 double budgetScale = 1.0, bool localClosed = false) {
     registerGenericModels(registry);
     auto module = dyn_cast<ModuleOp>(op);
     if (!module)
@@ -81,6 +81,7 @@ struct PointsToHolder {
     options.maxAncestors = maxAncestors;
     options.maxContextDepth = maxContextDepth;
     options.budgetScale = budgetScale;
+    options.localFunctionsClosed = localClosed;
     if (sycl)
       cir::addSYCLPointsToPlugin(options);
     analysis = std::make_unique<PointsToAnalysis>(module, &registry, options);
@@ -154,6 +155,11 @@ struct PointsToOptions : public PassWrapper<Derived, OperationPass<>> {
       *this, "closed-tu",
       llvm::cl::desc("Points-to: assume every caller is in the module"),
       llvm::cl::init(false)};
+  Pass::Option<bool> localClosed{
+      *this, "local-closed",
+      llvm::cl::desc("Points-to: PointsToAnalysisOptions::"
+                     "localFunctionsClosed"),
+      llvm::cl::init(false)};
   Pass::Option<std::string> ptMode{
       *this, "mode",
       llvm::cl::desc("Points-to: ci (context-insensitive) or bu (bottom-up)"),
@@ -223,7 +229,7 @@ struct TestCIRAliasAnalysisPass
                           this->ptMode == "bu", this->subobjects,
                           this->topDown, this->maxQueryContexts,
                           this->maxAncestors, this->maxContextDepth,
-                          this->budgetScale);
+                          this->budgetScale, this->localClosed);
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);
@@ -270,7 +276,7 @@ struct TestCIRAliasAnalysisModRefPass
                           this->ptMode == "bu", this->subobjects,
                           this->topDown, this->maxQueryContexts,
                           this->maxAncestors, this->maxContextDepth,
-                          this->budgetScale);
+                          this->budgetScale, this->localClosed);
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);

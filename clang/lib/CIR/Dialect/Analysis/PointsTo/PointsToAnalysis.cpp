@@ -599,7 +599,7 @@ void PointsToAnalysis::computeReplacedCalls() {
     });
   }
   stats.numReplacedCalls = replacedCalls.size();
-  if (replacedCalls.empty())
+  if (replacedCalls.empty() && !options.skipUnusedODRFunctions)
     return;
 
   // SOUNDNESS: a skipped body is never looked at, so each of its uses must
@@ -608,8 +608,13 @@ void PointsToAnalysis::computeReplacedCalls() {
   // skipped. Any other use (an address taken, a global initializer, a call
   // bound to the body) keeps it analysed. The callees of a skipped body lose
   // a caller that is not bound to them (unboundCallers below).
+  //
+  // skipUnusedODRFunctions: an ODR function whose every use (of any kind) is
+  // in a skipped function, or that has no use, is skipped too (see the
+  // option; the rule only drops code no execution of this TU's code runs).
   llvm::DenseMap<StringAttr, SmallVector<Operation *, 2>> usesOf;
   llvm::DenseSet<StringAttr> otherUses;
+  llvm::DenseMap<StringAttr, SmallVector<Operation *, 2>> otherUsersOf;
   std::optional<SymbolTable::UseRange> uses =
       SymbolTable::getSymbolUses(&module.getBodyRegion());
   if (!uses)
@@ -619,28 +624,51 @@ void PointsToAnalysis::computeReplacedCalls() {
     auto call = dyn_cast<CIRCallOpInterface>(use.getUser());
     auto callee =
         call ? call->getAttrOfType<FlatSymbolRefAttr>("callee") : nullptr;
-    if (call && !call.isIndirect() && callee && callee.getAttr() == name)
+    if (call && !call.isIndirect() && callee && callee.getAttr() == name) {
       usesOf[name].push_back(call);
-    else
+    } else {
       otherUses.insert(name);
+      if (options.skipUnusedODRFunctions)
+        otherUsersOf[name].push_back(use.getUser());
+    }
   }
+  auto isODR = [](cir::FuncOp func) {
+    cir::GlobalLinkageKind linkage = func.getLinkage();
+    return linkage == cir::GlobalLinkageKind::LinkOnceODRLinkage ||
+           linkage == cir::GlobalLinkageKind::WeakODRLinkage;
+  };
+  auto inSkipped = [&](Operation *user) {
+    auto parent = user->getParentOfType<cir::FuncOp>();
+    return parent && skipped.contains(parent);
+  };
   bool changed = true;
   while (changed) {
     changed = false;
     for (auto func : module.getOps<cir::FuncOp>()) {
-      if (!hasBodyIn(func, module) || skipped.contains(func) ||
-          otherUses.contains(func.getSymNameAttr()))
+      if (!hasBodyIn(func, module) || skipped.contains(func))
         continue;
       auto it = usesOf.find(func.getSymNameAttr());
-      if (it == usesOf.end() || it->second.empty())
-        continue;
-      if (llvm::all_of(it->second, [&](Operation *call) {
-            return replacedCalls.contains(call) ||
-                   skipped.contains(call->getParentOfType<cir::FuncOp>());
-          })) {
-        skipped.insert(func);
-        changed = true;
+      bool noCalls = it == usesOf.end() || it->second.empty();
+      bool odrUnused = false;
+      if (options.skipUnusedODRFunctions && isODR(func) &&
+          !func->hasAttr("global_ctor_priority") &&
+          !func->hasAttr("global_dtor_priority")) {
+        odrUnused = llvm::all_of(otherUsersOf.lookup(func.getSymNameAttr()),
+                                 inSkipped) &&
+                    (noCalls || llvm::all_of(it->second, [&](Operation *call) {
+                       return replacedCalls.contains(call) || inSkipped(call);
+                     }));
       }
+      if (!odrUnused) {
+        if (otherUses.contains(func.getSymNameAttr()) || noCalls)
+          continue;
+        if (!llvm::all_of(it->second, [&](Operation *call) {
+              return replacedCalls.contains(call) || inSkipped(call);
+            }))
+          continue;
+      }
+      skipped.insert(func);
+      changed = true;
     }
   }
   stats.numSkippedFunctions = skipped.size();
@@ -671,6 +699,9 @@ void PointsToAnalysis::computeVisibleCallers() {
       SymbolTable::getSymbolUses(&module.getBodyRegion());
   if (!uses)
     return;
+  // localFunctionsClosed: the uses of a symbol that are not direct calls, by
+  // name, and the global initializers that reference it.
+  llvm::DenseMap<StringAttr, SmallVector<Operation *, 2>> addressUses;
   for (const SymbolTable::SymbolUse &use : *uses) {
     StringAttr name = use.getSymbolRef().getRootReference();
     Operation *user = use.getUser();
@@ -686,9 +717,47 @@ void PointsToAnalysis::computeVisibleCallers() {
     }
     if (direct)
       direct = isAnalysed(user->getParentOfType<cir::FuncOp>());
-    if (!direct)
+    if (!direct) {
       otherUses.insert(name);
+      if (options.localFunctionsClosed)
+        addressUses[name].push_back(user);
+    }
   }
+  // SOUNDNESS (localFunctionsClosed): a use that is not a direct call is
+  // fine if the analysis sees where the address goes: an op in an analysed
+  // function (a get_global, a vtable.address_point; the value is in the
+  // graph, and markEscapedFunctions catches it reaching code we don't see),
+  // or the initializer of a local-linkage global (no other TU can name it)
+  // all of whose own uses are fine in the same way. A direct call that is
+  // not bound (a replaced call, a call from a skipped function) is not.
+  llvm::DenseMap<StringAttr, bool> usesSeen;
+  std::function<bool(StringAttr, unsigned)> usesAreSeen =
+      [&](StringAttr name, unsigned depth) -> bool {
+    auto [it, inserted] = usesSeen.try_emplace(name, false);
+    if (!inserted)
+      return it->second; // false while being decided (a cycle)
+    bool ok = depth < 8;
+    for (Operation *user : addressUses.lookup(name)) {
+      if (!ok)
+        break;
+      if (auto call = dyn_cast<CIRCallOpInterface>(user)) {
+        auto callee = call->getAttrOfType<FlatSymbolRefAttr>("callee");
+        if (callee && callee.getAttr() == name) {
+          ok = false; // an unbound direct call
+          break;
+        }
+      }
+      if (auto global = dyn_cast<cir::GlobalOp>(user)) {
+        ok = cir::isLocalLinkage(global.getLinkage()) &&
+             usesAreSeen(global.getSymNameAttr(), depth + 1);
+        continue;
+      }
+      auto func = user->getParentOfType<cir::FuncOp>();
+      ok = func && func != user && isAnalysed(func);
+    }
+    usesSeen[name] = ok;
+    return ok;
+  };
   for (auto func : module.getOps<cir::FuncOp>()) {
     if (!isAnalysed(func) || !cir::isLocalLinkage(func.getLinkage()))
       continue;
@@ -696,7 +765,8 @@ void PointsToAnalysis::computeVisibleCallers() {
     if (func->hasAttr("global_ctor_priority") ||
         func->hasAttr("global_dtor_priority"))
       continue;
-    if (!otherUses.contains(func.getSymNameAttr()))
+    if (!otherUses.contains(func.getSymNameAttr()) ||
+        (options.localFunctionsClosed && usesAreSeen(func.getSymNameAttr(), 0)))
       visibleCallers.insert(func.getOperation());
   }
 }

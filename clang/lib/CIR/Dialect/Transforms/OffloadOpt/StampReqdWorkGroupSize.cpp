@@ -139,6 +139,7 @@ void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
   options.relevanceSlice = hostFactsSlice;
   options.maxSeconds = hostFactsMaxSeconds;
   options.maxMemoryMB = hostFactsMaxMemoryMB;
+  options.internalize = hostFactsInternalize;
   std::optional<cir::KernelBindingTable> ownTable;
   cir::SYCLHostFactsCache *factsCache = nullptr;
   if (*mode != cir::HostFactsMode::Legacy) {
@@ -219,6 +220,13 @@ void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
       }
       kernel->setAttr("cir.reqd_work_group_size", attr);
       changed = true;
+      if (cir::isInternalizedSYCLKernel(kernel)) {
+        cir::noteInternalizedSYCLKernelUse(kernel);
+        mlir::emitRemark(kernel.getLoc())
+            << "reqd-work-group-size: kernel @" << kernel.getName() << " "
+            << formatLocal(local)
+            << cir::describeInternalizedSYCLKernel(kernel);
+      }
     }
   }
 

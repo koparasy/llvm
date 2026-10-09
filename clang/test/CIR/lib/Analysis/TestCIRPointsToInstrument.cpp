@@ -57,6 +57,10 @@
 //
 // Options:
 //   closed-tu=1               PointsToAnalysisOptions::assumeClosedTU
+//   local-closed=1            PointsToAnalysisOptions::localFunctionsClosed
+//   internalize=1             before the analysis, internalize every path
+//                             from main (LaunchPathInternalization.h, every
+//                             function a sink; the T26 open-mode variant)
 //   mode=bu                   the bottom-up mode (PointsToMode::BU)
 //   td=0                      bu: answer from each function's own graph
 //                             (PointsToAnalysisOptions::topDownQueries)
@@ -97,6 +101,7 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/StoredValues.h"
 #include "clang/CIR/Dialect/Builder/CIRBaseBuilder.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/LaunchPathInternalization.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/FileSystem.h"
@@ -206,6 +211,16 @@ struct TestCIRPointsToInstrumentPass
   Option<bool> closedTU{
       *this, "closed-tu",
       llvm::cl::desc("Points-to: assume every caller is in the module"),
+      llvm::cl::init(false)};
+  Option<bool> localClosed{
+      *this, "local-closed",
+      llvm::cl::desc("Points-to: PointsToAnalysisOptions::"
+                     "localFunctionsClosed"),
+      llvm::cl::init(false)};
+  Option<bool> internalize{
+      *this, "internalize",
+      llvm::cl::desc("Before the analysis, internalize every path from main "
+                     "(LaunchPathInternalization.h, every function a sink)"),
       llvm::cl::init(false)};
   Option<std::string> ptMode{
       *this, "mode",
@@ -353,10 +368,35 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
   ModuleOp module = getOperation();
   MLIRContext *ctx = &getContext();
 
+  // The open-mode-with-internalization variant (T26): clone every function
+  // another TU could call that main reaches, so that the run executes the
+  // copies (whose callers are all here) and checks their facts, while the
+  // originals stay for the code we don't see (PT_EXTRA, twins).
+  if (internalize) {
+    SmallVector<cir::FuncOp> sinks;
+    for (auto func : module.getOps<cir::FuncOp>())
+      if (!func.isDeclaration() && !cir::isClosedRoot(func))
+        sinks.push_back(func);
+    cir::InternalizationOptions iopts;
+    iopts.cloneSinks = true;
+    iopts.maxFunctions = ~0u;
+    iopts.maxOps = ~uint64_t(0);
+    cir::InternalizationResult res =
+        cir::internalizeLaunchPaths(module, sinks, iopts);
+    cir::stripInternalizationTags(module);
+    llvm::errs() << "PT-INTERNALIZED copies=" << res.numCloned
+                 << " in-place=" << res.numInPlace
+                 << " guards=" << res.numGuards
+                 << " vtables=" << res.numVTables << "\n";
+  }
+
   PointsToModelRegistry registry;
   registerGenericModels(registry);
   PointsToAnalysisOptions options;
   options.assumeClosedTU = closedTU;
+  options.localFunctionsClosed = localClosed;
+  // As the SYCL host facts do with internalized paths.
+  options.skipUnusedODRFunctions = internalize && localClosed;
   if (ptMode == "bu")
     options.mode = PointsToMode::BU;
   options.subobjects = subobjects;

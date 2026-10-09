@@ -378,3 +378,8 @@
 // RUN: cir-opt %S/stored-value-multi-parent.cir -test-cir-alias-analysis='use-points-to=1 subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/stored-value-multi-parent.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/models-thread.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// localFunctionsClosed (T26):
+// RUN: cir-opt %S/local-closed.cir -test-cir-alias-analysis='use-points-to=1 local-closed=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/local-closed.cir -test-cir-alias-analysis='use-points-to=1 local-closed=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/models-thread.cir -test-cir-alias-analysis='use-points-to=1 local-closed=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/virtual.cir -test-cir-alias-analysis='use-points-to=1 local-closed=1 mode=bu subobjects=1' -o /dev/null 2>/dev/null
