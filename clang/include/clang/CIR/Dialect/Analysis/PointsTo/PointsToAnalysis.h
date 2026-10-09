@@ -134,6 +134,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -224,6 +225,11 @@ struct PointsToAnalysisOptions {
   /// strong-update search skips the writes between the query point and the
   /// store it finds, which makes the rule wrong.
   bool testIgnoreStrongClobbers = false;
+  /// Test only (the negative control of the run-time check of the thread
+  /// model): the calls a model runs on another thread
+  /// (CallSiteRecord::concurrent) make nothing AsyncAccess in the
+  /// interprocedural phase, which makes the stored-value queries wrong.
+  bool testIgnoreConcurrentCalls = false;
   /// The caps of the copy closure (GraphBudgets).
   GraphBudgets graphBudgets;
   /// Multiply every budget above (and the clone budgets, maxIndirectRounds
@@ -882,6 +888,13 @@ private:
     size_t nodes = 0;
     /// Of those, the nodes the copies made.
     size_t copied = 0;
+    /// The ids of the graph's nodes, as ranges [first, last) of
+    /// Graph::getAllocatedNodes: the nodes made while the SCC was processed
+    /// (not those of an SCC processed meanwhile), and those of every graph
+    /// merged into it (propagateBottomUpStatus).
+    std::vector<std::pair<size_t, size_t>> nodeRanges;
+    /// The start of the range still open, or SIZE_MAX.
+    size_t openRange = SIZE_MAX;
   };
   enum class BindResult : uint8_t { Bound, Fallback };
   void runBottomUp(llvm::ArrayRef<llvm::SmallVector<cir::FuncOp, 1>> sccs,
@@ -909,6 +922,14 @@ private:
   llvm::SmallVector<std::pair<TUCallSite *, TUFunction *>, 0> allCallSites();
   /// Close the copies of \p scc's graph (N8).
   bool closePartition(unsigned scc);
+  /// Open and close the range of node ids made for partition \p part
+  /// (Partition::nodeRanges); closeNodeRange returns whether one was open.
+  void openNodeRange(unsigned part);
+  bool closeNodeRange(unsigned part);
+  /// BU: spread External and Incomplete along the links of \p scc's
+  /// finished graph, before any caller copies it (see the file comment of
+  /// PointsToBottomUp.cpp).
+  void propagateBottomUpStatus(unsigned scc);
   /// Project what the copies learnt in their callers' graphs back into the
   /// graphs they were copied from. Returns whether it changed anything.
   bool projectClones();

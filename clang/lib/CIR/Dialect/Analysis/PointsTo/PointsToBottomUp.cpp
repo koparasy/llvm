@@ -48,7 +48,10 @@
 //  - copies G's launch records (LaunchRecord::ctx) and copy records
 //    (MemTransferRecord, rerun by closePartition, N8).
 // What is copied is G's graph as it is when F is built: G's own effects are
-// all in it then, since the only things the later fixpoint adds to G's graph
+// all in it then (once G's graph is finished, propagateBottomUpStatus spreads
+// its External and Incomplete along the links its bindings added, which the
+// copies' flags would miss otherwise), since the only things the later
+// fixpoint adds to G's graph
 // are its own unknown callers (Incomplete formals, which F's copy must not
 // get: F is a known caller), the effects of the indirect calls still pending
 // in G's graph (F has its own copy of each of those sites and resolves it in
@@ -215,6 +218,10 @@ void PointsToAnalysis::mergePartitions(unsigned into, unsigned from) {
   llvm::append_range(dst.launches, src.launches);
   llvm::append_range(dst.transfers, src.transfers);
   dst.nodes += src.nodes;
+  // A graph is merged once finished (or while its SCC is processed, into
+  // itself): its ranges are closed.
+  llvm::append_range(dst.nodeRanges, src.nodeRanges);
+  src.nodeRanges.clear();
   src.members.clear();
   src.calls.clear();
   src.launches.clear();
@@ -228,6 +235,58 @@ bool PointsToAnalysis::closePartition(unsigned scc) {
   for (unsigned i : partition.transfers)
     records.push_back(memTransfers[i]);
   return closeMemTransfers(*graph, records);
+}
+
+void PointsToAnalysis::openNodeRange(unsigned part) {
+  Partition &partition = partitions[findPartition(part)];
+  assert(partition.openRange == SIZE_MAX && "a node range is open already");
+  partition.openRange = graph->getNumAllocatedNodes();
+}
+
+bool PointsToAnalysis::closeNodeRange(unsigned part) {
+  Partition &partition = partitions[findPartition(part)];
+  // None is open in the fixpoint, after the graphs are built.
+  if (partition.openRange == SIZE_MAX)
+    return false;
+  size_t last = graph->getNumAllocatedNodes();
+  if (last > partition.openRange)
+    partition.nodeRanges.emplace_back(partition.openRange, last);
+  partition.openRange = SIZE_MAX;
+  return true;
+}
+
+void PointsToAnalysis::propagateBottomUpStatus(unsigned scc) {
+  // SOUNDNESS (T27). A caller's copy of this graph copies the flags its
+  // nodes have now, and nothing the fixpoint adds later to this graph's own
+  // nodes reaches the copy (projectClones goes from the copies to the
+  // sources only). A status this graph's own code gives a node (an unknown
+  // call, a model, an unknown result) holds in every context, and so does
+  // what it reaches: the local phase spread it along the links the local
+  // graph had then, but the bindings since (the callees' copies, the
+  // indirect targets) add links, for example from the unique_ptr an unknown
+  // call is passed to the object a callee stored in it. Spread External and
+  // Incomplete again over this graph's nodes, so that every node they reach
+  // has them when the graph is copied. The roots are the flagged nodes made
+  // for this graph (its local graphs, its copies, the model objects, the
+  // graphs merged into it); a link from a node of another graph to one of
+  // this graph comes from a merge (whose ranges are this graph's then) or
+  // from a shared node, which copies do not copy. No unknown caller has
+  // added Incomplete yet (markUnknownCallers runs in the fixpoint), so the
+  // Incomplete spread here is this graph's own.
+  Partition &partition = partitions[findPartition(scc)];
+  for (NodeFlags flag : {NodeFlags::External, NodeFlags::Incomplete}) {
+    SmallVector<Node *, 0> sources;
+    llvm::SmallPtrSet<Node *, 32> seen;
+    for (auto [first, last] : partition.nodeRanges)
+      for (Node *node : graph->getAllocatedNodes(first, last)) {
+        Node *live = Cell(node).getNode();
+        if (live && live->hasFlags(flag) && seen.insert(live).second)
+          sources.push_back(live);
+      }
+    for (Node *node : sources)
+      graph->markReachable(Cell(node), flag, node->getReason(flag),
+                           /*stopAtFlagged=*/true);
+  }
 }
 
 void PointsToAnalysis::runBottomUp(ArrayRef<SmallVector<cir::FuncOp, 1>> sccs,
@@ -255,9 +314,11 @@ void PointsToAnalysis::processSCC(unsigned scc) {
   assert(partitions[scc].state == Partition::State::NotStarted &&
          findPartition(scc) == scc && "SCC processed twice");
   partitions[scc].state = Partition::State::InProgress;
+  openNodeRange(scc);
   // The guard tripped: the analysis gives up, nothing more is built (the
   // callers' bindings are skipped too, see bindBottomUp).
   if (guardTripped()) {
+    closeNodeRange(scc);
     partitions[scc].state = Partition::State::Done;
     return;
   }
@@ -316,6 +377,8 @@ void PointsToAnalysis::processSCC(unsigned scc) {
   // (absorbOverflowingSubobjects), in this graph and in every copy of it:
   // a copy has the same extent, so it overflows too.
 
+  closeNodeRange(scc);
+  propagateBottomUpStatus(scc);
   Partition &done = partitions[findPartition(scc)];
   done.state = Partition::State::Done;
   graph->flushShared();
@@ -349,8 +412,13 @@ PointsToAnalysis::bindBottomUp(TUCallSite &call, TUFunction &owner,
     return BindResult::Bound;
   }
   if (partitions[findPartition(calleeSCC)].state ==
-      Partition::State::NotStarted)
+      Partition::State::NotStarted) {
+    // The nodes the callee's SCC makes are its graph's, not the owner's.
+    bool reopen = closeNodeRange(owner.scc);
     processSCC(findPartition(calleeSCC));
+    if (reopen)
+      openNodeRange(owner.scc);
+  }
   unsigned calleePart = findPartition(calleeSCC);
   unsigned ownerPart = findPartition(owner.scc);
   if (partitions[calleePart].state != Partition::State::Done)

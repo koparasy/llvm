@@ -152,6 +152,29 @@ void ModelContext::addIndirectCall(const CallSiteRecord &site, Cell callee,
   extraCalls->push_back(std::move(call));
 }
 
+void ModelContext::addVirtualCall(const CallSiteRecord &site, Cell holder,
+                                  unsigned slotIndex,
+                                  ArrayRef<std::optional<Cell>> args,
+                                  bool concurrent) {
+  assert(extraCalls && "addVirtualCall without a call sink");
+  // The loads a virtual call spells (LocalBuilder::visitCall): the vptr at
+  // offset 0 of the object, then the slot past the address point it holds.
+  Graph &g = getGraph();
+  int64_t slot = static_cast<int64_t>(slotIndex) * g.getPointerSize();
+  Cell vptr = g.getLink(holder);
+  Cell callee = g.getLink(Cell(vptr.getRawNode(), vptr.getRawOffset() + slot));
+  CallSiteRecord call;
+  call.call = site.call;
+  call.synthetic = true;
+  call.calleePtr = callee;
+  call.vptrHolder = holder;
+  call.vtableSlot = slot;
+  call.concurrent = concurrent;
+  call.args.assign(args.begin(), args.end());
+  call.kind = CallKind::IndirectDeferred;
+  extraCalls->push_back(std::move(call));
+}
+
 void cir::pointsto::finishModelWrites(const PointsToModel &model,
                                       const CallSiteRecord &site,
                                       SmallVectorImpl<ModelWrite> &writes,
@@ -671,6 +694,139 @@ private:
 };
 
 //===--------------------------------------------------------------------===//
+// std::thread (libstdc++)
+//===--------------------------------------------------------------------===//
+
+/// std::thread::_M_start_thread(unique_ptr<_State> state, void (*)()), the
+/// out-of-line libstdc++ function every std::thread constructor ends in
+/// (libstdc++ <bits/std_thread.h>, src/c++11/thread.cc). It starts a thread
+/// that runs execute_native_thread_routine(state.get()): that takes the
+/// ownership of the state back into a unique_ptr<_State>, calls the virtual
+/// `state->_M_run()` (which invokes the copy of the callable the
+/// constructor stored in the _State_impl) and, at its end, deletes the state
+/// through its virtual destructor. It writes the thread id into the
+/// std::thread object and releases `state` (null). The second argument
+/// (_M_thread_deps_never_run) is never called. C++20
+/// [thread.thread.constr]p5-6: the new thread executes the invocation of the
+/// copy of f, and the completion of the constructor synchronizes with its
+/// beginning.
+///
+/// The model: the two virtual calls on the state object, `_M_run` (slot 2
+/// of std::thread::_State's vtable: the complete and the deleting
+/// destructor come first, Itanium C++ ABI 2.5.2) and the deleting destructor
+/// (slot 1), resolved and bound like any virtual call (from the vtables of
+/// the complete state object, getVirtualCallTargets); if they cannot be,
+/// they get the unknown-call rule, as the call got before the model.
+///
+/// SOUNDNESS. The two calls are made at the call of _M_start_thread, while
+/// the new thread runs them concurrently with the caller until a join
+/// (or never synchronizes, if detached). The points-to graph is
+/// flow-insensitive: every pointer the thread stores, and every object it
+/// can reach, is in it whatever the interleaving, so the alias facts of the
+/// accesses inside _M_run (a kernel launch made there, its accessors and
+/// pointers) hold. The order matters only to the flow-sensitive stored-value
+/// queries: a value the caller stores after the spawn may be the one the
+/// thread reads, and the thread's stores may come after a later store of the
+/// caller. So the calls are `concurrent`: every node reachable from the
+/// state (the stored callable and all it reaches: the captures, the objects
+/// they point to) is AsyncAccess (PointsToAnalysis::propagateStatus redoes
+/// that over the final graph, in every calling context): never
+/// strong-updated, an unknown writer for the stored-value queries (so no
+/// value read through them is a constant, in the thread or in the caller),
+/// and ModRef for every call (the thread may access them while any call
+/// runs). What the thread allocates is reached from the state or is its
+/// own. What it reaches only through a global's name is a Global node,
+/// which the stored-value queries never strong-update (they take every
+/// store to it); a call that synchronizes with the thread (a mutex, join)
+/// is a library call, which clobbers the globals.
+class ThreadStartModel : public SymbolModel {
+public:
+  ThreadStartModel()
+      : SymbolModel(
+            "std-thread-start",
+            "C++20 [thread.thread.constr]p5-6; libstdc++ src/c++11/thread.cc "
+            "(execute_native_thread_routine), <bits/std_thread.h>; Itanium "
+            "C++ ABI 2.5.2",
+            Accept::Declarations, /*minArgs=*/2) {}
+
+  void apply(CallSiteRecord &site, ModelContext &ctx) const override {
+    std::optional<Cell> uniquePtr = ModelContext::getArg(site, 1);
+    if (!uniquePtr || !ctx.canAddCalls() || site.result || site.resultSlots) {
+      ctx.applyUnknownCall(site, ctx.makeReason(site, Reason::Kind::EscapedTo,
+                                                "@" + name().str()));
+      return;
+    }
+    Graph &graph = ctx.getGraph();
+    // The unique_ptr<_State> holds the pointer at offset 0 (its
+    // __uniq_ptr_data / tuple<_State *, default_delete> head).
+    ctx.modRef(uniquePtr, /*mod=*/true, /*ref=*/true);
+    Cell state = graph.getLink(*uniquePtr);
+    ctx.modRef(state, /*mod=*/true, /*ref=*/true);
+    // The thread id written into the std::thread object.
+    ctx.modRef(ModelContext::getArg(site, 0), /*mod=*/true, /*ref=*/false);
+    ctx.addVirtualCall(site, state, /*slotIndex=*/2, {state},
+                       /*concurrent=*/true);
+    ctx.addVirtualCall(site, state, /*slotIndex=*/1, {state},
+                       /*concurrent=*/true);
+    // What the local graph already shows of the state; the rest is the
+    // interprocedural phase's (see above).
+    ctx.defer(DeferredEffect::Kind::Reachable, state, NodeFlags::AsyncAccess,
+              ctx.makeReason(site, Reason::Kind::EscapedTo,
+                             "accessed by another thread (std::thread)"));
+  }
+};
+
+/// std::thread::_State::~_State(), out of line in libstdc++
+/// (src/c++11/thread.cc, `= default`): the state's base holds nothing but
+/// the vptr. The deleting destructor also frees the object.
+class ThreadStateDtorModel : public NoPointerEffectModel {
+public:
+  ThreadStateDtorModel()
+      : NoPointerEffectModel(
+            "std-thread-state-dtor",
+            "libstdc++ src/c++11/thread.cc (thread::_State::~_State() = "
+            "default); C++20 [class.dtor]p13, [expr.delete]p6",
+            Accept::Declarations, ArgAccess::Mod) {}
+};
+
+/// std::thread::_State::_State() (inline, `= default` in <bits/std_thread.h>;
+/// the base of every _State_impl): it only stores the address point of
+/// _State's vtable into the vptr. Modelled instead of its body, as a write
+/// of an unknown value to the vptr that creates no link.
+///
+/// SOUNDNESS. The vtable a vptr points to matters only to a virtual call
+/// (getVirtualCallTargets), typeid or dynamic_cast on the object while it
+/// holds that value. _State is abstract (_M_run is pure), so every _State is
+/// the base of a _State_impl, whose constructor overwrites the vptr right
+/// after this one returns (C++20 [class.cdtor]p4: during the base's
+/// construction the object behaves as a _State). Nothing runs on the object
+/// between the two stores but this constructor, which makes no call, and
+/// the only other time the vptr holds _State's vtable again is inside
+/// _State's out-of-line destructor (ThreadStateDtorModel), which makes no
+/// call either. Linking the store would unify _State's one vtable node with
+/// the vtable of every _State_impl of the module (each object's vptr target
+/// is unified with both), so a virtual call on one thread's state would get
+/// the _M_run of every other thread as targets.
+class ThreadStateCtorModel : public SymbolModel {
+public:
+  ThreadStateCtorModel()
+      : SymbolModel("std-thread-state-ctor",
+                    "C++20 [class.cdtor]p4, [class.abstract]; libstdc++ "
+                    "<bits/std_thread.h> (thread::_State)",
+                    Accept::Declarations, /*minArgs=*/1) {}
+
+  bool matches(CIRCallOpInterface call, cir::FuncOp callee) const override {
+    return getNumArgs(call, callee) >= 1;
+  }
+  bool replacesDefinition() const override { return true; }
+
+  void apply(CallSiteRecord &site, ModelContext &ctx) const override {
+    ctx.writeUnknown(ModelContext::getArg(site, 0),
+                     ctx.getGraph().getPointerSize());
+  }
+};
+
+//===--------------------------------------------------------------------===//
 // #cir.memory_effects
 //===--------------------------------------------------------------------===//
 
@@ -946,6 +1102,20 @@ void cir::pointsto::registerGenericModels(PointsToModelRegistry &registry) {
           Accept::Declarations, /*minArgs=*/1));
 
   registry.addPredicateModel(std::make_unique<StdThrowModel>());
+
+  // std::thread (libstdc++): the thread start, and the destructors of the
+  // state's base. join() and detach() keep the unknown-call rule: they get
+  // the std::thread object only, which holds the thread id.
+  sym({"_ZNSt6thread15_M_start_threadESt10unique_ptrINS_6_StateESt14default_"
+       "deleteIS1_EEPFvvE",
+       "_ZNSt6thread15_M_start_threadESt10unique_ptrINS_6_StateESt14default_"
+       "deleteIS1_EE"},
+      std::make_unique<ThreadStartModel>());
+  sym({"_ZNSt6thread6_StateD0Ev", "_ZNSt6thread6_StateD1Ev",
+       "_ZNSt6thread6_StateD2Ev"},
+      std::make_unique<ThreadStateDtorModel>());
+  sym({"_ZNSt6thread6_StateC1Ev", "_ZNSt6thread6_StateC2Ev"},
+      std::make_unique<ThreadStateCtorModel>());
 
   // Termination. They do not return; exit runs the atexit functions and the
   // static destructors (C17 7.22.4.4, C++20 [support.start.term]), which

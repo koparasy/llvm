@@ -267,6 +267,11 @@ struct TestCIRPointsToInstrumentPass
       llvm::cl::desc("Test only: strong updates ignore the writes between "
                      "the store they find and the load"),
       llvm::cl::init(false)};
+  Option<bool> injectNoConcurrent{
+      *this, "inject-no-concurrent",
+      llvm::cl::desc("Test only: the calls a model runs on another thread "
+                     "make nothing AsyncAccess"),
+      llvm::cl::init(false)};
   Option<uint64_t> injectWrongValue{
       *this, "inject-wrong-value",
       llvm::cl::desc("Test only: check this value against a wrong constant"),
@@ -362,6 +367,7 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
   options.strongUpdates = strongUpdates;
   options.assumeIndeterminateReadsUB = indeterminateUB;
   options.testIgnoreStrongClobbers = injectWrongStrong;
+  options.testIgnoreConcurrentCalls = injectNoConcurrent;
   PointsToAnalysis pt(module, &registry, options);
   DataLayout dataLayout(module);
 

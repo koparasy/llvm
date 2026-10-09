@@ -196,6 +196,11 @@ struct CallSiteRecord {
   /// non-constant global with non-internal linkage. The globals graph (T08)
   /// applies this; the local phase only records it.
   bool clobbersGlobals = false;
+  /// Set by a model on a call it adds (ModelContext::addVirtualCall) that
+  /// runs on another thread, concurrently with the caller until a later
+  /// synchronization (std::thread): everything reachable from its pointer
+  /// arguments is AsyncAccess (PointsToAnalysis::propagateStatus).
+  bool concurrent = false;
   /// The cell of the callee pointer of an indirect call; std::nullopt for a
   /// direct call (or an indirect call through a null pointer).
   std::optional<Cell> calleePtr;

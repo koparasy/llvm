@@ -142,6 +142,46 @@ static cir::RecordType getPointeeRecord(Type type) {
   return ptr ? dyn_cast<cir::RecordType>(ptr.getPointee()) : cir::RecordType();
 }
 
+/// Whether pointer operand \p index is a sycl::property_list.
+static bool isPropertyListOperand(const CallSiteRecord &site, unsigned index) {
+  cir::RecordType rec = getPointeeRecord(getOperandType(site, index));
+  StringAttr name = rec ? rec.getName() : StringAttr();
+  return name && name.getValue() == "sycl::_V1::property_list";
+}
+
+/// Whether the sycl::property_list operand \p index may hold a use_mutex
+/// property. False only for a local of the caller that is only constructed
+/// by property_list's constructor from no property (`property_list{}`, the
+/// default argument), destroyed, and handed to this call: the type of each
+/// property the list is built from is in the mangled name of the
+/// constructor template, `property_list::property_list<Props...>`.
+static bool mayHoldUseMutex(const CallSiteRecord &site, unsigned index) {
+  auto call = dyn_cast_if_present<CIRCallOpInterface>(site.call);
+  if (site.synthetic || !call || index >= call.getNumArgOperands())
+    return true;
+  auto alloca = call.getArgOperand(index).getDefiningOp<cir::AllocaOp>();
+  if (!alloca)
+    return true;
+  for (Operation *user : alloca->getUsers()) {
+    if (user == site.call)
+      continue;
+    auto use = dyn_cast<CIRCallOpInterface>(user);
+    auto callee = use && !use.isIndirect()
+                      ? use->getAttrOfType<FlatSymbolRefAttr>("callee")
+                      : FlatSymbolRefAttr();
+    if (!callee)
+      return true;
+    StringRef name = callee.getValue();
+    if (!name.consume_front("_ZN4sycl3_V113property_list"))
+      return true;
+    if (name.starts_with("D") || name.starts_with("C1IJEvEEDpT_") ||
+        name.starts_with("C2IJEvEEDpT_"))
+      continue;
+    return true;
+  }
+  return false;
+}
+
 static Cell shiftCell(Cell cell, int64_t delta) {
   Cell r = cell.resolve();
   return Cell(r.getRawNode(), r.getRawOffset() + delta);
@@ -637,6 +677,30 @@ protected:
                       why);
     }
     SmallVector<unsigned, 2> written{self};
+    // SPEC (T27): the buffer keeps its properties, and the use_mutex
+    // property holds a reference to the application's std::mutex, which "is
+    // locked by the runtime whenever the data is in use and unlocked
+    // otherwise" (PI 5904-5912, property::buffer::use_mutex): the runtime
+    // writes the mutex (and may read anything a property holds) as long as
+    // the buffer lives. Which properties a list holds is not tracked, so
+    // what every property list operand reaches gets the unknown-call rule.
+    bool useMutex = false;
+    if (kind != Kind::Other) {
+      const Reason *kept = nullptr;
+      forEachPointerOperand(site, [&](unsigned i, Cell cell) {
+        if (i == self || !isPropertyListOperand(site, i))
+          return;
+        useMutex |= mayHoldUseMutex(site, i);
+        if (!kept)
+          kept = ctx.makeReason(site, Reason::Kind::EscapedTo,
+                                (role + ": the properties are kept by the "
+                                        "runtime (use_mutex)")
+                                    .str());
+        ctx.defer(DeferredEffect::Kind::Reachable, cell,
+                  NodeFlags::External | NodeFlags::Mod | NodeFlags::Ref, kept);
+        written.push_back(i);
+      });
+    }
     if (kind == Kind::HostPtr)
       if (std::optional<Cell> host = ModelContext::getArg(site, self + 1)) {
         graph.setGhostLink(storage, getSYCLHostField(), *host);
@@ -647,6 +711,18 @@ protected:
         // host memory's. The transfer closure relates both directions; the
         // ghost links describe the objects, not their contents.
         ctx.modRef(host, /*mod=*/true, /*ref=*/true);
+        // With use_mutex the application may access the host memory while
+        // the buffer lives, whenever it holds the mutex, and the runtime
+        // writes it whenever it does not (PI 5904-5912; without the property
+        // such an access is UB, sec:buf-sync-rules): the runtime's accesses
+        // are asynchronous to the host code.
+        if (useMutex)
+          graph.addFlags(*host, NodeFlags::AsyncAccess,
+                         ctx.makeReason(site, Reason::Kind::EscapedTo,
+                                        (role + ": host memory the runtime "
+                                                "may access while the buffer "
+                                                "lives (use_mutex)")
+                                            .str()));
         ctx.addMemTransfer(site, storage, *host, std::nullopt,
                            /*ghosts=*/false);
         written.push_back(self + 1);

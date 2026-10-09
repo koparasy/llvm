@@ -1,0 +1,343 @@
+// RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1 values=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefixes=CHECK,CI
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 values=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefixes=CHECK,BU
+// RUN: cir-opt %s -test-cir-points-to='mode=ci values=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=OPEN
+//
+// The std::thread model (T27). libstdc++'s std::thread constructor stores the
+// callable in a heap _State_impl and hands it to the out-of-line
+// _M_start_thread, which runs `state->_M_run()` on the new thread and then
+// deletes the state. The model gives that call two virtual calls on the
+// state, _M_run (slot 2) and the deleting destructor (slot 1), resolved from
+// the vtable of the complete state object, and makes everything the state
+// reaches AsyncAccess: the thread runs concurrently with spawn() until the
+// join. _State's constructor and destructor are modelled (no link from the
+// vptr to _State's own vtable, which would merge every _State_impl's vtable).
+//
+// The thread reads x through the captured px: x and px are AsyncAccess, so
+// the read of x in the thread is not a constant (spawn() may store x after
+// the spawn). y is not captured: its read after the join is strong.
+// Without closed-tu the vtable's functions may be called from unknown code,
+// so the slot nodes are Incomplete and the two calls get the unknown-call
+// rule, as the declaration did before the model.
+//
+// The input is clang -fclangir -emit-cir -O0 of this reduced libstdc++
+// (the same classes, members and manglings), with the target attributes and
+// locations dropped:
+//
+//   namespace std {
+//   template <class T> struct default_delete {
+//     void operator()(T *p) const { delete p; }
+//   };
+//   template <class T, class D = default_delete<T>> struct unique_ptr {
+//     T *p;
+//     explicit unique_ptr(T *q) : p(q) {}
+//     ~unique_ptr() { if (p) D()(p); }
+//   };
+//   class thread {
+//   public:
+//     struct _State {
+//       virtual ~_State();
+//       virtual void _M_run() = 0;
+//     };
+//     template <class F> struct _State_impl : _State {
+//       F f;
+//       _State_impl(F g) : f(g) {}
+//       void _M_run() override { f(); }
+//     };
+//     template <class F> explicit thread(F f) {
+//       _M_start_thread(unique_ptr<_State>(new _State_impl<F>(f)), nullptr);
+//     }
+//     void join();
+//     unsigned long id;
+//   private:
+//     void _M_start_thread(unique_ptr<_State>, void (*)());
+//   };
+//   } // namespace std
+//   void use(int *);
+//   void spawn() {
+//     int x = 1;
+//     int y = 2;
+//     int *px = &x;
+//     std::thread t([&] {
+//       int v = *px;        // xread
+//       use(&v);
+//     });
+//     y = 3;
+//     t.join();
+//     int ry = y;           // ry
+//     use(&ry);
+//   }
+
+// CHECK-LABEL: === TU graph
+// CHECK-DAG: [[PX:n[0-9]+]] [Stack|Mod|Ref|AsyncAccess] size=8 origins={stack(cir.alloca 'px' {{.*}})} links={0->[[X:n[0-9]+]]+0} reasons={AsyncAccess: {{.*}}"accessed by another thread (std::thread)")}
+// CHECK-DAG: [[X]] [Stack|Mod|Ref|AsyncAccess] size=4 origins={stack(cir.alloca 'x' {{.*}})} links={}
+// CHECK-DAG: {{n[0-9]+}} [Stack|Mod|Ref] size=4 origins={stack(cir.alloca 'y' {{.*}})} links={}
+// CHECK-LABEL: === calls
+// CHECK-DAG: @_ZNSt6threadC2IZ5spawnvE3$_0EET_ cir.call @_ZNSt6thread15_M_start_threadESt10unique_ptrINS_6_StateESt14default_deleteIS1_EEPFvvE -> model std-thread-start
+// CI-DAG: @_ZNSt6threadC2IZ5spawnvE3$_0EET_ cir.call synthetic -> indirect -> {@_ZNSt6thread11_State_implIZ5spawnvE3$_0E6_M_runEv}
+// CI-DAG: @_ZNSt6threadC2IZ5spawnvE3$_0EET_ cir.call synthetic -> indirect -> {@_ZNSt6thread11_State_implIZ5spawnvE3$_0ED0Ev}
+// BU-DAG: @_ZNSt6threadC2IZ5spawnvE3$_0EET_ cir.call synthetic -> indirect -> {@_ZNSt6thread11_State_implIZ5spawnvE3$_0E6_M_runEv} [@_ZNSt6thread11_State_implIZ5spawnvE3$_0E6_M_runEv clone #{{[0-9]+}}]
+// BU-DAG: @_ZNSt6threadC2IZ5spawnvE3$_0EET_ cir.call synthetic -> indirect -> {@_ZNSt6thread11_State_implIZ5spawnvE3$_0ED0Ev} [@_ZNSt6thread11_State_implIZ5spawnvE3$_0ED0Ev clone #{{[0-9]+}}]
+// BU-DAG: @_Z5spawnv cir.call in @_ZNSt6threadC2IZ5spawnvE3$_0EET_ prefix=#{{[0-9]+}} -> indirect -> {@_ZNSt6thread11_State_implIZ5spawnvE3$_0E6_M_runEv}
+// CHECK-DAG: @_ZNSt6thread11_State_implIZ5spawnvE3$_0EC2ES1_ cir.call @_ZNSt6thread6_StateC2Ev -> model std-thread-state-ctor
+// CHECK-DAG: @_ZNSt6thread11_State_implIZ5spawnvE3$_0ED2Ev cir.call @_ZNSt6thread6_StateD2Ev -> model std-thread-state-dtor
+// CHECK-LABEL: === values
+// CHECK-NEXT: ry: {#cir.int<3> : !cir.int<s, 32>} defs=0 complete strong
+// CHECK-NEXT: xread: {#cir.int<1> : !cir.int<s, 32>} defs=0 incomplete (EscapedTo, "written by code we don't see (AsyncAccess)"){{( contexts=1)?}} weak
+//
+// OPEN-LABEL: === calls
+// OPEN: @_ZNSt6threadC2IZ5spawnvE3$_0EET_ cir.call synthetic -> indirect-unresolved (IndirectUnresolved, "callee node is Incomplete")
+// OPEN: @_ZNSt6threadC2IZ5spawnvE3$_0EET_ cir.call synthetic -> indirect-unresolved (IndirectUnresolved, "callee node is Incomplete")
+// OPEN-LABEL: === values
+// OPEN-NEXT: ry: {#cir.int<2> : !cir.int<s, 32>, #cir.int<3> : !cir.int<s, 32>} defs=0 complete weak
+// OPEN-NEXT: xread: {} defs=0 incomplete
+
+!rec_std3A3Athread3A3A_State = !cir.struct<"std::thread::_State" {data !cir.vptr}>
+!s32i = !cir.int<s, 32>
+!s8i = !cir.int<s, 8>
+!u64i = !cir.int<u, 64>
+!u8i = !cir.int<u, 8>
+!void = !cir.void
+!rec_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E = !cir.struct<"std::default_delete<std::thread::_State>" {pad !u8i}>
+!rec_std3A3Athread = !cir.struct<class "std::thread" {data !u64i}>
+!rec_anon_struct = !cir.struct<{data !cir.ptr<!u8i>, data !cir.ptr<!u8i>, data !cir.ptr<!u8i>}>
+!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E = !cir.struct<"std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State>>" {data !cir.ptr<!rec_std3A3Athread3A3A_State>}>
+!rec_anon2E0 = !cir.struct<class "anon.0" {data !cir.ptr<!cir.ptr<!s32i>>}>
+!rec_anon_struct1 = !cir.struct<{data !cir.array<!cir.ptr<!u8i> x 5>}>
+!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E = !cir.struct<"std::thread::_State_impl<(lambda at thread-mock.cpp:42:17)>" {data !rec_std3A3Athread3A3A_State, data !rec_anon2E0}>
+module {
+  cir.global "private" constant internal dso_local @_ZTVNSt6thread11_State_implIZ5spawnvE3$_0EE = #cir.vtable<{#cir.const_array<[#cir.ptr<null> : !cir.ptr<!u8i>, #cir.global_view<@_ZTINSt6thread11_State_implIZ5spawnvE3$_0EE> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt6thread11_State_implIZ5spawnvE3$_0ED2Ev> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt6thread11_State_implIZ5spawnvE3$_0ED0Ev> : !cir.ptr<!u8i>, #cir.global_view<@_ZNSt6thread11_State_implIZ5spawnvE3$_0E6_M_runEv> : !cir.ptr<!u8i>]> : !cir.array<!cir.ptr<!u8i> x 5>}> : !rec_anon_struct1 align(8)
+  cir.global "private" external dso_local @_ZTVN10__cxxabiv120__si_class_type_infoE : !cir.ptr<!cir.ptr<!u8i>> align(8)
+  cir.global constant internal dso_local @_ZTSNSt6thread11_State_implIZ5spawnvE3$_0EE = #cir.const_array<"NSt6thread11_State_implIZ5spawnvE3$_0EE" : !cir.array<!s8i x 39>, trailing_zeros> : !cir.array<!s8i x 40> align(1)
+  cir.global "private" constant external dso_local @_ZTINSt6thread6_StateE : !cir.ptr<!u8i>
+  cir.global constant internal @_ZTINSt6thread11_State_implIZ5spawnvE3$_0EE = #cir.typeinfo<{#cir.global_view<@_ZTVN10__cxxabiv120__si_class_type_infoE, [2 : i32]> : !cir.ptr<!u8i>, #cir.global_view<@_ZTSNSt6thread11_State_implIZ5spawnvE3$_0EE> : !cir.ptr<!u8i>, #cir.global_view<@_ZTINSt6thread6_StateE> : !cir.ptr<!u8i>}> : !rec_anon_struct align(8)
+  cir.global "private" constant external dso_local @_ZTVNSt6thread6_StateE : !rec_anon_struct1 align(8)
+  cir.func no_inline dso_local @_Z5spawnv() {
+    %0 = cir.alloca "coerce" align(8) : !cir.ptr<!rec_anon2E0>
+    %1 = cir.alloca "x" align(4) init : !cir.ptr<!s32i>
+    %2 = cir.alloca "y" align(4) init : !cir.ptr<!s32i>
+    %3 = cir.alloca "px" align(8) init : !cir.ptr<!cir.ptr<!s32i>>
+    %4 = cir.alloca "t" align(8) init : !cir.ptr<!rec_std3A3Athread>
+    %5 = cir.alloca "agg.tmp0" align(8) : !cir.ptr<!rec_anon2E0>
+    %6 = cir.alloca "ry" align(4) init : !cir.ptr<!s32i>
+    %7 = cir.const #cir.int<1> : !s32i
+    cir.store align(4) %7, %1 : !s32i, !cir.ptr<!s32i>
+    %8 = cir.const #cir.int<2> : !s32i
+    cir.store align(4) %8, %2 : !s32i, !cir.ptr<!s32i>
+    cir.store align(8) %1, %3 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+    %9 = cir.get_member %5[0] {name = "px"} : !cir.ptr<!rec_anon2E0> -> !cir.ptr<!cir.ptr<!cir.ptr<!s32i>>>
+    cir.store align(8) %3, %9 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!cir.ptr<!cir.ptr<!s32i>>>
+    %10 = cir.load align(8) %5 : !cir.ptr<!rec_anon2E0>, !rec_anon2E0
+    cir.store %10, %0 : !rec_anon2E0, !cir.ptr<!rec_anon2E0>
+    %11 = cir.cast bitcast %0 : !cir.ptr<!rec_anon2E0> -> !cir.ptr<!cir.ptr<!void>>
+    %12 = cir.load %11 : !cir.ptr<!cir.ptr<!void>>, !cir.ptr<!void>
+    cir.call @_ZNSt6threadC2IZ5spawnvE3$_0EET_(%4, %12) : (!cir.ptr<!rec_std3A3Athread> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}, !cir.ptr<!void>) -> ()
+    %13 = cir.const #cir.int<3> : !s32i
+    cir.store align(4) %13, %2 : !s32i, !cir.ptr<!s32i>
+    cir.call @_ZNSt6thread4joinEv(%4) : (!cir.ptr<!rec_std3A3Athread> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) -> ()
+    %14 = cir.load align(4) %2 : !cir.ptr<!s32i>, !s32i {test.load = "ry"}
+    cir.store align(4) %14, %6 : !s32i, !cir.ptr<!s32i>
+    cir.call @_Z3usePi(%6) : (!cir.ptr<!s32i> {llvm.noundef}) -> ()
+    cir.return
+  }
+  cir.func no_inline alignment(2) internal private dso_local @_ZNSt6threadC2IZ5spawnvE3$_0EET_(%arg0: !cir.ptr<!rec_std3A3Athread> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}, %arg1: !cir.ptr<!void>) func_info<#cir.cxx_ctor<!rec_std3A3Athread, custom>> {
+    %0 = cir.alloca "coerce" align(8) : !cir.ptr<!rec_anon2E0>
+    %1 = cir.alloca "coerce" align(8) : !cir.ptr<!cir.ptr<!void>>
+    cir.store %arg1, %1 : !cir.ptr<!void>, !cir.ptr<!cir.ptr<!void>>
+    %2 = cir.cast bitcast %1 : !cir.ptr<!cir.ptr<!void>> -> !cir.ptr<!rec_anon2E0>
+    %3 = cir.load %2 : !cir.ptr<!rec_anon2E0>, !rec_anon2E0
+    %4 = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Athread>>
+    %5 = cir.alloca "f" align(8) init : !cir.ptr<!rec_anon2E0>
+    %6 = cir.alloca "agg.tmp0" align(8) : !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>
+    %7 = cir.alloca "__new_result" align(16) : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>
+    %8 = cir.alloca "agg.tmp1" align(8) : !cir.ptr<!rec_anon2E0>
+    cir.store %arg0, %4 : !cir.ptr<!rec_std3A3Athread>, !cir.ptr<!cir.ptr<!rec_std3A3Athread>>
+    cir.store %3, %5 : !rec_anon2E0, !cir.ptr<!rec_anon2E0>
+    %9 = cir.load %4 : !cir.ptr<!cir.ptr<!rec_std3A3Athread>>, !cir.ptr<!rec_std3A3Athread>
+    %10 = cir.const #cir.int<16> : !u64i
+    %11 = cir.call @_Znwm(%10) {allocsize = array<i32: 0>, builtin} : (!u64i {llvm.noundef}) -> (!cir.ptr<!void> {llvm.nonnull, llvm.noundef})
+    cir.cleanup.scope {
+      %14 = cir.cast bitcast %11 : !cir.ptr<!void> -> !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>
+      cir.store align(16) %14, %7 : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>, !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>
+      cir.copy %5 align(8) to %8 align(8) : !cir.ptr<!rec_anon2E0>
+      %15 = cir.load align(8) %8 : !cir.ptr<!rec_anon2E0>, !rec_anon2E0
+      cir.store %15, %0 : !rec_anon2E0, !cir.ptr<!rec_anon2E0>
+      %16 = cir.cast bitcast %0 : !cir.ptr<!rec_anon2E0> -> !cir.ptr<!cir.ptr<!void>>
+      %17 = cir.load %16 : !cir.ptr<!cir.ptr<!void>>, !cir.ptr<!void>
+      cir.call @_ZNSt6thread11_State_implIZ5spawnvE3$_0EC2ES1_(%14, %17) : (!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> {llvm.align = 8 : i64, llvm.dereferenceable = 16 : i64, llvm.nonnull, llvm.noundef}, !cir.ptr<!void>) -> ()
+      cir.yield
+    } cleanup eh {
+      cir.call @_ZdlPvm(%11, %10) nothrow {builtin} : (!cir.ptr<!void> {llvm.noundef}, !u64i {llvm.noundef}) -> ()
+      cir.yield
+    }
+    %12 = cir.load align(16) %7 : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>, !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>
+    %13 = cir.base_class_addr nonnull %12 [0] : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> -> !cir.ptr<!rec_std3A3Athread3A3A_State>
+    cir.call @_ZNSt10unique_ptrINSt6thread6_StateESt14default_deleteIS1_EEC2EPS1_(%6, %13) : (!cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}, !cir.ptr<!rec_std3A3Athread3A3A_State> {llvm.noundef}) -> ()
+    cir.cleanup.scope {
+      %14 = cir.const #cir.ptr<null> : !cir.ptr<!cir.func<()>>
+      cir.call @_ZNSt6thread15_M_start_threadESt10unique_ptrINS_6_StateESt14default_deleteIS1_EEPFvvE(%9, %6, %14) : (!cir.ptr<!rec_std3A3Athread> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}, !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nofreeobj, llvm.noundef}, !cir.ptr<!cir.func<()>> {llvm.noundef}) -> ()
+      cir.yield
+    } cleanup all {
+      cir.call @_ZNSt10unique_ptrINSt6thread6_StateESt14default_deleteIS1_EED2Ev(%6) nothrow : (!cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) -> ()
+      cir.yield
+    }
+    cir.return
+  }
+  cir.func private @_ZNSt6thread4joinEv(!cir.ptr<!rec_std3A3Athread> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef})
+  cir.func private dso_local @_Z3usePi(!cir.ptr<!s32i> {llvm.noundef})
+  cir.func private @_ZNSt6thread15_M_start_threadESt10unique_ptrINS_6_StateESt14default_deleteIS1_EEPFvvE(!cir.ptr<!rec_std3A3Athread> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}, !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nofreeobj, llvm.noundef}, !cir.ptr<!cir.func<()>> {llvm.noundef})
+  cir.func private @_Znwm(!u64i {llvm.noundef}) -> (!cir.ptr<!void> {llvm.nonnull, llvm.noundef}) attributes {allocsize = array<i32: 0>, "cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nobuiltin}
+  cir.func no_inline alignment(2) internal private dso_local @_ZNSt6thread11_State_implIZ5spawnvE3$_0EC2ES1_(%arg0: !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> {llvm.align = 8 : i64, llvm.dereferenceable = 16 : i64, llvm.nonnull, llvm.noundef}, %arg1: !cir.ptr<!void>) func_info<#cir.cxx_ctor<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E, custom>> {
+    %0 = cir.alloca "coerce" align(8) : !cir.ptr<!cir.ptr<!void>>
+    cir.store %arg1, %0 : !cir.ptr<!void>, !cir.ptr<!cir.ptr<!void>>
+    %1 = cir.cast bitcast %0 : !cir.ptr<!cir.ptr<!void>> -> !cir.ptr<!rec_anon2E0>
+    %2 = cir.load %1 : !cir.ptr<!rec_anon2E0>, !rec_anon2E0
+    %3 = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>
+    %4 = cir.alloca "g" align(8) init : !cir.ptr<!rec_anon2E0>
+    cir.store %arg0, %3 : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>, !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>
+    cir.store %2, %4 : !rec_anon2E0, !cir.ptr<!rec_anon2E0>
+    %5 = cir.load %3 : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>, !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>
+    %6 = cir.base_class_addr nonnull %5 [0] : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> -> !cir.ptr<!rec_std3A3Athread3A3A_State>
+    cir.call @_ZNSt6thread6_StateC2Ev(%6) nothrow : (!cir.ptr<!rec_std3A3Athread3A3A_State> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) -> ()
+    cir.cleanup.scope {
+      %7 = cir.vtable.address_point(@_ZTVNSt6thread11_State_implIZ5spawnvE3$_0EE, address_point = <index = 0, offset = 2>) : !cir.vptr
+      %8 = cir.vtable.get_vptr %5 : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> -> !cir.ptr<!cir.vptr>
+      cir.store align(8) %7, %8 : !cir.vptr, !cir.ptr<!cir.vptr>
+      %9 = cir.get_member %5[1] {name = "f"} : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> -> !cir.ptr<!rec_anon2E0>
+      cir.copy %4 align(8) to %9 align(8) : !cir.ptr<!rec_anon2E0>
+      cir.yield
+    } cleanup eh {
+      %7 = cir.base_class_addr nonnull %5 [0] : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> -> !cir.ptr<!rec_std3A3Athread3A3A_State>
+      cir.call @_ZNSt6thread6_StateD2Ev(%7) nothrow : (!cir.ptr<!rec_std3A3Athread3A3A_State> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) -> ()
+      cir.yield
+    }
+    cir.return
+  }
+  cir.func private dso_local @_ZdlPvm(!cir.ptr<!void> {llvm.noundef}, !u64i {llvm.noundef}) attributes {"cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nobuiltin, nothrow}
+  cir.func no_inline comdat alignment(2) linkonce_odr dso_local @_ZNSt10unique_ptrINSt6thread6_StateESt14default_deleteIS1_EEC2EPS1_(%arg0: !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}, %arg1: !cir.ptr<!rec_std3A3Athread3A3A_State> {llvm.noundef}) func_info<#cir.cxx_ctor<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E, custom>> {
+    %0 = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>>
+    %1 = cir.alloca "q" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>
+    cir.store %arg0, %0 : !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>, !cir.ptr<!cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>>
+    cir.store %arg1, %1 : !cir.ptr<!rec_std3A3Athread3A3A_State>, !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>
+    %2 = cir.load %0 : !cir.ptr<!cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>>, !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>
+    %3 = cir.get_member %2[0] {name = "p"} : !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E> -> !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>
+    %4 = cir.load align(8) %1 : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>, !cir.ptr<!rec_std3A3Athread3A3A_State>
+    cir.store align(8) %4, %3 : !cir.ptr<!rec_std3A3Athread3A3A_State>, !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>
+    cir.return
+  }
+  cir.func no_inline comdat alignment(2) linkonce_odr dso_local @_ZNSt10unique_ptrINSt6thread6_StateESt14default_deleteIS1_EED2Ev(%arg0: !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) personality(@__gxx_personality_v0) func_info<#cir.cxx_dtor<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>> attributes {"cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nothrow} {
+    %0 = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>>
+    cir.try {
+      cir.store %arg0, %0 : !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>, !cir.ptr<!cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>>
+      %1 = cir.load %0 : !cir.ptr<!cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>>, !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E>
+      cir.scope {
+        %2 = cir.get_member %1[0] {name = "p"} : !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E> -> !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>
+        %3 = cir.load align(8) %2 : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>, !cir.ptr<!rec_std3A3Athread3A3A_State>
+        %4 = cir.cast ptr_to_bool %3 : !cir.ptr<!rec_std3A3Athread3A3A_State> -> !cir.bool
+        cir.if %4 {
+          %5 = cir.alloca "ref.tmp0" align(1) : !cir.ptr<!rec_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E>
+          %6 = cir.get_member %1[0] {name = "p"} : !cir.ptr<!rec_std3A3Aunique_ptr3Cstd3A3Athread3A3A_State2C_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E3E> -> !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>
+          %7 = cir.load align(8) %6 : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>, !cir.ptr<!rec_std3A3Athread3A3A_State>
+          cir.call @_ZNKSt14default_deleteINSt6thread6_StateEEclEPS1_(%5, %7) : (!cir.ptr<!rec_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E> {llvm.align = 1 : i64, llvm.dereferenceable = 1 : i64, llvm.nonnull, llvm.noundef}, !cir.ptr<!rec_std3A3Athread3A3A_State> {llvm.noundef}) -> ()
+        }
+      }
+      cir.yield
+    } catch all (%arg1: !cir.eh_token) {
+      cir.eh.terminate %arg1 : !cir.eh_token
+    }
+    cir.return
+  }
+  cir.func no_inline comdat alignment(2) linkonce_odr dso_local @_ZNSt6thread6_StateC2Ev(%arg0: !cir.ptr<!rec_std3A3Athread3A3A_State> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) personality(@__gxx_personality_v0) func_info<#cir.cxx_ctor<!rec_std3A3Athread3A3A_State, default>> attributes {"cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nothrow} {
+    %0 = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>
+    cir.try {
+      cir.store %arg0, %0 : !cir.ptr<!rec_std3A3Athread3A3A_State>, !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>
+      %1 = cir.load %0 : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>, !cir.ptr<!rec_std3A3Athread3A3A_State>
+      %2 = cir.vtable.address_point(@_ZTVNSt6thread6_StateE, address_point = <index = 0, offset = 2>) : !cir.vptr
+      %3 = cir.vtable.get_vptr %1 : !cir.ptr<!rec_std3A3Athread3A3A_State> -> !cir.ptr<!cir.vptr>
+      cir.store align(8) %2, %3 : !cir.vptr, !cir.ptr<!cir.vptr>
+      cir.yield
+    } catch all (%arg1: !cir.eh_token) {
+      cir.eh.terminate %arg1 : !cir.eh_token
+    }
+    cir.return
+  }
+  cir.func private dso_local @_ZNSt6thread6_StateD2Ev(!cir.ptr<!rec_std3A3Athread3A3A_State> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) func_info<#cir.cxx_dtor<!rec_std3A3Athread3A3A_State>> attributes {"cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nothrow}
+  cir.func no_inline alignment(2) internal private dso_local @_ZNSt6thread11_State_implIZ5spawnvE3$_0ED2Ev(%arg0: !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> {llvm.align = 8 : i64, llvm.dereferenceable = 16 : i64, llvm.nonnull, llvm.noundef}) personality(@__gxx_personality_v0) func_info<#cir.cxx_dtor<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>> attributes {"cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nothrow} {
+    %0 = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>
+    cir.try {
+      cir.store %arg0, %0 : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>, !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>
+      %1 = cir.load %0 : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>, !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>
+      cir.cleanup.scope {
+        cir.yield
+      } cleanup all {
+        %2 = cir.base_class_addr nonnull %1 [0] : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> -> !cir.ptr<!rec_std3A3Athread3A3A_State>
+        cir.call @_ZNSt6thread6_StateD2Ev(%2) nothrow : (!cir.ptr<!rec_std3A3Athread3A3A_State> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) -> ()
+        cir.yield
+      }
+      cir.yield
+    } catch all (%arg1: !cir.eh_token) {
+      cir.eh.terminate %arg1 : !cir.eh_token
+    }
+    cir.return
+  }
+  cir.func no_inline alignment(2) internal private dso_local @_ZNSt6thread11_State_implIZ5spawnvE3$_0ED0Ev(%arg0: !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> {llvm.align = 8 : i64, llvm.dereferenceable = 16 : i64, llvm.nonnull, llvm.noundef}) personality(@__gxx_personality_v0) func_info<#cir.cxx_dtor<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>> attributes {"cir.target-cpu" = "x86-64", "cir.target-features" = "+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87", "cir.tune-cpu" = "generic", nothrow} {
+    %0 = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>
+    cir.try {
+      cir.store %arg0, %0 : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>, !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>
+      %1 = cir.load %0 : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>, !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>
+      cir.cleanup.scope {
+        cir.call @_ZNSt6thread11_State_implIZ5spawnvE3$_0ED2Ev(%1) nothrow : (!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> {llvm.align = 8 : i64, llvm.dereferenceable = 16 : i64, llvm.nonnull, llvm.noundef}) -> ()
+        cir.yield
+      } cleanup all {
+        %2 = cir.cast bitcast %1 : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> -> !cir.ptr<!void>
+        %3 = cir.const #cir.int<16> : !u64i
+        cir.call @_ZdlPvm(%2, %3) nothrow {builtin} : (!cir.ptr<!void> {llvm.noundef}, !u64i {llvm.noundef}) -> ()
+        cir.yield
+      }
+      cir.yield
+    } catch all (%arg1: !cir.eh_token) {
+      cir.eh.terminate %arg1 : !cir.eh_token
+    }
+    cir.return
+  }
+  cir.func no_inline alignment(2) internal private dso_local @_ZNSt6thread11_State_implIZ5spawnvE3$_0E6_M_runEv(%arg0: !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> {llvm.align = 8 : i64, llvm.dereferenceable = 16 : i64, llvm.nonnull, llvm.noundef}) {
+    %0 = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>
+    cir.store %arg0, %0 : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>, !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>
+    %1 = cir.load %0 : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>>, !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E>
+    %2 = cir.get_member %1[1] {name = "f"} : !cir.ptr<!rec_std3A3Athread3A3A_State_impl3C28lambda_at_thread-mock2Ecpp3A423A17293E> -> !cir.ptr<!rec_anon2E0>
+    cir.call @_ZZ5spawnvENK3$_0clEv(%2) : (!cir.ptr<!rec_anon2E0> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) -> ()
+    cir.return
+  }
+  cir.func private dso_local @__gxx_personality_v0(...) -> !s32i
+  cir.func no_inline lambda alignment(2) internal private dso_local @_ZZ5spawnvENK3$_0clEv(%arg0: !cir.ptr<!rec_anon2E0> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) {
+    %0 = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_anon2E0>>
+    %1 = cir.alloca "v" align(4) init : !cir.ptr<!s32i>
+    cir.store %arg0, %0 : !cir.ptr<!rec_anon2E0>, !cir.ptr<!cir.ptr<!rec_anon2E0>>
+    %2 = cir.load %0 : !cir.ptr<!cir.ptr<!rec_anon2E0>>, !cir.ptr<!rec_anon2E0>
+    %3 = cir.get_member %2[0] {name = "px"} : !cir.ptr<!rec_anon2E0> -> !cir.ptr<!cir.ptr<!cir.ptr<!s32i>>>
+    %4 = cir.load %3 : !cir.ptr<!cir.ptr<!cir.ptr<!s32i>>>, !cir.ptr<!cir.ptr<!s32i>>
+    %5 = cir.load deref align(8) %4 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+    %6 = cir.load align(4) %5 : !cir.ptr<!s32i>, !s32i {test.load = "xread"}
+    cir.store align(4) %6, %1 : !s32i, !cir.ptr<!s32i>
+    cir.call @_Z3usePi(%1) : (!cir.ptr<!s32i> {llvm.noundef}) -> ()
+    cir.return
+  }
+  cir.func no_inline comdat alignment(2) linkonce_odr dso_local @_ZNKSt14default_deleteINSt6thread6_StateEEclEPS1_(%arg0: !cir.ptr<!rec_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E> {llvm.align = 1 : i64, llvm.dereferenceable = 1 : i64, llvm.nonnull, llvm.noundef}, %arg1: !cir.ptr<!rec_std3A3Athread3A3A_State> {llvm.noundef}) {
+    %0 = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E>>
+    %1 = cir.alloca "p" align(8) init : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>
+    cir.store %arg0, %0 : !cir.ptr<!rec_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E>, !cir.ptr<!cir.ptr<!rec_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E>>
+    cir.store %arg1, %1 : !cir.ptr<!rec_std3A3Athread3A3A_State>, !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>
+    %2 = cir.load %0 : !cir.ptr<!cir.ptr<!rec_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E>>, !cir.ptr<!rec_std3A3Adefault_delete3Cstd3A3Athread3A3A_State3E>
+    %3 = cir.load align(8) %1 : !cir.ptr<!cir.ptr<!rec_std3A3Athread3A3A_State>>, !cir.ptr<!rec_std3A3Athread3A3A_State>
+    %4 = cir.const #cir.ptr<null> : !cir.ptr<!rec_std3A3Athread3A3A_State>
+    %5 = cir.cmp ne %3, %4 : !cir.ptr<!rec_std3A3Athread3A3A_State>
+    cir.if %5 {
+      %6 = cir.vtable.get_vptr %3 : !cir.ptr<!rec_std3A3Athread3A3A_State> -> !cir.ptr<!cir.vptr>
+      %7 = cir.load align(8) %6 : !cir.ptr<!cir.vptr>, !cir.vptr
+      %8 = cir.vtable.get_virtual_fn_addr %7[1] : !cir.vptr -> !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!rec_std3A3Athread3A3A_State>)>>>
+      %9 = cir.load align(8) %8 : !cir.ptr<!cir.ptr<!cir.func<(!cir.ptr<!rec_std3A3Athread3A3A_State>)>>>, !cir.ptr<!cir.func<(!cir.ptr<!rec_std3A3Athread3A3A_State>)>>
+      cir.call %9(%3) nothrow : (!cir.ptr<!cir.func<(!cir.ptr<!rec_std3A3Athread3A3A_State>)>>, !cir.ptr<!rec_std3A3Athread3A3A_State> {llvm.align = 8 : i64, llvm.dereferenceable = 8 : i64, llvm.nonnull, llvm.noundef}) -> ()
+    }
+    cir.return
+  }
+}
+

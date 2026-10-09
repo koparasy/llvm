@@ -1440,6 +1440,33 @@ void PointsToAnalysis::propagateStatus() {
       graph->markReachable(Cell(node), flag, node->getReason(flag),
                            /*stopAtFlagged=*/true);
   }
+  // SOUNDNESS (T27): a call a model added as running on another thread
+  // (CallSiteRecord::concurrent, std::thread's _M_run) may access what its
+  // arguments reach at any time until the caller synchronizes with it, so
+  // those nodes are AsyncAccess (ModRef for every call, no strong update, an
+  // unknown writer for the stored-value queries). The links the targets'
+  // bindings add since the model ran are in the graph now, and every
+  // calling context has its own copy of the site (BU inherits indirect
+  // sites), so each context marks its own nodes. AsyncAccess does not spread
+  // along links by itself (it marks the bytes an asynchronous memory command
+  // touches): the walk is redone from the site every round, without
+  // stopping at nodes that have it.
+  for (auto &fn : functions) {
+    auto markConcurrent = [&](const TUCallSite &call) {
+      if (!call.site.concurrent || options.testIgnoreConcurrentCalls)
+        return;
+      const Reason *why =
+          graph->makeReason(Reason::Kind::EscapedTo, call.site.call,
+                            "accessed by another thread (std::thread)");
+      for (const std::optional<Cell> &arg : call.site.args)
+        if (arg)
+          graph->markReachable(*arg, NodeFlags::AsyncAccess, why);
+    };
+    for (const TUCallSite &call : fn->callSites)
+      markConcurrent(call);
+    for (const std::unique_ptr<TUCallSite> &call : fn->inheritedCalls)
+      markConcurrent(*call);
+  }
   // BU: what a node that may be a global's object points to may be what
   // any function stored in that global (MayBeShared). Shared nodes are
   // exact: the walk neither flags them nor goes past them.

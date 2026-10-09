@@ -169,6 +169,19 @@ public:
   void addIndirectCall(const CallSiteRecord &site, Cell callee,
                        llvm::ArrayRef<std::optional<Cell>> args);
 
+  /// Add a virtual call the modelled function makes on the object \p
+  /// holder points to: the function in slot \p slotIndex (in pointers, from
+  /// the address point) of the vtable its vptr (at offset 0) points into,
+  /// with the pointer arguments \p args. Like addIndirectCall, but the
+  /// interprocedural phase may also resolve it from the object's vtables
+  /// (PointsToAnalysis::getVirtualCallTargets). With \p concurrent the call
+  /// runs on another thread (CallSiteRecord::concurrent). Requires
+  /// canAddCalls().
+  void addVirtualCall(const CallSiteRecord &site, Cell holder,
+                      unsigned slotIndex,
+                      llvm::ArrayRef<std::optional<Cell>> args,
+                      bool concurrent);
+
   /// Collect launches into \p out and synthetic calls into \p calls.
   void setLaunchSink(llvm::SmallVectorImpl<LaunchRecord> *out) {
     launches = out;

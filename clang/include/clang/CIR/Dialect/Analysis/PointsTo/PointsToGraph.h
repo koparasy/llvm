@@ -706,6 +706,13 @@ public:
   }
   /// Number of live nodes.
   size_t getNumLiveNodes() const;
+  /// Number of nodes ever made, forwarded ones included: the ids of the
+  /// nodes made from now on start there.
+  size_t getNumAllocatedNodes() const { return allNodes.size(); }
+  /// The nodes made with ids in [\p from, \p to), forwarded ones included.
+  llvm::ArrayRef<Node *> getAllocatedNodes(size_t from, size_t to) const {
+    return llvm::ArrayRef<Node *>(allNodes).slice(from, to - from);
+  }
 
   /// Print one line per live node in creation-id order:
   /// \code
