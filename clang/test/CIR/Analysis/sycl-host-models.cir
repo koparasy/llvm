@@ -199,7 +199,7 @@ module {
 // CHECK-LABEL: === TU graph
 // The closure: one $storage ghost link per accessor field, apart from the
 // pointer slots (the impl pointers point to runtime objects).
-// CHECK: [Stack|Mod|Ref] size=216 origins={stack(cir.alloca 'lam'{{.*}} ghost={0:$storage->[[A:n[0-9]+]]+0, 16:$storage->[[B:n[0-9]+]]+0, 32:$storage->[[C:n[0-9]+]]+0, 48:$storage->[[A]]+0, 64:$storage->[[B]]+0, 80:$storage->[[C]]+0, 96:$storage->[[G:n[0-9]+]]+0, 112:$storage->[[G]]+0,
+// CHECK: [Stack|Mod|Ref] size=216 origins={stack(cir.alloca 'lam'{{.*}} ghost={0:$storage->[[A:n[0-9]+]]+0, {{[0-9]+:\$view->n[0-9]+\+0}}, 16:$storage->[[B:n[0-9]+]]+0, {{[0-9]+:\$view->n[0-9]+\+0}}, 32:$storage->[[C:n[0-9]+]]+0, {{[0-9]+:\$view->n[0-9]+\+0}}, 48:$storage->[[A]]+0, {{[0-9]+:\$view->n[0-9]+\+0}}, 64:$storage->[[B]]+0, {{[0-9]+:\$view->n[0-9]+\+0}}, 80:$storage->[[C]]+0, {{[0-9]+:\$view->n[0-9]+\+0}}, 96:$storage->[[G:n[0-9]+]]+0, {{[0-9]+:\$view->n[0-9]+\+0}}, 112:$storage->[[G]]+0, {{[0-9]+:\$view->n[0-9]+\+0}},
 // CHECK: [[A]] [Ghost|External|Summary|Ref] size=0 origins={ghost(cir.call{{.*}}"written by device code: a kernel may store pointers into the memory its closure reaches"
 // CHECK: @vector_data return -> [[VEC:n[0-9]+]]+0
 // CHECK-LABEL: === calls
@@ -645,7 +645,7 @@ module {
 // CHECK: [[X:n[0-9]+]] [Stack|Summary] size=4 origins={stack(cir.alloca 'x'
 // CHECK: [Stack|Summary|Mod|AsyncAccess] size=64 origins={stack(cir.alloca 'hm'{{.*}} links={0->[[X]]+0}
 // CHECK: [[HB:n[0-9]+]] [Stack|Summary|Mod|Ref] size=64 origins={stack(cir.alloca 'hb'
-// CHECK: ghost={0:$storage->[[SA:n[0-9]+]]+0}
+// CHECK: ghost={0:$storage->[[SA:n[0-9]+]]+0, 0:$view->{{n[0-9]+}}+0}
 // CHECK: [[SA]] [Ghost|External|Summary|Mod|Ref] size=0 origins={ghost(cir.call{{.*}} links={0->[[Y:n[0-9]+]]+0}
 // CHECK: [Ghost|Summary|Mod] size=0 origins={ghost(cir.call{{.*}} ghost={0:$host->[[HB]]+0}
 // CHECK: [[D:n[0-9]+]] [Heap|Summary|Mod|Ref|HasUSM|AsyncAccess] size=8 origins={heap(cir.call{{.*}} links={0->[[X]]+0}
@@ -832,14 +832,14 @@ module {
 // their buffers' storage.
 // CHECK-LABEL: === TU graph
 // CHECK: [[FD:n[0-9]+]] [Stack|External|Mod|Ref] size=64 origins={stack(cir.alloca 'fd'
-// CHECK: origins={stack(cir.alloca 'bh'{{.*}} ghost={0:$storage->[[SH:n[0-9]+]]+0}
+// CHECK: origins={stack(cir.alloca 'bh'{{.*}} ghost={0:$storage->[[SH:n[0-9]+]]+0, 0:$view->{{n[0-9]+}}+0}
 // CHECK: [[SH]] [Ghost|External|Summary|Mod|Ref] size=0 origins={ghost(cir.call{{.*}} ghost={0:$host->
 // CHECK: [[SF:n[0-9]+]] [Ghost|External|Summary|Ref] size=0 origins={ghost(cir.call{{.*}} ghost={0:$final->[[FD]]+0}
 // CHECK: [[GD:n[0-9]+]] [Stack|Mod|Ref] size=64 origins={stack(cir.alloca 'gd'
-// CHECK: origins={stack(cir.alloca 'bk'{{.*}} ghost={0:$storage->[[SK:n[0-9]+]]+0}
+// CHECK: origins={stack(cir.alloca 'bk'{{.*}} ghost={0:$storage->[[SK:n[0-9]+]]+0, 0:$view->{{n[0-9]+}}+0}
 // CHECK: [Ghost|Summary|Ref] size=0 origins={ghost(cir.call{{.*}} ghost={0:$final->[[GD]]+0}
-// CHECK: [Stack|Mod] size=16 origins={stack(cir.alloca 'ha'{{.*}} ghost={0:$storage->[[SH]]+0}
-// CHECK: [Stack|Mod] size=16 origins={stack(cir.alloca 'hk2'{{.*}} ghost={0:$storage->[[SK]]+0}
+// CHECK: [Stack|Mod] size=16 origins={stack(cir.alloca 'ha'{{.*}} ghost={0:$storage->[[SH]]+0, 0:$view->{{n[0-9]+}}+0}
+// CHECK: [Stack|Mod] size=16 origins={stack(cir.alloca 'hk2'{{.*}} ghost={0:$storage->[[SK]]+0, 0:$view->{{n[0-9]+}}+0}
 // CHECK-NOT: === @set_write_back
 // CHECK-NOT: === @set_final_data
 // CHECK-NOT: === @get_range

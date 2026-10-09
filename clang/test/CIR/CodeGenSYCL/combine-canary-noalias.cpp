@@ -61,6 +61,21 @@
 // RUN: FileCheck %s --check-prefix=ALIAS --input-file=%t/sub.ll
 // RUN: FileCheck %s --check-prefix=ALIAS-REMARK --input-file=%t/sub.remarks
 //
+// Two sub-buffers of one parent whose ranges overlap ([0, NK) and
+// [NK/2, 3NK/2)): the ranges are compared, and they overlap.
+// REDEFINE: %{v} = subovl
+// REDEFINE: %{flags} = -DSUBOVL
+// RUN: %{pipe}
+// RUN: FileCheck %s --check-prefix=ALIAS --input-file=%t/subovl.ll
+// RUN: FileCheck %s --check-prefix=ALIAS-REMARK --input-file=%t/subovl.remarks
+//
+// Positive control for the ranges: two disjoint sub-buffers ([0, NK) and
+// [NK, 2NK)) of one parent are distinct memory.
+// REDEFINE: %{v} = subdis
+// REDEFINE: %{flags} = -DSUBDIS
+// RUN: %{pipe}
+// RUN: FileCheck %s --check-prefix=DISTINCT --input-file=%t/subdis.ll
+//
 // buffer(host_ptr) over one vector at two overlapping offsets.
 // REDEFINE: %{v} = hostptr
 // REDEFINE: %{flags} = -DHOSTPTR
@@ -167,6 +182,15 @@ int main() {
 #elif defined(SUB)
   Buf bA(va.data(), range<1>(2 * NK));
   Buf bC(bA, id<1>(0), range<1>(NK));
+#elif defined(SUBOVL) || defined(SUBDIS)
+  Buf bP(va.data(), range<1>(2 * NK));
+#ifdef SUBOVL
+  Buf bA(bP, id<1>(0), range<1>(NK));
+  Buf bC(bP, id<1>(NK / 2), range<1>(NK));
+#else
+  Buf bA(bP, id<1>(0), range<1>(NK));
+  Buf bC(bP, id<1>(NK), range<1>(NK));
+#endif
 #elif defined(HOSTPTR)
   Buf bA(va.data(), range<1>(NK));
   Buf bC(va.data() + NK / 2, range<1>(NK));

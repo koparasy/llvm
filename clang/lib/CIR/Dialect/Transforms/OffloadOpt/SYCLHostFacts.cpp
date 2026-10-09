@@ -59,11 +59,61 @@
 // values the host captured are unknown. Contents written by code we don't see
 // are what (b) excludes. For an accessor, the memory the device accesses is
 // its buffer's storage or, zero-copy, the host memory the buffer was built
-// over (buffer(hostData)); both are in the identity, and two buffers over the
-// same host memory share it (the spec makes that UB while both live, but this
-// rule does not rely on it). A summary node (an allocation in a loop) is
-// still one site: two fields bound to one summary node share it and are not
-// distinct.
+// over (buffer(hostData)); both are in the identity. A summary node (an
+// allocation in a loop) is still one site: two fields bound to one summary
+// node share it and are not distinct, except as below.
+//
+// Ranges (sameMemory, viewRange). Two accessors of one storage, or of two
+// storages over one host object, may still be distinct memory: what matters
+// for llvm.noalias is the memory each accesses, not where its `ptr` points.
+//  - DEVICE SIDE. The `ptr` kernel parameter of an accessor is the base of
+//    its memory range: the storage of its buffer, or for a sub-buffer the
+//    runtime's partition of the parent's storage at the sub-buffer's offset
+//    (allocateMemSubBuffer, urMemBufferPartition). The accessor's offset is
+//    applied in __init (MData = Ptr + lin(Offset, MemRange), accessor.hpp),
+//    get_pointer/get_multi_ptr give Ptr back, and every access is
+//    MData + lin(index, MemRange). The elements of the storage an accessor
+//    may access are so inside [lo, hi): lo = the sub-buffer's offset +
+//    lin(offset, MemRange), hi = that of offset + range - 1, plus 1 (lin is
+//    increasing in each coordinate, so the box lies in that interval).
+//  - SPEC. Accessing an element outside an accessor's range is undefined
+//    behavior, through operator[] or through get_pointer/get_multi_ptr (PI
+//    7613-7622, sec:accessors.ranged PI 7673-7678); the range of a buffer
+//    accessor is its buffer's (a sub-buffer's: PI 6090-6093), or the ranged
+//    accessor's, which the constructor checks against the buffer (PI 7959,
+//    7979, 8039, 8062: it throws if the box exceeds the buffer).
+//  - LLVM. noalias on two parameters says that memory accessed through one
+//    and modified is not accessed through the other (LangRef), not that the
+//    pointers differ. Accessors whose accessed elements are disjoint satisfy
+//    it, even if both pointers are the same storage base.
+// A handle's `$view` ghost (SYCLPointsToModels.h) is the node of the call
+// that chose its part of the storage; viewRange reads the range from that
+// call's constant operands (stored-value queries), composing a ranged
+// accessor with the sub-buffer it is made from. Every model that sets
+// `$storage` sets `$view`, so unification only adds origins to a view: a
+// view with several origins, none, or an UnknownObj flag is not known, and
+// neither is one made by reinterpret (the element type, the unit of the
+// ranges, changes; PI 5832-5836) or one whose root is not a constructor of
+// the identity's storage. An accessor whose box is not constant gets its
+// buffer's part (it lies inside, by the throw above); a sub-buffer whose
+// offset or range is not constant is not known. Ranges are compared only on
+// one storage node all of whose origins call one constructor (one element
+// type). Not known overlaps everything.
+//
+// Host pointers (D1). Two storages over the same host node: the runtime may
+// use the host memory as either storage. Their host pointers are known
+// exactly when the node is neither collapsed nor an array (cir.ptr_stride
+// makes it one, so `v.data() + n` is never exact), and then
+//  - equal host pointers: "Constructing more than one SYCL buffer managing
+//    the same host pointer is still undefined behavior" (PI 5358-5359), so
+//    they are distinct (HostFactsOptions::assumeSpecHostPtrUB, on by
+//    default; -cir-offload-host-facts-host-ptr-ub=false turns it off);
+//  - unequal ones: distinct only if the host bytes the two accessors may
+//    access (host offset + range * sizeof(T), T the hostData pointee) are
+//    disjoint. Within one object the offsets are comparable; different
+//    objects of a summary node are disjoint anyway.
+// A storage over host memory and a pointer to that memory (a USM pointer
+// behind buffer(usmPtr)) share the node and are never distinct.
 //
 // Every launch must be known. The launches of a kernel are the LaunchRecords
 // that name it. A record without kernel names may launch any kernel, so it
@@ -225,6 +275,33 @@ std::string mergedSuffix(const Node *node) {
                : std::string();
 }
 
+/// The shape of a sycl::range<D> or sycl::id<D> record: D, and the type and
+/// size of its elements (a detail::array<D> holding an array of D
+/// integers).
+struct RangeShape {
+  unsigned dims = 0;
+  Type elem;
+  uint64_t elemSize = 0;
+};
+
+std::optional<RangeShape> getRangeShape(Type type, const DataLayout &layout) {
+  for (unsigned depth = 0; depth < 4; ++depth) {
+    if (auto array = dyn_cast_if_present<cir::ArrayType>(type)) {
+      auto elem = dyn_cast<cir::IntType>(array.getElementType());
+      if (!elem || array.getSize() < 1 || array.getSize() > 3)
+        return std::nullopt;
+      return RangeShape{static_cast<unsigned>(array.getSize()), elem,
+                        layout.getTypeSize(elem).getFixedValue()};
+    }
+    auto rec = dyn_cast_if_present<cir::RecordType>(type);
+    if (!rec || rec.isIncomplete() || rec.isUnion() ||
+        rec.getNumElements() != 1)
+      return std::nullopt;
+    type = rec.getElementType(0);
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 // A measurement knob (T24): PointsToAnalysisOptions::assumeIndeterminateReadsUB
@@ -235,8 +312,17 @@ static llvm::cl::opt<bool> clIndeterminateReadsUB(
                    "stack or heap object is UB"),
     llvm::cl::init(true), llvm::cl::Hidden);
 
+// HostFactsOptions::assumeSpecHostPtrUB, for measurements and tests: off
+// treats two buffers over equal host pointers as the same memory.
+static llvm::cl::opt<bool> clHostPtrUB(
+    "cir-offload-host-facts-host-ptr-ub",
+    llvm::cl::desc("Host facts: assume no two buffers manage the same host "
+                   "pointer (SYCL 2020: undefined behavior)"),
+    llvm::cl::init(true), llvm::cl::Hidden);
+
 SYCLHostFacts::SYCLHostFacts(ModuleOp container,
-                             const HostFactsOptions &options) {
+                             const HostFactsOptions &options)
+    : assumeSpecHostPtrUB(options.assumeSpecHostPtrUB && clHostPtrUB) {
   ModuleOp host = getOffloadContainerHostModule(container);
   ownedRegistry = std::make_unique<PointsToModelRegistry>();
   registerGenericModels(*ownedRegistry);
@@ -283,8 +369,9 @@ SYCLHostFacts::SYCLHostFacts(ModuleOp container,
 }
 
 SYCLHostFacts::SYCLHostFacts(const PointsToAnalysis &analysis,
-                             Operation *deviceScope)
-    : analysis(&analysis) {
+                             Operation *deviceScope, bool assumeSpecHostPtrUB)
+    : analysis(&analysis),
+      assumeSpecHostPtrUB(assumeSpecHostPtrUB && clHostPtrUB) {
   collectDeviceKernels(deviceScope);
   buildIndex();
 }
@@ -600,22 +687,380 @@ SYCLHostFacts::identityOfClosureField(const LaunchRecord &launch,
                   ": " + *why);
     id.what += " over " + describeAllocation(id.host);
   }
+
+  // The part of the storage the accessor may access (its `$view`), and,
+  // over host memory, the host bytes.
+  std::optional<Cell> view = graph.lookupGhostLink(at, getSYCLViewField());
+  ViewRange range = viewRange(view ? view->getNode() : nullptr, id.node);
+  ArrayRef<Origin> origins = id.node->getOrigins();
+  Operation *site = origins.front().site;
+  cir::FuncOp ctor = getDirectCallee(site, symbols);
+  id.rangesComparable = ctor && llvm::all_of(origins, [&](const Origin &o) {
+                          return getDirectCallee(o.site, symbols) == ctor;
+                        });
+  bool oneSite =
+      llvm::all_of(origins, [&](const Origin &o) { return o.site == site; });
+  if (range.known) {
+    id.range = {range.lo, range.hi};
+    bool whole = range.lo == 0 && (!range.hi || range.hi == range.storageElems);
+    if (!whole)
+      id.what += (" [elements " + Twine(range.lo) + ".." +
+                  (range.hi ? Twine(*range.hi) : Twine("end")) + ")")
+                     .str();
+  }
+  if (id.host) {
+    const Node *h = id.host;
+    if (!hasAny(h->getFlags(), NodeFlags::Collapsed | NodeFlags::UnknownObj) &&
+        !h->isArray() && host->getOffset() >= 0)
+      id.hostOffset = host->getOffset();
+    // The element size: the pointee of buffer(T *hostData, ...)'s operand.
+    std::optional<uint64_t> elemSize;
+    auto call = dyn_cast_if_present<CIRCallOpInterface>(site);
+    unsigned self =
+        ctor && ctor.getNumArguments() && ctor.getArgAttr(0, "llvm.sret") ? 1
+                                                                          : 0;
+    if (oneSite && call && self + 1 < call.getNumArgOperands())
+      if (auto ptr = dyn_cast<cir::PointerType>(
+              call.getArgOperand(self + 1).getType()))
+        if (std::optional<int64_t> bytes =
+                getTypeSizeInBytes(ptr.getPointee(), *layout);
+            bytes && *bytes > 0)
+          elemSize = static_cast<uint64_t>(*bytes);
+    if (id.hostOffset) {
+      uint64_t base = static_cast<uint64_t>(*id.hostOffset);
+      id.hostLo = base;
+      auto mulAdd = [&](uint64_t elems) -> std::optional<uint64_t> {
+        uint64_t bytes, end;
+        if (__builtin_mul_overflow(elems, *elemSize, &bytes) ||
+            __builtin_add_overflow(base, bytes, &end))
+          return std::nullopt;
+        return end;
+      };
+      if (elemSize && range.known && range.hi && oneSite) {
+        std::optional<uint64_t> lo = mulAdd(range.lo), hi = mulAdd(*range.hi);
+        if (lo && hi) {
+          id.hostLo = *lo;
+          id.hostHi = *hi;
+        }
+      }
+    }
+  }
   id.complete = true;
   return id;
 }
 
-bool SYCLHostFacts::sameMemory(const MemIdentity &a, const MemIdentity &b) {
-  for (const Node *x : {a.node, a.host})
-    for (const Node *y : {b.node, b.host}) {
-      if (!x || !y)
-        continue;
-      if (x == y)
-        return true;
-      // Complete identities: a shared origin is a shared site.
-      for (const Origin &origin : x->getOrigins())
-        if (llvm::is_contained(y->getOrigins(), origin))
-          return true;
+namespace {
+
+/// The row-major linear index of \p index in a range of \p dims (SYCL
+/// linearization, sec:multi-dim-linearization: dimension 0 varies slowest),
+/// or std::nullopt on overflow.
+std::optional<uint64_t> linearize(ArrayRef<uint64_t> index,
+                                  ArrayRef<uint64_t> dims) {
+  uint64_t out = 0;
+  for (auto [i, x] : llvm::enumerate(index)) {
+    if (i && __builtin_mul_overflow(out, dims[i], &out))
+      return std::nullopt;
+    if (__builtin_add_overflow(out, x, &out))
+      return std::nullopt;
+  }
+  return out;
+}
+
+std::optional<uint64_t> product(ArrayRef<uint64_t> values) {
+  uint64_t out = 1;
+  for (uint64_t v : values)
+    if (__builtin_mul_overflow(out, v, &out))
+      return std::nullopt;
+  return out;
+}
+
+} // namespace
+
+std::optional<uint64_t> SYCLHostFacts::rangeComponent(Value value,
+                                                      unsigned index,
+                                                      Operation *call) const {
+  if (auto intTy = dyn_cast<cir::IntType>(value.getType())) {
+    if (index != 0)
+      return std::nullopt;
+    if (auto c = value.getDefiningOp<cir::ConstantOp>())
+      if (auto i = dyn_cast<cir::IntAttr>(c.getValue()))
+        return i.getValue().getZExtValue();
+    if (auto load = value.getDefiningOp<cir::LoadOp>())
+      if (std::optional<TypedAttr> c = analysis->isConstantAt(
+              load.getAddr(), intTy.getWidth() / 8, intTy, load))
+        if (auto i = dyn_cast<cir::IntAttr>(*c))
+          return i.getValue().getZExtValue();
+    return std::nullopt;
+  }
+  auto ptr = dyn_cast<cir::PointerType>(value.getType());
+  std::optional<RangeShape> shape =
+      ptr ? getRangeShape(ptr.getPointee(), *layout) : std::nullopt;
+  if (!shape || index >= shape->dims)
+    return std::nullopt;
+  std::optional<TypedAttr> c =
+      analysis->isConstantAt(value, shape->elemSize, shape->elem, call,
+                             static_cast<int64_t>(index * shape->elemSize));
+  auto i = c ? dyn_cast<cir::IntAttr>(*c) : cir::IntAttr();
+  if (!i)
+    return std::nullopt;
+  return i.getValue().getZExtValue();
+}
+
+std::optional<SmallVector<SmallVector<std::optional<uint64_t>, 3>, 2>>
+SYCLHostFacts::rangeOperands(Operation *call, unsigned first,
+                             unsigned dims) const {
+  SmallVector<Value, 6> ops = getSYCLRangeOperands(call, first);
+  SmallVector<SmallVector<std::optional<uint64_t>, 3>, 2> out;
+  for (unsigned i = 0; i < ops.size();) {
+    Value op = ops[i];
+    SmallVector<std::optional<uint64_t>, 3> range;
+    if (auto ptr = dyn_cast<cir::PointerType>(op.getType())) {
+      std::optional<RangeShape> shape =
+          getRangeShape(ptr.getPointee(), *layout);
+      if (!shape || (dims && shape->dims != dims))
+        return std::nullopt;
+      for (unsigned d = 0; d < shape->dims; ++d)
+        range.push_back(rangeComponent(op, d, call));
+      ++i;
+    } else {
+      // D integers: a range<D> or id<D> the ABI split.
+      if (!dims || i + dims > ops.size())
+        return std::nullopt;
+      for (unsigned d = 0; d < dims; ++d) {
+        if (!isa<cir::IntType>(ops[i + d].getType()))
+          return std::nullopt;
+        range.push_back(rangeComponent(ops[i + d], 0, call));
+      }
+      i += dims;
     }
+    out.push_back(std::move(range));
+  }
+  return out;
+}
+
+SYCLHostFacts::ViewRange SYCLHostFacts::viewRange(const Node *view,
+                                                  const Node *storage,
+                                                  unsigned depth) const {
+  auto unknown = [](const Twine &why) {
+    ViewRange r;
+    r.why = why.str();
+    return r;
+  };
+  if (!view)
+    return unknown("the handle has no view a model made");
+  if (depth > 8)
+    return unknown("the views nest too deep");
+  ArrayRef<Origin> origins = view->getOrigins();
+  if (hasAny(view->getFlags(), NodeFlags::UnknownObj) || origins.empty())
+    return unknown("the view was not made by a model");
+  Operation *site = origins.front().site;
+  if (!llvm::all_of(origins, [&](const Origin &o) {
+        return o.kind == Origin::Kind::GhostSite && o.site == site;
+      }))
+    return unknown("the view merges the views of several calls");
+  auto call = dyn_cast_if_present<CIRCallOpInterface>(site);
+  cir::FuncOp callee = getDirectCallee(site, symbols);
+  if (!call || !callee)
+    return unknown("the view was not made by a call");
+  StringRef role = getRole(callee);
+  unsigned self =
+      callee.getNumArguments() && callee.getArgAttr(0, "llvm.sret") ? 1 : 0;
+  auto parentOf = [&]() {
+    std::optional<Cell> parent = analysis->getGraph().lookupGhostLink(
+        Cell(const_cast<Node *>(view)), getSYCLViewField());
+    return viewRange(parent ? parent->getNode() : nullptr, storage, depth + 1);
+  };
+
+  // A buffer that owns its storage: all of it.
+  if (role == "buffer.alloc" || role == "buffer.host_ptr") {
+    if (!llvm::any_of(storage->getOrigins(),
+                      [&](const Origin &o) { return o.site == site; }))
+      return unknown("the view is of another buffer's storage");
+    ViewRange r;
+    r.known = true;
+    unsigned index = self + (role == "buffer.host_ptr" ? 2 : 1);
+    if (index < call.getNumArgOperands()) {
+      Value range = call.getArgOperand(index);
+      auto ptr = dyn_cast<cir::PointerType>(range.getType());
+      if (std::optional<RangeShape> shape =
+              ptr ? getRangeShape(ptr.getPointee(), *layout) : std::nullopt) {
+        r.rank = shape->dims;
+        for (unsigned d = 0; d < shape->dims; ++d) {
+          std::optional<uint64_t> c = rangeComponent(range, d, site);
+          if (!c) {
+            r.dims.clear();
+            break;
+          }
+          r.dims.push_back(*c);
+        }
+        if (!r.dims.empty())
+          if (std::optional<uint64_t> n = product(r.dims)) {
+            r.hi = n;
+            r.storageElems = n;
+          }
+        if (!r.hi)
+          r.dims.clear();
+      }
+    }
+    return r;
+  }
+
+  // buffer(buffer &b, const id<D> &baseIndex, const range<D> &subRange):
+  // [lin(baseIndex), lin(baseIndex) + |subRange|) of b's view, contiguous
+  // (PI 5593-5625, 6090-6097).
+  if (role == "buffer.sub") {
+    ViewRange parent = parentOf();
+    if (!parent.known)
+      return unknown("a sub-buffer of a buffer whose part is not known: " +
+                     parent.why);
+    auto ops = rangeOperands(site, self + 2, parent.rank);
+    if (!ops || ops->size() != 2 || (*ops)[0].size() != (*ops)[1].size())
+      return unknown("the sub-buffer's operands have an unexpected shape");
+    unsigned d = (*ops)[0].size();
+    SmallVector<uint64_t, 3> base, sub;
+    for (unsigned i = 0; i < d; ++i) {
+      if (!(*ops)[0][i] || !(*ops)[1][i])
+        return unknown("the sub-buffer's offset or range is not a constant");
+      base.push_back(*(*ops)[0][i]);
+      sub.push_back(*(*ops)[1][i]);
+    }
+    if (d > 1 && parent.dims.size() != d)
+      return unknown("the range of the sub-buffer's parent is not known");
+    std::optional<uint64_t> off = d == 1 ? std::optional<uint64_t>(base[0])
+                                         : linearize(base, parent.dims);
+    std::optional<uint64_t> n = product(sub);
+    uint64_t lo, hi;
+    if (!off || !n || __builtin_add_overflow(parent.lo, *off, &lo) ||
+        __builtin_add_overflow(lo, *n, &hi))
+      return unknown("the sub-buffer's range overflows");
+    ViewRange r;
+    r.known = true;
+    r.lo = lo;
+    r.hi = hi;
+    r.dims = sub;
+    r.rank = d;
+    r.storageElems = parent.storageElems;
+    return r;
+  }
+
+  // A ranged accessor, accessor(buffer &, [handler &,] range<D> accessRange,
+  // [id<D> accessOffset,] ...), or buffer::get_access(handler &, range,
+  // [id]): the box offset + [0, range) linearized against the buffer's
+  // range (its memory range). Any accessor stays inside its buffer: an
+  // index outside its range is UB (PI 7613-7622, 7673-7678), and the ranged
+  // constructors throw if the box exceeds the buffer (PI 7959-8062); so
+  // when the box is not known, the buffer's part is the answer.
+  if (role == "accessor.from_buffer" || role == "buffer.get_access") {
+    ViewRange parent = parentOf();
+    if (!parent.known)
+      return unknown("an accessor of a buffer whose part is not known: " +
+                     parent.why);
+    unsigned first = 2;
+    if (role == "accessor.from_buffer") {
+      unsigned arg = 0;
+      if (auto attr = callee->getAttrOfType<IntegerAttr>(
+              CIRDialect::getSYCLHostAPIArgAttrName()))
+        arg = attr.getInt();
+      first = self + 1 + arg + 1;
+    }
+    ViewRange coarse = parent;
+    coarse.dims.clear();
+    auto ops = rangeOperands(site, first, parent.rank);
+    if (!ops || ops->empty() || ops->size() > 2) {
+      coarse.why = "the access range operands have an unexpected shape";
+      return coarse;
+    }
+    unsigned d = (*ops)[0].size();
+    SmallVector<uint64_t, 3> range, offset(d, 0);
+    for (unsigned i = 0; i < d; ++i) {
+      std::optional<uint64_t> r = (*ops)[0][i];
+      std::optional<uint64_t> o = ops->size() == 2 && i < (*ops)[1].size()
+                                      ? (*ops)[1][i]
+                                      : std::optional<uint64_t>(0);
+      if (!r || !o || (ops->size() == 2 && (*ops)[1].size() != d)) {
+        coarse.why = "the access range or offset is not a constant";
+        return coarse;
+      }
+      range.push_back(*r);
+      offset[i] = *o;
+    }
+    if (d > 1 && parent.dims.size() != d) {
+      coarse.why = "the buffer's range is not known";
+      return coarse;
+    }
+    bool empty = llvm::is_contained(range, 0);
+    SmallVector<uint64_t, 3> last;
+    for (unsigned i = 0; i < d; ++i)
+      last.push_back(offset[i] + (empty ? 0 : range[i] - 1));
+    std::optional<uint64_t> lo = d == 1 ? std::optional<uint64_t>(offset[0])
+                                        : linearize(offset, parent.dims);
+    std::optional<uint64_t> hi = d == 1 ? std::optional<uint64_t>(last[0])
+                                        : linearize(last, parent.dims);
+    uint64_t absLo, absHi;
+    if (!lo || !hi || __builtin_add_overflow(parent.lo, *lo, &absLo) ||
+        __builtin_add_overflow(parent.lo, *hi, &absHi) ||
+        __builtin_add_overflow(absHi, empty ? 0 : 1, &absHi)) {
+      coarse.why = "the access range overflows";
+      return coarse;
+    }
+    ViewRange r;
+    r.known = true;
+    r.lo = absLo;
+    r.hi = absHi;
+    r.rank = d;
+    r.storageElems = parent.storageElems;
+    return r;
+  }
+  return unknown("the view is made by " +
+                 (role.empty() ? StringRef("an unknown call") : role) +
+                 ", which changes or hides its range");
+}
+
+bool SYCLHostFacts::sameMemory(const MemIdentity &a, const MemIdentity &b,
+                               bool assumeSpecHostPtrUB) {
+  // Whether two nodes are one object or share an allocation site.
+  auto shares = [](const Node *x, const Node *y) {
+    if (!x || !y)
+      return false;
+    if (x == y)
+      return true;
+    // Complete identities: a shared origin is a shared site.
+    for (const Origin &origin : x->getOrigins())
+      if (llvm::is_contained(y->getOrigins(), origin))
+        return true;
+    return false;
+  };
+  using Kind = MemIdentity::Kind;
+  if (a.kind == Kind::Storage && b.kind == Kind::Storage) {
+    if (shares(a.node, b.node)) {
+      // One storage: disjoint only if the parts the two accessors may
+      // access are, in units of one element type.
+      if (a.node != b.node || !a.rangesComparable || !b.rangesComparable ||
+          !a.range || !b.range)
+        return true;
+      auto [aLo, aHi] = *a.range;
+      auto [bLo, bHi] = *b.range;
+      return !((aHi && *aHi <= bLo) || (bHi && *bHi <= aLo));
+    }
+    if (shares(a.node, b.host) || shares(a.host, b.node))
+      return true;
+    if (!shares(a.host, b.host))
+      return false;
+    // Two storages over one host object (buffer(hostData, ...) twice): the
+    // runtime may use the host memory as either storage.
+    if (a.host != b.host || !a.hostOffset || !b.hostOffset)
+      return true;
+    // SPEC (PI 5358-5359): "Constructing more than one SYCL buffer managing
+    // the same host pointer is still undefined behavior."
+    if (*a.hostOffset == *b.hostOffset)
+      return !assumeSpecHostPtrUB;
+    return !((a.hostHi && *a.hostHi <= b.hostLo) ||
+             (b.hostHi && *b.hostHi <= a.hostLo));
+  }
+  for (const Node *x : {a.node, a.host})
+    for (const Node *y : {b.node, b.host})
+      if (shares(x, y))
+        return true;
   return false;
 }
 
@@ -658,7 +1103,7 @@ SYCLHostFacts::factsOfLaunch(const LaunchRecord &launch,
         d = {false, "'" + other.first + "' may alias it: " + other.second.what};
         break;
       }
-      if (sameMemory(id, other.second)) {
+      if (sameMemory(id, other.second, assumeSpecHostPtrUB)) {
         d = {false, "'" + name + "' and '" + other.first +
                         "' use the same memory, " + id.what};
         break;
@@ -773,33 +1218,6 @@ bool isNonNullAddress(Value value) {
     value = cast.getSrc();
   }
   return false;
-}
-
-/// The shape of a sycl::range<D> or sycl::id<D> record: D, and the type and
-/// size of its elements (a detail::array<D> holding an array of D
-/// integers).
-struct RangeShape {
-  unsigned dims = 0;
-  Type elem;
-  uint64_t elemSize = 0;
-};
-
-std::optional<RangeShape> getRangeShape(Type type, const DataLayout &layout) {
-  for (unsigned depth = 0; depth < 4; ++depth) {
-    if (auto array = dyn_cast_if_present<cir::ArrayType>(type)) {
-      auto elem = dyn_cast<cir::IntType>(array.getElementType());
-      if (!elem || array.getSize() < 1 || array.getSize() > 3)
-        return std::nullopt;
-      return RangeShape{static_cast<unsigned>(array.getSize()), elem,
-                        layout.getTypeSize(elem).getFixedValue()};
-    }
-    auto rec = dyn_cast_if_present<cir::RecordType>(type);
-    if (!rec || rec.isIncomplete() || rec.isUnion() ||
-        rec.getNumElements() != 1)
-      return std::nullopt;
-    type = rec.getElementType(0);
-  }
-  return std::nullopt;
 }
 
 } // namespace

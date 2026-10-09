@@ -78,6 +78,11 @@ GhostField cir::getSYCLStorageField() {
   return field;
 }
 
+GhostField cir::getSYCLViewField() {
+  static GhostField field = GhostField::get("$view");
+  return field;
+}
+
 GhostField cir::getSYCLHostField() {
   static GhostField field = GhostField::get("$host");
   return field;
@@ -247,6 +252,47 @@ static Cell makeGhost(const CallSiteRecord &site, ModelContext &ctx,
                       NodeFlags flags = NodeFlags::None) {
   return Cell(ctx.getGraph().makeNode(
       Origin{Origin::Kind::GhostSite, site.call}, NodeFlags::Ghost | flags));
+}
+
+/// Whether \p type is a pointer to a sycl::range or sycl::id record.
+static bool isRangeOrIdPointer(Type type) {
+  cir::RecordType rec = getPointeeRecord(type);
+  StringAttr name = rec ? rec.getName() : StringAttr();
+  if (!name)
+    return false;
+  StringRef n = name.getValue();
+  return n.starts_with("sycl::") && !n.contains("nd_range") &&
+         (n.contains("::range<") || n.contains("::id<"));
+}
+
+SmallVector<Value, 6> cir::getSYCLRangeOperands(Operation *call,
+                                                unsigned first) {
+  SmallVector<Value, 6> out;
+  auto op = dyn_cast_if_present<CIRCallOpInterface>(call);
+  if (!op)
+    return out;
+  for (unsigned i = first, e = op.getNumArgOperands(); i < e; ++i) {
+    Value arg = op.getArgOperand(i);
+    auto intTy = dyn_cast<cir::IntType>(arg.getType());
+    if ((intTy && intTy.getWidth() == 64) || isRangeOrIdPointer(arg.getType()))
+      out.push_back(arg);
+  }
+  return out;
+}
+
+/// The view (`$view` ghost link) a handle the call constructs from \p
+/// handle gets: a fresh view made at the call, whose own view is that of
+/// \p from (the buffer it is made from), if the call chooses a part of the
+/// storage or changes the element type; otherwise \p from's view.
+static Cell viewOf(const CallSiteRecord &site, ModelContext &ctx, Cell from,
+                   bool fresh, const Reason *why) {
+  Graph &graph = ctx.getGraph();
+  Cell parent = graph.getGhostLink(from, getSYCLViewField(), why);
+  if (!fresh)
+    return parent;
+  Cell view = makeGhost(site, ctx);
+  graph.setGhostLink(view, getSYCLViewField(), parent, why);
+  return view;
 }
 
 /// The operand holding the kernel (or command-group) function object of a
@@ -606,6 +652,9 @@ protected:
         written.push_back(self + 1);
       }
     graph.setGhostLink(*handle, getSYCLStorageField(), storage);
+    // The view of all of the storage, made at this call (SYCLHostFacts reads
+    // the buffer's range from its operands).
+    graph.setGhostLink(*handle, getSYCLViewField(), makeGhost(site, ctx));
     setRuntimeInternals(site, ctx, self, *handle);
     writeHandle(site, ctx, self, *handle);
     if (kind != Kind::Other)
@@ -628,8 +677,10 @@ private:
 /// "is a copy of the original SYCL buffer only" (PI 5356-5357); an accessor
 /// accesses the buffer it is constructed from (PI 7802ff,
 /// `table.accessors.command.buffer.constructors`), and get_access(handler&)
-/// is that constructor (PI 5703-5720). Sub-buffer ranges are not compared:
-/// the sub-buffer shares its parent's storage (conservative v1).
+/// is that constructor (PI 5703-5720). A sub-buffer shares its parent's
+/// storage; the part of it a handle gives access to is its `$view` (a fresh
+/// one for a sub-buffer, a reinterpreted buffer, and an accessor or
+/// get_access with an access range; see the file comment of the header).
 class ShareStorageModel : public RoleModel {
 public:
   enum class Shape {
@@ -681,6 +732,16 @@ protected:
                                        (role + ": same storage").str());
     Cell storage = graph.getGhostLink(*from, getSYCLStorageField(), why);
     graph.setGhostLink(*to, getSYCLStorageField(), storage, why);
+    // The view: a sub-buffer and a reinterpreted buffer get their own; an
+    // accessor or get_access with an access range gets its own (the range
+    // operands follow the buffer); every other shape shares from's.
+    bool freshView = false;
+    if (role == "buffer.sub" || role == "buffer.reinterpret")
+      freshView = true;
+    else if (role == "accessor.from_buffer" || role == "buffer.get_access")
+      freshView = !getSYCLRangeOperands(site.call, src + 1).empty();
+    graph.setGhostLink(*to, getSYCLViewField(),
+                       viewOf(site, ctx, *from, freshView, why), why);
     if (syncsHost)
       modRefHostMemory(graph, ctx, storage);
     setRuntimeInternals(site, ctx, dst, *to);
@@ -718,6 +779,8 @@ protected:
         ctx.makeReason(site, Reason::Kind::UnmodelledRole,
                        "accessor.other: storage not known"));
     ctx.getGraph().setGhostLink(*handle, getSYCLStorageField(), storage);
+    ctx.getGraph().setGhostLink(*handle, getSYCLViewField(),
+                                makeGhost(site, ctx));
     setRuntimeInternals(site, ctx, self, *handle);
     writeHandle(site, ctx, self, *handle);
     refOperands(site, ctx, {self});

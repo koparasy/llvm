@@ -18,6 +18,16 @@
 //    constructor that owns the storage. Copies share it (reference
 //    semantics). A handle without a `$storage` ghost link, or whose storage
 //    node has no origin, was not built by a model: its storage is unknown.
+//  - `$view` on a buffer or accessor handle: the part of its storage the
+//    handle gives access to, a Ghost node made by the call that chose it
+//    (SYCLHostFacts reads the range from that call's operands). A buffer
+//    constructor that owns its storage makes a view of all of it; a
+//    sub-buffer constructor, a ranged accessor constructor or
+//    buffer::get_access with a range makes a view whose own `$view` is the
+//    view of the buffer it was made from; reinterpret makes a view whose
+//    range is not known (the element type changes); copies share it. Every
+//    model that sets a handle's `$storage` sets its `$view`, so a handle
+//    unified with another has the views of both.
 //  - `$host` on a storage node: the host memory the runtime may use for it
 //    (buffer(hostData, ...)).
 //  - `$final` on a storage node: the memory buffer::set_final_data(T *) made
@@ -37,6 +47,7 @@
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToGraph.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <optional>
@@ -52,8 +63,22 @@ namespace cir {
 
 /// The ghost field a buffer or accessor handle's storage is reached through.
 pointsto::GhostField getSYCLStorageField();
+/// The ghost field a buffer or accessor handle's view of its storage is
+/// reached through (see the file comment).
+pointsto::GhostField getSYCLViewField();
 /// The ghost field a storage node's host memory is reached through.
 pointsto::GhostField getSYCLHostField();
+
+/// The operands of a SYCL host API call, from operand \p first on, that pass
+/// a sycl::range or sycl::id by value, in order: 64-bit integers (a range<D>
+/// or id<D> the ABI coerced to D integers) and pointers to a range or id
+/// record (one passed indirectly, or by reference). The other operands (the
+/// handler, property lists, code locations) are pointers to other records,
+/// and empty tag classes are dropped. A ranged accessor constructor and
+/// buffer::get_access(handler &, range, id) give the access range and then
+/// the access offset; the sub-buffer constructor &baseIndex and &subRange.
+llvm::SmallVector<mlir::Value, 6> getSYCLRangeOperands(mlir::Operation *call,
+                                                       unsigned first);
 /// The ghost field a storage node's set_final_data destination is reached
 /// through.
 pointsto::GhostField getSYCLFinalField();

@@ -1837,11 +1837,10 @@ StoredValueQuery &PointsToAnalysis::getStoredValueQuery() const {
   return *storedValues;
 }
 
-StoredValues PointsToAnalysis::valuesAtInContexts(Value addr,
-                                                  std::optional<uint64_t> size,
-                                                  Type type,
-                                                  unsigned *numContexts,
-                                                  Operation *at) const {
+StoredValues
+PointsToAnalysis::valuesAtInContexts(Value addr, std::optional<uint64_t> size,
+                                     Type type, unsigned *numContexts,
+                                     Operation *at, int64_t offset) const {
   if (numContexts)
     *numContexts = 0;
   StoredValues own;
@@ -1853,6 +1852,8 @@ StoredValues PointsToAnalysis::valuesAtInContexts(Value addr,
         bytes && *bytes > 0)
       size = static_cast<uint64_t>(*bytes);
   Cell cell = cellOf(addr);
+  if (cell && offset)
+    cell = Cell(cell.getNode(), cell.getOffset() + offset);
   if (!cell || !size) {
     own.setIncomplete(
         notAnalysedWhy ? notAnalysedWhy
@@ -1930,8 +1931,9 @@ StoredValues PointsToAnalysis::valuesAtInContexts(Value addr,
 
 std::optional<TypedAttr>
 PointsToAnalysis::isConstantAt(Value addr, std::optional<uint64_t> size,
-                               Type type, Operation *at) const {
-  StoredValues values = valuesAtInContexts(addr, size, type, nullptr, at);
+                               Type type, Operation *at, int64_t offset) const {
+  StoredValues values =
+      valuesAtInContexts(addr, size, type, nullptr, at, offset);
   if (!values.complete || !values.defs.empty() || values.consts.size() != 1)
     return std::nullopt;
   return values.consts.front();

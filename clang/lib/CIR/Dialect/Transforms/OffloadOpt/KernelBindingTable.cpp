@@ -490,7 +490,8 @@ std::string cir::getHostFactsAnalysisKey(const HostFactsOptions &options) {
   llvm::raw_string_ostream os(out);
   os << options.assumeClosedTU << options.bottomUp << options.subobjects
      << options.relevanceSlice << " " << options.budgetScale << " "
-     << options.maxSeconds << " " << options.maxMemoryMB;
+     << options.maxSeconds << " " << options.maxMemoryMB << " "
+     << options.assumeSpecHostPtrUB;
   return out;
 }
 

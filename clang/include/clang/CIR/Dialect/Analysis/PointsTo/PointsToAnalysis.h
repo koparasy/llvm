@@ -730,18 +730,22 @@ public:
   /// the own graph's answer).
   /// \p at, if given, is the op that reads the memory (a load of addr):
   /// the answer then holds just before it and may be a strong update
-  /// (StoredValueQuery::valuesAt).
+  /// (StoredValueQuery::valuesAt). \p offset: read the bytes that many
+  /// bytes past what \p addr points to (a member of the object; \p size
+  /// and \p type must then be given).
   StoredValues valuesAtInContexts(mlir::Value addr,
                                   std::optional<uint64_t> size = std::nullopt,
                                   mlir::Type type = {},
                                   unsigned *numContexts = nullptr,
-                                  mlir::Operation *at = nullptr) const;
+                                  mlir::Operation *at = nullptr,
+                                  int64_t offset = 0) const;
   /// The one constant the memory \p addr points to holds (just before
   /// \p at, if given), if valuesAtInContexts is complete with exactly one
   /// constant and no def.
   std::optional<mlir::TypedAttr>
   isConstantAt(mlir::Value addr, std::optional<uint64_t> size = std::nullopt,
-               mlir::Type type = {}, mlir::Operation *at = nullptr) const;
+               mlir::Type type = {}, mlir::Operation *at = nullptr,
+               int64_t offset = 0) const;
   /// The stored-value query engine (built on first use).
   StoredValueQuery &getStoredValueQuery() const;
 

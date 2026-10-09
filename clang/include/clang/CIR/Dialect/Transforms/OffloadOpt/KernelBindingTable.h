@@ -207,6 +207,11 @@ struct HostFactsOptions {
   // to no facts. 0: no limit.
   double maxSeconds = 120;
   unsigned maxMemoryMB = 8192;
+  // Two buffers constructed over equal host pointers are distinct storages:
+  // constructing more than one buffer managing the same host pointer is
+  // undefined behavior (SYCL 2020 PI 5358-5359, plan D1). On by default; the
+  // hidden -cir-offload-host-facts-host-ptr-ub=false turns it off.
+  bool assumeSpecHostPtrUB = true;
 };
 
 // The options that select one points-to analysis: every field but the mode,

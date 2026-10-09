@@ -80,6 +80,22 @@ public:
     /// Whether `node` (and `host`) each are one allocation and the field can
     /// only hold the value the analysed code gave it (see the .cpp file).
     bool complete = false;
+    /// A storage: the elements of the storage the accessor may access,
+    /// [lo, hi) in units of the storage's element type (hi std::nullopt: to
+    /// the end), if known; std::nullopt: anywhere in the storage. Only
+    /// comparable between identities whose storage nodes are equal and
+    /// `rangesComparable`.
+    std::optional<std::pair<uint64_t, std::optional<uint64_t>>> range;
+    /// Whether every origin of the storage is a call of one constructor, so
+    /// that the ranges of its views are in units of one element type.
+    bool rangesComparable = false;
+    /// A storage over host memory: the byte offset in `host` its host
+    /// pointer points to, if the analysis knows it exactly (`host` is
+    /// neither collapsed nor an array), and the bytes [hostLo, hostHi) of
+    /// `host` the accessor may access (hostHi std::nullopt: to the end).
+    std::optional<int64_t> hostOffset;
+    uint64_t hostLo = 0;
+    std::optional<uint64_t> hostHi;
     /// What the field refers to, for a complete identity ("buffer 'ba'
     /// (ghost n12)", "a USM allocation (n7)"), or why it is not complete.
     std::string what;
@@ -93,7 +109,7 @@ public:
   /// (addSYCLPointsToPlugin). The device kernels are the functions with a
   /// body under \p deviceScope whose arguments carry cir.sycl_kernel_param.
   SYCLHostFacts(const pointsto::PointsToAnalysis &analysis,
-                mlir::Operation *deviceScope);
+                mlir::Operation *deviceScope, bool assumeSpecHostPtrUB = true);
   ~SYCLHostFacts();
   SYCLHostFacts(const SYCLHostFacts &) = delete;
   SYCLHostFacts &operator=(const SYCLHostFacts &) = delete;
@@ -168,8 +184,13 @@ public:
   LaunchFacts factsOfLaunch(const pointsto::LaunchRecord &launch,
                             const SYCLNoAliasCandidates &candidates) const;
 
-  /// Whether two identities refer to the same memory: they share a node.
-  static bool sameMemory(const MemIdentity &a, const MemIdentity &b);
+  /// Whether two identities may refer to the same memory: they share a node
+  /// or an origin, unless they are two accessors of one storage whose ranges
+  /// are disjoint, or two storages over one host object whose host pointers
+  /// are equal (with \p assumeSpecHostPtrUB, see HostFactsOptions) or whose
+  /// host bytes are disjoint. See the .cpp file.
+  static bool sameMemory(const MemIdentity &a, const MemIdentity &b,
+                         bool assumeSpecHostPtrUB = true);
 
   /// The budgets of the points-to analysis that tripped so far
   /// (PointsToAnalysis::formatBudgetTrips), if they changed since the last
@@ -193,6 +214,39 @@ private:
                                                  bool storage, bool host) const;
   /// A short name of the allocation of \p node, for notes.
   std::string describeAllocation(const pointsto::Node *node) const;
+  /// The part of a storage a view (`$view` ghost node) gives access to.
+  struct ViewRange {
+    /// Whether [lo, hi) is known: the elements (of the storage's element
+    /// type) the view may access are in it. Otherwise: anywhere.
+    bool known = false;
+    uint64_t lo = 0;
+    /// std::nullopt: to the end of the storage.
+    std::optional<uint64_t> hi;
+    /// The view's own range per dimension (what an accessor's offset is
+    /// linearized against), if known; empty otherwise.
+    llvm::SmallVector<uint64_t, 3> dims;
+    /// The number of dimensions of the buffer, if known (0 otherwise).
+    unsigned rank = 0;
+    /// The elements of the whole storage, if known (the buffer's range).
+    std::optional<uint64_t> storageElems;
+    /// Why the range is not known, or what made it coarser.
+    std::string why;
+  };
+  /// The range of \p view inside \p storage (see the .cpp file).
+  ViewRange viewRange(const pointsto::Node *view, const pointsto::Node *storage,
+                      unsigned depth = 0) const;
+  /// The constant value of the range or id operand \p value of \p call
+  /// (a 64-bit integer, or component \p index of the range or id record a
+  /// pointer points to), if the stored-value queries prove one.
+  std::optional<uint64_t> rangeComponent(mlir::Value value, unsigned index,
+                                         mlir::Operation *call) const;
+  /// The \p dims components of each range or id operand of \p call from
+  /// operand \p first on (getSYCLRangeOperands): one entry per range, each
+  /// component std::nullopt if not constant. std::nullopt if the operands
+  /// do not group into ranges of \p dims components.
+  std::optional<
+      llvm::SmallVector<llvm::SmallVector<std::optional<uint64_t>, 3>, 2>>
+  rangeOperands(mlir::Operation *call, unsigned first, unsigned dims) const;
   /// Why the launches of \p kernel are not all known, or std::nullopt.
   std::optional<std::string> unknownLaunchWhy(llvm::StringRef kernel) const;
   /// The launch records that name \p kernel; \p why is set if they are not
@@ -217,6 +271,8 @@ private:
   mutable mlir::SymbolTableCollection symbols;
   /// Why there are no facts (the analysis gave up), or empty.
   std::string gaveUp;
+  /// HostFactsOptions::assumeSpecHostPtrUB.
+  bool assumeSpecHostPtrUB = true;
   /// The budget trips last reported (takeBudgetReport).
   mutable std::string reportedBudget;
 
