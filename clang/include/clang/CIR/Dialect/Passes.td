@@ -274,7 +274,26 @@ def CallConvLowering : Pass<"cir-call-conv-lowering", "mlir::ModuleOp"> {
 // The --cir-offload-host-facts options of the container passes that read
 // SYCL host facts from KernelBindingTable (see OffloadInferKernelParamNoAlias
 // for the noalias pass's own copy).
-defvar OffloadHostFactsOptions = [
+defvar OffloadHostFactsBudgetOptions = [
+  Option<"hostFactsBudgetScale", "host-facts-budget-scale", "double",
+         /*default=*/"1.0",
+         "Under ipo/both, multiply every budget of the points-to analysis by "
+         "this factor (PointsToAnalysisOptions::budgetScale; for tests).">,
+  Option<"hostFactsSlice", "host-facts-slice", "bool", /*default=*/"false",
+         "Under ipo/both, analyse only the functions that can matter to a "
+         "kernel launch (PointsToAnalysisOptions::relevanceSlice).">,
+  Option<"hostFactsMaxSeconds", "host-facts-max-seconds", "double",
+         /*default=*/"120",
+         "Under ipo/both, the wall-clock seconds the points-to analysis may "
+         "take; past it the bottom-up analysis falls back to the "
+         "context-insensitive one, and that to no facts (0: no limit).">,
+  Option<"hostFactsMaxMemoryMB", "host-facts-max-memory-mb", "unsigned",
+         /*default=*/"8192",
+         "Under ipo/both, the memory (MB) the points-to analysis may "
+         "allocate, with the same fallback (0: no limit).">,
+];
+
+defvar OffloadHostFactsOptions = !listconcat(OffloadHostFactsBudgetOptions, [
   Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"legacy\"",
          "Where the host facts come from: legacy (the KernelBindingTable "
          "trace), ipo (SYCLHostFacts, from points-to), or both (legacy is "
@@ -294,7 +313,7 @@ defvar OffloadHostFactsOptions = [
   Option<"hostFactsCensus", "host-facts-census", "bool", /*default=*/"false",
          "Under both, also emit one host-facts remark per fact on which the "
          "two sources agree.">,
-];
+]);
 
 def OffloadDeadKernelElimination
     : Pass<"cir-offload-dead-kernel-elimination", "mlir::ModuleOp"> {
@@ -431,6 +450,11 @@ def OffloadStampReqdWorkGroupSize
   let constructor = "mlir::createOffloadStampReqdWorkGroupSizePass()";
   let dependentDialects = ["cir::CIRDialect"];
   let options = OffloadHostFactsOptions;
+  let statistics = [
+    Statistic<"numHostFactsBuilt", "host-facts-analyses-built",
+              "Points-to analyses built for the host facts (0 when an "
+              "earlier container pass built the shared one)">
+  ];
 }
 
 def OffloadInferKernelParamNoAlias
@@ -457,7 +481,7 @@ def OffloadInferKernelParamNoAlias
   }];
   let constructor = "mlir::createOffloadInferKernelParamNoAliasPass()";
   let dependentDialects = ["cir::CIRDialect"];
-  let options = [
+  let options = !listconcat([
     Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"legacy\"",
            "Where the noalias fields come from: legacy (the "
            "KernelBindingTable trace), ipo (SYCLHostFacts, from points-to), "
@@ -480,6 +504,11 @@ def OffloadInferKernelParamNoAlias
     Option<"hostFactsCensus", "host-facts-census", "bool", /*default=*/"false",
            "Under both, also emit one host-facts remark per candidate field "
            "with both verdicts.">,
+  ], OffloadHostFactsBudgetOptions);
+  let statistics = [
+    Statistic<"numHostFactsBuilt", "host-facts-analyses-built",
+              "Points-to analyses built for the host facts (0 when an "
+              "earlier container pass built the shared one)">
   ];
 }
 
@@ -514,6 +543,11 @@ def OffloadPropagateSYCLKernelArgs
   let constructor = "mlir::createOffloadPropagateSYCLKernelArgsPass()";
   let dependentDialects = ["cir::CIRDialect"];
   let options = OffloadHostFactsOptions;
+  let statistics = [
+    Statistic<"numHostFactsBuilt", "host-facts-analyses-built",
+              "Points-to analyses built for the host facts (0 when an "
+              "earlier container pass built the shared one)">
+  ];
 }
 
 def OffloadDetectHostUniformIntDivisor

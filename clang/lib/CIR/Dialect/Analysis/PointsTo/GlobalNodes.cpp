@@ -11,15 +11,12 @@
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace cir;
 using namespace cir::pointsto;
-
-/// Aliases of aliases are followed this deep; deeper (or cyclic) chains give
-/// an unknown node.
-static constexpr unsigned kMaxAliasDepth = 8;
 
 //===----------------------------------------------------------------------===//
 // Constant attributes
@@ -258,11 +255,36 @@ Node *GlobalNodes::makeNode(FlatSymbolRefAttr sym, unsigned depth) {
     aliasee = global.getAliasee();
   else if (auto func = dyn_cast_if_present<cir::FuncOp>(target))
     aliasee = func.getAliasee();
-  if (aliasee && depth < kMaxAliasDepth) {
-    Node *node =
-        makeNode(FlatSymbolRefAttr::get(sym.getContext(), *aliasee), depth + 1);
-    nodes[sym] = node;
-    return node;
+  // An alias of an alias: follow the chain to the symbol it ends at (T19:
+  // a depth cap here gave the alias a node of its own, apart from its
+  // aliasee's, so two names of one object could be NoAlias). Only a cyclic
+  // chain, which names no object, gives an unknown node below.
+  if (aliasee) {
+    llvm::SmallPtrSet<Operation *, 8> seen;
+    if (target)
+      seen.insert(target);
+    FlatSymbolRefAttr end = FlatSymbolRefAttr::get(sym.getContext(), *aliasee);
+    bool cyclic = false;
+    while (true) {
+      Operation *at = lookup(end);
+      std::optional<StringRef> next;
+      if (auto global = dyn_cast_if_present<cir::GlobalOp>(at))
+        next = global.getAliasee();
+      else if (auto func = dyn_cast_if_present<cir::FuncOp>(at))
+        next = func.getAliasee();
+      if (!next)
+        break;
+      if (!seen.insert(at).second) {
+        cyclic = true;
+        break;
+      }
+      end = FlatSymbolRefAttr::get(sym.getContext(), *next);
+    }
+    if (!cyclic) {
+      Node *node = makeNode(end, depth + 1);
+      nodes[sym] = node;
+      return node;
+    }
   }
 
   Node *node;
@@ -281,7 +303,7 @@ Node *GlobalNodes::makeNode(FlatSymbolRefAttr sym, unsigned depth) {
     } else {
       graph.addFlags(Cell(node), NodeFlags::External | NodeFlags::Incomplete,
                      graph.makeReason(Reason::Kind::EscapedTo, target,
-                                      aliasee ? "alias chain too deep"
+                                      aliasee ? "cyclic alias chain"
                                               : "symbol not found"));
     }
   }

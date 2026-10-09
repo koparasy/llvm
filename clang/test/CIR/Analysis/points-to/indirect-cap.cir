@@ -1,5 +1,6 @@
 // RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1 print-stats=1' -cir-points-to-verify -o /dev/null | FileCheck %s
 // RUN: cir-opt %s -test-cir-points-to='mode=ci closed-tu=1 print-stats=1 max-indirect-rounds=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CAP
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1 print-cost=1 max-indirect-rounds=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=BUCAP
 
 // A chain of indirect calls that takes two rounds: the first call's only
 // target, @set, stores @target into the slot the second call loads its
@@ -27,6 +28,12 @@
 
 // CAP-LABEL: === TU graph
 // CAP: {{n[0-9]+}} [Stack|External|Mod|Ref] size=4 origins={stack(cir.alloca 'x' {{.*}})} links={} reasons={External: Budget(cir.call {{.*}}, "indirect-call rounds exhausted")
+// The same in BU mode, and the trip is counted (T19).
+// BUCAP-LABEL: === calls
+// BUCAP-NEXT: @main cir.call -> indirect -> {@set} [@set clone #{{[0-9]+}}]
+// BUCAP-NEXT: @main cir.call -> indirect-unresolved (Budget, "indirect-call rounds exhausted")
+// BUCAP: budget trips: indirect-rounds=1
+
 // CAP-LABEL: === calls
 // CAP-NEXT: @main cir.call -> indirect -> {@set}
 // CAP-NEXT: @main cir.call -> indirect-unresolved (Budget, "indirect-call rounds exhausted")

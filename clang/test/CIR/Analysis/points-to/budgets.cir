@@ -1,0 +1,144 @@
+// The budgets of the points-to analysis (T19). Each one, when it trips,
+// gives a sound, coarser answer and counts a trip; print-cost=1 prints the
+// trips ("budget trips:"), which the SYCL passes report as a remark
+// (sycl-host-facts-budgets.cir). The clone budgets are in ipo-bu-budget.cir,
+// maxQueryContexts in td-budget.cir, maxQueryVisits in
+// stored-value-budget.cir, maxIndirectRounds in indirect-cap.cir.
+//
+// The copy closure (GraphBudgets): too many offsets in one copy, or too many
+// rounds, and the copies are done field-insensitively (the two slots of dst
+// become one target).
+// RUN: cir-opt %s -test-cir-points-to='mode=ci subobjects=1 print-stats=1 print-cost=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=NORMAL
+// RUN: cir-opt %s -test-cir-points-to='mode=ci subobjects=1 print-stats=1 print-cost=1 max-transfer-slots=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefixes=SMASH,SLOTS
+// RUN: cir-opt %s -test-cir-points-to='mode=ci subobjects=1 print-stats=1 print-cost=1 max-transfer-rounds=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefixes=SMASH,ROUNDS
+//
+// The stored-value reads over subobjects: past maxAncestors a write cannot be
+// indexed at every ancestor (and a read cannot look in every one), past
+// maxReadHolders a read cannot gather every subobject: incomplete, Reason
+// Budget.
+// RUN: cir-opt %s -test-cir-points-to='mode=ci subobjects=1 values=1 print-graphs=0 print-cost=1 max-ancestors=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=VANC
+// RUN: cir-opt %s -test-cir-points-to='mode=ci subobjects=1 values=1 print-graphs=0 print-cost=1 max-read-holders=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=VHOLD
+//
+// Alias queries over subobjects: past maxAncestors a common ancestor may be
+// missing, so two members are MayAlias (not NoAlias).
+// RUN: cir-opt %S/subobj-alias.cir -test-cir-alias-analysis='points-to-only=1 closed-tu=1 subobjects=1 max-ancestors=1' -o /dev/null 2>&1 | FileCheck %s --check-prefix=AANC
+//
+// The depth of the walks up the copies (maxContextDepth): the top-down alias
+// query answers in the graph it reached (td-members.cir's @inner, two levels
+// below its callers: MayAlias instead of NoAlias), and the stored-value
+// query answers from the own graph or is incomplete
+// (stored-value-member.cir: no constant).
+// RUN: cir-opt %S/td-members.cir -test-cir-alias-analysis='points-to-only=1 mode=bu max-context-depth=1' -o /dev/null 2>&1 | FileCheck %s --check-prefix=TDDEPTH
+// RUN: cir-opt %S/stored-value-member.cir -test-cir-points-to='mode=bu closed-tu=1 values=1 print-graphs=0 print-cost=1 max-context-depth=0' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=VDEPTH
+//
+// budget-scale multiplies every budget (each kept at least 1): the stress
+// runs set them all tiny with it.
+// RUN: cir-opt %S/ipo-bu-budget.cir -test-cir-points-to='mode=bu closed-tu=1 print-graphs=0 print-cost=1 budget-scale=0.000001' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=SCALE
+//
+// The whole-analysis guard: past maxSeconds the analysis gives up, and
+// every query answers as for code it does not see.
+// RUN: cir-opt %S/ipo-bu-budget.cir -test-cir-points-to='mode=bu closed-tu=1 print-cost=1 max-seconds=0.000000001' -o /dev/null | FileCheck %s --check-prefix=GUARD
+// RUN: cir-opt %S/subobj-alias.cir -test-cir-alias-analysis='points-to-only=1 closed-tu=1 subobjects=1 budget-scale=0.000001' -o /dev/null 2>&1 | FileCheck %s --check-prefix=AANC
+//
+// The relevance slice (off by default): a callee is copied only if it can
+// matter to a kernel launch. ipo-bu-factory.cir launches nothing, so every
+// call is bound context-insensitively, the rule of a call over the clone
+// budget: @make's three objects in @f are one node, as in CI.
+// RUN: cir-opt %S/ipo-bu-factory.cir -test-cir-points-to='mode=bu closed-tu=1 print-cost=1 slice=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=SLICE
+
+// NORMAL: @slots slots.dst0 -> [[A:n[0-9]+]]+0 complete
+// NORMAL-NOT: @slots slots.dst1 -> [[A]]+0
+// NORMAL: @slots slots.dst1 -> n{{[0-9]+}}+0 complete
+// NORMAL: budget trips: none
+// NORMAL: copy closure settled: yes
+
+// SMASH: @slots slots.dst0 -> [[A:n[0-9]+]]+0 complete
+// SMASH-NEXT: @slots slots.dst1 -> [[A]]+0 complete
+// SLOTS: budget trips: transfer-slots={{[1-9][0-9]*}}
+// ROUNDS: budget trips: transfer-rounds={{[1-9][0-9]*}}
+
+// VANC: nested.a: {#cir.int<5> : !cir.int<s, 32>} defs=0 incomplete (Budget, "a write with too many ancestors to index (-max-ancestors)")
+// VANC: budget trips: value-ancestors={{[1-9][0-9]*}}
+// VHOLD: nested.a: {#cir.int<5> : !cir.int<s, 32>} defs=0 complete
+// VHOLD-NEXT: nested.whole: {} defs=0 incomplete (Budget, "a read of too many subobjects (-max-read-holders)")
+// VHOLD: budget trips: value-holders=1
+
+// AANC-LABEL: Testing : "nested"
+// AANC-DAG: wx#0 <-> sbr#0: MayAlias
+// AANC-DAG: saq#0 <-> sbr#0: MayAlias
+
+// TDDEPTH-LABEL: Testing : "inner"
+// TDDEPTH-NEXT: ia#0 <-> ib#0: MayAlias
+
+// VDEPTH: run.size: {} defs=0 incomplete
+// VDEPTH: main.a.size: {} defs=0 incomplete (Budget, "copies nested too deep")
+// VDEPTH: budget trips: context-depth={{[1-9][0-9]*}} value-depth={{[1-9][0-9]*}}
+
+// SCALE: budget trips: clone-nodes=1
+
+// SLICE: @f a -> [[N:n[0-9]+]]+0 complete
+// SLICE-NEXT: @f b -> [[N]]+0 complete
+// SLICE-NEXT: @f c -> [[N]]+0 complete
+// SLICE: relevance slice: 0 of {{[0-9]+}} functions, {{[1-9][0-9]*}} calls bound outside it
+
+// GUARD: budget trips: gave-up(the analysis ran past its time limit
+// GUARD-NEXT: gave up: the analysis ran past its time limit ({{.*}} s, -max-seconds)
+
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!void = !cir.void
+!rec_S = !cir.struct<"S" {data !cir.ptr<!s32i>, data !cir.ptr<!s32i>}>
+!rec_Inner = !cir.struct<"Inner" {data !s32i, data !s32i}>
+!rec_Outer = !cir.struct<"Outer" {data !rec_Inner, data !s32i}>
+
+module attributes {cir.int_type_width = 32 : i32, cir.size_type_width = 64 : i32} {
+cir.func @slots() {
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  %src = cir.alloca "src" align(8) : !cir.ptr<!rec_S>
+  %dst = cir.alloca "dst" align(8) : !cir.ptr<!rec_S>
+  %f0 = cir.get_member %src[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %a, %f0 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %f1 = cir.get_member %src[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %b, %f1 : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %s = cir.cast bitcast %src : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %d = cir.cast bitcast %dst : !cir.ptr<!rec_S> -> !cir.ptr<!void>
+  %len = cir.const #cir.int<16> : !u64i
+  cir.libc.memcpy %len bytes from %s to %d : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  %g0 = cir.get_member %dst[0] {name = "f0"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %p0 = cir.load %g0 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "slots.dst0"}
+  %g1 = cir.get_member %dst[1] {name = "f1"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %p1 = cir.load %g1 : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "slots.dst1"}
+  cir.return
+}
+// Copies that need two rounds: c <- b first (b has no link yet), then b <- a.
+cir.func @rounds() {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %pa = cir.alloca "pa" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %pb = cir.alloca "pb" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  %pc = cir.alloca "pc" align(8) : !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %x, %pa : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  %va = cir.cast bitcast %pa : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!void>
+  %vb = cir.cast bitcast %pb : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!void>
+  %vc = cir.cast bitcast %pc : !cir.ptr<!cir.ptr<!s32i>> -> !cir.ptr<!void>
+  %len = cir.const #cir.int<8> : !u64i
+  cir.libc.memcpy %len bytes from %vb to %vc : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  cir.libc.memcpy %len bytes from %va to %vb : !u64i, !cir.ptr<!void> -> !cir.ptr<!void>
+  %c = cir.load %pc : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i> {test.ptr = "rounds.c"}
+  cir.return
+}
+// A member of a member: o.in.a.
+cir.func @nested() -> !s32i {
+  %o = cir.alloca "o" align(4) : !cir.ptr<!rec_Outer>
+  %in = cir.get_member %o[0] {name = "in"} : !cir.ptr<!rec_Outer> -> !cir.ptr<!rec_Inner>
+  %a = cir.get_member %in[0] {name = "a"} : !cir.ptr<!rec_Inner> -> !cir.ptr<!s32i>
+  %k = cir.const #cir.int<5> : !s32i
+  cir.store %k, %a : !s32i, !cir.ptr<!s32i>
+  %v = cir.load %a : !cir.ptr<!s32i>, !s32i {test.load = "nested.a"}
+  %x = cir.get_member %o[1] {name = "x"} : !cir.ptr<!rec_Outer> -> !cir.ptr<!s32i>
+  %k2 = cir.const #cir.int<6> : !s32i
+  cir.store %k2, %x : !s32i, !cir.ptr<!s32i>
+  %w = cir.load %o : !cir.ptr<!rec_Outer>, !rec_Outer {test.load = "nested.whole"}
+  cir.return %v : !s32i
+}
+}

@@ -13,7 +13,7 @@
 // CHECK-NEXT: @f b -> [[N]]+0 complete
 // CHECK-NEXT: @f c -> [[N]]+0 complete
 // CHECK-LABEL: === calls
-// CHECK: @f cir.call @make -> direct @make [merged (Budget, "@make: the copy would exceed the clone budget")]
+// CHECK: @f cir.call @make -> direct @make [merged (Budget, "@make: the copy would exceed the clone budget (-max-clone-nodes)")]
 // CHECK-NEXT: @f cir.call @make -> direct @make [merged (MergedAt, "@make")]
 // CHECK-NEXT: @f cir.call @make -> direct @make [merged (MergedAt, "@make")]
 // CHECK-LABEL: --- bu stats
@@ -27,7 +27,7 @@
 // TOTAL-LABEL: === calls
 // TOTAL: @f cir.call @make -> direct @make [clone #{{[0-9]+}}]
 // TOTAL-NEXT: @f cir.call @make -> direct @make [clone #{{[0-9]+}}]
-// TOTAL-NEXT: @f cir.call @make -> direct @make [merged (Budget, "@make: the copy would exceed the clone budget")]
+// TOTAL-NEXT: @f cir.call @make -> direct @make [merged (Budget, "@make: the copy would exceed the total clone budget (-max-total-clone-nodes)")]
 // TOTAL-LABEL: --- bu stats
 // TOTAL: copies of callee graphs: 2
 // TOTAL: copied nodes: 2

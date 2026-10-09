@@ -105,9 +105,15 @@ static StringRef getRole(cir::FuncOp func) {
   return role ? role.getValue() : StringRef();
 }
 
-static cir::FuncOp lookupCallee(Operation *at, FlatSymbolRefAttr sym) {
+/// The function \p sym names from \p at, through \p symbols if given (the
+/// analysis' symbol tables: MLIR's lookupNearestSymbolFrom scans the module,
+/// which on a big TU is most of the analysis time).
+static cir::FuncOp lookupCallee(Operation *at, FlatSymbolRefAttr sym,
+                                SymbolTableCollection *symbols = nullptr) {
   if (!at || !sym)
     return {};
+  if (symbols)
+    return symbols->lookupNearestSymbolFrom<cir::FuncOp>(at, sym);
   return SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(at, sym);
 }
 
@@ -342,7 +348,8 @@ static std::optional<CGFOperand> findCGFOperand(const CallSiteRecord &site,
 /// pointee of the kernel operand of a hostkernel.ctor call on the object
 /// \p wrapper addresses (through base-class and cast steps), in the same
 /// function. Null if there is none.
-static Type findWrappedKernelType(Value wrapper) {
+static Type findWrappedKernelType(Value wrapper,
+                                  SymbolTableCollection *symbols) {
   for (unsigned i = 0; i < 8 && wrapper; ++i) {
     Operation *def = wrapper.getDefiningOp();
     if (auto base = dyn_cast_if_present<cir::BaseClassAddrOp>(def))
@@ -357,8 +364,8 @@ static Type findWrappedKernelType(Value wrapper) {
     auto call = dyn_cast<CIRCallOpInterface>(user);
     if (!call || call.isIndirect())
       continue;
-    cir::FuncOp ctor =
-        lookupCallee(call, call->getAttrOfType<FlatSymbolRefAttr>("callee"));
+    cir::FuncOp ctor = lookupCallee(
+        call, call->getAttrOfType<FlatSymbolRefAttr>("callee"), symbols);
     if (getRole(ctor) != "hostkernel.ctor")
       continue;
     unsigned self = hasSRet(ctor) ? 1 : 0;
@@ -373,24 +380,30 @@ static Type findWrappedKernelType(Value wrapper) {
 }
 
 /// The kernels the launch function \p callee names: the kernel.info markers
-/// its body (and the bodies it calls directly, transitively) calls.
+/// its body (and the bodies it calls directly, transitively) calls. Sets
+/// \p truncated if the walk stopped at its depth cap, so that the names
+/// may be only some of them.
 static void collectKernelNames(cir::FuncOp callee,
                                SmallVectorImpl<StringAttr> &out,
                                llvm::DenseSet<Operation *> &visited,
+                               SymbolTableCollection *symbols, bool &truncated,
                                unsigned depth = 0) {
   constexpr unsigned kMaxDepth = 16;
-  if (!callee || callee.isDeclaration() || depth > kMaxDepth ||
-      !visited.insert(callee).second)
+  if (!callee || callee.isDeclaration() || !visited.insert(callee).second)
     return;
+  if (depth > kMaxDepth) {
+    truncated = true;
+    return;
+  }
   callee.walk([&](CIRCallOpInterface call) {
     if (call.isIndirect())
       return;
-    cir::FuncOp target =
-        lookupCallee(call, call->getAttrOfType<FlatSymbolRefAttr>("callee"));
+    cir::FuncOp target = lookupCallee(
+        call, call->getAttrOfType<FlatSymbolRefAttr>("callee"), symbols);
     if (!target)
       return;
     if (getRole(target) == "kernel.info") {
-      std::string name = getSYCLKernelInfoName(target);
+      std::string name = getSYCLKernelInfoName(target, symbols);
       if (name.empty())
         return;
       auto attr = StringAttr::get(callee.getContext(), name);
@@ -398,17 +411,22 @@ static void collectKernelNames(cir::FuncOp callee,
         out.push_back(attr);
       return;
     }
-    collectKernelNames(target, out, visited, depth + 1);
+    collectKernelNames(target, out, visited, symbols, truncated, depth + 1);
   });
 }
 
-std::string cir::getSYCLKernelInfoName(cir::FuncOp kernelInfo) {
+std::string cir::getSYCLKernelInfoName(cir::FuncOp kernelInfo,
+                                       SymbolTableCollection *symbols) {
   std::string result;
   if (!kernelInfo || kernelInfo.isDeclaration())
     return result;
+  auto lookupGlobal = [&](Operation *at, FlatSymbolRefAttr sym) {
+    return symbols
+               ? symbols->lookupNearestSymbolFrom<cir::GlobalOp>(at, sym)
+               : SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(at, sym);
+  };
   kernelInfo.walk([&](cir::GetGlobalOp getGlobal) {
-    auto global = SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
-        getGlobal, getGlobal.getNameAttr());
+    auto global = lookupGlobal(getGlobal, getGlobal.getNameAttr());
     std::optional<Attribute> init =
         global ? global.getInitialValue() : std::nullopt;
     auto info = init ? dyn_cast<cir::ConstRecordAttr>(*init) : nullptr;
@@ -418,9 +436,8 @@ std::string cir::getSYCLKernelInfoName(cir::FuncOp kernelInfo) {
     if (!view || view.getMembers().empty())
       return WalkResult::advance();
     auto str = dyn_cast<cir::GlobalViewAttr>(view.getMembers()[0]);
-    auto strGlobal = str ? SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
-                               global, str.getSymbol())
-                         : cir::GlobalOp();
+    auto strGlobal =
+        str ? lookupGlobal(global, str.getSymbol()) : cir::GlobalOp();
     std::optional<Attribute> strInit =
         strGlobal ? strGlobal.getInitialValue() : std::nullopt;
     auto chars = strInit ? dyn_cast<cir::ConstArrayAttr>(*strInit) : nullptr;
@@ -509,7 +526,8 @@ public:
   StringRef specCitation() const override { return citation; }
 
   void apply(CallSiteRecord &site, ModelContext &ctx) const override {
-    if (applyRole(site, ctx, lookupCallee(site.call, site.callee)))
+    if (applyRole(site, ctx,
+                  lookupCallee(site.call, site.callee, ctx.getSymbols())))
       return;
     ctx.applyUnknownCall(
         site,
@@ -812,8 +830,19 @@ protected:
     LaunchRecord launch;
     launch.call = site.call;
     launch.model = role;
-    llvm::DenseSet<Operation *> visited;
-    collectKernelNames(callee, launch.kernelNames, visited);
+    // The names depend only on the callee's body: computed once per callee.
+    auto [it, inserted] = kernelNamesOf.try_emplace(callee.getOperation());
+    if (inserted) {
+      llvm::DenseSet<Operation *> visited;
+      bool truncated = false;
+      collectKernelNames(callee, it->second, visited, ctx.getSymbols(),
+                         truncated);
+      // SOUNDNESS: some of the kernels may be missing; a record without
+      // names may launch any kernel (SYCLHostFacts).
+      if (truncated)
+        it->second.clear();
+    }
+    launch.kernelNames = it->second;
     std::optional<unsigned> functor = findFunctorOperand(site, first);
     if (!functor) {
       ctx.recordLaunch(std::move(launch));
@@ -850,6 +879,8 @@ protected:
 
 private:
   bool isMethod;
+  /// collectKernelNames per callee.
+  mutable llvm::DenseMap<Operation *, SmallVector<StringAttr, 2>> kernelNamesOf;
 };
 
 /// launch.direct_impl: the runtime entry point of launch.direct (the queue
@@ -874,10 +905,11 @@ protected:
               call.getArgOperand(i).getDefiningOp<CIRCallOpInterface>())
         if (!marker.isIndirect()) {
           cir::FuncOp info = lookupCallee(
-              marker, marker->getAttrOfType<FlatSymbolRefAttr>("callee"));
+              marker, marker->getAttrOfType<FlatSymbolRefAttr>("callee"),
+              ctx.getSymbols());
           if (getRole(info) != "kernel.info")
             continue;
-          std::string name = getSYCLKernelInfoName(info);
+          std::string name = getSYCLKernelInfoName(info, ctx.getSymbols());
           auto attr = StringAttr::get(call.getContext(), name);
           if (!name.empty() && !llvm::is_contained(launch.kernelNames, attr))
             launch.kernelNames.push_back(attr);
@@ -889,7 +921,8 @@ protected:
       if (std::optional<Cell> kernel =
               ctx.getGraph().lookupGhostLink(cell, getSYCLKernelField())) {
         launch.closure = *kernel;
-        launch.closureType = findWrappedKernelType(call.getArgOperand(i));
+        launch.closureType =
+            findWrappedKernelType(call.getArgOperand(i), ctx.getSymbols());
         wrapper = i;
       }
     });

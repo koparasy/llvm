@@ -127,6 +127,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -212,6 +213,54 @@ struct TestCIRPointsToPass
   Option<unsigned> maxQueryVisits{
       *this, "max-query-visits",
       llvm::cl::desc("The stored-value query budget"), llvm::cl::init(4096)};
+  // The other budgets (T19), the relevance slice and the guard.
+  Option<double> budgetScale{
+      *this, "budget-scale",
+      llvm::cl::desc("Multiply every budget by this factor "
+                     "(PointsToAnalysisOptions::budgetScale)"),
+      llvm::cl::init(1.0)};
+  Option<unsigned> maxTransferSlots{
+      *this, "max-transfer-slots",
+      llvm::cl::desc("The most offsets one copy relates one by one"),
+      llvm::cl::init(GraphBudgets().maxTransferSlots)};
+  Option<unsigned> maxTransferRounds{
+      *this, "max-transfer-rounds",
+      llvm::cl::desc("The most rounds of the copy closure"),
+      llvm::cl::init(GraphBudgets().maxTransferRounds)};
+  Option<unsigned> maxContextDepth{
+      *this, "max-context-depth",
+      llvm::cl::desc("In bu mode, the deepest chain of copies a query walks"),
+      llvm::cl::init(PointsToAnalysisOptions().maxContextDepth)};
+  Option<unsigned> maxAncestors{
+      *this, "max-ancestors",
+      llvm::cl::desc("The most ancestors a query looks at"),
+      llvm::cl::init(PointsToAnalysisOptions().maxAncestors)};
+  Option<unsigned> maxReadHolders{
+      *this, "max-read-holders",
+      llvm::cl::desc("The most nodes a stored-value read gathers"),
+      llvm::cl::init(PointsToAnalysisOptions().maxReadHolders)};
+  Option<unsigned> maxQueryContexts{
+      *this, "max-query-contexts",
+      llvm::cl::desc("In bu mode, the most calling contexts per query"),
+      llvm::cl::init(PointsToAnalysisOptions().maxQueryContexts)};
+  Option<bool> slice{
+      *this, "slice",
+      llvm::cl::desc("In bu mode, copy only the callees in the relevance "
+                     "slice (PointsToAnalysisOptions::relevanceSlice)"),
+      llvm::cl::init(false)};
+  Option<double> maxSeconds{
+      *this, "max-seconds",
+      llvm::cl::desc("The analysis' wall-clock guard (0: none)"),
+      llvm::cl::init(0)};
+  Option<unsigned> maxMemoryMB{
+      *this, "max-memory-mb",
+      llvm::cl::desc("The analysis' memory guard in MB (0: none)"),
+      llvm::cl::init(0)};
+  Option<bool> printCost{
+      *this, "print-cost",
+      llvm::cl::desc("Print the budget trips, the relevance slice and the "
+                     "time of each phase"),
+      llvm::cl::init(false)};
 
   void runOnOperation() override;
   void runLocal();
@@ -412,6 +461,45 @@ static void printTagged(raw_ostream &os, cir::FuncOp func, StringRef prefix,
   });
 }
 
+/// The budget trips, the slice and the phase times (print-cost=1). The times
+/// vary from run to run; tests check the other lines.
+static void printCostReport(raw_ostream &os, const PointsToAnalysis &analysis) {
+  const PointsToAnalysisStats &st = analysis.getStats();
+  os << "--- cost\n";
+  std::string trips = analysis.formatBudgetTrips();
+  os << "budget trips: " << (trips.empty() ? "none" : trips) << "\n";
+  if (const Reason *why = analysis.getGaveUpReason())
+    os << "gave up: " << why->detail << "\n";
+  if (analysis.getOptions().relevanceSlice)
+    os << "relevance slice: " << st.numRelevantFunctions << " of "
+       << st.numFunctions << " functions, " << st.numSliceBindings
+       << " calls bound outside it\n";
+  os << "fixpoint rounds: " << st.numFixpointRounds << "\n";
+  std::string largest = "-";
+  if (auto f = dyn_cast_if_present<cir::FuncOp>(st.maxSCCClonedFunc))
+    largest = ("@" + f.getSymName()).str();
+  os << "most copied nodes in one SCC: " << st.maxSCCClonedNodes << " "
+     << largest << "\n";
+  auto line = [&](StringRef name, double seconds) {
+    os << "time " << name << ": " << llvm::format("%.4f", seconds) << "\n";
+  };
+  line("total", st.totalSeconds);
+  line("local graphs", st.buildLocalSeconds);
+  line("copies", st.cloneSeconds);
+  line("ci binding", st.bindSeconds);
+  line("fixpoint", st.fixpointSeconds);
+  line("  propagate", st.propagateSeconds);
+  line("  clobber globals", st.clobberSeconds);
+  line("  indirect calls", st.indirectSeconds);
+  line("  escaped functions", st.escapedSeconds);
+  line("  plug-in rule", st.extraRuleSeconds);
+  line("  project copies", st.projectSeconds);
+  line("  absorb subobjects", st.absorbSeconds);
+  line("  copy closure", st.transferSeconds);
+  line("summaries", st.summarySeconds);
+  line("covering launches", st.coveringSeconds);
+}
+
 void TestCIRPointsToPass::runCI() {
   raw_ostream &os = llvm::outs();
   PointsToModelRegistry registry;
@@ -427,6 +515,17 @@ void TestCIRPointsToPass::runCI() {
     options.maxCloneNodes = maxCloneNodes;
     options.maxTotalCloneNodes = maxTotalCloneNodes;
   }
+  options.maxQueryVisits = maxQueryVisits;
+  options.maxQueryContexts = maxQueryContexts;
+  options.graphBudgets.maxTransferSlots = maxTransferSlots;
+  options.graphBudgets.maxTransferRounds = maxTransferRounds;
+  options.maxContextDepth = maxContextDepth;
+  options.maxAncestors = maxAncestors;
+  options.maxReadHolders = maxReadHolders;
+  options.budgetScale = budgetScale;
+  options.relevanceSlice = slice;
+  options.maxSeconds = maxSeconds;
+  options.maxMemoryMB = maxMemoryMB;
   if (syclModels)
     cir::addSYCLPointsToPlugin(options);
   bool anyFailed = false;
@@ -535,7 +634,6 @@ void TestCIRPointsToPass::runCI() {
 
     if (printValues) {
       os << "=== values\n";
-      analysis.getStoredValueQuery().setMaxQueryVisits(maxQueryVisits);
       module.walk([&](cir::LoadOp load) {
         auto name = load->getAttrOfType<StringAttr>("test.load");
         if (!name)
@@ -614,6 +712,8 @@ void TestCIRPointsToPass::runCI() {
     if (syclModels)
       printLaunches(os, module, analysis);
 
+    if (printCost)
+      printCostReport(os, analysis);
     if (!printStats)
       continue;
     const PointsToAnalysisStats &stats = analysis.getStats();

@@ -40,6 +40,7 @@
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/Passes.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLHostFacts.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 
 namespace mlir {
@@ -79,15 +80,31 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
     return signalPassFailure();
   }
   // The legacy table is the cached analysis the other container passes share;
-  // the other modes build their own (only the noalias fields differ).
+  // the other modes build their own (only the noalias fields differ), on the
+  // host facts the container passes share (SYCLHostFactsCache).
   std::optional<cir::KernelBindingTable> ownTable;
+  cir::SYCLHostFactsCache *factsCache = nullptr;
   if (*mode != cir::HostFactsMode::Legacy) {
     cir::HostFactsOptions options;
     options.mode = *mode;
     options.assumeClosedTU = hostFactsClosedTU;
     options.bottomUp = hostFactsBottomUp;
     options.subobjects = hostFactsSubobjects;
-    ownTable.emplace(container, options);
+    options.budgetScale = hostFactsBudgetScale;
+    options.relevanceSlice = hostFactsSlice;
+    options.maxSeconds = hostFactsMaxSeconds;
+    options.maxMemoryMB = hostFactsMaxMemoryMB;
+    factsCache = &getAnalysis<cir::SYCLHostFactsCache>();
+    unsigned builtBefore = factsCache->getNumBuilt();
+    ownTable.emplace(container, options, factsCache);
+    numHostFactsBuilt += factsCache->getNumBuilt() - builtBefore;
+    // The budgets that tripped while this table was built (once per
+    // change: the passes share the analysis).
+    if (std::optional<std::string> trips =
+            factsCache->get(options).takeBudgetReport())
+      mlir::emitRemark(container.getLoc())
+          << "host-facts budget trips: " << *trips << " "
+          << cir::formatHostFactsOptions(options);
   }
   cir::KernelBindingTable &table =
       ownTable ? *ownTable : getAnalysis<cir::KernelBindingTable>();
@@ -222,6 +239,8 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
           container, binding, binding.launchSites,
           "noalias." + std::to_string(specTag++));
       if (spec) {
+        if (factsCache)
+          factsCache->recordSpecialization(spec->name, entry.first);
         decide(spec->deviceKernels, binding, /*stamp=*/true, "");
         changed = true; // The clone + redirect mutated the IR regardless.
       } else {
@@ -234,6 +253,10 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
 
   if (!changed)
     markAllAnalysesPreserved();
+  else
+    // SOUNDNESS: see SYCLHostFactsCache: the stamps and the specializations
+    // leave the host facts true.
+    markAnalysesPreserved<cir::SYCLHostFactsCache>();
 }
 
 } // namespace

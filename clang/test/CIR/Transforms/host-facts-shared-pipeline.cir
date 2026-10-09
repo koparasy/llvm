@@ -1,0 +1,29 @@
+// The container passes share one points-to analysis (SYCLHostFactsCache),
+// kept across the passes that change the container: the noalias pass
+// specializes a kernel visible to other TUs (a device copy, host globals and
+// a getter copy, its launches redirected), then the constant pass and the
+// noalias pass run again on the facts built before the specialization. They
+// must give what each pass gives on a fresh analysis of the changed IR.
+//
+// RUN: cir-opt %S/infer-kernel-param-noalias-accessor.cir -split-input-file \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-infer-kernel-param-noalias{host-facts=ipo},cir-offload-propagate-sycl-kernel-args{host-facts=ipo},cir-offload-infer-kernel-param-noalias{host-facts=ipo})" \
+// RUN:   -o %t.shared.cir 2> %t.shared.log
+// RUN: cir-opt %S/infer-kernel-param-noalias-accessor.cir -split-input-file \
+// RUN:   -cir-offload-infer-kernel-param-noalias='host-facts=ipo' -o %t.1.cir 2> %t.1.log
+// RUN: cir-opt %t.1.cir -split-input-file -cir-offload-propagate-sycl-kernel-args='host-facts=ipo' \
+// RUN:   -o %t.2.cir 2> %t.2.log
+// RUN: cir-opt %t.2.cir -split-input-file -cir-offload-infer-kernel-param-noalias='host-facts=ipo' \
+// RUN:   -o %t.fresh.cir 2> %t.3.log
+// RUN: diff %t.shared.cir %t.fresh.cir
+// RUN: cat %t.1.log %t.2.log %t.3.log | grep 'remark:' | sed 's/^.*remark:/remark:/' | sort > %t.fresh.log
+// RUN: grep 'remark:' %t.shared.log | sed 's/^.*remark:/remark:/' | sort | diff - %t.fresh.log
+// RUN: FileCheck %s --input-file=%t.shared.cir
+
+// The specialization happened, and the second noalias run specialized the
+// copy again: a copy of a copy, whose facts the cache reads under the
+// original name through both (so the checks above are not vacuous).
+// CHECK: cir.func @_Z9accKernelv.spec.noalias.0(
+// CHECK: cir.func @_Z9accKernelv.spec.noalias.0.spec.noalias.0(
+// RUN: FileCheck %s --check-prefix=REMARK --input-file=%t.shared.log
+// REMARK: kernel @_Z9accKernelv.spec.noalias.0 arg 0 (accessor 'A'): noalias (buffer 'ba'
+// REMARK: kernel @_Z9accKernelv.spec.noalias.0.spec.noalias.0 arg 0 (accessor 'A'): already noalias

@@ -22,8 +22,13 @@
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/DebugLog.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 
 #define DEBUG_TYPE "cir-points-to"
 
@@ -57,10 +62,40 @@ StringRef cir::pointsto::getPointsToModeName(PointsToMode mode) {
   llvm_unreachable("unknown points-to mode");
 }
 
+/// \p options with every budget multiplied by its budgetScale, each kept at
+/// least 1 (see PointsToAnalysisOptions::budgetScale).
+static PointsToAnalysisOptions applyBudgetScale(PointsToAnalysisOptions o) {
+  if (o.budgetScale == 1.0)
+    return o;
+  auto scale = [&](auto &budget) {
+    using T = std::remove_reference_t<decltype(budget)>;
+    double scaled = std::floor(static_cast<double>(budget) * o.budgetScale);
+    budget = static_cast<T>(std::max(1.0, scaled));
+  };
+  scale(o.maxCloneNodes);
+  scale(o.maxTotalCloneNodes);
+  scale(o.maxIndirectRounds);
+  scale(o.maxQueryContexts);
+  scale(o.maxQueryVisits);
+  scale(o.maxContextDepth);
+  scale(o.maxAncestors);
+  scale(o.maxReadHolders);
+  scale(o.graphBudgets.maxTransferSlots);
+  scale(o.graphBudgets.maxTransferRounds);
+  return o;
+}
+
+double cir::pointsto::ScopedPhaseTimer::now() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 PointsToAnalysis::PointsToAnalysis(ModuleOp module,
                                    const PointsToModelRegistry *models,
                                    PointsToAnalysisOptions options)
-    : module(module), models(models), options(options) {
+    : module(module), models(models), baseModels(models),
+      options(applyBudgetScale(options)) {
   if (this->options.extraModels) {
     ownedModels = std::make_unique<PointsToModelRegistry>();
     this->options.extraModels(*ownedModels);
@@ -111,7 +146,7 @@ ObjectSet PointsToAnalysis::pointsTo(Value value) const {
 
 ObjectSet PointsToAnalysis::objectsAt(Cell cell) const {
   ObjectSet set;
-  if (!cell) {
+  if (!cell || gaveUpWhy) {
     set.complete = false;
     set.why = notAnalysedWhy;
     return set;
@@ -192,6 +227,9 @@ void PointsToAnalysis::run() {
       cir::PointerType::get(cir::VoidType::get(module.getContext()));
   unsigned pointerSize = dataLayout->getTypeSize(voidPtrTy).getFixedValue();
   graph = std::make_unique<Graph>(pointerSize, &reasons);
+  graph->setBudgets(options.graphBudgets);
+  guardStartSeconds = ScopedPhaseTimer::now();
+  guardStartBytes = llvm::sys::Process::GetMallocUsage();
   notAnalysedWhy =
       reasons.make(Reason::Kind::UnhandledOp, nullptr, "value not analysed");
   globals = std::make_unique<GlobalNodes>(*graph, *dataLayout, symbols, module);
@@ -249,6 +287,10 @@ void PointsToAnalysis::run() {
     }
   };
 
+  // The relevance slice (BU): which functions' graphs are copied.
+  if (options.mode == PointsToMode::BU && options.relevanceSlice)
+    computeRelevance(sccs);
+
   llvm::TimeRecord localStart = llvm::TimeRecord::getCurrentTime(true);
   if (options.mode == PointsToMode::BU) {
     graph->enableSharedTracking();
@@ -264,6 +306,8 @@ void PointsToAnalysis::run() {
   } else {
     for (ArrayRef<cir::FuncOp> scc : sccs)
       for (cir::FuncOp func : scc) {
+        if (guardTripped())
+          break;
         bool complete = (options.assumeClosedTU ||
                          visibleCallers.contains(func.getOperation())) &&
                         !unboundCallers.contains(func.getOperation());
@@ -277,14 +321,31 @@ void PointsToAnalysis::run() {
 
     // Context-insensitive binding: every caller shares the callee's formals
     // and return cell. Unification only merges, so one pass is enough.
-    stats.numBindings = bindCalls(/*dryRun=*/false);
+    if (!gaveUpWhy) {
+      ScopedPhaseTimer timer(stats.bindSeconds);
+      stats.numBindings = bindCalls(/*dryRun=*/false);
+    }
 
     // The bindings added links on both sides of the copies: relate the new
     // offsets.
     stats.transfersSettled = closeMemTransfers(*graph, memTransfers);
   }
 
+  // The guard tripped: the graph is not finished and is not used (see
+  // getGaveUpReason). No query may read it.
+  auto giveUp = [&] {
+    scalarMap.clear();
+    aggregateMap.clear();
+    notAnalysedWhy = gaveUpWhy;
+    llvm::TimeRecord total = llvm::TimeRecord::getCurrentTime(false);
+    total -= start;
+    stats.totalSeconds = total.getWallTime();
+  };
+  if (guardTripped(/*force=*/true))
+    return giveUp();
   runFixpoint();
+  if (gaveUpWhy)
+    return giveUp();
   for (std::unique_ptr<TUFunction> &fn : functions)
     for (TUCallSite &call : fn->callSites) {
       if (call.resolution == CallResolution::Indirect)
@@ -294,9 +355,13 @@ void PointsToAnalysis::run() {
     }
 
   // The graph is final: no rule merges nodes any more.
-  computeRecursion();
-  markSummaries();
+  {
+    ScopedPhaseTimer timer(stats.summarySeconds);
+    computeRecursion();
+    markSummaries();
+  }
   if (options.mode == PointsToMode::BU) {
+    ScopedPhaseTimer timer(stats.coveringSeconds);
     computeCoveringLaunches();
     stats.numCallPaths = callPaths.size();
     stats.numLaunchInstances = launches.size();
@@ -325,6 +390,65 @@ void PointsToAnalysis::run() {
   llvm::TimeRecord total = llvm::TimeRecord::getCurrentTime(false);
   total -= start;
   stats.totalSeconds = total.getWallTime();
+}
+
+std::string PointsToAnalysis::formatBudgetTrips() const {
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  auto add = [&](StringRef budget, size_t count) {
+    if (!count)
+      return;
+    if (!out.empty())
+      os << " ";
+    os << budget << "=" << count;
+  };
+  if (gaveUpWhy)
+    os << "gave-up(" << gaveUpWhy->detail << ")";
+  add("clone-nodes", stats.numBudgetBindings - stats.numTotalBudgetBindings);
+  add("total-clone-nodes", stats.numTotalBudgetBindings);
+  add("indirect-rounds", stats.numIndirectBudget);
+  add("transfer-slots", graph ? graph->getBudgets().numTransferSlotTrips : 0);
+  add("transfer-rounds", graph ? graph->getBudgets().numTransferRoundTrips : 0);
+  add("query-contexts", queryStats.numBudgetHits);
+  add("context-depth", queryStats.numDepthHits);
+  add("ancestors", queryStats.numAncestorHits);
+  if (storedValues) {
+    const StoredValueQuery::Stats &values = storedValues->getStats();
+    add("value-visits", values.numBudgetHits);
+    add("value-depth", values.numDepthHits);
+    add("value-ancestors", values.numAncestorHits);
+    add("value-holders", values.numHolderHits);
+  }
+  return out;
+}
+
+bool PointsToAnalysis::guardTripped(bool force) {
+  if (gaveUpWhy)
+    return true;
+  if (!options.maxSeconds && !options.maxMemoryMB)
+    return false;
+  // The clock and the allocator statistics are read every 16th time.
+  if (guardTicks++ % 16 && !force)
+    return false;
+  std::string why;
+  double elapsed = ScopedPhaseTimer::now() - guardStartSeconds;
+  if (options.maxSeconds && elapsed > options.maxSeconds) {
+    llvm::raw_string_ostream os(why);
+    os << "the analysis ran past its time limit (" << options.maxSeconds
+       << " s, -max-seconds)";
+  } else if (options.maxMemoryMB) {
+    size_t used = llvm::sys::Process::GetMallocUsage();
+    size_t grown = used > guardStartBytes ? used - guardStartBytes : 0;
+    if ((grown >> 20) > options.maxMemoryMB) {
+      llvm::raw_string_ostream os(why);
+      os << "the analysis allocated past its memory limit ("
+         << options.maxMemoryMB << " MB, -max-memory-mb)";
+    }
+  }
+  if (why.empty())
+    return false;
+  gaveUpWhy = reasons.make(Reason::Kind::Budget, module, why);
+  return true;
 }
 
 void PointsToAnalysis::markUnknownCallers(TUFunction &fn) {
@@ -396,31 +520,58 @@ void PointsToAnalysis::runFixpoint() {
   // one (call, target) pair, of finitely many, and maxIndirectRounds caps
   // the rounds that may do so. (BU: binding a target may copy its graph;
   // see PointsToBottomUp.cpp for why that is bounded.)
+  //
+  // The guard (maxSeconds, maxMemoryMB) is checked once per round; past it
+  // the analysis gives up (run() then discards the graph).
+  ScopedPhaseTimer fixpointTimer(stats.fixpointSeconds);
+  auto timed = [](double &total, auto &&rule) {
+    ScopedPhaseTimer timer(total);
+    return rule();
+  };
   bool changed = true;
   while (changed) {
-    propagateStatus();
-    changed = clobberGlobals();
-    propagateStatus();
+    if (guardTripped(/*force=*/true))
+      return;
+    ++stats.numFixpointRounds;
+    timed(stats.propagateSeconds, [&] {
+      propagateStatus();
+      return true;
+    });
+    changed = timed(stats.clobberSeconds, [&] { return clobberGlobals(); });
+    timed(stats.propagateSeconds, [&] {
+      propagateStatus();
+      return true;
+    });
     bool bound = false;
-    changed |= resolveIndirectCalls(/*finalize=*/false, bound);
-    changed |= markEscapedFunctions();
+    changed |= timed(stats.indirectSeconds, [&] {
+      return resolveIndirectCalls(/*finalize=*/false, bound);
+    });
+    changed |=
+        timed(stats.escapedSeconds, [&] { return markEscapedFunctions(); });
     if (options.extraFixpointRule)
-      changed |= options.extraFixpointRule(*this);
+      changed |= timed(stats.extraRuleSeconds,
+                       [&] { return options.extraFixpointRule(*this); });
     bool projected = false;
     if (options.mode == PointsToMode::BU) {
-      projected = projectClones();
+      projected = timed(stats.projectSeconds, [&] { return projectClones(); });
       changed |= projected;
     }
     // A merge can make a child at offset 0 overflow its slot.
-    if (options.subobjects && graph->absorbOverflowingSubobjects(reasons.make(
-                                  Reason::Kind::MergedAt, nullptr,
-                                  "member used as its enclosing object"))) {
+    if (options.subobjects && timed(stats.absorbSeconds, [&] {
+          return graph->absorbOverflowingSubobjects(
+              reasons.make(Reason::Kind::MergedAt, nullptr,
+                           "member used as its enclosing object"));
+        })) {
       changed = projected = true;
     }
     if (!changed)
-      changed = resolveIndirectCalls(/*finalize=*/true, bound);
+      changed = timed(stats.indirectSeconds, [&] {
+        return resolveIndirectCalls(/*finalize=*/true, bound);
+      });
     if (bound || projected)
-      stats.transfersSettled &= closeMemTransfers(*graph, memTransfers);
+      stats.transfersSettled &= timed(stats.transferSeconds, [&] {
+        return closeMemTransfers(*graph, memTransfers);
+      });
   }
 }
 
@@ -550,8 +701,10 @@ void PointsToAnalysis::computeVisibleCallers() {
 }
 
 void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
+  ScopedPhaseTimer timer(stats.buildLocalSeconds);
   bool bottomUp = options.mode == PointsToMode::BU;
   LocalBuilder builder(func, &symbols, &reasons, models);
+  builder.setGraphBudgets(options.graphBudgets);
   // BU: the formals of the local graph are what each copy of it gets from
   // its own caller; runFixpoint marks the function's own graph.
   builder.setFormalsComplete(bottomUp || formalsComplete);
@@ -560,6 +713,10 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
   std::unique_ptr<FunctionGraph> fg = builder.build();
   if (builder.hadVerifyErrors())
     verifyErrors = true;
+  graph->getBudgets().numTransferSlotTrips +=
+      fg->getGraph().getBudgets().numTransferSlotTrips;
+  graph->getBudgets().numTransferRoundTrips +=
+      fg->getGraph().getBudgets().numTransferRoundTrips;
   for (const auto &entry : builder.getUnhandledOps())
     unhandledOps[entry.getKey()] += entry.getValue();
 
@@ -1038,7 +1195,7 @@ PointsToAnalysis::getVirtualCallTargets(const CallSiteRecord &site) const {
     auto [it, inserted] = constantVTables.try_emplace(sym.getAttr(), false);
     if (inserted) {
       ModuleOp scope = module;
-      auto global = SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
+      auto global = symbols.lookupNearestSymbolFrom<cir::GlobalOp>(
           scope.getOperation(), sym);
       std::optional<Attribute> init = global && !global.isDeclaration()
                                           ? global.getInitialValue()
@@ -1093,6 +1250,7 @@ void PointsToAnalysis::applyDeclarationTarget(TUCallSite &call,
       site.callee = target;
       SmallVector<DeferredEffect, 0> deferred;
       ModelContext ctx(*graph, *dataLayout, deferred, memTransfers);
+      ctx.setSymbols(&symbols);
       // The writes belong to the graph of the call: the owner's (BU), or
       // the one of the function holding it.
       TUFunction *holder = owner;

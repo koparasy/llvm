@@ -93,9 +93,10 @@ using namespace mlir;
 using namespace cir;
 using namespace cir::pointsto;
 
-/// The deepest chain of copies a walk follows: a guard only, the call graph
-/// has no cycle through a covered function.
-static constexpr unsigned kMaxContextDepth = 256;
+// The deepest chain of copies a walk follows is maxContextDepth: a budget
+// (the call graph has no cycle through a covered function). Past it, the
+// walk answers in the graph it is in, which is sound for all of that graph's
+// contexts.
 
 const PointsToAnalysis::CloneIndex &
 PointsToAnalysis::getCloneIndex(const TUClone &clone) const {
@@ -181,7 +182,9 @@ PointsToAnalysis::ContextWalkResult PointsToAnalysis::forEachContext(
   std::function<void(const TUFunction &, ArrayRef<RootGroup>, unsigned)> walk =
       [&](const TUFunction &at, ArrayRef<RootGroup> groups, unsigned depth) {
         auto copies = coveredClones.find(&at);
-        if (copies == coveredClones.end() || depth >= kMaxContextDepth) {
+        bool tooDeep = depth >= options.maxContextDepth;
+        queryStats.numDepthHits += tooDeep && copies != coveredClones.end();
+        if (copies == coveredClones.end() || tooDeep) {
           visitLeaf(at, groups);
           return;
         }

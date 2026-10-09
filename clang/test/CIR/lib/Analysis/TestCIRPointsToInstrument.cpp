@@ -61,6 +61,9 @@
 //   td=0                      bu: answer from each function's own graph
 //                             (PointsToAnalysisOptions::topDownQueries)
 //   max-query-contexts=<n>    bu: PointsToAnalysisOptions::maxQueryContexts
+//   budget-scale=<f>          PointsToAnalysisOptions::budgetScale (the
+//                             stress run sets every budget tiny with 0.001)
+//   slice=1                   bu: PointsToAnalysisOptions::relevanceSlice
 //   max-pairs-per-func=<n>    as above
 //   seed=<s>                  the sampling seed
 //   table=<path>              write the side table: one line per check,
@@ -221,6 +224,15 @@ struct TestCIRPointsToInstrumentPass
       *this, "max-query-contexts",
       llvm::cl::desc("Points-to, bu: the most calling contexts per query"),
       llvm::cl::init(64)};
+  Option<double> budgetScale{
+      *this, "budget-scale",
+      llvm::cl::desc("Points-to: multiply every budget by this factor"),
+      llvm::cl::init(1.0)};
+  Option<bool> slice{
+      *this, "slice",
+      llvm::cl::desc("Points-to, bu: copy only the callees in the relevance "
+                     "slice"),
+      llvm::cl::init(false)};
   Option<unsigned> maxPairs{
       *this, "max-pairs-per-func",
       llvm::cl::desc("The most pairs checked per function (0 = all)"),
@@ -332,6 +344,8 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
   options.subobjects = subobjects;
   options.topDownQueries = topDown;
   options.maxQueryContexts = maxQueryContexts;
+  options.budgetScale = budgetScale;
+  options.relevanceSlice = slice;
   PointsToAnalysis pt(module, &registry, options);
   DataLayout dataLayout(module);
 
@@ -696,6 +710,7 @@ void TestCIRPointsToInstrumentPass::runOnOperation() {
     llvm::sort(rules);
     for (auto [rule, count] : rules)
       *table << "# rule " << rule << " " << count << "\n";
+    *table << "# budget trips " << pt.formatBudgetTrips() << "\n";
   }
 }
 

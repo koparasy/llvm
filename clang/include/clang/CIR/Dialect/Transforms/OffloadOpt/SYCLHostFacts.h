@@ -35,6 +35,7 @@
 #define CLANG_CIR_DIALECT_TRANSFORMS_OFFLOADOPT_SYCLHOSTFACTS_H
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/SymbolTable.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/LocalBuilder.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
@@ -43,6 +44,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -169,6 +171,11 @@ public:
   /// Whether two identities refer to the same memory: they share a node.
   static bool sameMemory(const MemIdentity &a, const MemIdentity &b);
 
+  /// The budgets of the points-to analysis that tripped so far
+  /// (PointsToAnalysis::formatBudgetTrips), if they changed since the last
+  /// call: what the passes report in a "host-facts budget trips" remark.
+  std::optional<std::string> takeBudgetReport() const;
+
 private:
   void collectDeviceKernels(mlir::Operation *scope);
   /// Index the finished graph: holders, handles, formal targets, and the
@@ -206,6 +213,12 @@ private:
   const pointsto::PointsToAnalysis *analysis = nullptr;
   std::unique_ptr<mlir::DataLayout> layout;
   std::unique_ptr<SYCLClosureLayout> closureLayout;
+  /// The symbol tables of the host module, for the lookups of the queries.
+  mutable mlir::SymbolTableCollection symbols;
+  /// Why there are no facts (the analysis gave up), or empty.
+  std::string gaveUp;
+  /// The budget trips last reported (takeBudgetReport).
+  mutable std::string reportedBudget;
 
   llvm::StringMap<llvm::SmallVector<cir::FuncOp, 1>> deviceKernels;
   /// The nodes that hold a pointer to each node (link targets), and the
@@ -221,6 +234,62 @@ private:
   /// The kernels named by a kernel.info marker in an analysed function that
   /// does not feed a recorded launch: a launch path no model records.
   llvm::StringMap<mlir::Operation *> unrecordedMarkers;
+};
+
+/// The SYCLHostFacts of one offload container, built once per set of
+/// analysis options (getHostFactsAnalysisKey) and shared by the container
+/// passes that read them (StampReqdWorkGroupSize, InferKernelParamNoAlias,
+/// PropagateSYCLKernelArgs): an MLIR analysis of the container
+/// (Pass::getAnalysis), which those passes preserve
+/// (Pass::markAnalysesPreserved) even when they change the container.
+///
+/// Why their changes leave the facts true. The facts are about the host
+/// module: what the memory a recorded kernel launch reads (its closure and
+/// its range) holds, which allocation each captured pointer or accessor
+/// refers to, and which launches name each kernel. The passes change
+///  - device modules: attributes on kernels (llvm.noalias,
+///    cir.reqd_work_group_size), constants substituted for kernel
+///    parameters, and copies of kernels. None of that is host code;
+///  - the host module, when a pass specializes a kernel for its launches
+///    (specializeSYCLKernelForLaunches): new globals (the name string and
+///    kernel info of the copy, copies of the getter's static locals) and a
+///    copy of the kernel.info getter, which no recorded launch's memory
+///    reaches, and the callee of the launches' kernel.info marker calls,
+///    which now name the copy. The marker's result is the DeviceKernelInfo
+///    pointer the launch passes to the runtime; the launch reads the same
+///    closure and range, so its facts are those of the launch before. What
+///    changes is the kernel name the launch is recorded under: a pass that
+///    specializes a kernel calls recordSpecialization, and the facts of the
+///    copy are read under the original name (getOriginalKernel). The copy's
+///    launches are some of the original's launches, so its facts, ANDed over
+///    all of them, hold for it; and the original keeps a subset of its
+///    launches, for which the same AND holds too.
+/// No pass erases a host op, so the analysis' pointers into the host module
+/// stay valid; the symbol tables it cached only miss the new symbols, which
+/// no fact names. Any other pass that changes the container invalidates the
+/// cache as usual (it does not preserve it).
+class SYCLHostFactsCache {
+public:
+  explicit SYCLHostFactsCache(mlir::Operation *container);
+  ~SYCLHostFactsCache();
+  SYCLHostFactsCache(SYCLHostFactsCache &&) = default;
+
+  /// The facts of the container for the analysis options of \p options (its
+  /// mode is not part of the key), built on first use.
+  const SYCLHostFacts &get(const HostFactsOptions &options);
+  /// Record that \p clone is a specialization of \p original whose
+  /// launches are some of the original's.
+  void recordSpecialization(llvm::StringRef clone, llvm::StringRef original);
+  /// The kernel \p kernel was specialized from, transitively, or \p kernel.
+  llvm::StringRef getOriginalKernel(llvm::StringRef kernel) const;
+  /// The number of analyses built so far (one per key), for tests.
+  unsigned getNumBuilt() const { return numBuilt; }
+
+private:
+  mlir::ModuleOp container;
+  std::map<std::string, std::unique_ptr<SYCLHostFacts>> facts;
+  llvm::StringMap<std::string> origins;
+  unsigned numBuilt = 0;
 };
 
 } // namespace cir

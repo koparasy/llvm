@@ -180,6 +180,10 @@ AliasResult PointsToAnalysis::alias(Value a, Value b,
 AliasAnswer
 PointsToAnalysis::aliasWithRule(Value a, Value b, std::optional<uint64_t> sizeA,
                                 std::optional<uint64_t> sizeB) const {
+  // The analysis gave up (getGaveUpReason): it knows nothing.
+  if (gaveUpWhy)
+    return {a == b ? AliasResult::MustAlias : AliasResult::MayAlias,
+            a == b ? AliasRule::SameValue : AliasRule::NotAnalysed};
   AliasAnswer own = aliasOwn(a, b, sizeA, sizeB);
   // BU: the own graph's MayAlias between cells of a covered function may be
   // NoAlias (or MustAlias) in each of its calling contexts.
@@ -249,15 +253,19 @@ struct AncestorCell {
 
 /// The cell \p cell (resolved) and the cells it is in its ancestors: for a
 /// child at [o, o + size) of a parent whose start is the child's offset c,
-/// the child's offset x is o + (x - c) in the parent.
+/// the child's offset x is o + (x - c) in the parent. Past \p maxAncestors
+/// entries the walk stops and sets \p truncated: some ancestors may be
+/// missing.
 static SmallVector<AncestorCell, 4> collectAncestors(const Graph &graph,
-                                                     Cell cell) {
-  constexpr size_t kMaxAncestors = 64;
+                                                     Cell cell,
+                                                     size_t maxAncestors,
+                                                     bool &truncated) {
   SmallVector<AncestorCell, 4> out;
   const Node *node = cell.getRawNode();
   out.push_back({node, cell.getRawOffset(),
                  !node->isCollapsed() && !node->isArray(), /*pure=*/true});
-  for (size_t i = 0; i < out.size() && out.size() < kMaxAncestors; ++i) {
+  size_t i = 0;
+  for (; i < out.size() && out.size() < maxAncestors; ++i) {
     AncestorCell at = out[i];
     SmallVector<ParentLink, 1> parents = graph.getParents(at.node);
     bool onlyMember = at.node->getOrigins().empty() && parents.size() == 1;
@@ -273,6 +281,7 @@ static SmallVector<AncestorCell, 4> collectAncestors(const Graph &graph,
       out.push_back({parent.parent, offset, exact, at.pure && onlyMember});
     }
   }
+  truncated = i < out.size();
   return out;
 }
 
@@ -296,8 +305,17 @@ AliasAnswer PointsToAnalysis::aliasCells(Cell cellA, Cell cellB, uint64_t sizeA,
   // is in each. Unknown code may have made a pointer anywhere in an object
   // it reaches (the argument of rule 3), so then the offsets say nothing.
   if (nodeA != nodeB && graph->hasSubobjects()) {
-    SmallVector<AncestorCell, 4> upA = collectAncestors(*graph, cellA);
-    SmallVector<AncestorCell, 4> upB = collectAncestors(*graph, cellB);
+    bool truncatedA = false, truncatedB = false;
+    SmallVector<AncestorCell, 4> upA =
+        collectAncestors(*graph, cellA, options.maxAncestors, truncatedA);
+    SmallVector<AncestorCell, 4> upB =
+        collectAncestors(*graph, cellB, options.maxAncestors, truncatedB);
+    // SOUNDNESS (budget maxAncestors): a common ancestor may be missing, so
+    // neither "no common ancestor" nor "disjoint in every one" is known.
+    if (truncatedA || truncatedB) {
+      ++queryStats.numAncestorHits;
+      return {AliasResult::MayAlias, AliasRule::SubobjectOverlap};
+    }
     bool related = false, overlap = false;
     const AncestorCell *pureA = nullptr, *pureB = nullptr;
     for (const AncestorCell &a : upA)
@@ -643,6 +661,8 @@ static std::optional<uint64_t> getConstantLength(Value length) {
 }
 
 ModRefResult PointsToAnalysis::getModRef(Operation *op, Value location) const {
+  if (gaveUpWhy)
+    return ModRefResult::getModAndRef();
   ModRefResult own = getModRefOwn(op, location);
   // BU: what a call of a covered function may access in each of its calling
   // contexts. The other ops ask alias(), which enumerates the contexts.

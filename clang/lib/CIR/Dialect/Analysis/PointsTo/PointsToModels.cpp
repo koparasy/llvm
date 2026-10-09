@@ -26,6 +26,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
+#include "mlir/IR/SymbolTable.h"
 #include "clang/CIR/Dialect/Analysis/CIRPointerDecomposition.h"
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
 #include "llvm/ADT/STLExtras.h"
@@ -58,6 +59,15 @@ void ModelContext::forEachPointerArg(const CallSiteRecord &site,
     for (const auto &slot : entry.second)
       if (slot.second)
         fn(slot.second);
+}
+
+cir::FuncOp ModelContext::lookupFunction(Operation *at,
+                                         FlatSymbolRefAttr sym) const {
+  if (!at || !sym)
+    return {};
+  if (symbols)
+    return symbols->lookupNearestSymbolFrom<cir::FuncOp>(at, sym);
+  return SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(at, sym);
 }
 
 const Reason *ModelContext::makeReason(const CallSiteRecord &site,
@@ -750,8 +760,7 @@ public:
     auto call = dyn_cast_if_present<CIRCallOpInterface>(site.call);
     cir::FuncOp callee;
     if (site.callee)
-      callee = dyn_cast_if_present<cir::FuncOp>(
-          SymbolTable::lookupNearestSymbolFrom(site.call, site.callee));
+      callee = ctx.lookupFunction(site.call, site.callee);
     MemoryEffectsAttr effects =
         *getMemoryEffects(site.synthetic ? CIRCallOpInterface() : call, callee);
     Class cls = *classify(effects);

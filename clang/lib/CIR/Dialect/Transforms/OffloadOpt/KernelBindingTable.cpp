@@ -37,6 +37,35 @@
 
 using namespace cir;
 
+// The symbol tables of the container while a KernelBindingTable is built
+// (the IR of the container does not change then): MLIR's
+// lookupNearestSymbolFrom scans the module on every call, which on a big TU
+// was most of the table's cost. Lookups from ops outside the container (the
+// throwaway clone the trace inlines into, which does change) and outside a
+// table's construction are not cached.
+namespace {
+struct SymbolCacheScope {
+  static thread_local SymbolCacheScope *active;
+  mlir::Operation *container;
+  mlir::SymbolTableCollection symbols;
+  SymbolCacheScope *previous;
+  explicit SymbolCacheScope(mlir::Operation *container)
+      : container(container), previous(active) {
+    active = this;
+  }
+  ~SymbolCacheScope() { active = previous; }
+};
+thread_local SymbolCacheScope *SymbolCacheScope::active = nullptr;
+} // namespace
+
+template <typename T>
+static T lookupSymbol(mlir::Operation *from, mlir::SymbolRefAttr sym) {
+  SymbolCacheScope *scope = SymbolCacheScope::active;
+  if (scope && from && scope->container->isProperAncestor(from))
+    return scope->symbols.lookupNearestSymbolFrom<T>(from, sym);
+  return mlir::SymbolTable::lookupNearestSymbolFrom<T>(from, sym);
+}
+
 // The constant `v` holds, or null if it is not a constant.
 static mlir::TypedAttr asConst(mlir::Value v) {
   if (!v)
@@ -97,8 +126,7 @@ static bool constructsRecord(cir::CallOp call, mlir::Type recordType) {
   mlir::FlatSymbolRefAttr callee = call.getCalleeAttr();
   if (!callee)
     return false;
-  auto fn =
-      mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(call, callee);
+  auto fn = lookupSymbol<cir::FuncOp>(call, callee);
   if (!fn)
     return false;
   auto ctor = mlir::dyn_cast_if_present<cir::CXXCtorAttr>(fn.getFuncInfoAttr());
@@ -457,6 +485,15 @@ std::string cir::formatHostFactsOptions(const HostFactsOptions &options) {
   return out + ")";
 }
 
+std::string cir::getHostFactsAnalysisKey(const HostFactsOptions &options) {
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  os << options.assumeClosedTU << options.bottomUp << options.subobjects
+     << options.relevanceSlice << " " << options.budgetScale << " "
+     << options.maxSeconds << " " << options.maxMemoryMB;
+  return out;
+}
+
 bool HostFactsGeometryComparison::disagrees() const {
   return formatSyclGeometry(legacy) != formatSyclGeometry(ipo);
 }
@@ -508,7 +545,13 @@ std::string cir::formatHostFactsDisagreement(const HostFactsComparison &cmp) {
 
 KernelBindingTable::KernelBindingTable(mlir::ModuleOp container,
                                        const HostFactsOptions &options)
-    : hostFactsOptions(options) {
+    : KernelBindingTable(container, options, nullptr) {}
+
+KernelBindingTable::KernelBindingTable(mlir::ModuleOp container,
+                                       const HostFactsOptions &options,
+                                       SYCLHostFactsCache *cache)
+    : hostFactsOptions(options), hostFactsCache(cache) {
+  SymbolCacheScope symbolCache(container);
   // `container` must be an offload container; the helpers assert the unit attr
   // and recover the nested host and device modules.
   mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
@@ -776,8 +819,7 @@ static cir::GlobalOp getCompileTimeKernelName(cir::GlobalOp info) {
   auto strView = mlir::dyn_cast<cir::GlobalViewAttr>(view.getMembers()[0]);
   if (!strView)
     return {};
-  return mlir::SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
-      info, strView.getSymbol());
+  return lookupSymbol<cir::GlobalOp>(info, strView.getSymbol());
 }
 
 // The _ZTS name-string GlobalOp a `getDeviceKernelInfo<Kernel>()` call targets.
@@ -788,14 +830,13 @@ static cir::GlobalOp resolveLaunchedNameString(cir::CallOp call) {
   mlir::FlatSymbolRefAttr callee = call.getCalleeAttr();
   if (!callee)
     return {};
-  auto fn =
-      mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(call, callee);
+  auto fn = lookupSymbol<cir::FuncOp>(call, callee);
   if (!fn)
     return {};
   cir::GlobalOp nameString;
   fn.walk([&](cir::GetGlobalOp getGlobal) {
-    auto global = mlir::SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
-        getGlobal, getGlobal.getNameAttr());
+    auto global =
+        lookupSymbol<cir::GlobalOp>(getGlobal, getGlobal.getNameAttr());
     if (!global || !global.getName().contains("CompileTimeKernelInfo"))
       return;
     if (cir::GlobalOp name = getCompileTimeKernelName(global))
@@ -907,8 +948,7 @@ static void bridgeSubmitCGF(mlir::ModuleOp clone) {
   });
 
   for (cir::CallOp ctor : ctors) {
-    auto ctorFn = mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
-        ctor, ctor.getCalleeAttr());
+    auto ctorFn = lookupSymbol<cir::FuncOp>(ctor, ctor.getCalleeAttr());
     if (!ctorFn)
       continue;
     // The invoker trampoline: the (only) func-typed global the ctor stores.
@@ -916,8 +956,7 @@ static void bridgeSubmitCGF(mlir::ModuleOp clone) {
     ctorFn.walk([&](cir::GetGlobalOp gg) {
       if (invoker)
         return;
-      if (auto f = mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
-              gg, gg.getNameAttr()))
+      if (auto f = lookupSymbol<cir::FuncOp>(gg, gg.getNameAttr()))
         invoker = f;
     });
     if (!invoker)
@@ -927,8 +966,7 @@ static void bridgeSubmitCGF(mlir::ModuleOp clone) {
     invoker.walk([&](cir::CallOp inner) {
       if (cgOperator || inner.isIndirect())
         return;
-      auto f = mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
-          inner, inner.getCalleeAttr());
+      auto f = lookupSymbol<cir::FuncOp>(inner, inner.getCalleeAttr());
       if (f && f.getCallableRegion() && !f.getCallableRegion()->empty())
         cgOperator = f;
     });
@@ -995,8 +1033,7 @@ static void inlineLaunchChain(mlir::ModuleOp clone) {
       mlir::FlatSymbolRefAttr callee = call.getCalleeAttr();
       if (!callee)
         return;
-      auto fn =
-          mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(call, callee);
+      auto fn = lookupSymbol<cir::FuncOp>(call, callee);
       // The synthetic command-group operator() call (see bridgeSubmitCGF) is
       // inlined by its tag rather than its name -- the lambda operator() has no
       // stable mangled shape to match.
@@ -1010,8 +1047,7 @@ static void inlineLaunchChain(mlir::ModuleOp clone) {
     });
     for (cir::CallOp call : worklist) {
       auto callee = call.getCalleeAttr();
-      auto fn =
-          mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(call, callee);
+      auto fn = lookupSymbol<cir::FuncOp>(call, callee);
       if (!fn)
         continue;
       auto callable = mlir::cast<mlir::CallableOpInterface>(fn.getOperation());
@@ -1370,8 +1406,7 @@ public:
   static cir::FuncOp calleeOf(cir::CallOp call) {
     if (call.isIndirect())
       return {};
-    return mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
-        call, call.getCalleeAttr());
+    return lookupSymbol<cir::FuncOp>(call, call.getCalleeAttr());
   }
 
 private:
@@ -1400,8 +1435,7 @@ private:
       return false;
     if (call.isIndirect())
       return true;
-    auto callee = mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
-        call, call.getCalleeAttr());
+    auto callee = lookupSymbol<cir::FuncOp>(call, call.getCalleeAttr());
     if (!callee)
       return true;
     return callee.isCxxConstructor() || callee.isCxxSpecialAssignment();
@@ -2353,6 +2387,20 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
       nameStrings.try_emplace(value, global);
   });
 
+  // The symbols the host module uses, collected once (getSymbolUses per
+  // kernel walked the whole module for each).
+  std::optional<llvm::DenseSet<mlir::StringAttr>> hostUses;
+  auto isUsedInHost = [&](cir::GlobalOp global) {
+    if (!hostUses) {
+      hostUses.emplace();
+      if (auto uses =
+              mlir::SymbolTable::getSymbolUses(&hostModule.getBodyRegion()))
+        for (const mlir::SymbolTable::SymbolUse &use : *uses)
+          hostUses->insert(use.getSymbolRef().getRootReference());
+    }
+    return hostUses->contains(global.getSymNameAttr());
+  };
+
   for (mlir::ModuleOp deviceMod :
        cir::getOffloadContainerDeviceModules(container)) {
     deviceMod.walk([&](cir::FuncOp kernel) {
@@ -2368,8 +2416,7 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
       cir::GlobalOp nameString = it->second;
       // A device kernel the host never names by string launches nothing this
       // TU describes; skip it rather than record a host-less binding.
-      auto uses = mlir::SymbolTable::getSymbolUses(nameString, hostModule);
-      if (!uses || uses->empty())
+      if (!isUsedInHost(nameString))
         return;
 
       KernelBinding &binding = bindings[name];
@@ -2423,8 +2470,15 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
   llvm::StringMap<llvm::StringSet<>> noAliasFields;
   llvm::StringMap<llvm::StringMap<std::string>> noAliasNotes;
   llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> constArgs;
-  llvm::StringMap<SyclGeometry> geometry = computeSYCLGeometry(
-      container, noAliasCandidates, noAliasFields, noAliasNotes, constArgs);
+  // Under HostFactsMode::IPO, applyHostFacts replaces everything the trace
+  // gives (the noalias fields and notes of every kernel with candidates, the
+  // constants and every site's geometry), so the trace is not run: it is the
+  // cost of the table (most of it on big TUs), and the passes build one table
+  // each.
+  llvm::StringMap<SyclGeometry> geometry;
+  if (hostFactsOptions.mode != HostFactsMode::IPO)
+    geometry = computeSYCLGeometry(container, noAliasCandidates, noAliasFields,
+                                   noAliasNotes, constArgs);
 
   for (auto &binding : bindings) {
     if (binding.second.kind != BindingKind::SYCLName)
@@ -2490,16 +2544,26 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
 void KernelBindingTable::applyHostFacts(
     mlir::ModuleOp container,
     const llvm::StringMap<SYCLNoAliasCandidates> &candidates) {
-  SYCLHostFacts facts(container, hostFactsOptions);
+  std::optional<SYCLHostFacts> ownFacts;
+  if (!hostFactsCache)
+    ownFacts.emplace(container, hostFactsOptions);
+  const SYCLHostFacts &facts =
+      hostFactsCache ? hostFactsCache->get(hostFactsOptions) : *ownFacts;
   bool ipoMode = hostFactsOptions.mode == HostFactsMode::IPO;
   for (auto &entry : bindings) {
     KernelBinding &binding = entry.second;
     if (binding.kind != BindingKind::SYCLName)
       continue;
+    // A kernel a pass specialized after the facts were built is asked about
+    // under the name of the kernel it was cloned from (see
+    // SYCLHostFactsCache::recordSpecialization).
+    llvm::StringRef factsName =
+        hostFactsCache ? hostFactsCache->getOriginalKernel(entry.first)
+                       : entry.first;
 
     // The scalar-capture constants.
     llvm::StringMap<SYCLHostFacts::ConstFact> consts =
-        facts.constantFields(entry.first);
+        facts.constantFields(factsName);
     if (ipoMode) {
       binding.syclConstArgs.clear();
       for (auto &c : consts)
@@ -2522,7 +2586,7 @@ void KernelBindingTable::applyHostFacts(
     }
 
     // The geometry, the same for every launch site (as the legacy one).
-    SYCLHostFacts::GeometryFact geometry = facts.geometry(entry.first);
+    SYCLHostFacts::GeometryFact geometry = facts.geometry(factsName);
     if (ipoMode) {
       for (LaunchSite &site : binding.launchSites)
         site.syclNDRange = geometry.geometry;
@@ -2540,7 +2604,7 @@ void KernelBindingTable::applyHostFacts(
     if (candIt == candidates.end() || candIt->second.fields.empty())
       continue;
     llvm::StringMap<NoAliasDecision> ipo =
-        facts.noAliasFields(entry.first, candIt->second);
+        facts.noAliasFields(factsName, candIt->second);
     if (hostFactsOptions.mode == HostFactsMode::IPO) {
       binding.syclNoAliasFields.clear();
       binding.syclNoAliasNotes.clear();
@@ -2765,8 +2829,7 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
 static cir::GlobalOp findGetterCompileTimeInfo(cir::FuncOp getter) {
   cir::GlobalOp info;
   getter.walk([&](cir::GetGlobalOp gg) {
-    auto g = mlir::SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
-        gg, gg.getNameAttr());
+    auto g = lookupSymbol<cir::GlobalOp>(gg, gg.getNameAttr());
     if (g && g.getName().contains("CompileTimeKernelInfo"))
       info = g;
   });
@@ -2878,8 +2941,7 @@ std::optional<cir::SpecializedKernel> cir::specializeSYCLKernelForLaunches(
   // 3. Resolve the getter this launch marker calls and the
   // CompileTimeKernelInfo it names.
   cir::CallOp marker = site.syclMarkerCall;
-  auto getter = mlir::SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(
-      marker, marker.getCalleeAttr());
+  auto getter = lookupSymbol<cir::FuncOp>(marker, marker.getCalleeAttr());
   if (!getter)
     return std::nullopt;
   cir::GlobalOp ctki = findGetterCompileTimeInfo(getter);
@@ -2907,8 +2969,7 @@ std::optional<cir::SpecializedKernel> cir::specializeSYCLKernelForLaunches(
   llvm::SmallVector<cir::GlobalOp, 2> clonedCluster;
   llvm::SmallPtrSet<mlir::Operation *, 4> seen;
   getter.walk([&](cir::GetGlobalOp gg) {
-    auto g = mlir::SymbolTable::lookupNearestSymbolFrom<cir::GlobalOp>(
-        gg, gg.getNameAttr());
+    auto g = lookupSymbol<cir::GlobalOp>(gg, gg.getNameAttr());
     if (!g || g == ctki || !seen.insert(g).second)
       return;
     auto uses = mlir::SymbolTable::getSymbolUses(g, hostModule);

@@ -101,9 +101,6 @@ using namespace cir::pointsto;
 
 static constexpr uint64_t kUnknownSize = PointsToAnalysis::kUnknownSize;
 static constexpr int64_t kUnbounded = WriteLocation::kUnbounded;
-/// The deepest chain of copies a walk follows (a guard: the copies of the
-/// bottom-up mode form no cycle).
-static constexpr unsigned kMaxChain = 256;
 
 //===----------------------------------------------------------------------===//
 // StoredValues
@@ -155,17 +152,18 @@ WriteLocation StoredValueIndex::makeLocation(const Node *node, int64_t offset,
   return {offset, offset + static_cast<int64_t>(size), true};
 }
 
-void StoredValueIndex::locate(
+bool StoredValueIndex::locate(
     Cell cell, uint64_t size,
     SmallVectorImpl<std::pair<const Node *, WriteLocation>> &out,
     bool anywhere) const {
-  constexpr size_t kMaxAncestors = 64;
+  size_t maxAncestors = analysis.options.maxAncestors;
   Cell at = cell.resolve();
   const Node *base = at.getNode();
   out.push_back({base, anywhere ? WriteLocation{0, kUnbounded, false}
                                 : makeLocation(base, at.getOffset(), size)});
   const Graph &graph = analysis.getGraph();
-  for (size_t i = 0; i < out.size() && out.size() < kMaxAncestors; ++i) {
+  size_t i = 0;
+  for (; i < out.size() && out.size() < maxAncestors; ++i) {
     auto [node, loc] = out[i];
     for (const ParentLink &link : graph.getParents(node)) {
       WriteLocation up;
@@ -186,6 +184,8 @@ void StoredValueIndex::locate(
       out.push_back({link.parent, up});
     }
   }
+  // Past maxAncestors entries, some ancestors may be missing.
+  return i == out.size();
 }
 
 namespace {
@@ -252,7 +252,13 @@ void StoredValueIndex::addWrite(WriteRecord write) {
     return;
   unsigned id = writes.size();
   SmallVector<std::pair<const Node *, WriteLocation>, 4> where;
-  locate(write.dst, write.size, where, write.anywhere);
+  // SOUNDNESS (budget maxAncestors): a write not indexed at every ancestor
+  // would be missed by a read of one; then no read is complete.
+  if (!locate(write.dst, write.size, where, write.anywhere) && !globalUnknown)
+    globalUnknown =
+        analysis.getGraph().makeReason(Reason::Kind::Budget, write.op,
+                                       "a write with too many ancestors to "
+                                       "index (-max-ancestors)");
   for (auto [node, loc] : where) {
     entries[node].push_back({id, loc});
     ++numEntries;
@@ -445,8 +451,8 @@ void StoredValueIndex::indexWrites() {
   // the other global's bytes, and missing from its own (V4fix, Csmith seed
   // 100570).
   for (auto [sym, cell] : analysis.getSymbolCells()) {
-    auto global = dyn_cast_if_present<cir::GlobalOp>(
-        SymbolTable::lookupNearestSymbolFrom(analysis.getModule(), sym));
+    auto global = analysis.symbols.lookupNearestSymbolFrom<cir::GlobalOp>(
+        analysis.getModule(), sym);
     if (!global)
       continue;
     WriteRecord write{WriteRecord::Kind::GlobalInit, global, cell};
@@ -736,11 +742,16 @@ StoredValueQuery::valuesInContext(Cell cell, uint64_t size, Type type,
 
 /// The nodes that hold bytes of the read [lo, hi) of \p node: it and the
 /// subobjects overlapping the range (all of them on an array or collapsed
-/// node).
+/// node). Past \p max nodes it stops and sets \p truncated.
 static void collectHolders(const Node *node, int64_t lo, int64_t hi,
-                           SmallVectorImpl<const Node *> &out) {
-  if (out.size() > 256 || llvm::is_contained(out, node))
+                           SmallVectorImpl<const Node *> &out, size_t max,
+                           bool &truncated) {
+  if (llvm::is_contained(out, node))
     return;
+  if (out.size() >= max) {
+    truncated = true;
+    return;
+  }
   out.push_back(node);
   bool all = node->isCollapsed() || node->isArray();
   for (const SubobjectLink &sub : node->getSubobjects()) {
@@ -749,7 +760,8 @@ static void collectHolders(const Node *node, int64_t lo, int64_t hi,
       continue;
     Cell child = sub.child.resolve();
     int64_t shift = child.getOffset() - sub.offset;
-    collectHolders(child.getNode(), lo + shift, hi + shift, out);
+    collectHolders(child.getNode(), lo + shift, hi + shift, out, max,
+                   truncated);
   }
 }
 
@@ -790,7 +802,17 @@ StoredValues StoredValueQuery::cellValues(Cell cell, uint64_t size, Type type,
   // Unknown writers of the bytes read.
   SmallVector<const Node *, 4> holders;
   int64_t lo = resolved.getOffset();
-  collectHolders(base, lo, lo + static_cast<int64_t>(size), holders);
+  bool truncatedHolders = false;
+  collectHolders(base, lo, lo + static_cast<int64_t>(size), holders,
+                 analysis.options.maxReadHolders, truncatedHolders);
+  // SOUNDNESS (budget maxReadHolders): an unknown writer or a write of a
+  // holder left out would be missed.
+  if (truncatedHolders) {
+    ++stats.numHolderHits;
+    out.setIncomplete(reason(Reason::Kind::Budget, nullptr,
+                             "a read of too many subobjects "
+                             "(-max-read-holders)"));
+  }
   for (const Node *node : holders) {
     NodeFlags flags = node->getFlags();
     constexpr NodeFlags kUnknownWriter =
@@ -827,7 +849,14 @@ StoredValues StoredValueQuery::cellValues(Cell cell, uint64_t size, Type type,
     // subobject is indexed at it and at its ancestors, not at the nodes
     // below the one it names.
     SmallVector<std::pair<const Node *, WriteLocation>, 4> where;
-    index->locate(analysis.getGraph().descend(resolved), size, where);
+    // SOUNDNESS (budget maxAncestors): the writes indexed at a missing
+    // ancestor would be missed.
+    if (!index->locate(analysis.getGraph().descend(resolved), size, where)) {
+      ++stats.numAncestorHits;
+      out.setIncomplete(reason(Reason::Kind::Budget, nullptr,
+                               "a read with too many ancestors "
+                               "(-max-ancestors)"));
+    }
     SmallVector<const TUClone *, 8> chain(context.begin(), context.end());
     // One level: the writes of every node the read is in, then the copies
     // of callees' graphs below those nodes.
@@ -858,7 +887,8 @@ StoredValues StoredValueQuery::cellValues(Cell cell, uint64_t size, Type type,
             applyWrite(index->getWrites()[id], rel, delta, size, type, path,
                        out);
           }
-          if (path.size() >= kMaxChain) {
+          if (path.size() >= analysis.options.maxContextDepth) {
+            ++stats.numDepthHits;
             out.setIncomplete(reason(Reason::Kind::Budget, nullptr,
                                      "copies nested too deep"));
             return;
@@ -1097,7 +1127,8 @@ void StoredValueQuery::resolveValue(Value value, uint64_t size, Type type,
 
 StoredValueQuery &PointsToAnalysis::getStoredValueQuery() const {
   if (!storedValues)
-    storedValues = std::make_unique<StoredValueQuery>(*this);
+    storedValues =
+        std::make_unique<StoredValueQuery>(*this, options.maxQueryVisits);
   return *storedValues;
 }
 
@@ -1147,7 +1178,9 @@ StoredValues PointsToAnalysis::valuesAtInContexts(Value addr,
     if (overBudget || !all.complete)
       return;
     auto copies = coveredClones.find(&at);
-    if (copies == coveredClones.end() || path.size() >= 256) {
+    bool tooDeep = path.size() >= options.maxContextDepth;
+    queryStats.numDepthHits += tooDeep && copies != coveredClones.end();
+    if (copies == coveredClones.end() || tooDeep) {
       if (++count > options.maxQueryContexts) {
         overBudget = true;
         return;

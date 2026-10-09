@@ -32,6 +32,7 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToGraph.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
@@ -86,7 +87,10 @@ void addSYCLPointsToPlugin(pointsto::PointsToAnalysisOptions &options);
 /// The kernel name a `kernel.info` marker function names: the string its
 /// CompileTimeKernelInfo record's first member (a string_view) points to,
 /// found structurally from the globals its body reads. Empty if none.
-std::string getSYCLKernelInfoName(cir::FuncOp kernelInfo);
+/// \p symbols, if given, are the symbol tables to look the globals up in.
+std::string
+getSYCLKernelInfoName(cir::FuncOp kernelInfo,
+                      mlir::SymbolTableCollection *symbols = nullptr);
 
 /// The byte offset of the member \p path (one member name per nesting level)
 /// in the record \p closure, from the names CIRGen gives the

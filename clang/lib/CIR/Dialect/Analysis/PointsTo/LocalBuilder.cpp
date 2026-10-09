@@ -1490,6 +1490,7 @@ void LocalBuilder::dispatchCall(size_t index, CIRCallOpInterface call) {
   if (models)
     if (const PointsToModel *model = models->lookup(call, callee, name)) {
       ModelContext ctx(*fg, dataLayout, deferredEffects);
+      ctx.setSymbols(symbols);
       SmallVector<CallSiteRecord, 0> extraCalls;
       ctx.setLaunchSink(&fg->launches);
       ctx.setCallSink(&extraCalls);
@@ -1525,6 +1526,7 @@ void LocalBuilder::applyUnknownCall(CallSiteRecord &site, const Reason *why) {
          NodeFlags::External | NodeFlags::Mod | NodeFlags::Ref, why});
   });
   ModelContext ctx(*fg, dataLayout, deferredEffects);
+  ctx.setSymbols(symbols);
   ctx.setResultUnknown(site, NodeFlags::External | NodeFlags::Incomplete, why);
   // And it may read or write any global another TU can name; the globals
   // graph (T08) applies this.
@@ -1598,6 +1600,7 @@ void LocalBuilder::applyResolvedTargets(CallSiteRecord &site) {
         CallSiteRecord targetSite = site;
         targetSite.callee = target;
         ModelContext ctx(*fg, dataLayout, deferredEffects);
+        ctx.setSymbols(symbols);
         size_t firstWrite = fg->modelWrites.size();
         ctx.setWriteSink(&fg->modelWrites);
         model->apply(targetSite, ctx);
@@ -1867,17 +1870,16 @@ void LocalBuilder::visitDeleteArray(cir::DeleteArrayOp op) {
 // Copy closure
 //===----------------------------------------------------------------------===//
 
-/// More (offset) pairs than this in one copy, or more rounds than this over
-/// all copies, and the copy is done field-insensitively instead.
-static constexpr size_t kMaxTransferSlots = 1024;
-static constexpr unsigned kMaxTransferRounds = 64;
+/// More (offset) pairs than GraphBudgets::maxTransferSlots in one copy, or
+/// more rounds than GraphBudgets::maxTransferRounds over all copies, and the
+/// copy is done field-insensitively instead.
 
 /// The offsets k in [0, length) at which the cell \p at (resolved, on a node
 /// that is not collapsed) has a link on its node. With \p onePerLink, only
 /// the smallest such k per link (on an array node the others are the same
-/// slot). False if there are more than kMaxTransferSlots.
+/// slot). False if there are more than \p maxSlots.
 static bool collectLinkedOffsets(Cell at, int64_t length,
-                                 SmallVectorImpl<int64_t> &out,
+                                 SmallVectorImpl<int64_t> &out, size_t maxSlots,
                                  bool onePerLink = false) {
   const Node *node = at.getRawNode();
   int64_t base = at.getRawOffset();
@@ -1894,19 +1896,20 @@ static bool collectLinkedOffsets(Cell at, int64_t length,
       out.push_back(k);
       if (onePerLink)
         break;
-      if (out.size() > kMaxTransferSlots)
+      if (out.size() > maxSlots)
         return false;
     }
   }
-  return out.size() <= kMaxTransferSlots;
+  return out.size() <= maxSlots;
 }
 
 /// The offsets k in [0, length) at which the cell \p at (resolved, on a node
 /// that is not collapsed) is pointer-aligned within its node, one per
 /// distinct normalized offset. False if there are more than
-/// kMaxTransferSlots.
+/// \p maxSlots.
 static bool collectAlignedOffsets(Cell at, int64_t length, int64_t pointerSize,
-                                  SmallVectorImpl<int64_t> &out) {
+                                  SmallVectorImpl<int64_t> &out,
+                                  size_t maxSlots) {
   const Node *node = at.getRawNode();
   int64_t base = at.getRawOffset();
   int64_t k = ((-base % pointerSize) + pointerSize) % pointerSize;
@@ -1916,7 +1919,7 @@ static bool collectAlignedOffsets(Cell at, int64_t length, int64_t pointerSize,
   int64_t end = elem ? std::min<int64_t>(length, *elem) : length;
   for (; k < end; k += pointerSize) {
     out.push_back(k);
-    if (out.size() > kMaxTransferSlots)
+    if (out.size() > maxSlots)
       return false;
   }
   return true;
@@ -1928,6 +1931,13 @@ struct TransferApplier {
   Graph &graph;
   const MemTransferRecord &record;
   const Reason *why = nullptr;
+  size_t maxSlots = graph.getBudgets().maxTransferSlots;
+
+  /// Count a trip of the slot cap.
+  bool overSlots() {
+    ++graph.getBudgets().numTransferSlotTrips;
+    return false;
+  }
 
   const Reason *reason() {
     if (!why)
@@ -2010,8 +2020,8 @@ struct TransferApplier {
         int64_t e = static_cast<int64_t>(*elem);
         for (k = ((k % e) + e) % e; k < length; k += e) {
           moves.emplace_back(k, ghost.field, ghost.target, toDst);
-          if (moves.size() > kMaxTransferSlots)
-            return false;
+          if (moves.size() > maxSlots)
+            return overSlots();
         }
       }
       return true;
@@ -2051,12 +2061,13 @@ struct TransferApplier {
       // if the collapsed side holds a pointer, every pointer-aligned one.
       Cell collapsed = dstCollapsed ? dst : src;
       Cell other = dstCollapsed ? src : dst;
-      if (!collectLinkedOffsets(other, length, offsets, /*onePerLink=*/true))
-        return smash();
+      if (!collectLinkedOffsets(other, length, offsets, maxSlots,
+                                /*onePerLink=*/true))
+        return overSlots() | smash();
       if (graph.lookupLink(collapsed) &&
-          !collectAlignedOffsets(other, length, graph.getPointerSize(),
-                                 offsets))
-        return smash();
+          !collectAlignedOffsets(other, length, graph.getPointerSize(), offsets,
+                                 maxSlots))
+        return overSlots() | smash();
       llvm::sort(offsets);
       offsets.erase(llvm::unique(offsets), offsets.end());
       bool changed = false;
@@ -2065,9 +2076,10 @@ struct TransferApplier {
       return changed;
     }
 
-    if (!collectLinkedOffsets(dst, length, offsets) ||
-        !collectLinkedOffsets(src, length, offsets) ||
-        offsets.size() > kMaxTransferSlots) {
+    if (!collectLinkedOffsets(dst, length, offsets, maxSlots) ||
+        !collectLinkedOffsets(src, length, offsets, maxSlots) ||
+        offsets.size() > maxSlots) {
+      overSlots();
       // Too many offsets: a long (or unknown) range over an array. The
       // offsets of a range over arrays repeat every element, so make both
       // sides arrays of one element size and take one offset per class.
@@ -2150,7 +2162,10 @@ struct SubobjectTransfers {
           int64_t first = sub.offset - x.getRawOffset();
           int64_t step = elem ? static_cast<int64_t>(*elem) : 0;
           auto size = static_cast<int64_t>(sub.size);
-          if (step && length / step > static_cast<int64_t>(kMaxTransferSlots)) {
+          if (step &&
+              length / step >
+                  static_cast<int64_t>(graph.getBudgets().maxTransferSlots)) {
+            ++graph.getBudgets().numTransferSlotTrips;
             // Too many elements to list: the other side becomes an array of
             // the same elements, where one position stands for all.
             graph.markArray(y.getNode(), *elem,
@@ -2200,7 +2215,8 @@ bool cir::pointsto::closeMemTransfers(Graph &graph,
   // Unification is symmetric, so this treats dst and src alike: it only
   // ever adds links and merges targets, which over-approximates the
   // one-directional copy. That is the DSA treatment of memcpy, with offsets.
-  for (unsigned round = 0; round != kMaxTransferRounds; ++round) {
+  for (unsigned round = 0; round != graph.getBudgets().maxTransferRounds;
+       ++round) {
     bool changed = false;
     if (subobjects) {
       changed |= subobjects->expand();
@@ -2211,6 +2227,7 @@ bool cir::pointsto::closeMemTransfers(Graph &graph,
     if (!changed)
       return true;
   }
+  ++graph.getBudgets().numTransferRoundTrips;
   for (const MemTransferRecord &record : transfers)
     TransferApplier{graph, record}.smash();
   return false;

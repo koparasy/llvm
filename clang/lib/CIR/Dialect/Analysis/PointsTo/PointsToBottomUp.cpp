@@ -232,9 +232,12 @@ void PointsToAnalysis::runBottomUp(ArrayRef<SmallVector<cir::FuncOp, 1>> sccs,
     for (cir::FuncOp func : scc)
       sccOf[func.getOperation()] = i;
   }
-  for (unsigned i = 0, e = sccs.size(); i != e; ++i)
+  for (unsigned i = 0, e = sccs.size(); i != e; ++i) {
+    if (guardTripped())
+      break;
     if (partitions[i].state == Partition::State::NotStarted)
       processSCC(i);
+  }
   for (const std::unique_ptr<TUFunction> &fn : functions)
     stats.numInheritedCalls += fn->inheritedCalls.size();
 }
@@ -243,6 +246,12 @@ void PointsToAnalysis::processSCC(unsigned scc) {
   assert(partitions[scc].state == Partition::State::NotStarted &&
          findPartition(scc) == scc && "SCC processed twice");
   partitions[scc].state = Partition::State::InProgress;
+  // The guard tripped: the analysis gives up, nothing more is built (the
+  // callers' bindings are skipped too, see bindBottomUp).
+  if (guardTripped()) {
+    partitions[scc].state = Partition::State::Done;
+    return;
+  }
   for (cir::FuncOp func : SmallVector<cir::FuncOp, 1>(partitions[scc].funcs)) {
     bool complete = (options.assumeClosedTU ||
                      visibleCallers.contains(func.getOperation())) &&
@@ -305,11 +314,18 @@ void PointsToAnalysis::processSCC(unsigned scc) {
     stats.maxGraphNodes = done.nodes;
     stats.largestGraph = partitions[scc].funcs.front().getOperation();
   }
+  if (done.copied > stats.maxSCCClonedNodes) {
+    stats.maxSCCClonedNodes = done.copied;
+    stats.maxSCCClonedFunc = partitions[scc].funcs.front().getOperation();
+  }
 }
 
 PointsToAnalysis::BindResult
 PointsToAnalysis::bindBottomUp(TUCallSite &call, TUFunction &owner,
                                cir::FuncOp calleeFunc) {
+  // The analysis gave up (its guard tripped): what is built is discarded.
+  if (guardTripped())
+    return BindResult::Bound;
   auto calleeName = [&] { return ("@" + calleeFunc.getSymName()).str(); };
   unsigned calleeSCC = sccOf.lookup(calleeFunc.getOperation());
   // Inside the SCC (or a graph merged into it): its own graph, as in CI.
@@ -340,23 +356,40 @@ PointsToAnalysis::bindBottomUp(TUCallSite &call, TUFunction &owner,
   });
   // Over budget: bind it to the callee's own graph too.
   size_t estimate = partitions[calleePart].nodes;
-  bool overBudget =
-      partitions[ownerPart].nodes + estimate > options.maxCloneNodes ||
-      stats.numClonedNodes + estimate > options.maxTotalCloneNodes;
-  if (cycle || overBudget) {
+  bool overGraph =
+      partitions[ownerPart].nodes + estimate > options.maxCloneNodes;
+  bool overTotal = stats.numClonedNodes + estimate > options.maxTotalCloneNodes;
+  // The relevance slice: a callee outside it is bound to its own graph, the
+  // same rule as over budget (see computeRelevance).
+  bool outsideSlice =
+      options.relevanceSlice && !relevant.contains(calleeFunc.getOperation());
+  if (cycle || overGraph || overTotal || outsideSlice) {
     const Reason *why =
         cycle ? graph->makeReason(Reason::Kind::MergedAt, call.site.call,
                                   calleeName() + ": a cycle of copies")
-              : graph->makeReason(
-                    Reason::Kind::Budget, call.site.call,
-                    calleeName() + ": the copy would exceed the clone budget");
+        : outsideSlice && !overGraph && !overTotal
+            ? graph->makeReason(Reason::Kind::MergedAt, call.site.call,
+                                calleeName() + ": outside the relevance slice")
+            : graph->makeReason(
+                  Reason::Kind::Budget, call.site.call,
+                  calleeName() +
+                      (overTotal ? ": the copy would exceed the total clone "
+                                   "budget (-max-total-clone-nodes)"
+                                 : ": the copy would exceed the clone budget "
+                                   "(-max-clone-nodes)"));
     // SOUNDNESS: binding to the callee's own graph is the CI rule. The two
     // graphs become one, so that a later copy of either has the call sites
     // and records of both.
     mergePartitions(ownerPart, calleePart);
     bindMapped(call, callee, -1, [](Cell cell) { return cell; }, why);
     call.notClonedWhy = why;
-    ++(cycle ? stats.numCycleBindings : stats.numBudgetBindings);
+    if (cycle)
+      ++stats.numCycleBindings;
+    else if (overGraph || overTotal) {
+      ++stats.numBudgetBindings;
+      stats.numTotalBudgetBindings += !overGraph;
+    } else if (outsideSlice)
+      ++stats.numSliceBindings;
     return BindResult::Bound;
   }
   cloneCallee(call, owner, callee);
@@ -426,6 +459,7 @@ void PointsToAnalysis::bindMapped(TUCallSite &call, const TUFunction &callee,
 
 void PointsToAnalysis::cloneCallee(TUCallSite &call, TUFunction &owner,
                                    TUFunction &callee) {
+  ScopedPhaseTimer timer(stats.cloneSeconds);
   graph->flushShared();
   unsigned ownerPart = findPartition(owner.scc);
   unsigned calleePart = findPartition(callee.scc);
@@ -582,8 +616,146 @@ void PointsToAnalysis::cloneCallee(TUCallSite &call, TUFunction &owner,
     memTransfers.push_back(transfer);
   }
   dst.nodes += copied;
+  dst.copied += copied;
   ++stats.numClones;
   stats.numClonedNodes += copied;
+}
+
+//===----------------------------------------------------------------------===//
+// Relevance slice
+//===----------------------------------------------------------------------===//
+
+// The relevance slice (plan D3, PointsToAnalysisOptions::relevanceSlice).
+//
+// Which callees are copied. A copy buys context sensitivity for what the
+// callee does to the objects its callers pass it and for the objects it
+// allocates. The SYCL clients ask about the objects a kernel launch reads:
+// what the closure and the range of a LaunchRecord reach. So a callee is in
+// the slice if
+//  - its graph may hold a launch record: it launches a kernel, or calls a
+//    function in the slice for that reason (transitively, over the direct
+//    calls and the bound indirect targets);
+//  - or one of its values (formals, results, locals, loaded pointers) may
+//    point to an object a launch reads (reachable from a record's closure or
+//    range cells), or to an object from which one is reachable (a holder of
+//    such a pointer, at any depth).
+// Both are computed on a context-insensitive analysis of the module, run
+// first: it over-approximates every flow (CI merges more than BU), so a
+// function whose values point to none of those objects in CI touches none
+// of them in any context.
+//
+// SOUNDNESS. A call to a callee outside the slice is bound to the callee's
+// own graph, context-insensitively: the rule of a call over the clone budget
+// (bindBottomUp), with the same argument (T17: the two graphs merge, and a
+// later copy of either has the call sites and records of both). The slice
+// only chooses which calls get that rule, so the analysis is sound for any
+// slice, generic queries (CIRPointsToAliasAnalysis) included: the slice
+// changes precision, never soundness. The stress run with every budget tiny
+// (maxCloneNodes 1: every call bound this way) checks that rule.
+void PointsToAnalysis::computeRelevance(
+    ArrayRef<SmallVector<cir::FuncOp, 1>> sccs) {
+  PointsToAnalysisOptions ciOptions = options;
+  ciOptions.mode = PointsToMode::CI;
+  ciOptions.relevanceSlice = false;
+  ciOptions.budgetScale = 1.0; // Already applied to `options`.
+  PointsToAnalysis ci(module, baseModels, ciOptions);
+  auto all = [&] {
+    for (ArrayRef<cir::FuncOp> scc : sccs)
+      for (cir::FuncOp func : scc)
+        relevant.insert(func.getOperation());
+    stats.numRelevantFunctions = relevant.size();
+  };
+  // A slice is only a choice of copies: with no CI answer, copy everything.
+  if (ci.getGaveUpReason() || ci.hadVerifyErrors())
+    return all();
+  const Graph &ciGraph = ci.getGraph();
+
+  // The objects a launch reads, and the nodes they are reachable from.
+  llvm::DenseSet<const Node *> marked;
+  SmallVector<const Node *, 0> worklist;
+  auto mark = [&](const Node *node) {
+    node = Cell(const_cast<Node *>(node)).getNode();
+    if (marked.insert(node).second)
+      worklist.push_back(node);
+  };
+  for (const LaunchRecord &launch : ci.getAllLaunches()) {
+    if (launch.closure)
+      mark(launch.closure->getNode());
+    if (launch.geometry)
+      mark(launch.geometry->getNode());
+  }
+  while (!worklist.empty()) {
+    const Node *node = worklist.pop_back_val();
+    ciGraph.forEachSuccessor(
+        node, [&](Node *next) { mark(next); },
+        /*allParents=*/true);
+  }
+  // Backward: every node with a path to a marked one (reverse successors).
+  llvm::DenseMap<const Node *, SmallVector<const Node *, 2>> preds;
+  for (const Node *node : ciGraph.nodes())
+    ciGraph.forEachSuccessor(
+        node,
+        [&](Node *next) {
+          preds[Cell(next).getNode()].push_back(
+              Cell(const_cast<Node *>(node)).getNode());
+        },
+        /*allParents=*/true);
+  for (const Node *node :
+       SmallVector<const Node *, 0>(marked.begin(), marked.end()))
+    worklist.push_back(node);
+  while (!worklist.empty()) {
+    const Node *node = worklist.pop_back_val();
+    for (const Node *pred : preds.lookup(node))
+      mark(pred);
+  }
+
+  auto touches = [&](Cell cell) {
+    return cell && marked.contains(cell.getNode());
+  };
+  for (const auto &[value, cell] : ci.scalarMap) {
+    if (!touches(cell))
+      continue;
+    Region *region = Value(value).getParentRegion();
+    auto func = region ? region->getParentOfType<cir::FuncOp>() : nullptr;
+    if (func)
+      relevant.insert(func.getOperation());
+  }
+  for (const auto &[value, slots] : ci.aggregateMap) {
+    if (!llvm::any_of(slots,
+                      [&](const auto &slot) { return touches(slot.second); }))
+      continue;
+    Region *region = Value(value).getParentRegion();
+    auto func = region ? region->getParentOfType<cir::FuncOp>() : nullptr;
+    if (func)
+      relevant.insert(func.getOperation());
+  }
+  // The functions whose graphs may hold a launch record: those holding one,
+  // and their callers, transitively.
+  llvm::DenseMap<Operation *, SmallVector<Operation *, 2>> callers;
+  for (const std::unique_ptr<TUFunction> &fn : ci.functions)
+    for (const TUCallSite &call : fn->callSites) {
+      Operation *caller = cir::FuncOp(fn->func).getOperation();
+      if (call.callee)
+        callers[cir::FuncOp(call.callee).getOperation()].push_back(caller);
+      for (FlatSymbolRefAttr target : call.targets)
+        if (auto func =
+                symbols.lookupNearestSymbolFrom<cir::FuncOp>(module, target))
+          callers[func.getOperation()].push_back(caller);
+    }
+  SmallVector<Operation *, 0> up;
+  llvm::DenseSet<Operation *> launching;
+  for (const LaunchRecord &launch : ci.getAllLaunches())
+    if (auto func = launch.call->getParentOfType<cir::FuncOp>())
+      if (launching.insert(func.getOperation()).second)
+        up.push_back(func.getOperation());
+  while (!up.empty()) {
+    Operation *func = up.pop_back_val();
+    for (Operation *caller : callers.lookup(func))
+      if (launching.insert(caller).second)
+        up.push_back(caller);
+  }
+  relevant.insert(launching.begin(), launching.end());
+  stats.numRelevantFunctions = relevant.size();
 }
 
 //===----------------------------------------------------------------------===//
@@ -602,14 +774,21 @@ bool PointsToAnalysis::projectClones() {
   // The latest copies first: a caller's copy is made after the copies in
   // the callee's graph, so what a root learns reaches the leaves in one
   // pass.
-  for (const std::unique_ptr<TUClone> &clone : llvm::reverse(clones)) {
+  // Deterministic order: by the id of the source node. A copy's map never
+  // changes once made, so each is sorted once, not in every round (T19).
+  if (projectionOrder.size() < clones.size())
+    projectionOrder.resize(clones.size());
+  for (size_t index = clones.size(); index-- > 0;) {
+    const std::unique_ptr<TUClone> &clone = clones[index];
     const Reason *sharedWhy = nullptr;
-    // Deterministic order: by the id of the source node.
-    SmallVector<std::pair<const Node *, Cell>, 0> entries(
-        clone->map.entries().begin(), clone->map.entries().end());
-    llvm::sort(entries, [](const auto &a, const auto &b) {
-      return a.first->getId() < b.first->getId();
-    });
+    std::vector<std::pair<const Node *, Cell>> &entries =
+        projectionOrder[index];
+    if (entries.empty() && !clone->map.entries().empty()) {
+      entries.assign(clone->map.entries().begin(), clone->map.entries().end());
+      llvm::sort(entries, [](const auto &a, const auto &b) {
+        return a.first->getId() < b.first->getId();
+      });
+    }
     // The source cells (resolved now) whose copies share a node, with the
     // offset of the copy's cell minus the source cell's.
     llvm::MapVector<Node *, SmallVector<std::pair<Node *, int64_t>, 2>> groups;

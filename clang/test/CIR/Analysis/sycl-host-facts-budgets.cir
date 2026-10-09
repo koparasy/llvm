@@ -1,0 +1,70 @@
+// The budgets of the points-to analysis behind the SYCL host facts, on the
+// container of sycl-host-facts-values.cir.
+//
+// RUN: cir-opt %S/sycl-host-facts-values.cir -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=NORMAL
+// RUN: cir-opt %S/sycl-host-facts-values.cir -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 slice=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=NORMAL
+// RUN: cir-opt %S/sycl-host-facts-values.cir -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 budget-scale=0.000001})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=TINY
+// RUN: cir-opt %S/sycl-host-facts-values.cir -pass-pipeline="builtin.module(cir-offload-infer-kernel-param-noalias{host-facts=ipo host-facts-closed-tu=1 host-facts-budget-scale=0.000001})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
+// RUN: cir-opt %S/sycl-host-facts-values.cir -pass-pipeline="builtin.module(cir-offload-infer-kernel-param-noalias{host-facts=ipo host-facts-closed-tu=1 host-facts-max-seconds=0.000000001})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=GUARD
+// RUN: cir-opt %S/sycl-host-facts-values.cir -mlir-pass-statistics \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-stamp-reqd-work-group-size{host-facts=ipo host-facts-closed-tu=1},cir-offload-infer-kernel-param-noalias{host-facts=ipo host-facts-closed-tu=1},cir-offload-propagate-sycl-kernel-args{host-facts=ipo host-facts-closed-tu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=SHARED
+// RUN: cir-opt %S/sycl-host-facts-values.cir -mlir-pass-statistics \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-stamp-reqd-work-group-size{host-facts=ipo host-facts-closed-tu=1},cir-offload-infer-kernel-param-noalias{host-facts=ipo},cir-offload-propagate-sycl-kernel-args{host-facts=ipo host-facts-closed-tu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=KEYED
+
+// Normal budgets: K1's constant and K1/K3's geometry are recovered; the same
+// with the relevance slice (every host function here can matter to a launch).
+// NORMAL-LABEL: - kernel _ZTSZ4mainEUlvE_
+// NORMAL: const-args n=#cir.int<7>
+// NORMAL: launch in @pf_K1 {{.*}} global=[1024], local=[64]
+// NORMAL-LABEL: - kernel _ZTSZ4mainEUlvE1_
+// NORMAL: const-args n=#cir.int<42>
+// NORMAL: no-alias p
+// NORMAL: launch in @pf_K3 {{.*}} global=[2048], local=[64]
+
+// Every budget tiny (each at least 1): every call is bound
+// context-insensitively and the stored-value queries run out of visits. The
+// answers degrade (no constant, no geometry); none is invented. The USM
+// identity of K3's pointer does not need a context, so it stays.
+// TINY-LABEL: - kernel _ZTSZ4mainEUlvE_
+// TINY-NOT: const-args
+// TINY: launch in @pf_K1 {{.*}} global=[?], local=[?]
+// TINY-LABEL: - kernel _ZTSZ4mainEUlvE1_
+// TINY-NOT: const-args
+// TINY: no-alias p
+// TINY: launch in @pf_K3 {{.*}} global=[?], local=[?]
+
+// The trips are a remark of the pass that built the table.
+// REMARK: remark: host-facts budget trips: clone-nodes={{[1-9][0-9]*}} {{.*}}value-visits={{[1-9][0-9]*}}{{.*}} (closed-tu, bu, subobjects)
+
+// The whole-analysis guard: past its time limit the bottom-up analysis falls
+// back to the context-insensitive one; that one is past it too, so there are
+// no facts at all, and every candidate says why.
+// GUARD: remark: host-facts: the bottom-up points-to analysis gave up: the analysis ran past its time limit {{.*}}; using the context-insensitive analysis
+// GUARD: remark: host-facts: the points-to analysis gave up: the analysis ran past its time limit {{.*}}; no host facts
+// GUARD: remark: host-facts budget trips: gave-up(
+// GUARD: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE1_ arg 1 (pointer 'p'): not stamped (the points-to analysis gave up: the analysis ran past its time limit
+
+// One analysis for the three container passes (SYCLHostFactsCache), kept
+// across the passes that change the container.
+// SHARED-LABEL: OffloadStampReqdWorkGroupSize
+// SHARED-NEXT: (S) 1 host-facts-analyses-built
+// SHARED-LABEL: OffloadInferKernelParamNoAlias
+// SHARED-NEXT: (S) 0 host-facts-analyses-built
+// SHARED-LABEL: OffloadPropagateSYCLKernelArgs
+// SHARED-NEXT: (S) 0 host-facts-analyses-built
+
+// The cache is keyed by the analysis options: a pass asking for another set
+// (open instead of closed-tu) gets its own analysis.
+// KEYED-LABEL: OffloadStampReqdWorkGroupSize
+// KEYED-NEXT: (S) 1 host-facts-analyses-built
+// KEYED-LABEL: OffloadInferKernelParamNoAlias
+// KEYED-NEXT: (S) 1 host-facts-analyses-built
+// KEYED-LABEL: OffloadPropagateSYCLKernelArgs
+// KEYED-NEXT: (S) 0 host-facts-analyses-built

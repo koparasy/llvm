@@ -43,6 +43,8 @@ class raw_ostream;
 
 namespace cir {
 
+class SYCLHostFactsCache;
+
 // How a binding's host side was discovered. CUDA/HIP anchors on a device-stub
 // FuncOp carrying cu.kernel_name; SYCL has no stub -- the host names the device
 // kernel through a mangled-name string constant.
@@ -193,7 +195,23 @@ struct HostFactsOptions {
   /// Give class, union and array members their own points-to nodes
   /// (PointsToAnalysisOptions::subobjects). On by default.
   bool subobjects = true;
+  // Multiply every budget of the points-to analysis by this factor
+  // (PointsToAnalysisOptions::budgetScale; tests set it tiny).
+  double budgetScale = 1.0;
+  // Analyse only the functions that can matter to a kernel launch
+  // (PointsToAnalysisOptions::relevanceSlice). Off by default.
+  bool relevanceSlice = false;
+  // The wall-clock (seconds) and memory (MB) the points-to analysis may use
+  // (PointsToAnalysisOptions::maxSeconds, maxMemoryMB); past it, the
+  // bottom-up analysis falls back to the context-insensitive one, and that
+  // to no facts. 0: no limit.
+  double maxSeconds = 120;
+  unsigned maxMemoryMB = 8192;
 };
+
+// The options that select one points-to analysis: every field but the mode,
+// as a key for SYCLHostFactsCache.
+std::string getHostFactsAnalysisKey(const HostFactsOptions &options);
 
 // "(closed-tu|open, bu|ci[, subobjects])", the analysis options the
 // host-facts-disagreements remarks name.
@@ -417,6 +435,11 @@ public:
   // `options` select where syclNoAliasFields come from (see HostFactsMode).
   // Only the noalias fields and notes depend on them.
   KernelBindingTable(mlir::ModuleOp container, const HostFactsOptions &options);
+  // The same, with the SYCLHostFacts of `cache` (built once per container and
+  // set of analysis options, see SYCLHostFactsCache) instead of facts built
+  // for this table alone.
+  KernelBindingTable(mlir::ModuleOp container, const HostFactsOptions &options,
+                     SYCLHostFactsCache *cache);
 
   const KernelBinding *lookup(llvm::StringRef kernelName) const;
 
@@ -491,6 +514,7 @@ private:
   // about a binding does not depend on the caller passing the right module.
   mlir::ModuleOp hostModule;
   HostFactsOptions hostFactsOptions;
+  SYCLHostFactsCache *hostFactsCache = nullptr;
   llvm::SmallVector<HostFactsComparison, 0> hostFactsComparisons;
   llvm::SmallVector<HostFactsConstComparison, 0> hostFactsConstComparisons;
   llvm::SmallVector<HostFactsGeometryComparison, 0>

@@ -191,6 +191,38 @@ struct PointsToAnalysisOptions {
   /// BU, top-down queries: the most calling contexts one query enumerates;
   /// past it, the query answers from the function's own graph.
   unsigned maxQueryContexts = 64;
+  /// Stored-value queries: the most cells one query visits; past it, the
+  /// answer is incomplete (Reason Budget).
+  unsigned maxQueryVisits = 4096;
+  /// BU: the deepest chain of copies a top-down or stored-value query walks
+  /// up or down; past it, the query answers in the graph it is in (top-down)
+  /// or is incomplete (stored values, Reason Budget).
+  unsigned maxContextDepth = 256;
+  /// The most ancestors (subobject parents, transitively) a query looks at;
+  /// past it, an alias query answers MayAlias and a stored-value query is
+  /// incomplete (Reason Budget).
+  unsigned maxAncestors = 64;
+  /// The most nodes (a node and its subobjects) a stored-value read
+  /// gathers; past it, the read is incomplete (Reason Budget).
+  unsigned maxReadHolders = 256;
+  /// The caps of the copy closure (GraphBudgets).
+  GraphBudgets graphBudgets;
+  /// Multiply every budget above (and the clone budgets, maxIndirectRounds
+  /// and the graph budgets) by this factor, keeping each at least 1: the
+  /// stress tests run with all of them tiny (budgetScale = 0.001). Each
+  /// budget degrades soundly when it trips (see the file comment).
+  double budgetScale = 1.0;
+  /// BU: the relevance slice (PointsToBottomUp.cpp): copy into a caller's
+  /// graph only the callees that can matter to a kernel launch record; bind
+  /// every other call to its callee's own graph (context-insensitively, as
+  /// over budget). Off by default.
+  bool relevanceSlice = false;
+  /// The whole-analysis guard: the wall-clock seconds and the memory (MB,
+  /// allocated since the analysis started) it may use; 0 is no limit. Past
+  /// either, the analysis gives up: every query answers as for code it does
+  /// not see (getGaveUpReason). A client may then run it again in CI mode.
+  double maxSeconds = 0;
+  size_t maxMemoryMB = 0;
   /// If set, called on a registry the analysis owns, which is asked before
   /// the registry passed to the constructor (its fallback): how a client
   /// adds a plug-in's models (the SYCL ones, from OffloadOpt) without this
@@ -452,6 +484,11 @@ struct PointsToQueryStats {
   /// stopped, and the most one query visited.
   size_t totalContexts = 0;
   size_t maxContexts = 0;
+  /// Walks up the copies that stopped at maxContextDepth, and alias queries
+  /// that answered MayAlias because a node had more than maxAncestors
+  /// ancestors (both budgets, of any query).
+  size_t numDepthHits = 0;
+  size_t numAncestorHits = 0;
 };
 
 /// Counters of one run, for statistics and tests.
@@ -478,6 +515,13 @@ struct PointsToAnalysisStats {
   size_t numCycleBindings = 0;
   size_t numBudgetBindings = 0;
   size_t numCycleFallbacks = 0;
+  /// Of numBudgetBindings, those over maxTotalCloneNodes (the others are
+  /// over maxCloneNodes); and the bindings the relevance slice made instead
+  /// of a copy.
+  size_t numTotalBudgetBindings = 0;
+  size_t numSliceBindings = 0;
+  /// The relevance slice: the functions in it, of the analysed ones.
+  size_t numRelevantFunctions = 0;
   /// What the projection from copies to their sources added: flags, and
   /// the merges of source nodes that a caller's context merged.
   size_t numProjectedFlags = 0;
@@ -514,6 +558,47 @@ struct PointsToAnalysisStats {
   size_t numLocalNodes = 0;
   double localSeconds = 0;
   double totalSeconds = 0;
+
+  /// Wall time per phase, in seconds (the cost analysis of T19):
+  ///  - building the local graphs (LocalBuilder and the clone into the TU
+  ///    graph), the BU copies (cloneCallee, also those the fixpoint makes)
+  ///    and the CI binding of the calls;
+  ///  - the fixpoint, and each of its rules summed over its rounds;
+  ///  - computeRecursion with markSummaries, and computeCoveringLaunches.
+  double buildLocalSeconds = 0;
+  double cloneSeconds = 0;
+  double bindSeconds = 0;
+  double fixpointSeconds = 0;
+  double propagateSeconds = 0;
+  double clobberSeconds = 0;
+  double indirectSeconds = 0;
+  double escapedSeconds = 0;
+  double extraRuleSeconds = 0;
+  double projectSeconds = 0;
+  double absorbSeconds = 0;
+  double transferSeconds = 0;
+  double summarySeconds = 0;
+  double coveringSeconds = 0;
+  size_t numFixpointRounds = 0;
+  /// BU: the most nodes the copies made for one SCC's graph, and that SCC.
+  size_t maxSCCClonedNodes = 0;
+  mlir::Operation *maxSCCClonedFunc = nullptr;
+};
+
+/// Adds the wall time of its scope, in seconds, to a counter (the phase
+/// times of PointsToAnalysisStats).
+class ScopedPhaseTimer {
+public:
+  explicit ScopedPhaseTimer(double &total) : total(total), start(now()) {}
+  ~ScopedPhaseTimer() { total += now() - start; }
+  ScopedPhaseTimer(const ScopedPhaseTimer &) = delete;
+  ScopedPhaseTimer &operator=(const ScopedPhaseTimer &) = delete;
+  /// Seconds on a monotonic clock.
+  static double now();
+
+private:
+  double &total;
+  double start;
 };
 
 /// The context-insensitive points-to analysis of a module (see the file
@@ -674,13 +759,19 @@ public:
   /// the callers' graphs (LaunchRecord::ctx), up to a function that has
   /// unknown callers, no callers, or one bound context-insensitively.
   llvm::ArrayRef<LaunchRecord> getLaunches() const {
+    if (gaveUpWhy)
+      return {};
     return options.mode == PointsToMode::BU ? coveringLaunches : launches;
   }
   /// Every launch record: CI mode, getLaunches(); BU mode, also the copies
   /// in every caller's graph and the records they replace. A rule about
   /// what a launch does to its graph (the SYCL device-write rule) applies
   /// to all of them.
-  llvm::ArrayRef<LaunchRecord> getAllLaunches() const { return launches; }
+  llvm::ArrayRef<LaunchRecord> getAllLaunches() const {
+    if (gaveUpWhy)
+      return {};
+    return launches;
+  }
 
   PointsToMode getMode() const { return options.mode; }
   /// BU mode: the calling contexts (Origin::ctx, LaunchRecord::ctx).
@@ -696,6 +787,17 @@ public:
   }
 
   const PointsToAnalysisStats &getStats() const { return stats; }
+  /// Why the analysis gave up (its maxSeconds or maxMemoryMB guard tripped),
+  /// or null. An analysis that gave up has no usable graph: every query
+  /// answers as for a value it does not see (pointsTo incomplete, alias
+  /// MayAlias, getModRef ModRef, stored values incomplete, no launches).
+  const Reason *getGaveUpReason() const { return gaveUpWhy; }
+  /// The budgets that tripped so far, with how often, as
+  /// "<budget>=<count>" separated by spaces ("" if none): the construction
+  /// budgets, and those of the queries run so far.
+  std::string formatBudgetTrips() const;
+  /// The options in effect (after budgetScale).
+  const PointsToAnalysisOptions &getOptions() const { return options; }
   /// The counters of the top-down queries run so far.
   const PointsToQueryStats &getQueryStats() const { return queryStats; }
 
@@ -716,6 +818,9 @@ private:
   friend class StoredValueQuery;
 
   void run();
+  /// Whether the whole-analysis guard (maxSeconds, maxMemoryMB) tripped,
+  /// now or before; sets gaveUpWhy the first time.
+  bool guardTripped(bool force = false);
   void buildLocal(cir::FuncOp func, bool formalsComplete);
   /// The fixpoint of step 5 (see the file comment).
   void runFixpoint();
@@ -744,6 +849,8 @@ private:
     std::vector<unsigned> transfers;
     /// The nodes made for the graph: the local graphs and the copies.
     size_t nodes = 0;
+    /// Of those, the nodes the copies made.
+    size_t copied = 0;
   };
   enum class BindResult : uint8_t { Bound, Fallback };
   void runBottomUp(llvm::ArrayRef<llvm::SmallVector<cir::FuncOp, 1>> sccs,
@@ -918,10 +1025,13 @@ private:
 
   mlir::ModuleOp module;
   const PointsToModelRegistry *models;
+  /// The registry passed to the constructor (the fallback of ownedModels).
+  const PointsToModelRegistry *baseModels;
   /// The registry of PointsToAnalysisOptions::extraModels, if any.
   std::unique_ptr<PointsToModelRegistry> ownedModels;
   PointsToAnalysisOptions options;
-  mlir::SymbolTableCollection symbols;
+  /// Mutable: the const queries look symbols up too (it is a cache).
+  mutable mlir::SymbolTableCollection symbols;
   /// Whether a global is a constant with a #cir.vtable initializer, by name
   /// (getVirtualCallTargets).
   mutable llvm::DenseMap<mlir::Attribute, bool> constantVTables;
@@ -954,6 +1064,8 @@ private:
       coveredClones;
   CallPathTable callPaths;
   std::vector<std::unique_ptr<TUClone>> clones;
+  /// projectClones: the entries of each copy's map, sorted by source node.
+  std::vector<std::vector<std::pair<const Node *, Cell>>> projectionOrder;
   std::vector<Partition> partitions;
   /// The functions some direct call of which got the unknown-call rule
   /// because they were still being analysed: their formals are never
@@ -967,6 +1079,16 @@ private:
   const Reason *notAnalysedWhy = nullptr;
   llvm::StringMap<unsigned> unhandledOps;
   PointsToAnalysisStats stats;
+  /// The guard: when the analysis started, the bytes allocated then, and
+  /// why it gave up.
+  double guardStartSeconds = 0;
+  size_t guardStartBytes = 0;
+  unsigned guardTicks = 0;
+  const Reason *gaveUpWhy = nullptr;
+  /// The relevance slice (BU): the functions whose graphs are copied into
+  /// their callers'; computeRelevance.
+  llvm::DenseSet<mlir::Operation *> relevant;
+  void computeRelevance(llvm::ArrayRef<llvm::SmallVector<cir::FuncOp, 1>> sccs);
   bool verifyErrors = false;
   /// Set if a model wrote at a call no analysed function holds: the
   /// stored-value queries then read everything as incomplete.

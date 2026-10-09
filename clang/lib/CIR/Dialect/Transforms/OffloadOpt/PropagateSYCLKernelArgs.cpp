@@ -40,6 +40,7 @@
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/Passes.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLHostFacts.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 
 namespace mlir {
@@ -76,9 +77,25 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
   options.assumeClosedTU = hostFactsClosedTU;
   options.bottomUp = hostFactsBottomUp;
   options.subobjects = hostFactsSubobjects;
+  options.budgetScale = hostFactsBudgetScale;
+  options.relevanceSlice = hostFactsSlice;
+  options.maxSeconds = hostFactsMaxSeconds;
+  options.maxMemoryMB = hostFactsMaxMemoryMB;
   std::optional<cir::KernelBindingTable> ownTable;
-  if (*mode != cir::HostFactsMode::Legacy)
-    ownTable.emplace(container, options);
+  cir::SYCLHostFactsCache *factsCache = nullptr;
+  if (*mode != cir::HostFactsMode::Legacy) {
+    factsCache = &getAnalysis<cir::SYCLHostFactsCache>();
+    unsigned builtBefore = factsCache->getNumBuilt();
+    ownTable.emplace(container, options, factsCache);
+    numHostFactsBuilt += factsCache->getNumBuilt() - builtBefore;
+    // The budgets that tripped while this table was built (once per
+    // change: the passes share the analysis).
+    if (std::optional<std::string> trips =
+            factsCache->get(options).takeBudgetReport())
+      mlir::emitRemark(container.getLoc())
+          << "host-facts budget trips: " << *trips << " "
+          << cir::formatHostFactsOptions(options);
+  }
   cir::KernelBindingTable &table =
       ownTable ? *ownTable : getAnalysis<cir::KernelBindingTable>();
   if (*mode == cir::HostFactsMode::Both) {
@@ -167,6 +184,8 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
           container, binding, binding.launchSites,
           "constprop." + std::to_string(specTag++));
       if (spec) {
+        if (factsCache)
+          factsCache->recordSpecialization(spec->name, entry.first);
         applyConstArgs(spec->deviceKernels, binding.syclConstArgs);
         changed = true; // The clone + redirect mutated the IR regardless.
       }
@@ -175,6 +194,10 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
 
   if (!changed)
     markAllAnalysesPreserved();
+  else
+    // SOUNDNESS: see SYCLHostFactsCache: the device-side changes and the
+    // specializations leave the host facts true.
+    markAnalysesPreserved<cir::SYCLHostFactsCache>();
 }
 
 } // namespace

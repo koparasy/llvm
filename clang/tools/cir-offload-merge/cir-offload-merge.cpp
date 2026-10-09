@@ -32,6 +32,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Support/LogicalResult.h"
+#include "mlir/Support/Timing.h"
 #include "mlir/Transforms/Passes.h"
 #include "clang/Basic/TargetID.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
@@ -144,6 +145,32 @@ llvm::cl::opt<bool> HostFactsCensus(
     llvm::cl::desc("Under --cir-offload-host-facts=both, also remark both "
                    "verdicts of every candidate field"),
     llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
+// The budgets of the points-to analysis (T19): a factor on all of them (for
+// stress tests), the relevance slice, and the whole-analysis guard.
+llvm::cl::opt<double> HostFactsBudgetScale(
+    "cir-offload-host-facts-budget-scale",
+    llvm::cl::desc("Multiply every budget of the points-to analysis behind "
+                   "--cir-offload-host-facts=ipo|both by this factor"),
+    llvm::cl::init(1.0), llvm::cl::Hidden,
+    llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<bool> HostFactsSlice(
+    "cir-offload-host-facts-slice",
+    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, analyse only the "
+                   "host functions that can matter to a kernel launch"),
+    llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<double> HostFactsMaxSeconds(
+    "cir-offload-host-facts-max-seconds",
+    llvm::cl::desc("The wall-clock seconds the points-to analysis behind "
+                   "--cir-offload-host-facts=ipo|both may take (0: no limit)"),
+    llvm::cl::init(120), llvm::cl::Hidden,
+    llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<unsigned> HostFactsMaxMemoryMB(
+    "cir-offload-host-facts-max-memory-mb",
+    llvm::cl::desc("The memory (MB) the points-to analysis behind "
+                   "--cir-offload-host-facts=ipo|both may allocate (0: no "
+                   "limit)"),
+    llvm::cl::init(8192), llvm::cl::Hidden,
+    llvm::cl::cat(CIROffloadMergeCategory));
 
 struct InputTarget {
   std::string Input;
@@ -453,6 +480,11 @@ static std::string getHostFactsPassOptions() {
       " host-facts-bu=" + std::string(flag(HostFactsBottomUp && !HostFactsCI));
   options += " host-facts-subobjects=" + std::string(flag(HostFactsSubobjects));
   options += " host-facts-census=" + std::string(flag(HostFactsCensus));
+  options += " host-facts-budget-scale=" + std::to_string(HostFactsBudgetScale);
+  options += " host-facts-slice=" + std::string(flag(HostFactsSlice));
+  options += " host-facts-max-seconds=" + std::to_string(HostFactsMaxSeconds);
+  options +=
+      " host-facts-max-memory-mb=" + std::to_string(HostFactsMaxMemoryMB);
   return options;
 }
 
@@ -467,6 +499,12 @@ static bool setHostFactsOptions(mlir::Pass &pass) {
 
 int runOffloadOptPasses(mlir::ModuleOp module) {
   mlir::PassManager pm(module.getContext(), mlir::ModuleOp::getOperationName());
+  if (mlir::failed(mlir::applyPassManagerCLOptions(pm)))
+    return reportError("bad pass manager options");
+  mlir::DefaultTimingManager timingManager;
+  mlir::applyDefaultTimingManagerCLOptions(timingManager);
+  mlir::TimingScope timing = timingManager.getRootScope();
+  pm.enableTiming(timing);
   mlir::OpPassManager &modulePM = pm.nest<mlir::ModuleOp>();
 
   // Warn when a SYCL kernel's captured-closure layout diverges between the host
@@ -647,6 +685,11 @@ int splitInput(llvm::StringRef inputFileName,
 
 int main(int argc, char **argv) {
   llvm::InitLLVM y(argc, argv);
+  // --mlir-timing, --mlir-disable-threading and the other pass manager
+  // options (hidden below), for measuring the container passes.
+  mlir::registerMLIRContextCLOptions();
+  mlir::registerPassManagerCLOptions();
+  mlir::registerDefaultTimingManagerCLOptions();
   llvm::cl::HideUnrelatedOptions(CIROffloadMergeCategory);
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "CIR host-device offload merge\n");

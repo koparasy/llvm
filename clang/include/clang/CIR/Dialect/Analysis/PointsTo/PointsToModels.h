@@ -53,6 +53,7 @@
 
 namespace mlir {
 class DataLayout;
+class SymbolTableCollection;
 } // namespace mlir
 
 namespace cir::pointsto {
@@ -75,6 +76,14 @@ public:
 
   Graph &getGraph() { return graph; }
   const mlir::DataLayout &getDataLayout() const { return dataLayout; }
+  /// The symbol tables of the analysis, for a model's symbol lookups (null
+  /// if the caller has none: look up without a cache).
+  mlir::SymbolTableCollection *getSymbols() const { return symbols; }
+  void setSymbols(mlir::SymbolTableCollection *s) { symbols = s; }
+  /// Look up the function \p sym names from \p at, through getSymbols() if
+  /// set (MLIR's lookupNearestSymbolFrom scans the module otherwise).
+  cir::FuncOp lookupFunction(mlir::Operation *at,
+                             mlir::FlatSymbolRefAttr sym) const;
 
   /// The value of argument \p index if it is an integer constant;
   /// std::nullopt otherwise and for a synthetic site.
@@ -179,6 +188,7 @@ public:
 private:
   Graph &graph;
   const mlir::DataLayout &dataLayout;
+  mlir::SymbolTableCollection *symbols = nullptr;
   llvm::SmallVectorImpl<DeferredEffect> &deferred;
   llvm::SmallVectorImpl<MemTransferRecord> &memTransfers;
   llvm::SmallVectorImpl<LaunchRecord> *launches = nullptr;

@@ -64,7 +64,9 @@ struct PointsToHolder {
 
   PointsToHolder(Operation *op, bool closedTU, bool sycl = false,
                  bool bottomUp = false, bool subobjects = false,
-                 bool topDown = true, unsigned maxQueryContexts = 64) {
+                 bool topDown = true, unsigned maxQueryContexts = 64,
+                 unsigned maxAncestors = 64, unsigned maxContextDepth = 256,
+                 double budgetScale = 1.0) {
     registerGenericModels(registry);
     auto module = dyn_cast<ModuleOp>(op);
     if (!module)
@@ -76,6 +78,9 @@ struct PointsToHolder {
     options.subobjects = subobjects;
     options.topDownQueries = topDown;
     options.maxQueryContexts = maxQueryContexts;
+    options.maxAncestors = maxAncestors;
+    options.maxContextDepth = maxContextDepth;
+    options.budgetScale = budgetScale;
     if (sycl)
       cir::addSYCLPointsToPlugin(options);
     analysis = std::make_unique<PointsToAnalysis>(module, &registry, options);
@@ -170,6 +175,19 @@ struct PointsToOptions : public PassWrapper<Derived, OperationPass<>> {
       *this, "max-query-contexts",
       llvm::cl::desc("Points-to, bu: the most calling contexts per query"),
       llvm::cl::init(64)};
+  Pass::Option<unsigned> maxAncestors{
+      *this, "max-ancestors",
+      llvm::cl::desc("Points-to: the most ancestors a query looks at"),
+      llvm::cl::init(64)};
+  Pass::Option<unsigned> maxContextDepth{
+      *this, "max-context-depth",
+      llvm::cl::desc("Points-to, bu: the deepest chain of copies a query "
+                     "walks"),
+      llvm::cl::init(256)};
+  Pass::Option<double> budgetScale{
+      *this, "budget-scale",
+      llvm::cl::desc("Points-to: multiply every budget by this factor"),
+      llvm::cl::init(1.0)};
   Pass::Option<bool> pointsToOnly{
       *this, "points-to-only",
       llvm::cl::desc("Print the answers of the points-to analysis alone"),
@@ -203,7 +221,9 @@ struct TestCIRAliasAnalysisPass
     }
     PointsToHolder holder(getOperation(), this->closedTU, this->syclModels,
                           this->ptMode == "bu", this->subobjects,
-                          this->topDown, this->maxQueryContexts);
+                          this->topDown, this->maxQueryContexts,
+                          this->maxAncestors, this->maxContextDepth,
+                          this->budgetScale);
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);
@@ -248,7 +268,9 @@ struct TestCIRAliasAnalysisModRefPass
     }
     PointsToHolder holder(getOperation(), this->closedTU, this->syclModels,
                           this->ptMode == "bu", this->subobjects,
-                          this->topDown, this->maxQueryContexts);
+                          this->topDown, this->maxQueryContexts,
+                          this->maxAncestors, this->maxContextDepth,
+                          this->budgetScale);
     const PointsToAnalysis &pt = *holder.analysis;
     for (Operation *op : getTestedOps(getOperation())) {
       mlir::AliasAnalysis aliasAnalysis(op);

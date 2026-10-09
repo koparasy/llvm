@@ -53,6 +53,21 @@ struct PrintKernelBindingsPass
                      "their own points-to nodes (the default)"),
       llvm::cl::init(cir::HostFactsOptions().subobjects)};
 
+  Option<double> budgetScale{
+      *this, "budget-scale",
+      llvm::cl::desc("Under ipo/both, multiply every budget of the points-to "
+                     "analysis by this factor"),
+      llvm::cl::init(1.0)};
+  Option<bool> slice{
+      *this, "slice",
+      llvm::cl::desc("Under ipo/both, the relevance slice of the points-to "
+                     "analysis"),
+      llvm::cl::init(false)};
+  Option<double> maxSeconds{
+      *this, "max-seconds",
+      llvm::cl::desc("Under ipo/both, the points-to analysis' time limit"),
+      llvm::cl::init(cir::HostFactsOptions().maxSeconds)};
+
   StringRef getArgument() const final { return "test-print-kernel-bindings"; }
   StringRef getDescription() const final {
     return "Print the host<->device kernel bindings of an offload container.";
@@ -77,6 +92,9 @@ struct PrintKernelBindingsPass
     options.assumeClosedTU = closedTU;
     options.bottomUp = bottomUp;
     options.subobjects = subobjects;
+    options.budgetScale = budgetScale;
+    options.relevanceSlice = slice;
+    options.maxSeconds = maxSeconds;
     cir::KernelBindingTable(getOperation(), options).print(llvm::errs());
   }
 };

@@ -131,6 +131,7 @@
 
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLHostFacts.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Location.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "clang/CIR/Dialect/Analysis/CIRPointerDecomposition.h"
@@ -160,14 +161,14 @@ StringRef getRole(cir::FuncOp func) {
   return role ? role.getValue() : StringRef();
 }
 
-cir::FuncOp getDirectCallee(Operation *op) {
+cir::FuncOp getDirectCallee(Operation *op, SymbolTableCollection &symbols) {
   auto call = dyn_cast_if_present<CIRCallOpInterface>(op);
   if (!call || call.isIndirect())
     return {};
   auto sym = op->getAttrOfType<FlatSymbolRefAttr>("callee");
   if (!sym)
     return {};
-  return SymbolTable::lookupNearestSymbolFrom<cir::FuncOp>(op, sym);
+  return symbols.lookupNearestSymbolFrom<cir::FuncOp>(op, sym);
 }
 
 /// "file:line" of \p op, or "in @func".
@@ -235,9 +236,36 @@ SYCLHostFacts::SYCLHostFacts(ModuleOp container,
   if (options.bottomUp)
     ptOptions.mode = pointsto::PointsToMode::BU;
   ptOptions.subobjects = options.subobjects;
+  ptOptions.budgetScale = options.budgetScale;
+  ptOptions.relevanceSlice = options.relevanceSlice;
+  ptOptions.maxSeconds = options.maxSeconds;
+  ptOptions.maxMemoryMB = options.maxMemoryMB;
   addSYCLPointsToPlugin(ptOptions);
   ownedAnalysis =
       std::make_unique<PointsToAnalysis>(host, ownedRegistry.get(), ptOptions);
+  // The compile-time guard (T19): a bottom-up analysis over its time or
+  // memory limit falls back to the context-insensitive one, which is
+  // cheaper; one over the limit again gives no facts at all (every query
+  // answers "not known", see unknownLaunchWhy).
+  if (const pointsto::Reason *why = ownedAnalysis->getGaveUpReason()) {
+    std::string detail = why->detail.str();
+    if (ptOptions.mode == pointsto::PointsToMode::BU) {
+      mlir::emitRemark(container.getLoc())
+          << "host-facts: the bottom-up points-to analysis gave up: " << detail
+          << "; using the context-insensitive analysis";
+      ptOptions.mode = pointsto::PointsToMode::CI;
+      ptOptions.relevanceSlice = false;
+      ownedAnalysis = std::make_unique<PointsToAnalysis>(
+          host, ownedRegistry.get(), ptOptions);
+      why = ownedAnalysis->getGaveUpReason();
+      detail = why ? why->detail.str() : "";
+    }
+    if (why) {
+      gaveUp = "the points-to analysis gave up: " + detail;
+      mlir::emitRemark(container.getLoc())
+          << "host-facts: " << gaveUp << "; no host facts";
+    }
+  }
   analysis = ownedAnalysis.get();
   for (ModuleOp device : getOffloadContainerDeviceModules(container))
     collectDeviceKernels(device);
@@ -252,6 +280,43 @@ SYCLHostFacts::SYCLHostFacts(const PointsToAnalysis &analysis,
 }
 
 SYCLHostFacts::~SYCLHostFacts() = default;
+
+std::optional<std::string> SYCLHostFacts::takeBudgetReport() const {
+  std::string trips = analysis->formatBudgetTrips();
+  if (trips.empty() || trips == reportedBudget)
+    return std::nullopt;
+  reportedBudget = trips;
+  return trips;
+}
+
+//===----------------------------------------------------------------------===//
+// SYCLHostFactsCache
+//===----------------------------------------------------------------------===//
+
+SYCLHostFactsCache::SYCLHostFactsCache(Operation *container)
+    : container(cast<ModuleOp>(container)) {}
+
+SYCLHostFactsCache::~SYCLHostFactsCache() = default;
+
+const SYCLHostFacts &SYCLHostFactsCache::get(const HostFactsOptions &options) {
+  std::unique_ptr<SYCLHostFacts> &entry =
+      facts[getHostFactsAnalysisKey(options)];
+  if (!entry) {
+    entry = std::make_unique<SYCLHostFacts>(container, options);
+    ++numBuilt;
+  }
+  return *entry;
+}
+
+void SYCLHostFactsCache::recordSpecialization(StringRef clone,
+                                              StringRef original) {
+  origins[clone] = getOriginalKernel(original).str();
+}
+
+StringRef SYCLHostFactsCache::getOriginalKernel(StringRef kernel) const {
+  auto it = origins.find(kernel);
+  return it == origins.end() ? kernel : StringRef(it->second);
+}
 
 void SYCLHostFacts::collectDeviceKernels(Operation *scope) {
   // The device kernels: functions with a body whose arguments carry the
@@ -305,7 +370,7 @@ void SYCLHostFacts::buildIndex() {
       unnamedLaunch = launch.call;
   }
   module.walk([&](CIRCallOpInterface call) {
-    cir::FuncOp callee = getDirectCallee(call);
+    cir::FuncOp callee = getDirectCallee(call, symbols);
     if (getRole(callee) != "kernel.info")
       return;
     auto func = call->getParentOfType<cir::FuncOp>();
@@ -316,7 +381,7 @@ void SYCLHostFacts::buildIndex() {
     });
     if (feedsLaunch)
       return;
-    std::string name = getSYCLKernelInfoName(callee);
+    std::string name = getSYCLKernelInfoName(callee, &symbols);
     if (!name.empty())
       unrecordedMarkers.try_emplace(name, call.getOperation());
   });
@@ -335,7 +400,7 @@ std::string SYCLHostFacts::describeAllocation(const Node *node) const {
   const Origin &origin = node->getOrigins().front();
   switch (origin.kind) {
   case Origin::Kind::GhostSite: {
-    cir::FuncOp callee = getDirectCallee(origin.site);
+    cir::FuncOp callee = getDirectCallee(origin.site, symbols);
     StringRef name;
     if (auto call = dyn_cast_if_present<CIRCallOpInterface>(origin.site)) {
       unsigned self = callee && callee.getNumArguments() &&
@@ -390,7 +455,7 @@ std::optional<std::string> SYCLHostFacts::notOneAllocationWhy(const Node *node,
   // sites, for instance std::allocator's aligned and plain operator new.
   auto originWhy = [&](const Origin &origin) -> std::optional<std::string> {
     if (storage) {
-      StringRef role = getRole(getDirectCallee(origin.site));
+      StringRef role = getRole(getDirectCallee(origin.site, symbols));
       if (origin.kind != Origin::Kind::GhostSite ||
           (role != "buffer.alloc" && role != "buffer.host_ptr"))
         return ("the storage " + id + " is made by " +
@@ -505,7 +570,8 @@ SYCLHostFacts::identityOfClosureField(const LaunchRecord &launch,
   if (std::optional<std::string> why =
           unknownValueWhy(id.node, /*storage=*/true))
     return fail("accessor '" + field + "': " + *why);
-  StringRef role = getRole(getDirectCallee(id.node->getOrigins()[0].site));
+  StringRef role =
+      getRole(getDirectCallee(id.node->getOrigins()[0].site, symbols));
   std::optional<Cell> host =
       graph.lookupGhostLink(*storage, getSYCLHostField());
   if (role == "buffer.host_ptr" && !host)
@@ -594,6 +660,8 @@ SYCLHostFacts::factsOfLaunch(const LaunchRecord &launch,
 
 std::optional<std::string>
 SYCLHostFacts::unknownLaunchWhy(StringRef kernel) const {
+  if (!gaveUp.empty())
+    return gaveUp;
   if (unnamedLaunch)
     return "the launch at " + formatLocation(unnamedLaunch) +
            " may launch any kernel: its kernel is not known";

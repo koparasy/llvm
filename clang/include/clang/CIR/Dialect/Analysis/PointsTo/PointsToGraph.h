@@ -515,6 +515,20 @@ struct CloneOptions {
 ///  - an explicit collapse();
 ///  - a link of a node that runs into one of its subobjects, a cycle of
 ///    subobject links, or a child that is its own parent at a shift.
+/// The caps of the graph-level algorithms (closeMemTransfers). Each one, when
+/// it trips, falls back to a coarser rule that is sound (see LocalBuilder.h):
+/// a copy with too many offsets to list is related as arrays or smashed, and
+/// a closure that does not settle smashes every copy.
+struct GraphBudgets {
+  /// The most offsets one copy relates one by one.
+  size_t maxTransferSlots = 1024;
+  /// The most rounds of the copy closure.
+  unsigned maxTransferRounds = 64;
+  /// How often each cap tripped (for statistics and tests).
+  mutable size_t numTransferSlotTrips = 0;
+  mutable size_t numTransferRoundTrips = 0;
+};
+
 class Graph {
 public:
   /// \p pointerSize is the size of a pointer slot in bytes. \p reasons is a
@@ -526,6 +540,9 @@ public:
 
   unsigned getPointerSize() const { return pointerSize; }
   ReasonTable &getReasonTable() const { return *reasonTable; }
+  /// The caps of the graph-level algorithms, and their trip counters.
+  const GraphBudgets &getBudgets() const { return budgets; }
+  void setBudgets(const GraphBudgets &b) { budgets = b; }
 
   /// Convenience for getReasonTable().make(...).
   const Reason *makeReason(Reason::Kind kind, mlir::Operation *op = nullptr,
@@ -754,6 +771,7 @@ private:
   static void recordReason(Node *node, NodeFlags bit, const Reason *why);
 
   unsigned pointerSize;
+  GraphBudgets budgets;
   bool trackShared = false;
   bool anySubobjects = false;
   /// The nodes a subobject link at offset 0 was made on (forwarded ones

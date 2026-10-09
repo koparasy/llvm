@@ -153,8 +153,10 @@ public:
 
   /// The locations of an access of \p size bytes at \p cell (resolved) in
   /// its node and in each of its ancestors (the node first); with
-  /// \p anywhere, of an access anywhere in the node.
-  void
+  /// \p anywhere, of an access anywhere in the node. False if there were
+  /// more ancestors than PointsToAnalysisOptions::maxAncestors: some are
+  /// missing.
+  bool
   locate(Cell cell, uint64_t size,
          llvm::SmallVectorImpl<std::pair<const Node *, WriteLocation>> &out,
          bool anywhere = false) const;
@@ -216,6 +218,10 @@ public:
     size_t numQueries = 0;
     size_t numVisits = 0;
     size_t numBudgetHits = 0;
+    /// Reads past maxContextDepth, maxAncestors and maxReadHolders.
+    size_t numDepthHits = 0;
+    size_t numAncestorHits = 0;
+    size_t numHolderHits = 0;
   };
   const Stats &getStats() const { return stats; }
 

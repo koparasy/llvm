@@ -389,6 +389,11 @@ public:
   /// the file comment of PointsToGraph.h). Call before build(). Off by
   /// default.
   void setSubobjects(bool enable) { subobjects = enable; }
+  /// The caps of the graph-level algorithms the walk runs (the copy
+  /// closure). Call before build().
+  void setGraphBudgets(const GraphBudgets &budgets) {
+    fg->getGraph().setBudgets(budgets);
+  }
 
   /// Walk the body and return the finished graph. Call once. Under
   /// -cir-points-to-verify the graph is verified before it is returned.
