@@ -35,6 +35,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/IR/Diagnostics.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/Passes.h"
@@ -42,6 +43,7 @@
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 
 namespace mlir {
+#define GEN_PASS_DECL_OFFLOADPROPAGATESYCLKERNELARGS
 #define GEN_PASS_DEF_OFFLOADPROPAGATESYCLKERNELARGS
 #include "clang/CIR/Dialect/Passes.h.inc"
 } // namespace mlir
@@ -61,7 +63,46 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
   mlir::ModuleOp container = getOperation();
   if (!cir::isOffloadContainer(container))
     return;
-  cir::KernelBindingTable &table = getAnalysis<cir::KernelBindingTable>();
+  std::optional<cir::HostFactsMode> mode = cir::parseHostFactsMode(hostFacts);
+  if (!mode) {
+    container.emitError() << "unknown host-facts mode '" << hostFacts
+                          << "' (expected legacy, ipo or both)";
+    return signalPassFailure();
+  }
+  // The legacy table is the cached analysis the other container passes share;
+  // the other modes build their own.
+  cir::HostFactsOptions options;
+  options.mode = *mode;
+  options.assumeClosedTU = hostFactsClosedTU;
+  options.bottomUp = hostFactsBottomUp;
+  options.subobjects = hostFactsSubobjects;
+  std::optional<cir::KernelBindingTable> ownTable;
+  if (*mode != cir::HostFactsMode::Legacy)
+    ownTable.emplace(container, options);
+  cir::KernelBindingTable &table =
+      ownTable ? *ownTable : getAnalysis<cir::KernelBindingTable>();
+  if (*mode == cir::HostFactsMode::Both) {
+    // Legacy is the result; report where the two sources differ.
+    unsigned disagreements = 0;
+    for (const cir::HostFactsConstComparison &cmp :
+         table.getHostFactsConstComparisons()) {
+      mlir::Location loc = container.getLoc();
+      if (const cir::KernelBinding *binding = table.lookup(cmp.kernel))
+        if (!binding->deviceKernels.empty())
+          loc = binding->deviceKernels.front()->getLoc();
+      if (cmp.disagrees()) {
+        ++disagreements;
+        mlir::emitRemark(loc) << cir::formatHostFactsDisagreement(cmp);
+      } else if (hostFactsCensus) {
+        mlir::emitRemark(loc)
+            << "host-facts: " << cir::formatHostFactsComparison(cmp);
+      }
+    }
+    mlir::emitRemark(container.getLoc())
+        << "host-facts-disagreements: " << disagreements << " of "
+        << table.getHostFactsConstComparisons().size()
+        << " scalar capture fields " << cir::formatHostFactsOptions(options);
+  }
   bool changed = false;
 
   // Replace each scalar kernel parameter bound to an agreed-constant capture

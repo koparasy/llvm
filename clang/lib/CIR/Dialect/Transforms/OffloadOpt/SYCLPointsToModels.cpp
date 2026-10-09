@@ -34,11 +34,29 @@
 //  - a model whose function returns a runtime object (an event) gives its
 //    result slot the same treatment.
 //
+// Writes (PointsToModel::declaresAllWrites, audited for T23): every model
+// reports each write it makes to memory the caller can see, so that the
+// stored-value queries (StoredValues.h) do not read a value the call
+// overwrote. A handle a model constructs, assigns or destroys, and a result
+// slot it fills, are written with an unknown value over the handle's bytes
+// (writeHandle: the runtime keeps its own state there); host memory a buffer
+// may write back, a write-back destination and a memory command's
+// destination are written with an unknown value anywhere in their node (and
+// a copy is also recorded as one); what a launch's other operands reach is
+// written (a reduction's result). Nothing else is written: the closure of a
+// launch is read (the kernel gets a copy, PI 17660-17672), and so is its
+// geometry, a by-value parameter of the launch functions (a range or
+// nd_range, PI 14745ff `table.members.handler.kernel`; the runtime glue
+// takes the detail::nd_range_view over it and copies the sizes). A model
+// that falls back to the unknown-call rule writes everything the call's
+// pointers reach.
+//
 //===----------------------------------------------------------------------===//
 
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/SymbolTable.h"
+#include "clang/CIR/Dialect/Analysis/CIRPointerDecomposition.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
@@ -141,12 +159,59 @@ static void refOperands(const CallSiteRecord &site, ModelContext &ctx,
 /// keeps none of these pointers for code we don't see.
 static void modRefReachableOperands(const CallSiteRecord &site,
                                     ModelContext &ctx,
-                                    ArrayRef<unsigned> except) {
+                                    ArrayRef<unsigned> except,
+                                    std::optional<unsigned> readOnly = {}) {
   forEachPointerOperand(site, [&](unsigned i, Cell cell) {
-    if (!llvm::is_contained(except, i))
-      ctx.defer(DeferredEffect::Kind::Reachable, cell,
-                NodeFlags::Mod | NodeFlags::Ref, nullptr);
+    if (llvm::is_contained(except, i))
+      return;
+    ctx.defer(DeferredEffect::Kind::Reachable, cell,
+              readOnly == i ? NodeFlags::Ref : NodeFlags::Mod | NodeFlags::Ref,
+              nullptr);
   });
+  // The pointers in an aggregate passed by value (a reduction object, say).
+  for (const auto &entry : site.aggregateArgs)
+    for (const auto &slot : entry.second)
+      if (slot.second)
+        ctx.defer(DeferredEffect::Kind::Reachable, slot.second,
+                  NodeFlags::Mod | NodeFlags::Ref, nullptr);
+}
+
+/// The size of the object pointer operand \p index points to, if known.
+static std::optional<uint64_t>
+getPointeeSize(const CallSiteRecord &site, ModelContext &ctx, unsigned index) {
+  auto ptr = dyn_cast_if_present<cir::PointerType>(getOperandType(site, index));
+  if (!ptr)
+    return std::nullopt;
+  std::optional<int64_t> size =
+      getTypeSizeInBytes(ptr.getPointee(), ctx.getDataLayout());
+  if (!size || *size <= 0)
+    return std::nullopt;
+  return static_cast<uint64_t>(*size);
+}
+
+/// A handle (or result slot) at \p handle, the object operand \p index points
+/// to, that the call constructs, assigns or destroys: Mod, and a write of an
+/// unknown value over the object's bytes (anywhere in its node if its type
+/// has no size): the runtime keeps its own state in it.
+static void writeHandle(const CallSiteRecord &site, ModelContext &ctx,
+                        unsigned index, Cell handle) {
+  ctx.writeUnknown(handle, getPointeeSize(site, ctx, index));
+}
+
+/// Whether pointer operand \p index is a launch geometry the call only reads:
+/// a range or nd_range the callee takes by value (`llvm.byval`: the callee
+/// gets its own copy, the caller's object is not written), or the
+/// detail::nd_range_view over one, whose sizes the runtime copies.
+static bool isReadOnlyGeometry(const CallSiteRecord &site, cir::FuncOp callee,
+                               unsigned index) {
+  cir::RecordType rec = getPointeeRecord(getOperandType(site, index));
+  StringAttr name = rec ? rec.getName() : StringAttr();
+  if (!name || !name.getValue().starts_with("sycl::"))
+    return false;
+  if (name.getValue().contains("::nd_range_view"))
+    return true;
+  return callee && index < callee.getNumArguments() &&
+         callee.getArgAttr(index, "llvm.byval");
 }
 
 /// What the runtime keeps in a handle it constructs: each pointer slot of the
@@ -200,24 +265,36 @@ static std::optional<unsigned> findFunctorOperand(const CallSiteRecord &site,
   return std::nullopt;
 }
 
+/// Whether \p rec is a sycl::range, sycl::nd_range or detail::nd_range_view.
+static bool isGeometryRecord(cir::RecordType rec) {
+  StringAttr name = rec ? rec.getName() : StringAttr();
+  if (!name || !name.getValue().starts_with("sycl::"))
+    return false;
+  StringRef n = name.getValue();
+  return n.contains("::range<") || n.contains("::nd_range<") ||
+         n.contains("::nd_range_view");
+}
+
 /// The operand holding the launch geometry: a pointer to a sycl::range,
 /// sycl::nd_range or detail::nd_range_view, past \p first. A range passed by
-/// value has no cell.
+/// value has no cell. With \p unique, std::nullopt if a later operand is one
+/// too (parallel_for_work_group(numWorkGroups, workGroupSize, ...): the
+/// first range is not the global range).
 static std::optional<unsigned> findGeometryOperand(const CallSiteRecord &site,
-                                                   unsigned first) {
+                                                   unsigned first,
+                                                   bool unique = false) {
+  std::optional<unsigned> found;
   for (unsigned i = first; i < site.args.size(); ++i) {
-    if (!site.args[i])
+    if (!site.args[i] ||
+        !isGeometryRecord(getPointeeRecord(getOperandType(site, i))))
       continue;
-    cir::RecordType rec = getPointeeRecord(getOperandType(site, i));
-    StringAttr name = rec ? rec.getName() : StringAttr();
-    if (!name || !name.getValue().starts_with("sycl::"))
-      continue;
-    StringRef n = name.getValue();
-    if (n.contains("::range<") || n.contains("::nd_range<") ||
-        n.contains("::nd_range_view"))
+    if (!unique)
       return i;
+    if (found)
+      return std::nullopt;
+    found = i;
   }
-  return std::nullopt;
+  return found;
 }
 
 /// The cgfo object of a queue submission: the operand that points to a
@@ -421,6 +498,13 @@ public:
     return static_cast<bool>(call);
   }
   bool replacesDefinition() const override { return true; }
+  /// Every SYCL model reports its writes (see the file comment): through
+  /// ModelContext::modRef, writeUnknown and defer with Mod, addMemTransfer,
+  /// or the unknown-call rule. The links and ghost links a model sets
+  /// directly are on handles it also writes (setRuntimeInternals), on ghost
+  /// nodes (which the stored-value queries read as unknown), or relate
+  /// objects (setResult), not memory contents.
+  bool declaresAllWrites() const override { return true; }
   StringRef name() const override { return role; }
   StringRef specCitation() const override { return citation; }
 
@@ -466,10 +550,28 @@ protected:
       return false;
     Graph &graph = ctx.getGraph();
     Cell storage = makeGhost(site, ctx);
-    if (kind == Kind::Other)
-      graph.addFlags(storage, NodeFlags::External,
-                     ctx.makeReason(site, Reason::Kind::UnmodelledRole,
-                                    "buffer.other: storage not known"));
+    if (kind == Kind::Other) {
+      const Reason *why = ctx.makeReason(site, Reason::Kind::UnmodelledRole,
+                                         "buffer.other: storage not known");
+      graph.addFlags(storage, NodeFlags::External, why);
+      // SPEC: the other constructors may keep what they are given and write
+      // through it: buffer(shared_ptr<T> hostData, ...) and
+      // buffer(Container &, ...) write the data back on destruction
+      // (sec:buf-sync-rules, PI 5979-6087); interop handles are the
+      // backend's. So everything the operands but the handle reach gets
+      // the unknown-call rule.
+      forEachPointerOperand(site, [&](unsigned i, Cell cell) {
+        if (i != self)
+          ctx.defer(DeferredEffect::Kind::Reachable, cell,
+                    NodeFlags::External | NodeFlags::Mod | NodeFlags::Ref, why);
+      });
+      for (const auto &entry : site.aggregateArgs)
+        for (const auto &slot : entry.second)
+          if (slot.second)
+            ctx.defer(DeferredEffect::Kind::Reachable, slot.second,
+                      NodeFlags::External | NodeFlags::Mod | NodeFlags::Ref,
+                      why);
+    }
     SmallVector<unsigned, 2> written{self};
     if (kind == Kind::HostPtr)
       if (std::optional<Cell> host = ModelContext::getArg(site, self + 1)) {
@@ -487,8 +589,11 @@ protected:
       }
     graph.setGhostLink(*handle, getSYCLStorageField(), storage);
     setRuntimeInternals(site, ctx, self, *handle);
-    ctx.modRef(handle, /*mod=*/true, /*ref=*/false);
-    refOperands(site, ctx, written);
+    writeHandle(site, ctx, self, *handle);
+    if (kind != Kind::Other)
+      refOperands(site, ctx, written);
+    else
+      ctx.modRef(handle, /*mod=*/false, /*ref=*/true);
     return true;
   }
 
@@ -561,7 +666,7 @@ protected:
     if (syncsHost)
       modRefHostMemory(graph, ctx, storage);
     setRuntimeInternals(site, ctx, dst, *to);
-    ctx.modRef(to, /*mod=*/true, /*ref=*/false);
+    writeHandle(site, ctx, dst, *to);
     refOperands(site, ctx, {dst});
     if (returnsThis)
       ctx.setResult(site, *to);
@@ -596,7 +701,7 @@ protected:
                        "accessor.other: storage not known"));
     ctx.getGraph().setGhostLink(*handle, getSYCLStorageField(), storage);
     setRuntimeInternals(site, ctx, self, *handle);
-    ctx.modRef(handle, /*mod=*/true, /*ref=*/false);
+    writeHandle(site, ctx, self, *handle);
     refOperands(site, ctx, {self});
     return true;
   }
@@ -672,7 +777,7 @@ protected:
     if (hasSRet(callee))
       if (std::optional<Cell> event = ModelContext::getArg(site, 0)) {
         setRuntimeInternals(site, ctx, 0, *event);
-        ctx.modRef(event, /*mod=*/true, /*ref=*/false);
+        writeHandle(site, ctx, 0, *event);
         written.push_back(0);
       }
     refOperands(site, ctx, written);
@@ -718,19 +823,27 @@ protected:
     if (auto ptr = dyn_cast_if_present<cir::PointerType>(
             getOperandType(site, *functor)))
       launch.closureType = ptr.getPointee();
+    std::optional<unsigned> readOnly;
     if (std::optional<unsigned> geometry = findGeometryOperand(site, first))
-      if (*geometry != *functor)
-        launch.geometry = site.args[*geometry];
+      if (*geometry != *functor) {
+        if (findGeometryOperand(site, first, /*unique=*/true)) {
+          launch.geometry = site.args[*geometry];
+          launch.geometryType =
+              getPointeeRecord(getOperandType(site, *geometry));
+        }
+        if (isReadOnlyGeometry(site, callee, *geometry))
+          readOnly = geometry;
+      }
     ctx.defer(DeferredEffect::Kind::Reachable, *launch.closure, NodeFlags::Ref,
               nullptr);
     SmallVector<unsigned, 2> done{*functor};
     if (sret)
       if (std::optional<Cell> event = ModelContext::getArg(site, 0)) {
         setRuntimeInternals(site, ctx, 0, *event);
-        ctx.modRef(event, /*mod=*/true, /*ref=*/false);
+        writeHandle(site, ctx, 0, *event);
         done.push_back(0);
       }
-    modRefReachableOperands(site, ctx, done);
+    modRefReachableOperands(site, ctx, done, readOnly);
     ctx.recordLaunch(std::move(launch));
     return true;
   }
@@ -781,8 +894,15 @@ protected:
       }
     });
     unsigned first = hasSRet(callee) ? 1 : 0;
-    if (std::optional<unsigned> geometry = findGeometryOperand(site, first))
-      launch.geometry = site.args[*geometry];
+    std::optional<unsigned> readOnly;
+    if (std::optional<unsigned> geometry = findGeometryOperand(site, first)) {
+      if (findGeometryOperand(site, first, /*unique=*/true)) {
+        launch.geometry = site.args[*geometry];
+        launch.geometryType = getPointeeRecord(getOperandType(site, *geometry));
+      }
+      if (isReadOnlyGeometry(site, callee, *geometry))
+        readOnly = geometry;
+    }
     if (!launch.closure) {
       ctx.recordLaunch(std::move(launch));
       return false;
@@ -793,10 +913,10 @@ protected:
     if (hasSRet(callee))
       if (std::optional<Cell> event = ModelContext::getArg(site, 0)) {
         setRuntimeInternals(site, ctx, 0, *event);
-        ctx.modRef(event, /*mod=*/true, /*ref=*/false);
+        writeHandle(site, ctx, 0, *event);
         done.push_back(0);
       }
-    modRefReachableOperands(site, ctx, done);
+    modRefReachableOperands(site, ctx, done, readOnly);
     ctx.recordLaunch(std::move(launch));
     return true;
   }
@@ -819,7 +939,7 @@ protected:
     if (!wrapper || !kernel)
       return false;
     ctx.getGraph().setGhostLink(*wrapper, getSYCLKernelField(), *kernel);
-    ctx.modRef(wrapper, /*mod=*/true, /*ref=*/false);
+    writeHandle(site, ctx, self, *wrapper);
     refOperands(site, ctx, {self});
     return true;
   }
@@ -836,8 +956,14 @@ public:
 
 protected:
   bool applyRole(CallSiteRecord &site, ModelContext &ctx,
-                 cir::FuncOp) const override {
+                 cir::FuncOp callee) const override {
     refOperands(site, ctx);
+    // The handler setters store what they are given in the handler (`this`):
+    // the runtime's state, an unknown value.
+    if (role.starts_with("handler."))
+      if (std::optional<Cell> handler =
+              ModelContext::getArg(site, hasSRet(callee) ? 1 : 0))
+        ctx.modRef(handler, /*mod=*/true, /*ref=*/true);
     if (site.result || site.resultSlots)
       ctx.setResultUnknown(site, NodeFlags::External | NodeFlags::Incomplete,
                            ctx.makeReason(site, Reason::Kind::EscapedTo,
@@ -882,6 +1008,8 @@ protected:
               graph.lookupGhostLink(*handle, getSYCLStorageField()))
         modRefHostMemory(graph, ctx, *storage);
     refOperands(site, ctx);
+    // The handle's lifetime ends; the runtime's destructor writes its state.
+    writeHandle(site, ctx, self, *handle);
     return true;
   }
 
@@ -905,7 +1033,8 @@ private:
 /// object may hold a pointer the user gave the constructor (use_mutex).
 class NoPointerEffectModel : public RoleModel {
 public:
-  using RoleModel::RoleModel;
+  NoPointerEffectModel(StringRef role, StringRef citation, bool writesThis)
+      : RoleModel(role, citation), writesThis(writesThis) {}
 
 protected:
   bool applyRole(CallSiteRecord &site, ModelContext &ctx,
@@ -919,12 +1048,21 @@ protected:
         // A range: no pointer slots (getPointerSlotOffsets is empty); were
         // there any, they would get fresh runtime objects.
         setRuntimeInternals(site, ctx, 0, *result);
-        ctx.modRef(result, /*mod=*/true, /*ref=*/false);
+        writeHandle(site, ctx, 0, *result);
         written.push_back(0);
       }
     refOperands(site, ctx, written);
+    // set_write_back changes the buffer's state: the runtime's, an unknown
+    // value in the handle. The queries are const members.
+    unsigned self = hasSRet(callee) ? 1 : 0;
+    if (writesThis)
+      if (std::optional<Cell> handle = ModelContext::getArg(site, self))
+        writeHandle(site, ctx, self, *handle);
     return true;
   }
+
+private:
+  bool writesThis;
 };
 
 /// buffer.set_final_data: set_final_data(T *finalData) or (nullptr).
@@ -968,6 +1106,8 @@ protected:
       done.push_back(self + 1);
     }
     refOperands(site, ctx, done);
+    // It changes the buffer's state (the runtime's) in the handle.
+    writeHandle(site, ctx, self, *handle);
     return true;
   }
 };
@@ -1082,8 +1222,9 @@ protected:
         ctx.addMemTransfer(site, *dst, *src,
                            copyLength(site, ctx, *dstIndex, *srcIndex),
                            /*ghosts=*/!dstIsAccessor && !srcIsAccessor);
-      else
-        ctx.modRef(dst, /*mod=*/true, /*ref=*/false);
+      // The copy runs later, from the source's value then: the destination
+      // holds an unknown value too.
+      ctx.modRef(dst, /*mod=*/true, /*ref=*/false);
       async(dst, dstIsAccessor);
       async(src, srcIsAccessor);
       break;
@@ -1127,7 +1268,7 @@ protected:
     if (sret)
       if (std::optional<Cell> event = ModelContext::getArg(site, 0)) {
         setRuntimeInternals(site, ctx, 0, *event);
-        ctx.modRef(event, /*mod=*/true, /*ref=*/false);
+        writeHandle(site, ctx, 0, *event);
         done.push_back(0);
       }
     refOperands(site, ctx, done);
@@ -1250,16 +1391,18 @@ void cir::registerSYCLPointsToModels(PointsToModelRegistry &registry) {
       "buffer.set_write_back",
       std::make_unique<NoPointerEffectModel>(
           "buffer.set_write_back",
-          "SYCL 2020 api:buffer-set-write-back (PI 5789-5799)"));
+          "SYCL 2020 api:buffer-set-write-back (PI 5789-5799)",
+          /*writesThis=*/true));
   registry.addRoleModel(
       "buffer.set_final_data",
       std::make_unique<SetFinalDataModel>(
           "buffer.set_final_data",
           "SYCL 2020 api:buffer-set-final-data (PI 5770-5786)"));
-  registry.addRoleModel(
-      "buffer.query",
-      std::make_unique<NoPointerEffectModel>(
-          "buffer.query", "SYCL 2020 sec:buffer-member-funcs (PI 5638-5810)"));
+  registry.addRoleModel("buffer.query",
+                        std::make_unique<NoPointerEffectModel>(
+                            "buffer.query",
+                            "SYCL 2020 sec:buffer-member-funcs (PI 5638-5810)",
+                            /*writesThis=*/false));
   // vector.data is not modelled: its body is analysed, so a host pointer
   // reaches the vector's storage.
 

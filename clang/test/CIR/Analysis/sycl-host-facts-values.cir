@@ -1,0 +1,371 @@
+// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
+// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 subobjects=0})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
+// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
+// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=0 subobjects=0})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=CI
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=TABLE-IPO
+// RUN: cir-opt %s -cir-offload-propagate-sycl-kernel-args='host-facts=ipo host-facts-closed-tu=1' \
+// RUN:   | FileCheck %s --check-prefix=PROP-IPO
+// RUN: cir-opt %s -cir-offload-propagate-sycl-kernel-args \
+// RUN:   | FileCheck %s --check-prefix=PROP-LEGACY
+// RUN: cir-opt %s -cir-offload-propagate-sycl-kernel-args='host-facts=both host-facts-closed-tu=1' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PROP-BOTH
+// RUN: cir-opt %s -cir-offload-stamp-reqd-work-group-size='host-facts=ipo host-facts-closed-tu=1' \
+// RUN:   | FileCheck %s --check-prefix=STAMP-IPO
+// RUN: cir-opt %s -cir-offload-stamp-reqd-work-group-size \
+// RUN:   | FileCheck %s --check-prefix=STAMP-LEGACY
+// RUN: cir-opt %s -cir-offload-stamp-reqd-work-group-size='host-facts=both host-facts-closed-tu=1 host-facts-census=1' \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=STAMP-BOTH
+
+// Kernel-argument constants and launch geometry from the stored-value
+// queries (T23, SYCLHostFacts::constantField and geometry), behind
+// --cir-offload-host-facts: ipo replaces KernelBinding::syclConstArgs and the
+// launch sites' syclNDRange, both keeps the legacy ones and remarks where
+// they differ. The legacy trace recovers neither here (the closure and the
+// geometry of the handler path are inside the launch functions' bodies).
+//
+//  - K1: launched twice with n = 7 over nd_range(1024, 64): the constant 7
+//    and the geometry, every launch agreeing (stamped, propagated);
+//  - K2: launched with n = 7 over (1024, 64) and n = 8 over (1024, 128): no
+//    constant, no local size (the launches disagree);
+//  - K3: Bench(int n, size_t g) : size(n), geo(g, 64) {} built by @main with
+//    (42, 2048), and Bench::run(h) launching over this->geo with the capture
+//    s = this->size: 42 and global=[2048] local=[64] under bottom-up with
+//    closed-TU (the record of @bench_run is replaced by its copy in @main's
+//    graph, every caller of @bench_run having copied it); open, @bench_run and
+//    @bench_ctor may have other callers: neither is known (the "geometry
+//    none" case);
+//  - K4: a model call (buffer::get_range, through sret) overwrites the range
+//    whose element is then captured (9 before the call), and the global range
+//    of the nd_range (1024 before the call): neither is known, the local size
+//    is;
+//  - K5: like K1, but the launch function takes the nd_range by address (no
+//    llvm.byval): it may write it, so no geometry.
+// In the CI mode (bu=0), @ndr_ctor's formals hold every caller's operands
+// and one node stands for every nd_range: no geometry.
+
+// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// BOTH:   host-facts const-arg n: legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
+// BOTH-NEXT:   host-facts geometry: legacy=none ipo=global=[1024] local=[64]
+// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE0_
+// BOTH:   host-facts const-arg n: legacy=none ipo=none (the launches disagree: 7 at {{.*}}, 8 at {{.*}})
+// BOTH-NEXT:   host-facts geometry: legacy=none ipo=global=[1024] local=[?] (the launches disagree on the local size at {{.*}})
+// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE1_
+// BOTH:   host-facts const-arg n: legacy=none ipo=#cir.int<42> : !cir.int<s, 32>
+// BOTH-NEXT:   host-facts geometry: legacy=none ipo=global=[2048] local=[64]
+// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE2_
+// BOTH:   host-facts const-arg m: legacy=none ipo=none ('m' at the launch at {{.*}}: it holds a value computed at run time ({{.*}}): it is an escaped pointer ("written with an unknown value") ({{.*}}))
+// BOTH-NEXT:   host-facts geometry: legacy=none ipo=global=[?] local=[64] (component 0: it may hold a value the analysis does not know: it is an escaped pointer ("written with an unknown value") ({{.*}}))
+// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE3_
+// BOTH:   host-facts const-arg n: legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
+// BOTH-NEXT:   host-facts geometry: legacy=none ipo=global=[?] local=[?] (component 0: {{.*}}"written with an unknown value"{{.*}})
+// BOTH: // host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ const-arg n legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
+// BOTH-NEXT: // host-facts-disagreement: kernel _ZTSZ4mainEUlvE1_ const-arg n legacy=none ipo=#cir.int<42> : !cir.int<s, 32>
+// BOTH-NEXT: // host-facts-disagreement: kernel _ZTSZ4mainEUlvE3_ const-arg n legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
+// BOTH-NEXT: // host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ geometry legacy=none ipo=global=[1024] local=[64]
+// BOTH: // host-facts-const-arg-disagreements: 3 of 5 scalar fields
+// BOTH-NEXT: // host-facts-geometry-disagreements: 5 of 5 kernels
+
+// OPEN-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// OPEN:   host-facts const-arg n: legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
+// OPEN-NEXT:   host-facts geometry: legacy=none ipo=global=[1024] local=[64]
+// OPEN-LABEL: // - kernel _ZTSZ4mainEUlvE1_
+// OPEN:   host-facts const-arg n: legacy=none ipo=none ('n' at the launch at {{.*}}: it holds a value computed at run time ({{.*}}): it is parameter #0 of @bench_run, which may have callers that are not analysed ({{.*}}))
+// OPEN-NEXT:   host-facts geometry: legacy=none ipo=global=[?] local=[?] (component 0: it may hold a value the analysis does not know: it is parameter #0 of @bench_run, which may have callers that are not analysed ({{.*}}))
+
+// CI-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// CI:   host-facts const-arg n: legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
+// CI-NEXT:   host-facts geometry: legacy=none ipo=global=[?] local=[?] ({{.*}})
+// CI-LABEL: // - kernel _ZTSZ4mainEUlvE1_
+// CI:   host-facts const-arg n: legacy=none ipo=none ({{.*}})
+// CI-NEXT:   host-facts geometry: legacy=none ipo=global=[?] local=[?] ({{.*}})
+
+// The ipo table: the constants and the geometry of every launch site.
+// TABLE-IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// TABLE-IPO:   const-args n=#cir.int<7> : !cir.int<s, 32>
+// TABLE-IPO:   launch in @pf_K1 (sycl, all-visible), closure none, global=[1024], local=[64]
+// TABLE-IPO-LABEL: // - kernel _ZTSZ4mainEUlvE0_
+// TABLE-IPO-NOT: const-args
+// TABLE-IPO:   launch in @pf_K2 (sycl, all-visible), closure none, global=[1024], local=[?]
+
+// PROP-IPO-LABEL: cir.func @_ZTSZ4mainEUlvE_(
+// PROP-IPO-NEXT:    %[[C:.*]] = cir.const #cir.int<7> : !s32i
+// PROP-IPO:         cir.store %[[C]], {{.*}} : !s32i, !cir.ptr<!s32i>
+// PROP-IPO-LABEL: cir.func @_ZTSZ4mainEUlvE0_(
+// PROP-IPO:         cir.store %arg0, {{.*}} : !s32i, !cir.ptr<!s32i>
+// PROP-IPO-LABEL: cir.func @_ZTSZ4mainEUlvE1_(
+// PROP-IPO-NEXT:    %[[C:.*]] = cir.const #cir.int<42> : !s32i
+// PROP-IPO-LABEL: cir.func @_ZTSZ4mainEUlvE2_(
+// PROP-IPO:         cir.store %arg0, {{.*}} : !u64i, !cir.ptr<!u64i>
+
+// PROP-LEGACY-LABEL: module @device_sycl_spir64
+// PROP-LEGACY-NOT: cir.const #cir.int<7>
+// PROP-LEGACY-NOT: cir.const #cir.int<42>
+
+// PROP-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ const-arg n legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
+// PROP-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE1_ const-arg n legacy=none ipo=#cir.int<42> : !cir.int<s, 32>
+// PROP-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE3_ const-arg n legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
+// PROP-BOTH: remark: host-facts-disagreements: 3 of 5 scalar capture fields (closed-tu, bu, subobjects)
+// PROP-BOTH-LABEL: module @device_sycl_spir64
+// PROP-BOTH-NOT: cir.const #cir.int<7>
+
+// STAMP-IPO: cir.func @_ZTSZ4mainEUlvE_({{.*}}cir.reqd_work_group_size = [64 : i32]
+// STAMP-IPO-NOT: reqd_work_group_size
+// STAMP-IPO: cir.func @_ZTSZ4mainEUlvE1_({{.*}}cir.reqd_work_group_size = [64 : i32]
+// STAMP-IPO: cir.func @_ZTSZ4mainEUlvE2_({{.*}}cir.reqd_work_group_size = [64 : i32]
+// STAMP-IPO-NOT: reqd_work_group_size
+
+// STAMP-LEGACY-NOT: reqd_work_group_size
+
+// STAMP-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ geometry legacy=none ipo=global=[1024] local=[64]
+// STAMP-BOTH: remark: host-facts: kernel _ZTSZ4mainEUlvE_ reqd-work-group-size legacy=none ipo=[64]
+// STAMP-BOTH: remark: host-facts: kernel _ZTSZ4mainEUlvE0_ reqd-work-group-size legacy=none ipo=none
+// STAMP-BOTH: remark: host-facts: kernel _ZTSZ4mainEUlvE1_ reqd-work-group-size legacy=none ipo=[64]
+// STAMP-BOTH: remark: host-facts: kernel _ZTSZ4mainEUlvE3_ reqd-work-group-size legacy=none ipo=none
+// STAMP-BOTH: remark: host-facts-disagreements: 5 of 5 kernel geometries (closed-tu, bu, subobjects)
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_arr = !cir.struct<class "sycl::_V1::detail::array<1>" {data !cir.array<!u64i x 1>}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !rec_arr}>
+!rec_id = !cir.struct<class "sycl::_V1::id<1>" {data !rec_arr}>
+!rec_ndr = !cir.struct<class "sycl::_V1::nd_range<1>" {data !rec_range, data !rec_range, data !rec_id}>
+!rec_handler = !cir.struct<class "sycl::_V1::handler" {data !cir.ptr<!s8i>}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_lam = !cir.struct<"lam" {data !s32i, data !cir.ptr<!f32>}>
+!rec_lam4 = !cir.struct<"lam4" {data !u64i}>
+!rec_bench = !cir.struct<class "Bench" {data !s32i, data !rec_ndr}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.func private @malloc_device(!u64i) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @buffer_get_range(!cir.ptr<!rec_range> {llvm.sret = !rec_range}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.query", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPv(!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "handler.set_kernel_info", cir.sycl_host_api_arg = 0 : i32}
+    cir.global "private" constant cir_private @".strK1" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIK1EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strK1"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant cir_private @".strK2" = #cir.const_array<"_ZTSZ4mainEUlvE0_" : !cir.array<!s8i x 17>, trailing_zeros> : !cir.array<!s8i x 18>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIK2EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strK2"> : !cir.ptr<!s8i>, #cir.int<17> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant cir_private @".strK3" = #cir.const_array<"_ZTSZ4mainEUlvE1_" : !cir.array<!s8i x 17>, trailing_zeros> : !cir.array<!s8i x 18>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIK3EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strK3"> : !cir.ptr<!s8i>, #cir.int<17> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant cir_private @".strK4" = #cir.const_array<"_ZTSZ4mainEUlvE2_" : !cir.array<!s8i x 17>, trailing_zeros> : !cir.array<!s8i x 18>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIK4EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strK4"> : !cir.ptr<!s8i>, #cir.int<17> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant cir_private @".strK5" = #cir.const_array<"_ZTSZ4mainEUlvE3_" : !cir.array<!s8i x 17>, trailing_zeros> : !cir.array<!s8i x 18>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIK5EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strK5"> : !cir.ptr<!s8i>, #cir.int<17> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIK1EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIK1EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    // handler::parallel_for<K1>(nd_range, lambda): replaced by the launch model.
+    cir.func internal @pf_K1(%h: !cir.ptr<!rec_handler>, %r: !cir.ptr<!rec_ndr> {llvm.byval = !rec_ndr}, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 1 : i32} {
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIK1EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPv(%h, %dki) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIK2EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIK2EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    // handler::parallel_for<K2>(nd_range, lambda): replaced by the launch model.
+    cir.func internal @pf_K2(%h: !cir.ptr<!rec_handler>, %r: !cir.ptr<!rec_ndr> {llvm.byval = !rec_ndr}, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 1 : i32} {
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIK2EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPv(%h, %dki) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIK3EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIK3EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    // handler::parallel_for<K3>(nd_range, lambda): replaced by the launch model.
+    cir.func internal @pf_K3(%h: !cir.ptr<!rec_handler>, %r: !cir.ptr<!rec_ndr> {llvm.byval = !rec_ndr}, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 1 : i32} {
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIK3EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPv(%h, %dki) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIK4EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIK4EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    // handler::parallel_for<K4>(nd_range, lambda): replaced by the launch model.
+    cir.func internal @pf_K4(%h: !cir.ptr<!rec_handler>, %r: !cir.ptr<!rec_ndr> {llvm.byval = !rec_ndr}, %k: !cir.ptr<!rec_lam4>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 1 : i32} {
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIK4EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPv(%h, %dki) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIK5EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIK5EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    // handler::parallel_for<K5>(nd_range, lambda): replaced by the launch model.
+    cir.func internal @pf_K5(%h: !cir.ptr<!rec_handler>, %r: !cir.ptr<!rec_ndr>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 1 : i32} {
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIK5EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPv(%h, %dki) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    // nd_range(range<1> global, range<1> local) with the ranges coerced to
+    // integers: analysed, not modelled.
+    cir.func internal @ndr_ctor(%this: !cir.ptr<!rec_ndr>, %g: !u64i, %l: !u64i) attributes {cir.sycl_host_api = "ndrange.ctor", cir.sycl_host_api_arg = 0 : i32} {
+      %gs = cir.get_member %this[0] {name = "globalSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      %ga = cir.get_member %gs[0] {name = "common_array"} : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
+      %gv = cir.get_member %ga[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %g0 = cir.cast array_to_ptrdecay %gv : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      cir.store %g, %g0 : !u64i, !cir.ptr<!u64i>
+      %ls = cir.get_member %this[1] {name = "localSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      %la = cir.get_member %ls[0] {name = "common_array"} : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
+      %lv = cir.get_member %la[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %l0 = cir.cast array_to_ptrdecay %lv : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      cir.store %l, %l0 : !u64i, !cir.ptr<!u64i>
+      %os = cir.get_member %this[2] {name = "offset"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_id>
+      %oa = cir.get_member %os[0] {name = "common_array"} : !cir.ptr<!rec_id> -> !cir.ptr<!rec_arr>
+      %ov = cir.get_member %oa[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %o0 = cir.cast array_to_ptrdecay %ov : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      %zero = cir.const #cir.int<0> : !u64i
+      cir.store %zero, %o0 : !u64i, !cir.ptr<!u64i>
+      cir.return
+    }
+    // Bench(int n, size_t g) : size(n), geo(g, 64) {}
+    cir.func @bench_ctor(%this: !cir.ptr<!rec_bench>, %n: !s32i, %g: !u64i) {
+      %size = cir.get_member %this[0] {name = "size"} : !cir.ptr<!rec_bench> -> !cir.ptr<!s32i>
+      cir.store %n, %size : !s32i, !cir.ptr<!s32i>
+      %geo = cir.get_member %this[1] {name = "geo"} : !cir.ptr<!rec_bench> -> !cir.ptr<!rec_ndr>
+      %c64 = cir.const #cir.int<64> : !u64i
+      cir.call @ndr_ctor(%geo, %g, %c64) : (!cir.ptr<!rec_ndr>, !u64i, !u64i) -> ()
+      cir.return
+    }
+    // Bench::run(handler &h): h.parallel_for<K3>(geo, [=, s = size] { ... }).
+    cir.func @bench_run(%this: !cir.ptr<!rec_bench>, %h: !cir.ptr<!rec_handler>, %p: !cir.ptr<!f32>) {
+      %lam = cir.alloca "lam3" align(8) : !cir.ptr<!rec_lam>
+      %size = cir.get_member %this[0] {name = "size"} : !cir.ptr<!rec_bench> -> !cir.ptr<!s32i>
+      %s = cir.load %size : !cir.ptr<!s32i>, !s32i
+      %fn = cir.get_member %lam[0] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %s, %fn : !s32i, !cir.ptr<!s32i>
+      %fp = cir.get_member %lam[1] {name = "p"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %p, %fp : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      // The by-value nd_range argument: a copy of this->geo.
+      %tmp = cir.alloca "agg.tmp" align(8) : !cir.ptr<!rec_ndr>
+      %geo = cir.get_member %this[1] {name = "geo"} : !cir.ptr<!rec_bench> -> !cir.ptr<!rec_ndr>
+      cir.copy %geo to %tmp : !cir.ptr<!rec_ndr>
+      cir.call @pf_K3(%h, %tmp, %lam) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_ndr>, !cir.ptr<!rec_lam>) -> ()
+      cir.return
+    }
+    cir.func @main(%h: !cir.ptr<!rec_handler>, %r: !cir.ptr<!rec_range>) {
+      %c4096 = cir.const #cir.int<4096> : !u64i
+      %p = cir.call @malloc_device(%c4096) : (!u64i) -> !cir.ptr<!f32>
+      %c7 = cir.const #cir.int<7> : !s32i
+      %c8 = cir.const #cir.int<8> : !s32i
+      %c64 = cir.const #cir.int<64> : !u64i
+      %c128 = cir.const #cir.int<128> : !u64i
+      %c1024 = cir.const #cir.int<1024> : !u64i
+
+      // K1, launched twice with n = 7 over nd_range(1024, 64).
+      %lam1 = cir.alloca "lam1" align(8) : !cir.ptr<!rec_lam>
+      %f1n = cir.get_member %lam1[0] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %c7, %f1n : !s32i, !cir.ptr<!s32i>
+      %f1p = cir.get_member %lam1[1] {name = "p"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %p, %f1p : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %ndr1 = cir.alloca "ndr1" align(8) : !cir.ptr<!rec_ndr>
+      cir.call @ndr_ctor(%ndr1, %c1024, %c64) : (!cir.ptr<!rec_ndr>, !u64i, !u64i) -> ()
+      cir.call @pf_K1(%h, %ndr1, %lam1) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_ndr>, !cir.ptr<!rec_lam>) -> ()
+      %lam1b = cir.alloca "lam1b" align(8) : !cir.ptr<!rec_lam>
+      %f1bn = cir.get_member %lam1b[0] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %c7, %f1bn : !s32i, !cir.ptr<!s32i>
+      %ndr1b = cir.alloca "ndr1b" align(8) : !cir.ptr<!rec_ndr>
+      cir.call @ndr_ctor(%ndr1b, %c1024, %c64) : (!cir.ptr<!rec_ndr>, !u64i, !u64i) -> ()
+      cir.call @pf_K1(%h, %ndr1b, %lam1b) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_ndr>, !cir.ptr<!rec_lam>) -> ()
+
+      // K2, launched with n = 7 over nd_range(1024, 64) and with n = 8 over
+      // nd_range(1024, 128): the launches disagree.
+      %lam2 = cir.alloca "lam2" align(8) : !cir.ptr<!rec_lam>
+      %f2n = cir.get_member %lam2[0] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %c7, %f2n : !s32i, !cir.ptr<!s32i>
+      %ndr2 = cir.alloca "ndr2" align(8) : !cir.ptr<!rec_ndr>
+      cir.call @ndr_ctor(%ndr2, %c1024, %c64) : (!cir.ptr<!rec_ndr>, !u64i, !u64i) -> ()
+      cir.call @pf_K2(%h, %ndr2, %lam2) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_ndr>, !cir.ptr<!rec_lam>) -> ()
+      %lam2b = cir.alloca "lam2b" align(8) : !cir.ptr<!rec_lam>
+      %f2bn = cir.get_member %lam2b[0] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %c8, %f2bn : !s32i, !cir.ptr<!s32i>
+      %ndr2b = cir.alloca "ndr2b" align(8) : !cir.ptr<!rec_ndr>
+      cir.call @ndr_ctor(%ndr2b, %c1024, %c128) : (!cir.ptr<!rec_ndr>, !u64i, !u64i) -> ()
+      cir.call @pf_K2(%h, %ndr2b, %lam2b) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_ndr>, !cir.ptr<!rec_lam>) -> ()
+
+      // K3: Bench b(42, 2048); b.run(h, p).
+      %bench = cir.alloca "bench" align(8) : !cir.ptr<!rec_bench>
+      %c42 = cir.const #cir.int<42> : !s32i
+      %c2048 = cir.const #cir.int<2048> : !u64i
+      cir.call @bench_ctor(%bench, %c42, %c2048) : (!cir.ptr<!rec_bench>, !s32i, !u64i) -> ()
+      cir.call @bench_run(%bench, %h, %p) : (!cir.ptr<!rec_bench>, !cir.ptr<!rec_handler>, !cir.ptr<!f32>) -> ()
+
+      // K4: a model call (buffer::get_range, through sret) overwrites a range
+      // that held 9 before its first element is captured, and the global
+      // range of the nd_range.
+      %buf = cir.alloca "buf" align(8) : !cir.ptr<!rec_buf>
+      cir.call @buffer_alloc(%buf, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+      %rr = cir.alloca "rr" align(8) : !cir.ptr<!rec_range>
+      %ra = cir.get_member %rr[0] {name = "common_array"} : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
+      %rv = cir.get_member %ra[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+      %r0 = cir.cast array_to_ptrdecay %rv : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+      %c9 = cir.const #cir.int<9> : !u64i
+      cir.store %c9, %r0 : !u64i, !cir.ptr<!u64i>
+      cir.call @buffer_get_range(%rr, %buf) : (!cir.ptr<!rec_range>, !cir.ptr<!rec_buf>) -> ()
+      %m = cir.load %r0 : !cir.ptr<!u64i>, !u64i
+      %lam4 = cir.alloca "lam4" align(8) : !cir.ptr<!rec_lam4>
+      %f4m = cir.get_member %lam4[0] {name = "m"} : !cir.ptr<!rec_lam4> -> !cir.ptr<!u64i>
+      cir.store %m, %f4m : !u64i, !cir.ptr<!u64i>
+      %ndr4 = cir.alloca "ndr4" align(8) : !cir.ptr<!rec_ndr>
+      cir.call @ndr_ctor(%ndr4, %c1024, %c64) : (!cir.ptr<!rec_ndr>, !u64i, !u64i) -> ()
+      %g4 = cir.get_member %ndr4[0] {name = "globalSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+      cir.call @buffer_get_range(%g4, %buf) : (!cir.ptr<!rec_range>, !cir.ptr<!rec_buf>) -> ()
+      cir.call @pf_K4(%h, %ndr4, %lam4) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_ndr>, !cir.ptr<!rec_lam4>) -> ()
+
+      // K5: like K1, but the launch function takes the nd_range by address,
+      // not by value: it may write it.
+      %lam5 = cir.alloca "lam5" align(8) : !cir.ptr<!rec_lam>
+      %f5n = cir.get_member %lam5[0] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+      cir.store %c7, %f5n : !s32i, !cir.ptr<!s32i>
+      %ndr5 = cir.alloca "ndr5" align(8) : !cir.ptr<!rec_ndr>
+      cir.call @ndr_ctor(%ndr5, %c1024, %c64) : (!cir.ptr<!rec_ndr>, !u64i, !u64i) -> ()
+      cir.call @pf_K5(%h, %ndr5, %lam5) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_ndr>, !cir.ptr<!rec_lam>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%arg0: !s32i {cir.sycl_kernel_param = {field = "n", kind = "scalar", path = ["n"]}}, %arg1: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "p", kind = "pointer", path = ["p"]}}) cc(spir_kernel) {
+      %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+      cir.store %arg0, %x : !s32i, !cir.ptr<!s32i>
+      cir.return
+    }
+    cir.func @_ZTSZ4mainEUlvE0_(%arg0: !s32i {cir.sycl_kernel_param = {field = "n", kind = "scalar", path = ["n"]}}, %arg1: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "p", kind = "pointer", path = ["p"]}}) cc(spir_kernel) {
+      %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+      cir.store %arg0, %x : !s32i, !cir.ptr<!s32i>
+      cir.return
+    }
+    cir.func @_ZTSZ4mainEUlvE1_(%arg0: !s32i {cir.sycl_kernel_param = {field = "n", kind = "scalar", path = ["n"]}}, %arg1: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "p", kind = "pointer", path = ["p"]}}) cc(spir_kernel) {
+      %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+      cir.store %arg0, %x : !s32i, !cir.ptr<!s32i>
+      cir.return
+    }
+    cir.func @_ZTSZ4mainEUlvE2_(%arg0: !u64i {cir.sycl_kernel_param = {field = "m", kind = "scalar", path = ["m"]}}) cc(spir_kernel) {
+      %x = cir.alloca "x" align(8) : !cir.ptr<!u64i>
+      cir.store %arg0, %x : !u64i, !cir.ptr<!u64i>
+      cir.return
+    }
+    cir.func @_ZTSZ4mainEUlvE3_(%arg0: !s32i {cir.sycl_kernel_param = {field = "n", kind = "scalar", path = ["n"]}}, %arg1: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "p", kind = "pointer", path = ["p"]}}) cc(spir_kernel) {
+      %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+      cir.store %arg0, %x : !s32i, !cir.ptr<!s32i>
+      cir.return
+    }
+  }
+}

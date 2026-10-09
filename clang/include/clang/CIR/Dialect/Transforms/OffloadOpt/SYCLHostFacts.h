@@ -11,10 +11,15 @@
 // host module with the SYCL plug-in (SYCLPointsToModels.h) instead of from
 // KernelBindingTable's trace of a collapsed launch clone.
 //
-// So far it answers the question of InferKernelParamNoAlias: which captured
-// USM pointers and accessors of a kernel's closure refer to memory distinct
-// from every other one, at every launch of the kernel
-// (--cir-offload-host-facts=ipo|both, see HostFactsMode).
+// It answers three questions (--cir-offload-host-facts=ipo|both, see
+// HostFactsMode):
+//  - InferKernelParamNoAlias's: which captured USM pointers and accessors of
+//    a kernel's closure refer to memory distinct from every other one, at
+//    every launch of the kernel (noAliasFields);
+//  - PropagateSYCLKernelArgs's: which scalar captures hold one constant at
+//    every launch (constantFields, from the stored-value queries);
+//  - StampReqdWorkGroupSize's: the constant global and local sizes every
+//    launch uses (geometry, from the stored-value queries).
 //
 // Identity, not escape. A kernel launch makes everything its closure reaches
 // External (applySYCLDeviceWrites), so the escape rule of the alias queries
@@ -117,6 +122,41 @@ public:
   /// The device kernels named \p kernel.
   llvm::ArrayRef<cir::FuncOp> getDeviceKernels(llvm::StringRef kernel) const;
 
+  /// The constant a closure field holds, or why none is known.
+  struct ConstFact {
+    mlir::TypedAttr value;
+    std::string note;
+  };
+  /// The scalar fields of \p kernel's closure that its device kernels take
+  /// as scalar parameters (kind "scalar", a top-level int, float or bool
+  /// member: the candidates of the legacy fold), with the parameter type.
+  llvm::StringMap<mlir::Type> getConstCandidates(llvm::StringRef kernel) const;
+  /// The constant the scalar closure field \p field holds at \p launch:
+  /// the stored values of its cell, complete with exactly one constant.
+  ConstFact constantOfLaunch(const pointsto::LaunchRecord &launch,
+                             llvm::StringRef field, mlir::Type type) const;
+  /// The constant \p field holds at every launch of \p kernel: every launch
+  /// is known and recorded with a closure, and each gives the same one.
+  ConstFact constantField(llvm::StringRef kernel, llvm::StringRef field) const;
+  /// constantField for every candidate of \p kernel.
+  llvm::StringMap<ConstFact> constantFields(llvm::StringRef kernel) const;
+
+  /// The launch geometry, or why it is not known.
+  struct GeometryFact {
+    SyclGeometry geometry;
+    std::string note;
+  };
+  /// The geometry of \p launch: the global and local sizes its range,
+  /// nd_range or nd_range_view object holds, each component a constant the
+  /// stored-value queries prove, or std::nullopt.
+  GeometryFact geometryOfLaunch(const pointsto::LaunchRecord &launch) const;
+  /// The geometry of every launch of \p kernel, ANDed: the same number of
+  /// dimensions, a local size at every launch or at none, and per component
+  /// the constant every launch agrees on. Invalid if a launch is not known,
+  /// has no geometry the models recorded, or the launches disagree on the
+  /// shape.
+  GeometryFact geometry(llvm::StringRef kernel) const;
+
   /// Per launch: the identity of each candidate, and the per-launch verdicts
   /// before the AND over the launches (for the test pass).
   struct LaunchFacts {
@@ -148,6 +188,18 @@ private:
   std::string describeAllocation(const pointsto::Node *node) const;
   /// Why the launches of \p kernel are not all known, or std::nullopt.
   std::optional<std::string> unknownLaunchWhy(llvm::StringRef kernel) const;
+  /// The launch records that name \p kernel; \p why is set if they are not
+  /// all of its launches or one has no closure the analysis sees.
+  llvm::SmallVector<const pointsto::LaunchRecord *, 2>
+  launchesOf(llvm::StringRef kernel, std::optional<std::string> &why) const;
+  /// Whether the closure of \p launch has every top-level field the
+  /// parameters of \p kernels name.
+  bool isClosureOf(const pointsto::LaunchRecord &launch,
+                   llvm::ArrayRef<cir::FuncOp> kernels) const;
+  /// The one constant of type \p type the \p size bytes at \p cell hold,
+  /// or why not.
+  ConstFact constantAt(pointsto::Cell cell, uint64_t size,
+                       mlir::Type type) const;
 
   std::unique_ptr<pointsto::PointsToModelRegistry> ownedRegistry;
   std::unique_ptr<pointsto::PointsToAnalysis> ownedAnalysis;

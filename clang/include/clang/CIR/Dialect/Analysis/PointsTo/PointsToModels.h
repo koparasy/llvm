@@ -98,7 +98,14 @@ public:
                            llvm::StringRef detail = {});
 
   /// Set Mod and/or Ref on the node of \p cell (nothing for std::nullopt).
+  /// Mod is also a write of unknown value anywhere in the node (see
+  /// setWriteSink).
   void modRef(std::optional<Cell> cell, bool mod, bool ref);
+
+  /// Set Mod on the node of \p cell and record a write of unknown value to
+  /// the \p size bytes from it (nothing for std::nullopt; std::nullopt
+  /// \p size: anywhere in the node, like modRef).
+  void writeUnknown(std::optional<Cell> cell, std::optional<uint64_t> size);
 
   /// A fresh Heap node allocated at the call site (origin HeapCall), of
   /// \p size bytes if known. It holds no links: fresh memory holds no

@@ -820,6 +820,13 @@ void TestCIRPointsToPass::printLaunches(raw_ostream &os, ModuleOp module,
     os << " geometry=";
     Graph::printCell(os, launch.geometry ? *launch.geometry : Cell());
     os << "\n";
+    if (printValues) {
+      cir::SYCLHostFacts::GeometryFact g = facts.geometryOfLaunch(launch);
+      os << "  geometry " << cir::formatSyclGeometry(g.geometry);
+      if (!g.note.empty())
+        os << " (" << g.note << ")";
+      os << "\n";
+    }
     for (StringAttr name : launch.kernelNames) {
       kernels.insert(name);
       os << "  kernel " << name.getValue();
@@ -857,6 +864,22 @@ void TestCIRPointsToPass::printLaunches(raw_ostream &os, ModuleOp module,
         os << (id.complete ? " complete" : " unknown (" + id.what + ")")
            << "\n";
       }
+      llvm::StringMap<mlir::Type> consts =
+          facts.getConstCandidates(name.getValue());
+      SmallVector<StringRef> constNames;
+      for (const auto &c : consts)
+        constNames.push_back(c.first());
+      llvm::sort(constNames);
+      for (StringRef field : printValues ? constNames : SmallVector<StringRef>()) {
+        cir::SYCLHostFacts::ConstFact c =
+            facts.constantOfLaunch(launch, field, consts.lookup(field));
+        os << "    const " << field << " ";
+        if (c.value)
+          c.value.print(os);
+        else
+          os << "none (" << c.note << ")";
+        os << "\n";
+      }
       if (!candidates.poison.empty())
         os << "    blocked: " << candidates.poison << "\n";
       for (size_t a = 0; a < here.fields.size(); ++a)
@@ -889,6 +912,29 @@ void TestCIRPointsToPass::printLaunches(raw_ostream &os, ModuleOp module,
     if (explainSets)
       for (StringRef f : names)
         os << "  note " << f << ": " << decisions.lookup(f).note << "\n";
+    if (!printValues)
+      continue;
+    llvm::StringMap<cir::SYCLHostFacts::ConstFact> consts =
+        facts.constantFields(name.getValue());
+    SmallVector<StringRef> constNames;
+    for (const auto &c : consts)
+      constNames.push_back(c.first());
+    llvm::sort(constNames);
+    for (StringRef f : constNames) {
+      const cir::SYCLHostFacts::ConstFact &c = consts.find(f)->second;
+      os << "kernel " << name.getValue() << ": const " << f << " ";
+      if (c.value)
+        c.value.print(os);
+      else
+        os << "none (" << c.note << ")";
+      os << "\n";
+    }
+    cir::SYCLHostFacts::GeometryFact g = facts.geometry(name.getValue());
+    os << "kernel " << name.getValue() << ": geometry "
+       << cir::formatSyclGeometry(g.geometry);
+    if (!g.note.empty())
+      os << " (" << g.note << ")";
+    os << "\n";
   }
 }
 

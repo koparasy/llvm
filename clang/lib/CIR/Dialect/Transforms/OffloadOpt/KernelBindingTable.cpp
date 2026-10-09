@@ -422,6 +422,84 @@ std::string cir::formatHostFactsVerdict(llvm::StringRef source,
   return (source + "=not stamped (" + decision.note + ")").str();
 }
 
+std::string cir::formatSyclGeometry(const SyclGeometry &geometry) {
+  if (!geometry.valid)
+    return "none";
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  auto emit = [&](llvm::StringRef tag,
+                  llvm::ArrayRef<std::optional<int64_t>> sizes) {
+    os << tag << "=[";
+    for (auto [i, s] : llvm::enumerate(sizes)) {
+      if (i)
+        os << ",";
+      if (s)
+        os << *s;
+      else
+        os << "?";
+    }
+    os << "]";
+  };
+  emit("global", geometry.global);
+  if (!geometry.local.empty()) {
+    os << " ";
+    emit("local", geometry.local);
+  }
+  return out;
+}
+
+std::string cir::formatHostFactsOptions(const HostFactsOptions &options) {
+  std::string out = "(";
+  out += options.assumeClosedTU ? "closed-tu" : "open";
+  out += options.bottomUp ? ", bu" : ", ci";
+  if (options.subobjects)
+    out += ", subobjects";
+  return out + ")";
+}
+
+bool HostFactsGeometryComparison::disagrees() const {
+  return formatSyclGeometry(legacy) != formatSyclGeometry(ipo);
+}
+
+static std::string formatConstArg(mlir::TypedAttr value) {
+  if (!value)
+    return "none";
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  value.print(os);
+  return out;
+}
+
+std::string
+cir::formatHostFactsComparison(const HostFactsConstComparison &cmp) {
+  std::string out = "kernel " + cmp.kernel + " const-arg " + cmp.field +
+                    " legacy=" + formatConstArg(cmp.legacy) +
+                    " ipo=" + formatConstArg(cmp.ipo);
+  if (!cmp.ipo && !cmp.ipoNote.empty())
+    out += " (" + cmp.ipoNote + ")";
+  return out;
+}
+
+std::string
+cir::formatHostFactsComparison(const HostFactsGeometryComparison &cmp) {
+  std::string out = "kernel " + cmp.kernel +
+                    " geometry legacy=" + formatSyclGeometry(cmp.legacy) +
+                    " ipo=" + formatSyclGeometry(cmp.ipo);
+  if (!cmp.ipoNote.empty())
+    out += " (" + cmp.ipoNote + ")";
+  return out;
+}
+
+std::string
+cir::formatHostFactsDisagreement(const HostFactsConstComparison &cmp) {
+  return "host-facts-disagreement: " + formatHostFactsComparison(cmp);
+}
+
+std::string
+cir::formatHostFactsDisagreement(const HostFactsGeometryComparison &cmp) {
+  return "host-facts-disagreement: " + formatHostFactsComparison(cmp);
+}
+
 std::string cir::formatHostFactsDisagreement(const HostFactsComparison &cmp) {
   return "host-facts-disagreement: kernel " + cmp.kernel + " field " +
          cmp.field + " " + formatHostFactsVerdict("legacy", cmp.legacy) + " " +
@@ -2365,9 +2443,6 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
       binding.second.syclConstArgs = std::move(cit->second);
   }
 
-  if (hostFactsOptions.mode != HostFactsMode::Legacy)
-    applyHostFacts(container, noAliasCandidates);
-
   hostModule.walk([&](cir::CallOp call) {
     if (!isGetDeviceKernelInfoCall(call))
       return;
@@ -2404,6 +2479,9 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
       site.syclNDRange = geomIt->second;
     binding.launchSites.push_back(site);
   });
+
+  if (hostFactsOptions.mode != HostFactsMode::Legacy)
+    applyHostFacts(container, noAliasCandidates);
 }
 
 // --cir-offload-host-facts=ipo|both: the noalias verdicts of SYCLHostFacts,
@@ -2413,10 +2491,51 @@ void KernelBindingTable::applyHostFacts(
     mlir::ModuleOp container,
     const llvm::StringMap<SYCLNoAliasCandidates> &candidates) {
   SYCLHostFacts facts(container, hostFactsOptions);
+  bool ipoMode = hostFactsOptions.mode == HostFactsMode::IPO;
   for (auto &entry : bindings) {
     KernelBinding &binding = entry.second;
     if (binding.kind != BindingKind::SYCLName)
       continue;
+
+    // The scalar-capture constants.
+    llvm::StringMap<SYCLHostFacts::ConstFact> consts =
+        facts.constantFields(entry.first);
+    if (ipoMode) {
+      binding.syclConstArgs.clear();
+      for (auto &c : consts)
+        if (c.second.value)
+          binding.syclConstArgs[c.first()] = c.second.value;
+    } else {
+      llvm::SmallVector<llvm::StringRef, 4> names;
+      for (const auto &c : consts)
+        names.push_back(c.first());
+      llvm::sort(names);
+      for (llvm::StringRef name : names) {
+        HostFactsConstComparison cmp;
+        cmp.kernel = entry.first.str();
+        cmp.field = name.str();
+        cmp.legacy = binding.syclConstArgs.lookup(name);
+        cmp.ipo = consts.lookup(name).value;
+        cmp.ipoNote = consts.lookup(name).note;
+        hostFactsConstComparisons.push_back(std::move(cmp));
+      }
+    }
+
+    // The geometry, the same for every launch site (as the legacy one).
+    SYCLHostFacts::GeometryFact geometry = facts.geometry(entry.first);
+    if (ipoMode) {
+      for (LaunchSite &site : binding.launchSites)
+        site.syclNDRange = geometry.geometry;
+    } else {
+      HostFactsGeometryComparison cmp;
+      cmp.kernel = entry.first.str();
+      if (!binding.launchSites.empty())
+        cmp.legacy = binding.launchSites.front().syclNDRange;
+      cmp.ipo = geometry.geometry;
+      cmp.ipoNote = geometry.note;
+      hostFactsGeometryComparisons.push_back(std::move(cmp));
+    }
+
     auto candIt = candidates.find(entry.first);
     if (candIt == candidates.end() || candIt->second.fields.empty())
       continue;
@@ -2527,6 +2646,20 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
           os << "//   host-facts " << cmp.field << ": "
              << formatHostFactsVerdict("legacy", cmp.legacy) << " "
              << formatHostFactsVerdict("ipo", cmp.ipo) << "\n";
+      for (const HostFactsConstComparison &cmp : hostFactsConstComparisons)
+        if (cmp.kernel == binding.first)
+          os << "//   host-facts const-arg " << cmp.field
+             << ": legacy=" << formatConstArg(cmp.legacy)
+             << " ipo=" << formatConstArg(cmp.ipo)
+             << (cmp.ipo || cmp.ipoNote.empty() ? "" : " (" + cmp.ipoNote + ")")
+             << "\n";
+      for (const HostFactsGeometryComparison &cmp :
+           hostFactsGeometryComparisons)
+        if (cmp.kernel == binding.first)
+          os << "//   host-facts geometry: legacy="
+             << formatSyclGeometry(cmp.legacy)
+             << " ipo=" << formatSyclGeometry(cmp.ipo)
+             << (cmp.ipoNote.empty() ? "" : " (" + cmp.ipoNote + ")") << "\n";
     } else {
       cir::FuncOp stub = binding.second.hostStub;
       os << "//   host-stub @" << stub.getName() << "\n";
@@ -2603,6 +2736,21 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
     }
     os << "// host-facts-disagreements: " << disagreements << " of "
        << hostFactsComparisons.size() << " candidate fields\n";
+    unsigned constDisagreements = 0, geometryDisagreements = 0;
+    for (const HostFactsConstComparison &cmp : hostFactsConstComparisons)
+      if (cmp.disagrees()) {
+        ++constDisagreements;
+        os << "// " << formatHostFactsDisagreement(cmp) << "\n";
+      }
+    for (const HostFactsGeometryComparison &cmp : hostFactsGeometryComparisons)
+      if (cmp.disagrees()) {
+        ++geometryDisagreements;
+        os << "// " << formatHostFactsDisagreement(cmp) << "\n";
+      }
+    os << "// host-facts-const-arg-disagreements: " << constDisagreements
+       << " of " << hostFactsConstComparisons.size() << " scalar fields\n";
+    os << "// host-facts-geometry-disagreements: " << geometryDisagreements
+       << " of " << hostFactsGeometryComparisons.size() << " kernels\n";
   }
   os << "// ----------------------------\n";
 }

@@ -94,9 +94,11 @@ llvm::cl::opt<bool> DisableCirPropKernelArgs(
 
 llvm::cl::opt<std::string> HostFacts(
     "cir-offload-host-facts",
-    llvm::cl::desc("Where the SYCL noalias host facts come from: legacy (the "
-                   "KernelBindingTable trace, the default), ipo (points-to), "
-                   "or both (legacy is used; disagreements are remarks)"),
+    llvm::cl::desc("Where the SYCL host facts (noalias fields, scalar "
+                   "capture constants, nd_range geometry) come from: legacy "
+                   "(the KernelBindingTable trace, the default), ipo "
+                   "(points-to), or both (legacy is used; disagreements are "
+                   "remarks)"),
     llvm::cl::init("legacy"), llvm::cl::cat(CIROffloadMergeCategory));
 // Plan D2: the host points-to analysis may assume that every caller of every
 // host function is in this TU. Off by default: a function another TU can call
@@ -441,6 +443,28 @@ combineInputs(llvm::ArrayRef<InputTarget> inputTargets,
 // The container is a module, so passes are scheduled over the module; DKE and
 // KACP early-return on modules that do not carry the `cir.offload.container`
 // unit attribute.
+// The --cir-offload-host-facts options of the container passes that read
+// SYCL host facts, as a pass option string.
+static std::string getHostFactsPassOptions() {
+  auto flag = [](bool on) { return on ? "true" : "false"; };
+  std::string options = "host-facts=" + HostFacts;
+  options += " host-facts-closed-tu=" + std::string(flag(AssumeClosedTU));
+  options +=
+      " host-facts-bu=" + std::string(flag(HostFactsBottomUp && !HostFactsCI));
+  options += " host-facts-subobjects=" + std::string(flag(HostFactsSubobjects));
+  options += " host-facts-census=" + std::string(flag(HostFactsCensus));
+  return options;
+}
+
+// Give \p pass the --cir-offload-host-facts options.
+static bool setHostFactsOptions(mlir::Pass &pass) {
+  return mlir::succeeded(pass.initializeOptions(getHostFactsPassOptions(),
+                                                [](const llvm::Twine &message) {
+                                                  reportError(message);
+                                                  return mlir::failure();
+                                                }));
+}
+
 int runOffloadOptPasses(mlir::ModuleOp module) {
   mlir::PassManager pm(module.getContext(), mlir::ModuleOp::getOperationName());
   mlir::OpPassManager &modulePM = pm.nest<mlir::ModuleOp>();
@@ -471,7 +495,13 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   // from their host-side constant nd_range local size. Runs at container level
   // (needs the host<->device binding table) after mem2reg/sccp have exposed the
   // constants the geometry recovery reads.
-  pm.addPass(mlir::createOffloadStampReqdWorkGroupSizePass());
+  {
+    std::unique_ptr<mlir::Pass> stamp =
+        mlir::createOffloadStampReqdWorkGroupSizePass();
+    if (!setHostFactsOptions(*stamp))
+      return reportError("bad --cir-offload-host-facts options");
+    pm.addPass(std::move(stamp));
+  }
 
   // Infer llvm.noalias on SYCL device kernel pointer parameters whose captured
   // USM allocations are pairwise distinct at every visible launch. Runs at
@@ -480,22 +510,8 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   {
     std::unique_ptr<mlir::Pass> noAlias =
         mlir::createOffloadInferKernelParamNoAliasPass();
-    {
-      auto flag = [](bool on) { return on ? "true" : "false"; };
-      std::string options = "host-facts=" + HostFacts;
-      options += " host-facts-closed-tu=" + std::string(flag(AssumeClosedTU));
-      options += " host-facts-bu=" +
-                 std::string(flag(HostFactsBottomUp && !HostFactsCI));
-      options +=
-          " host-facts-subobjects=" + std::string(flag(HostFactsSubobjects));
-      options += " host-facts-census=" + std::string(flag(HostFactsCensus));
-      if (mlir::failed(noAlias->initializeOptions(
-              options, [](const llvm::Twine &message) {
-                reportError(message);
-                return mlir::failure();
-              })))
-        return reportError("bad --cir-offload-host-facts options");
-    }
+    if (!setHostFactsOptions(*noAlias))
+      return reportError("bad --cir-offload-host-facts options");
     pm.addPass(std::move(noAlias));
   }
 
@@ -503,7 +519,13 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   // every visible launch into the device kernel body. Runs at container level
   // (needs the host<->device binding table) after mem2reg/sccp have exposed the
   // host-side constant capture stores the analysis traces.
-  pm.addPass(mlir::createOffloadPropagateSYCLKernelArgsPass());
+  {
+    std::unique_ptr<mlir::Pass> propagate =
+        mlir::createOffloadPropagateSYCLKernelArgsPass();
+    if (!setHostFactsOptions(*propagate))
+      return reportError("bad --cir-offload-host-facts options");
+    pm.addPass(std::move(propagate));
+  }
 
   // Simplify the nested modules again after the propagation above: mem2reg/sccp
   // promote the scalar spill slots the substituted constant now feeds, folding

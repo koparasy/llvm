@@ -1,0 +1,183 @@
+// RUN: cir-opt %s -cir-points-to-verify -test-cir-points-to='mode=ci sycl=1 values=1 print-graphs=0' -o /dev/null | FileCheck %s --check-prefixes=CHECK,CI
+// RUN: cir-opt %s -cir-points-to-verify -test-cir-points-to='mode=bu sycl=1 values=1 print-graphs=0' -o /dev/null | FileCheck %s --check-prefixes=CHECK,BU
+// RUN: cir-opt %s -cir-points-to-verify -test-cir-points-to='mode=bu closed-tu=1 subobjects=1 sycl=1 values=1 print-graphs=0' -o /dev/null | FileCheck %s --check-prefixes=CHECK,BU
+
+// The writes of the SYCL models (T23, PointsToModel::declaresAllWrites): a
+// stored-value query must not read a constant a model call overwrote. Each
+// case stores a constant into memory a model then writes, and loads it
+// after the call: the answer is incomplete, not the constant.
+//  - buffer(hostData, range): the runtime may write the host memory back;
+//  - buffer::get_range: writes its sret result;
+//  - set_final_data(T *): the write-back destination;
+//  - the buffer destructor: the handle;
+//  - queue::memcpy: the destination (asynchronously, too);
+//  - queue::parallel_for: its event result;
+//  - another buffer constructor (buffer.other): what its operands reach;
+//  - a handler setter (handler.set_kernel_func): the handler.
+// And what the models do not write keeps its constant:
+//  - an accessor constructed in a closure member writes the accessor's
+//    bytes, not the closure's scalar member next to it;
+//  - a launch reads its closure, and the nd_range it takes by value; one it
+//    takes by address (no llvm.byval) it may write.
+
+// CHECK-LABEL: === values
+// CHECK-NEXT: host_ptr.host: {{.*}} incomplete (EscapedTo, "written with an unknown value")
+// CHECK-NEXT: query.result: {{.*}} incomplete (EscapedTo, "written with an unknown value")
+// CHECK-NEXT: final.dest: {{.*}} incomplete (EscapedTo,
+// CHECK-NEXT: dtor.handle: {{.*}} incomplete (EscapedTo, "written with an unknown value")
+// CHECK-NEXT: memcpy.dest: {{.*}} incomplete (EscapedTo,
+// CHECK-NEXT: closure.n: {#cir.int<7> : !cir.int<s, 32>} defs=0 complete
+// CHECK-NEXT: launch.event: {{.*}} incomplete (EscapedTo, "written with an unknown value")
+// CHECK-NEXT: launch.closure.n: {#cir.int<7> : !cir.int<s, 32>} defs=0 complete
+// The CI mode merges every range @elem0 is given: 9 is stored into one of
+// them, and @buffer_get_range writes another.
+// CI-NEXT: launch.byval.global: {{.*}} incomplete (EscapedTo, "written with an unknown value")
+// BU-NEXT: launch.byval.global: {#cir.int<1024> : !cir.int<u, 64>} defs=0 complete
+// CHECK-NEXT: launch.byaddr.global: {{.*}} incomplete (EscapedTo, "written with an unknown value")
+// CHECK-NEXT: other.src: {{.*}} incomplete (UnmodelledRole, "buffer.other: storage not known")
+// CHECK-NEXT: setter.handler: {{.*}} incomplete (EscapedTo, "written with an unknown value")
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!void = !cir.void
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_arr = !cir.struct<class "sycl::_V1::detail::array<1>" {data !cir.array<!u64i x 1>}>
+!rec_range = !cir.struct<class "sycl::_V1::range<1>" {data !rec_arr}>
+!rec_id = !cir.struct<class "sycl::_V1::id<1>" {data !rec_arr}>
+!rec_ndr = !cir.struct<class "sycl::_V1::nd_range<1>" {data !rec_range, data !rec_range, data !rec_id}>
+!rec_handler = !cir.struct<class "sycl::_V1::handler" {data !cir.ptr<!s8i>, data !s32i}>
+!rec_queue = !cir.struct<class "sycl::_V1::queue" {data !cir.ptr<!s8i>}>
+!rec_event = !cir.struct<class "sycl::_V1::event" {data !cir.ptr<!s8i>, data !s32i}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_acc = !cir.struct<class "sycl::_V1::accessor<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_src = !cir.struct<"Src" {data !s32i}>
+!rec_lam = !cir.struct<"lam" {data !rec_acc, data !s32i}>
+
+module {
+  cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTS1K" : !cir.array<!s8i x 6>, trailing_zeros> : !cir.array<!s8i x 7>
+  cir.global "private" constant internal @kinfo = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<6> : !u64i}> : !rec_sv}> : !rec_ctki
+  cir.func private @buffer_alloc(!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.alloc", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @buffer_host_ptr(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.host_ptr", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @buffer_other(!cir.ptr<!rec_buf>, !cir.ptr<!rec_src>) attributes {cir.sycl_host_api = "buffer.other", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @buffer_get_range(!cir.ptr<!rec_range> {llvm.sret = !rec_range}, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.query", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @buffer_set_final(!cir.ptr<!rec_buf>, !cir.ptr<!f32>) attributes {cir.sycl_host_api = "buffer.set_final_data", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @buffer_dtor(!cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.dtor", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @accessor_from_buffer(!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) attributes {cir.sycl_host_api = "accessor.from_buffer", cir.sycl_host_api_arg = 0 : i32}
+  cir.func private @queue_memcpy(!cir.ptr<!rec_event> {llvm.sret = !rec_event}, !cir.ptr<!rec_queue>, !cir.ptr<!void>, !cir.ptr<!void>, !u64i) attributes {cir.sycl_host_api = "queue.memcpy", cir.sycl_host_api_arg = 0 : i32, cir.sycl_host_api_arg2 = 1 : i32}
+  cir.func private @set_kernel_func(!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "handler.set_kernel_func", cir.sycl_host_api_arg = 0 : i32}
+  cir.func internal @kernel_info() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+    %0 = cir.get_global @kinfo : !cir.ptr<!rec_ctki>
+    %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+    cir.return %1 : !cir.ptr<!s8i>
+  }
+  // queue::parallel_for(nd_range, lambda) -> event, and the same with the
+  // nd_range by address: replaced by the launch model.
+  cir.func internal @queue_pf(%ev: !cir.ptr<!rec_event> {llvm.sret = !rec_event}, %q: !cir.ptr<!rec_queue>, %r: !cir.ptr<!rec_ndr> {llvm.byval = !rec_ndr}, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "queue.kernel", cir.sycl_host_api_arg = 1 : i32} {
+    %info = cir.call @kernel_info() : () -> !cir.ptr<!s8i>
+    cir.return
+  }
+  cir.func internal @queue_pf_byaddr(%ev: !cir.ptr<!rec_event> {llvm.sret = !rec_event}, %q: !cir.ptr<!rec_queue>, %r: !cir.ptr<!rec_ndr>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "queue.kernel", cir.sycl_host_api_arg = 1 : i32} {
+    %info = cir.call @kernel_info() : () -> !cir.ptr<!s8i>
+    cir.return
+  }
+  // The first element of a range.
+  cir.func internal @elem0(%r: !cir.ptr<!rec_range>) -> !cir.ptr<!u64i> {
+    %a = cir.get_member %r[0] {name = "common_array"} : !cir.ptr<!rec_range> -> !cir.ptr<!rec_arr>
+    %v = cir.get_member %a[0] {name = "common_array"} : !cir.ptr<!rec_arr> -> !cir.ptr<!cir.array<!u64i x 1>>
+    %e = cir.cast array_to_ptrdecay %v : !cir.ptr<!cir.array<!u64i x 1>> -> !cir.ptr<!u64i>
+    cir.return %e : !cir.ptr<!u64i>
+  }
+  cir.func @main(%q: !cir.ptr<!rec_queue>, %r: !cir.ptr<!rec_range>, %src: !cir.ptr<!f32>) {
+    %c7 = cir.const #cir.int<7> : !s32i
+    %c9 = cir.const #cir.int<9> : !u64i
+    %c1024 = cir.const #cir.int<1024> : !u64i
+    %one = cir.const #cir.fp<1.000000e+00> : !f32
+    %buf = cir.alloca "buf" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_alloc(%buf, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+
+    // buffer(hostData, range).
+    %hm = cir.alloca "hm" align(4) : !cir.ptr<!f32>
+    cir.store %one, %hm : !f32, !cir.ptr<!f32>
+    %bh = cir.alloca "bh" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_host_ptr(%bh, %hm, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+    %v1 = cir.load %hm : !cir.ptr<!f32>, !f32 {test.load = "host_ptr.host"}
+
+    // buffer::get_range.
+    %rr = cir.alloca "rr" align(8) : !cir.ptr<!rec_range>
+    %rr0 = cir.call @elem0(%rr) : (!cir.ptr<!rec_range>) -> !cir.ptr<!u64i>
+    cir.store %c9, %rr0 : !u64i, !cir.ptr<!u64i>
+    cir.call @buffer_get_range(%rr, %buf) : (!cir.ptr<!rec_range>, !cir.ptr<!rec_buf>) -> ()
+    %v2 = cir.load %rr0 : !cir.ptr<!u64i>, !u64i {test.load = "query.result"}
+
+    // set_final_data(T *).
+    %fd = cir.alloca "fd" align(4) : !cir.ptr<!f32>
+    cir.store %one, %fd : !f32, !cir.ptr<!f32>
+    cir.call @buffer_set_final(%buf, %fd) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>) -> ()
+    %v3 = cir.load %fd : !cir.ptr<!f32>, !f32 {test.load = "final.dest"}
+
+    // The buffer destructor.
+    %bd = cir.alloca "bd" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_alloc(%bd, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_range>) -> ()
+    %bdn = cir.get_member %bd[1] {name = "n"} : !cir.ptr<!rec_buf> -> !cir.ptr<!u64i>
+    cir.store %c9, %bdn : !u64i, !cir.ptr<!u64i>
+    cir.call @buffer_dtor(%bd) : (!cir.ptr<!rec_buf>) -> ()
+    %v4 = cir.load %bdn : !cir.ptr<!u64i>, !u64i {test.load = "dtor.handle"}
+
+    // queue::memcpy.
+    %d = cir.alloca "d" align(4) : !cir.ptr<!f32>
+    cir.store %one, %d : !f32, !cir.ptr<!f32>
+    %ev = cir.alloca "ev" align(8) : !cir.ptr<!rec_event>
+    %dv = cir.cast bitcast %d : !cir.ptr<!f32> -> !cir.ptr<!void>
+    %sv = cir.cast bitcast %src : !cir.ptr<!f32> -> !cir.ptr<!void>
+    %c4 = cir.const #cir.int<4> : !u64i
+    cir.call @queue_memcpy(%ev, %q, %dv, %sv, %c4) : (!cir.ptr<!rec_event>, !cir.ptr<!rec_queue>, !cir.ptr<!void>, !cir.ptr<!void>, !u64i) -> ()
+    %v5 = cir.load %d : !cir.ptr<!f32>, !f32 {test.load = "memcpy.dest"}
+
+    // A launch's event, and what a launch reads.
+    %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+    %ln = cir.get_member %lam[1] {name = "n"} : !cir.ptr<!rec_lam> -> !cir.ptr<!s32i>
+    cir.store %c7, %ln : !s32i, !cir.ptr<!s32i>
+    %h = cir.alloca "h" align(8) : !cir.ptr<!rec_handler>
+    %la = cir.get_member %lam[0] {name = "a"} : !cir.ptr<!rec_lam> -> !cir.ptr<!rec_acc>
+    cir.call @accessor_from_buffer(%la, %buf, %h) : (!cir.ptr<!rec_acc>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_handler>) -> ()
+    %v9 = cir.load %ln : !cir.ptr<!s32i>, !s32i {test.load = "closure.n"}
+    %ev2 = cir.alloca "ev2" align(8) : !cir.ptr<!rec_event>
+    %evn = cir.get_member %ev2[1] {name = "n"} : !cir.ptr<!rec_event> -> !cir.ptr<!s32i>
+    cir.store %c7, %evn : !s32i, !cir.ptr<!s32i>
+    %ndr = cir.alloca "ndr" align(8) : !cir.ptr<!rec_ndr>
+    %gs = cir.get_member %ndr[0] {name = "globalSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+    %g0 = cir.call @elem0(%gs) : (!cir.ptr<!rec_range>) -> !cir.ptr<!u64i>
+    cir.store %c1024, %g0 : !u64i, !cir.ptr<!u64i>
+    cir.call @queue_pf(%ev2, %q, %ndr, %lam) : (!cir.ptr<!rec_event>, !cir.ptr<!rec_queue>, !cir.ptr<!rec_ndr>, !cir.ptr<!rec_lam>) -> ()
+    %v6 = cir.load %evn : !cir.ptr<!s32i>, !s32i {test.load = "launch.event"}
+    %v10 = cir.load %ln : !cir.ptr<!s32i>, !s32i {test.load = "launch.closure.n"}
+    %v11 = cir.load %g0 : !cir.ptr<!u64i>, !u64i {test.load = "launch.byval.global"}
+    %ndr2 = cir.alloca "ndr2" align(8) : !cir.ptr<!rec_ndr>
+    %gs2 = cir.get_member %ndr2[0] {name = "globalSize"} : !cir.ptr<!rec_ndr> -> !cir.ptr<!rec_range>
+    %g20 = cir.call @elem0(%gs2) : (!cir.ptr<!rec_range>) -> !cir.ptr<!u64i>
+    cir.store %c1024, %g20 : !u64i, !cir.ptr<!u64i>
+    %ev3 = cir.alloca "ev3" align(8) : !cir.ptr<!rec_event>
+    cir.call @queue_pf_byaddr(%ev3, %q, %ndr2, %lam) : (!cir.ptr<!rec_event>, !cir.ptr<!rec_queue>, !cir.ptr<!rec_ndr>, !cir.ptr<!rec_lam>) -> ()
+    %v12 = cir.load %g20 : !cir.ptr<!u64i>, !u64i {test.load = "launch.byaddr.global"}
+
+    // buffer.other.
+    %so = cir.alloca "so" align(4) : !cir.ptr<!rec_src>
+    %sox = cir.get_member %so[0] {name = "x"} : !cir.ptr<!rec_src> -> !cir.ptr<!s32i>
+    cir.store %c7, %sox : !s32i, !cir.ptr<!s32i>
+    %bo = cir.alloca "bo" align(8) : !cir.ptr<!rec_buf>
+    cir.call @buffer_other(%bo, %so) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_src>) -> ()
+    %v7 = cir.load %sox : !cir.ptr<!s32i>, !s32i {test.load = "other.src"}
+
+    // handler::setKernelFunc.
+    %hs = cir.alloca "hs" align(8) : !cir.ptr<!rec_handler>
+    %hsn = cir.get_member %hs[1] {name = "n"} : !cir.ptr<!rec_handler> -> !cir.ptr<!s32i>
+    cir.store %c7, %hsn : !s32i, !cir.ptr<!s32i>
+    %kp = cir.cast bitcast %lam : !cir.ptr<!rec_lam> -> !cir.ptr<!s8i>
+    cir.call @set_kernel_func(%hs, %kp) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+    %v8 = cir.load %hsn : !cir.ptr<!s32i>, !s32i {test.load = "setter.handler"}
+    cir.return
+  }
+}

@@ -69,6 +69,10 @@ struct SyclGeometry {
   bool valid = false;
 };
 
+// "global=[g0,g1] local=[l0,l1]" ("?" for a component that is not a
+// constant; no local part for a plain range launch), or "none" if invalid.
+std::string formatSyclGeometry(const SyclGeometry &geometry);
+
 // One host-side launch of a kernel.
 //
 // CUDA: `stubCall` is the call to the device stub, which carries the kernel
@@ -154,14 +158,17 @@ struct LaunchSite {
   bool hasGeometry() const { return pushConfigCall != nullptr; }
 };
 
-// Where KernelBinding::syclNoAliasFields come from (the
-// --cir-offload-host-facts flag of cir-offload-merge):
+// Where KernelBinding::syclNoAliasFields, syclConstArgs and the launch
+// sites' syclNDRange come from (the --cir-offload-host-facts flag of
+// cir-offload-merge):
 //  - Legacy: the KernelBindingTable trace of the collapsed launch clone (the
 //    default);
 //  - IPO: SYCLHostFacts, built on the points-to analysis of the host module;
-//  - Both: both; the result is Legacy's, and every candidate field on which
-//    they differ is recorded (KernelBindingTable::getHostFactsComparisons)
-//    and reported as a host-facts-disagreement remark.
+//  - Both: both; the result is Legacy's, and every candidate field (and
+//    kernel geometry) on which they differ is recorded
+//    (KernelBindingTable::getHostFactsComparisons, ...ConstComparisons,
+//    ...GeometryComparisons) and reported as a host-facts-disagreement
+//    remark by the pass that uses it.
 enum class HostFactsMode { Legacy, IPO, Both };
 
 // The name of `mode` as the flag spells it ("legacy", "ipo", "both"), and the
@@ -187,6 +194,10 @@ struct HostFactsOptions {
   /// (PointsToAnalysisOptions::subobjects). On by default.
   bool subobjects = true;
 };
+
+// "(closed-tu|open, bu|ci[, subobjects])", the analysis options the
+// host-facts-disagreements remarks name.
+std::string formatHostFactsOptions(const HostFactsOptions &options);
 
 // Which closure fields of a SYCL kernel are candidates for llvm.noalias, read
 // off the device kernel's parameters (cir.sycl_kernel_param): captured USM
@@ -234,6 +245,41 @@ struct HostFactsComparison {
   NoAliasDecision ipo;
   bool disagrees() const { return legacy.ok != ipo.ok; }
 };
+
+// Under --cir-offload-host-facts=both, the legacy and the SYCLHostFacts
+// constants of one scalar capture field (null: none). They disagree iff the
+// constants differ.
+struct HostFactsConstComparison {
+  std::string kernel;
+  std::string field;
+  mlir::TypedAttr legacy;
+  mlir::TypedAttr ipo;
+  // Why SYCLHostFacts found no constant, or where it found it.
+  std::string ipoNote;
+  bool disagrees() const { return legacy != ipo; }
+};
+
+// Under --cir-offload-host-facts=both, the legacy and the SYCLHostFacts
+// geometry of one kernel. They disagree iff they print differently
+// (formatSyclGeometry).
+struct HostFactsGeometryComparison {
+  std::string kernel;
+  SyclGeometry legacy;
+  SyclGeometry ipo;
+  std::string ipoNote;
+  bool disagrees() const;
+};
+
+// "host-facts-disagreement: kernel K const-arg F legacy=<c|none>
+// ipo=<c|none> (<ipo note>)".
+std::string formatHostFactsDisagreement(const HostFactsConstComparison &cmp);
+// "host-facts-disagreement: kernel K geometry legacy=<g> ipo=<g>
+// (<ipo note>)".
+std::string formatHostFactsDisagreement(const HostFactsGeometryComparison &cmp);
+// The same text without the "host-facts-disagreement: " prefix, for the
+// census remarks.
+std::string formatHostFactsComparison(const HostFactsConstComparison &cmp);
+std::string formatHostFactsComparison(const HostFactsGeometryComparison &cmp);
 
 // "<source>=noalias" or "<source>=not stamped (<note>)", as the remarks and
 // the table print a verdict.
@@ -406,6 +452,18 @@ public:
   llvm::ArrayRef<HostFactsComparison> getHostFactsComparisons() const {
     return hostFactsComparisons;
   }
+  // Under HostFactsMode::Both, the two constants of every scalar capture
+  // field (syclConstArgs) of every SYCL kernel, and the two geometries
+  // (syclNDRange) of every SYCL kernel, in binding order (then by field
+  // name). Empty in the other modes.
+  llvm::ArrayRef<HostFactsConstComparison>
+  getHostFactsConstComparisons() const {
+    return hostFactsConstComparisons;
+  }
+  llvm::ArrayRef<HostFactsGeometryComparison>
+  getHostFactsGeometryComparisons() const {
+    return hostFactsGeometryComparisons;
+  }
 
 private:
   // Adds the SYCL name-string <-> spir_kernel bindings and their eligibility.
@@ -416,9 +474,12 @@ private:
   // bindSYCLKernels, so every binding already has its name-string.
   void recordSYCLLaunchSites(mlir::ModuleOp container);
 
-  // Under HostFactsMode::IPO or Both, compute the noalias verdicts with
-  // SYCLHostFacts from the same candidates, and replace the legacy ones (IPO)
-  // or record both (Both, hostFactsComparisons).
+  // Under HostFactsMode::IPO or Both, compute the noalias verdicts, the
+  // scalar-capture constants and the geometry with SYCLHostFacts (the
+  // noalias verdicts from the same candidates), and replace the legacy ones
+  // (IPO: syclNoAliasFields/Notes, syclConstArgs, every launch site's
+  // syclNDRange) or record both (Both, the host-facts comparisons). Runs
+  // after the launch sites are recorded.
   void applyHostFacts(mlir::ModuleOp container,
                       const llvm::StringMap<SYCLNoAliasCandidates> &candidates);
 
@@ -431,6 +492,9 @@ private:
   mlir::ModuleOp hostModule;
   HostFactsOptions hostFactsOptions;
   llvm::SmallVector<HostFactsComparison, 0> hostFactsComparisons;
+  llvm::SmallVector<HostFactsConstComparison, 0> hostFactsConstComparisons;
+  llvm::SmallVector<HostFactsGeometryComparison, 0>
+      hostFactsGeometryComparisons;
 };
 
 } // namespace cir

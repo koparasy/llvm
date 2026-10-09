@@ -407,6 +407,16 @@ void StoredValueIndex::indexWrites() {
         write.anywhere = true;
         addWrite(write);
       };
+      if (!model.reachable && model.size != ModelWrite::kAnywhere) {
+        // The bytes [cell, cell + size) (ModelContext::writeUnknown).
+        if (model.size == 0)
+          continue;
+        WriteRecord write{WriteRecord::Kind::Unknown, model.op, model.cell};
+        write.owner = fn.get();
+        write.size = model.size;
+        addWrite(write);
+        continue;
+      }
       if (!model.reachable) {
         add(model.cell);
         continue;

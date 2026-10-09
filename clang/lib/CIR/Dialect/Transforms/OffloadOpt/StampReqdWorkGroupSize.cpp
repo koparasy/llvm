@@ -17,6 +17,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/IR/Diagnostics.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/Passes.h"
@@ -24,8 +25,10 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <optional>
+#include <string>
 
 namespace mlir {
+#define GEN_PASS_DECL_OFFLOADSTAMPREQDWORKGROUPSIZE
 #define GEN_PASS_DEF_OFFLOADSTAMPREQDWORKGROUPSIZE
 #include "clang/CIR/Dialect/Passes.h.inc"
 } // namespace mlir
@@ -42,6 +45,21 @@ namespace {
 // Agreement is a property of the whole set of sites, so a plain-range launch
 // (empty local), a runtime local size, or two launches with different locals
 // all forbid stamping a required work-group size on the kernel.
+// The constant local size of one geometry: nullopt if it has none (a plain
+// range launch, an invalid geometry) or a component is not a constant.
+static std::optional<llvm::SmallVector<int32_t, 3>>
+constantLocal(const cir::SyclGeometry &geom) {
+  if (!geom.valid || geom.local.empty())
+    return std::nullopt;
+  llvm::SmallVector<int32_t, 3> cur;
+  for (const std::optional<int64_t> &dim : geom.local) {
+    if (!dim)
+      return std::nullopt;
+    cur.push_back(static_cast<int32_t>(*dim));
+  }
+  return cur;
+}
+
 static std::optional<llvm::SmallVector<int32_t, 3>>
 commonConstantLocal(const cir::KernelBinding &binding) {
   llvm::SmallVector<int32_t, 3> common;
@@ -80,11 +98,79 @@ struct OffloadStampReqdWorkGroupSizePass
   void runOnOperation() override;
 };
 
+// The required work-group size the pass stamps on `binding`'s kernels, if
+// any: every launch is visible and they agree on a constant local size.
+static std::optional<llvm::SmallVector<int32_t, 3>>
+stampedLocal(const cir::KernelBinding &binding) {
+  if (!binding.isTULocalOptimizable || binding.launchSites.empty())
+    return std::nullopt;
+  return commonConstantLocal(binding);
+}
+
+static std::string
+formatLocal(const std::optional<llvm::SmallVector<int32_t, 3>> &local) {
+  if (!local)
+    return "none";
+  std::string out = "[";
+  for (auto [i, d] : llvm::enumerate(*local))
+    out += (i ? "," : "") + std::to_string(d);
+  return out + "]";
+}
+
 void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
   mlir::ModuleOp container = getOperation();
   if (!cir::isOffloadContainer(container))
     return;
-  cir::KernelBindingTable &table = getAnalysis<cir::KernelBindingTable>();
+  std::optional<cir::HostFactsMode> mode = cir::parseHostFactsMode(hostFacts);
+  if (!mode) {
+    container.emitError() << "unknown host-facts mode '" << hostFacts
+                          << "' (expected legacy, ipo or both)";
+    return signalPassFailure();
+  }
+  // The legacy table is the cached analysis the other container passes share;
+  // the other modes build their own.
+  cir::HostFactsOptions options;
+  options.mode = *mode;
+  options.assumeClosedTU = hostFactsClosedTU;
+  options.bottomUp = hostFactsBottomUp;
+  options.subobjects = hostFactsSubobjects;
+  std::optional<cir::KernelBindingTable> ownTable;
+  if (*mode != cir::HostFactsMode::Legacy)
+    ownTable.emplace(container, options);
+  cir::KernelBindingTable &table =
+      ownTable ? *ownTable : getAnalysis<cir::KernelBindingTable>();
+  if (*mode == cir::HostFactsMode::Both) {
+    // Legacy is the result; report where the two geometries differ, and, for
+    // the census, what each source would stamp.
+    unsigned disagreements = 0;
+    for (const cir::HostFactsGeometryComparison &cmp :
+         table.getHostFactsGeometryComparisons()) {
+      mlir::Location loc = container.getLoc();
+      const cir::KernelBinding *binding = table.lookup(cmp.kernel);
+      if (binding && !binding->deviceKernels.empty())
+        loc = binding->deviceKernels.front()->getLoc();
+      if (cmp.disagrees()) {
+        ++disagreements;
+        mlir::emitRemark(loc) << cir::formatHostFactsDisagreement(cmp);
+      } else if (hostFactsCensus) {
+        mlir::emitRemark(loc)
+            << "host-facts: " << cir::formatHostFactsComparison(cmp);
+      }
+      if (hostFactsCensus && binding) {
+        cir::KernelBinding ipo = *binding;
+        for (cir::LaunchSite &site : ipo.launchSites)
+          site.syclNDRange = cmp.ipo;
+        mlir::emitRemark(loc) << "host-facts: kernel " << cmp.kernel
+                              << " reqd-work-group-size legacy="
+                              << formatLocal(stampedLocal(*binding))
+                              << " ipo=" << formatLocal(stampedLocal(ipo));
+      }
+    }
+    mlir::emitRemark(container.getLoc())
+        << "host-facts-disagreements: " << disagreements << " of "
+        << table.getHostFactsGeometryComparisons().size()
+        << " kernel geometries " << cir::formatHostFactsOptions(options);
+  }
   mlir::OpBuilder builder(container);
   bool changed = false;
 
@@ -94,13 +180,7 @@ void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
     // Only SYCL, TU-local kernels whose every launch this TU can see may be
     // specialized: another TU could launch a cross-TU kernel with a different
     // geometry.
-    if (!binding.isTULocalOptimizable)
-      continue;
-    if (binding.launchSites.empty())
-      continue;
-
-    std::optional<llvm::SmallVector<int32_t, 3>> local =
-        commonConstantLocal(binding);
+    std::optional<llvm::SmallVector<int32_t, 3>> local = stampedLocal(binding);
     if (!local)
       continue;
 

@@ -271,6 +271,31 @@ def CallConvLowering : Pass<"cir-call-conv-lowering", "mlir::ModuleOp"> {
   ];
 }
 
+// The --cir-offload-host-facts options of the container passes that read
+// SYCL host facts from KernelBindingTable (see OffloadInferKernelParamNoAlias
+// for the noalias pass's own copy).
+defvar OffloadHostFactsOptions = [
+  Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"legacy\"",
+         "Where the host facts come from: legacy (the KernelBindingTable "
+         "trace), ipo (SYCLHostFacts, from points-to), or both (legacy is "
+         "used; every fact on which they differ gets a "
+         "host-facts-disagreement remark).">,
+  Option<"hostFactsClosedTU", "host-facts-closed-tu", "bool",
+         /*default=*/"false",
+         "Under ipo/both, assume the module holds every caller of every "
+         "function (PointsToAnalysisOptions::assumeClosedTU).">,
+  Option<"hostFactsBottomUp", "host-facts-bu", "bool", /*default=*/"true",
+         "Under ipo/both, run the points-to analysis bottom-up (the "
+         "default); false runs it context-insensitively.">,
+  Option<"hostFactsSubobjects", "host-facts-subobjects", "bool",
+         /*default=*/"true",
+         "Under ipo/both, give class, union and array members their own "
+         "points-to nodes (the default).">,
+  Option<"hostFactsCensus", "host-facts-census", "bool", /*default=*/"false",
+         "Under both, also emit one host-facts remark per fact on which the "
+         "two sources agree.">,
+];
+
 def OffloadDeadKernelElimination
     : Pass<"cir-offload-dead-kernel-elimination", "mlir::ModuleOp"> {
   let summary = "Remove device kernels that can never be launched";
@@ -398,9 +423,14 @@ def OffloadStampReqdWorkGroupSize
     The SYCL-shaped metadata (`!work_group_num_dim` and the reversed/padded
     `!reqd_work_group_size`) is emitted from this attribute later, at LLVM
     lowering.
+
+    The geometry comes from the legacy trace or from SYCLHostFacts
+    (`host-facts`); under `both` the legacy one is used and every kernel whose
+    two geometries differ gets a `host-facts-disagreement:` remark.
   }];
   let constructor = "mlir::createOffloadStampReqdWorkGroupSizePass()";
   let dependentDialects = ["cir::CIRDialect"];
+  let options = OffloadHostFactsOptions;
 }
 
 def OffloadInferKernelParamNoAlias
@@ -476,9 +506,14 @@ def OffloadPropagateSYCLKernelArgs
     coefficient feeds only folds once the value reaches it: this pass makes the
     closure-field store a constant, and a follow-up device-module mem2reg/SCCP
     (or the device backend's inline + SROA) performs the fold.
+
+    The constants come from the legacy trace or from SYCLHostFacts
+    (`host-facts`); under `both` the legacy ones are used and every field
+    whose two constants differ gets a `host-facts-disagreement:` remark.
   }];
   let constructor = "mlir::createOffloadPropagateSYCLKernelArgsPass()";
   let dependentDialects = ["cir::CIRDialect"];
+  let options = OffloadHostFactsOptions;
 }
 
 def OffloadDetectHostUniformIntDivisor

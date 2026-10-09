@@ -632,7 +632,8 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
       fn->modelTransfers.push_back(memTransfers.back());
   }
   for (const ModelWrite &write : fg->modelWrites)
-    fn->modelWrites.push_back({write.op, map(write.cell), write.reachable});
+    fn->modelWrites.push_back(
+        {write.op, map(write.cell), write.reachable, write.size});
   for (const LaunchRecord &local : fg->launches) {
     LaunchRecord launch = local;
     launch.closure = mapOpt(local.closure);

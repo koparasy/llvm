@@ -114,10 +114,15 @@ struct MemTransferRecord {
 struct ModelWrite {
   /// The modelled call.
   mlir::Operation *op = nullptr;
-  /// The object written: anywhere in the node of the cell.
+  /// The object written: anywhere in the node of the cell, or, with a
+  /// `size`, the `size` bytes from the cell.
   Cell cell;
   /// Also every node reachable from it (a deferred Reachable effect).
   bool reachable = false;
+  /// The bytes written from `cell` (ModelContext::writeUnknown); kAnywhere:
+  /// anywhere in its node.
+  static constexpr uint64_t kAnywhere = ~uint64_t(0);
+  uint64_t size = kAnywhere;
 };
 
 /// Apply the copies \p transfers to \p graph until no link changes (see
@@ -228,8 +233,10 @@ struct LaunchRecord {
   /// the model found it, and its type (the record a pointer to it points to).
   std::optional<Cell> closure;
   mlir::Type closureType;
-  /// The launch geometry object (range or nd_range), if passed by address.
+  /// The launch geometry object (range or nd_range), if passed by address,
+  /// and its type (the record a pointer to it points to).
   std::optional<Cell> geometry;
+  mlir::Type geometryType;
   /// The bottom-up phase: for a record cloned into a caller's graph, the
   /// calls from that caller down to the function holding `call` (a
   /// CallPathTable id, outermost call first). 0 for the record of the

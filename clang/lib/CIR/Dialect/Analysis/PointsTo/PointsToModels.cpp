@@ -79,6 +79,17 @@ void ModelContext::modRef(std::optional<Cell> cell, bool mod, bool ref) {
   getGraph().addFlags(*cell, flags);
 }
 
+void ModelContext::writeUnknown(std::optional<Cell> cell,
+                                std::optional<uint64_t> size) {
+  if (!cell)
+    return;
+  if (!size)
+    return modRef(cell, /*mod=*/true, /*ref=*/false);
+  getGraph().addFlags(*cell, NodeFlags::Mod);
+  if (writes)
+    writes->push_back({nullptr, *cell, /*reachable=*/false, *size});
+}
+
 Cell ModelContext::makeHeapObject(const CallSiteRecord &site,
                                   std::optional<int64_t> size) {
   Graph &graph = getGraph();
