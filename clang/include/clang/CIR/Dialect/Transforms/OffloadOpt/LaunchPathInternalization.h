@@ -96,6 +96,13 @@ inline constexpr llvm::StringLiteral kInternalizedEdgeAttr =
 /// original candidate whose copy the true branch calls.
 inline constexpr llvm::StringLiteral kInternalizedGuardAttr =
     "cir.offload.internalized_guard";
+/// On an op of a launch path whose reference to a kernel's naming artifact
+/// (its name string, CompileTimeKernelInfo, kernel.info getter, or a constant
+/// that carries one) was redirected to a kernel copy's: a dictionary
+/// {getter = "<the kernel copy's getter>", attrs = <the op's attributes
+/// before>}, so that the reference is restored with the copy's markers.
+inline constexpr llvm::StringLiteral kInternalizedNameReadAttr =
+    "cir.offload.internalized_name_read";
 
 struct InternalizationOptions {
   /// Whether the function address \p addr (in \p holder) may be redirected to

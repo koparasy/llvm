@@ -331,6 +331,10 @@ void OffloadInternalizeLaunchPathsPass::runOnOperation() {
       call.setCalleeAttr(FlatSymbolRefAttr::get(copy->getter.getSymNameAttr()));
       call->setAttr(cir::kInternalizedEdgeAttr, sink.sink.getSymNameAttr());
     }
+    // The other reads of the kernel's name on the paths (the handler's
+    // kernel name, T26c), checked.
+    numNameReadViolations +=
+        copier.redirectNameReads(*copy, sink.calls, ".int");
     SmallVector<Attribute> roots;
     for (const std::string &root : sink.roots)
       roots.push_back(StringAttr::get(ctx, root));

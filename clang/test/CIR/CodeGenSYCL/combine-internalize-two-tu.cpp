@@ -25,13 +25,15 @@
 // RUN: %{dev} -emit-cir %s -o %t/tu1.dev.cir
 // RUN: %{host} -emit-cir %s -o %t/tu1.host.cir
 // RUN: cir-offload-merge -combine %{targets} -input=%t/tu1.host.cir -input=%t/tu1.dev.cir \
-// RUN:   --cir-offload-host-facts=ipo -output=%t/tu1.cir 2>&1 | FileCheck %s --check-prefix=TU1-REMARK
+// RUN:   --cir-offload-host-facts=ipo -output=%t/tu1.cir 2>&1 | FileCheck %s --check-prefix=TU1-REMARK \
+// RUN:   --implicit-check-not=kernel-name-redirect:
 // RUN: cir-offload-merge -split %{targets} -input=%t/tu1.cir -output=%t/tu1.split.host.cir \
 // RUN:   -output=%t/tu1.split.dev.cir
 // RUN: %{dev} -O1 -emit-llvm -x cir %t/tu1.split.dev.cir -o %t/tu1.dev.ll
 // RUN: %{host} -emit-llvm -x cir %t/tu1.split.host.cir -o %t/tu1.host.ll
 // RUN: FileCheck %s --check-prefix=TU1-DEV --input-file=%t/tu1.dev.ll
 // RUN: FileCheck %s --check-prefix=TU1-HOST --input-file=%t/tu1.host.ll
+// RUN: FileCheck %s --check-prefix=TU1-NAME --input-file=%t/tu1.host.ll
 //
 // RUN: %{dev} -emit-cir -DTU2 %s -o %t/tu2.dev.cir
 // RUN: %{host} -emit-cir -DTU2 %s -o %t/tu2.host.cir
@@ -96,6 +98,14 @@ void tu2_api(queue &q) {
 // TU1-HOST-DAG: define linkonce_odr void @_Z6launchRN4sycl3_V15queueEPfS3_S3_(
 // TU1-HOST-DAG: define internal void @_Z6launchRN4sycl3_V15queueEPfS3_S3_.int(
 // TU1-HOST-DAG: define internal {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI7KSharedEERNS1_16DeviceKernelInfoEv.int()
+// The handler's kernel name on the internal path is the copy's too (T26c):
+// an internal copy of setDeviceKernelInfo<KShared>'s `__const` Info.
+// TU1-NAME-DAG: @[[INFO:__const._ZN4sycl3_V17handler19setDeviceKernelInfoI7KSharedEEvPv.Info]].int = internal constant {{.*}} { ptr @[[STR:.str[.0-9]*]].int, i64 33 } }
+// TU1-NAME-DAG: @[[STR]].int = internal constant [34 x i8] c"_ZTS7KShared.int.{{[0-9a-f]+}}\00"
+// TU1-NAME-DAG: @[[INFO]] = private constant {{.*}} { ptr @[[STR]], i64 12 } }
+// TU1-NAME-LABEL: define internal void @_ZN4sycl3_V17handler19setDeviceKernelInfoI7KSharedEEvPv.int(
+// TU1-NAME: call void @llvm.memcpy{{.*}}(ptr {{.*}}, ptr {{.*}}@[[INFO]].int, i64 16
+// TU1-NAME: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI7KSharedEERNS1_16DeviceKernelInfoEv.int()
 
 // TU2: no closed root, nothing internalized, nothing stamped.
 // TU2-REMARK: remark: launch-path-internalization: kernel @_ZTS7KShared not internalized (no closed root (main, a dynamic initializer) reaches it)
@@ -116,5 +126,7 @@ void tu2_api(queue &q) {
 // LINKED-NOT: .int(
 // LINKED: call void @_ZN4sycl3_V15queue6submitIZ6launchRS1_PfS4_S4_EUlRNS0_7handlerEE_EENS0_5eventET_(
 // LINKED-LABEL: define linkonce_odr void @_ZN4sycl3_V17handler19setDeviceKernelInfoI7KSharedEEvPv(
-// LINKED-NOT: .int(
+// LINKED-NOT: .int
+// LINKED: call void @llvm.memcpy{{.*}}(ptr {{.*}}, ptr {{.*}}@__const._ZN4sycl3_V17handler19setDeviceKernelInfoI7KSharedEEvPv.Info{{(\.[0-9]+)?}}, i64 16
+// LINKED-NOT: .int
 // LINKED: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI7KSharedEERNS1_16DeviceKernelInfoEv()

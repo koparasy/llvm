@@ -564,6 +564,9 @@ def OffloadInternalizeLaunchPaths
     Statistic<"numCopies", "function-copies", "Host function copies made">,
     Statistic<"numKernelCopies", "kernel-copies",
               "Kernels specialized for an internalized path">,
+    Statistic<"numNameReadViolations", "name-read-violations",
+              "Functions of an internalized path that still name the "
+              "original kernel">,
   ];
 }
 

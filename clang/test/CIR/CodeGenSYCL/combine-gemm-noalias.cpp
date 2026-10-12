@@ -12,7 +12,7 @@
 // RUN: cir-offload-merge -combine -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
 // RUN:   -input=%t/host.cir -input=%t/dev.cir --cir-offload-host-facts=ipo \
 // RUN:   -cir-offload-assume-closed-tu -output=%t/closed.cir 2>&1 \
-// RUN:   | FileCheck %s --check-prefix=REMARK
+// RUN:   | FileCheck %s --check-prefix=REMARK --implicit-check-not=kernel-name-redirect:
 // RUN: cir-offload-merge -split -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
 // RUN:   -input=%t/closed.cir -output=%t/closed.host.cir -output=%t/closed.dev.cir
 // RUN: %clang_cc1 -std=c++17 -fsycl-is-device -triple spir64-unknown-unknown \
@@ -25,7 +25,8 @@
 // launches gets A, B and C noalias.
 // RUN: cir-offload-merge -combine -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
 // RUN:   -input=%t/host.cir -input=%t/dev.cir --cir-offload-host-facts=ipo \
-// RUN:   -output=%t/open.cir
+// RUN:   -output=%t/open.cir 2>&1 | FileCheck %s --check-prefix=OPEN-REMARK \
+// RUN:   --implicit-check-not=kernel-name-redirect:
 // RUN: cir-offload-merge -split -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
 // RUN:   -input=%t/open.cir -output=%t/open.host.cir -output=%t/open.dev.cir
 // RUN: %clang_cc1 -std=c++17 -fsycl-is-device -triple spir64-unknown-unknown \
@@ -33,6 +34,10 @@
 // RUN:   %t/open.dev.cir -o %t/open.dev.ll
 // RUN: FileCheck %s --check-prefix=NONE --input-file=%t/open.dev.ll
 // RUN: FileCheck %s --check-prefix=OPEN-COPY --input-file=%t/open.dev.ll
+// RUN: %clang_cc1 -std=c++17 -fsycl-is-host -triple x86_64-unknown-linux-gnu \
+// RUN:   -aux-triple spir64-unknown-unknown -fclangir -emit-llvm -x cir \
+// RUN:   %t/open.host.cir -o %t/open.host.ll
+// RUN: FileCheck %s --check-prefix=OPEN-HOST --input-file=%t/open.host.ll
 //
 // -DSAME: B's buffer is a copy of A's (one storage), so A and B may alias;
 // only C is noalias.
@@ -43,7 +48,7 @@
 // RUN: cir-offload-merge -combine -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
 // RUN:   -input=%t/same.host.cir -input=%t/same.dev.cir --cir-offload-host-facts=ipo \
 // RUN:   -cir-offload-assume-closed-tu -output=%t/same.cir 2>&1 \
-// RUN:   | FileCheck %s --check-prefix=SAME-REMARK
+// RUN:   | FileCheck %s --check-prefix=SAME-REMARK --implicit-check-not=kernel-name-redirect:
 // RUN: cir-offload-merge -split -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
 // RUN:   -input=%t/same.cir -output=%t/same.host2.cir -output=%t/same.dev2.cir
 // RUN: %clang_cc1 -std=c++17 -fsycl-is-device -triple spir64-unknown-unknown \
@@ -77,6 +82,24 @@
 // OPEN-COPY-SAME: ptr addrspace(1) noalias {{[^,]*}}%{{[0-9]+}},
 // OPEN-COPY-SAME: ptr addrspace(1) noalias {{[^,]*}}%{{[0-9]+}},
 // OPEN-COPY-SAME: ptr addrspace(1) noalias {{[^,]*}}%{{[0-9]+}},
+
+// OPEN-REMARK: remark: launch-path-internalization: kernel @_ZTS4Gemm -> @_ZTS4Gemm.int.{{[0-9a-f]+}}
+
+// The handler's kernel name (handler::finalize() asserts that it is the
+// name of the DeviceKernelInfo) on the internalized path is the kernel
+// copy's: the internal copy of setDeviceKernelInfo<Gemm> copies it from a
+// copy of its `__const` Info that names the copy's string, with its length.
+// The original keeps the original's.
+// OPEN-HOST-DAG: @__const._ZN4sycl3_V17handler19setDeviceKernelInfoI4GemmEEvPv.Info = private constant {{.*}} { ptr @.str, i64 9 } }
+// OPEN-HOST-DAG: @__const._ZN4sycl3_V17handler19setDeviceKernelInfoI4GemmEEvPv.Info.int = internal constant {{.*}} { ptr @.str.int, i64 30 } }
+// OPEN-HOST-DAG: @.str = private constant [10 x i8] c"_ZTS4Gemm\00"
+// OPEN-HOST-DAG: @.str.int = internal constant [31 x i8] c"_ZTS4Gemm.int.{{[0-9a-f]+}}\00"
+// OPEN-HOST-LABEL: define linkonce_odr void @_ZN4sycl3_V17handler19setDeviceKernelInfoI4GemmEEvPv(
+// OPEN-HOST: call void @llvm.memcpy{{.*}}(ptr {{.*}}, ptr {{.*}}@__const._ZN4sycl3_V17handler19setDeviceKernelInfoI4GemmEEvPv.Info, i64 16
+// OPEN-HOST: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4GemmEERNS1_16DeviceKernelInfoEv()
+// OPEN-HOST-LABEL: define internal void @_ZN4sycl3_V17handler19setDeviceKernelInfoI4GemmEEvPv.int(
+// OPEN-HOST: call void @llvm.memcpy{{.*}}(ptr {{.*}}, ptr {{.*}}@__const._ZN4sycl3_V17handler19setDeviceKernelInfoI4GemmEEvPv.Info.int, i64 16
+// OPEN-HOST: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4GemmEERNS1_16DeviceKernelInfoEv.int()
 
 // SAME-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'A'): not stamped ('A' and 'B' use the same memory{{.*}})
 // SAME-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'B'): not stamped ('B' and 'A' use the same memory{{.*}})
@@ -229,7 +252,7 @@ struct CompileTimeKernelInfoTy {
 template <class K>
 inline constexpr CompileTimeKernelInfoTy CompileTimeKernelInfo{
     {__builtin_sycl_unique_stable_name(K),
-     sizeof(__builtin_sycl_unique_stable_name(K)) - 1}};
+     __builtin_strlen(__builtin_sycl_unique_stable_name(K))}};
 struct DeviceKernelInfo {};
 DeviceKernelInfo &getDeviceKernelInfo(const CompileTimeKernelInfoTy &);
 template <class K> DeviceKernelInfo &getDeviceKernelInfo() {
@@ -282,7 +305,14 @@ class handler {
   void setKernelFunc(void *p);
   void setDeviceKernelInfoPtr(detail::DeviceKernelInfo *p);
   void setNDRangeDescriptor(detail::nd_range_view rv);
+  // The real headers' shape: the handler's kernel name comes from a
+  // constexpr copy of the CompileTimeKernelInfo (a `__const.<f>.Info`
+  // global in CIR), and handler::finalize() asserts that it is the name of
+  // the DeviceKernelInfo.
+  detail::string_view MKernelName;
   template <class Kn> void setDeviceKernelInfo(void *p) {
+    constexpr auto Info = detail::CompileTimeKernelInfo<Kn>;
+    MKernelName = Info.Name;
     setKernelFunc(p);
     setDeviceKernelInfoPtr(&detail::getDeviceKernelInfo<Kn>());
   }

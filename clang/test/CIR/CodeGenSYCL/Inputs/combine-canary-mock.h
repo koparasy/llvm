@@ -168,7 +168,7 @@ struct CompileTimeKernelInfoTy {
 template <class K>
 inline constexpr CompileTimeKernelInfoTy CompileTimeKernelInfo{
     {__builtin_sycl_unique_stable_name(K),
-     sizeof(__builtin_sycl_unique_stable_name(K)) - 1}};
+     __builtin_strlen(__builtin_sycl_unique_stable_name(K))}};
 struct DeviceKernelInfo {};
 DeviceKernelInfo &getDeviceKernelInfo(const CompileTimeKernelInfoTy &);
 template <class K> DeviceKernelInfo &getDeviceKernelInfo() {
@@ -228,7 +228,14 @@ class handler {
   void setKernelFunc(void *p);
   void setDeviceKernelInfoPtr(detail::DeviceKernelInfo *p);
   void setNDRangeDescriptor(detail::nd_range_view rv);
+  // The real headers' shape: the handler's kernel name comes from a
+  // constexpr copy of the CompileTimeKernelInfo (a `__const.<f>.Info`
+  // global in CIR), and handler::finalize() asserts that it is the name of
+  // the DeviceKernelInfo.
+  detail::string_view MKernelName;
   template <class Kn> void setDeviceKernelInfo(void *p) {
+    constexpr auto Info = detail::CompileTimeKernelInfo<Kn>;
+    MKernelName = Info.Name;
     setKernelFunc(p);
     setDeviceKernelInfoPtr(&detail::getDeviceKernelInfo<Kn>());
   }
@@ -238,6 +245,7 @@ class handler {
   std::unique_ptr<detail::HostKernelBase> MHostKernel;
   template <class Kn, class K> void StoreLambda(const K &k) {
     MHostKernel.reset(new detail::HostKernel<K>(k));
+    MKernelName = detail::CompileTimeKernelInfo<Kn>.Name;
     setDeviceKernelInfoPtr(&detail::getDeviceKernelInfo<Kn>());
   }
 #else

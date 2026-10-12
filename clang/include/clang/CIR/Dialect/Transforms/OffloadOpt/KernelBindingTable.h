@@ -447,11 +447,15 @@ struct SpecializedKernel {
 // then repoints the getDeviceKernelInfo marker call of every launch in `sites`
 // at the getter clone (H4), so exactly those launches resolve the clone at
 // runtime while every other launch (this TU's or another's) keeps the generic
-// original. `sites` must all belong to `binding` (they share one getter
-// instantiation, so H1-H3 are minted once); pass the full launchSites list to
-// specialize a cross-TU functor for this TU, or an agreeing subset to split a
-// kernel launched several ways. `uniqueTag` disambiguates the minted symbol
-// names within the TU.
+// original; and every other reference to the kernel's naming artifacts in
+// the SYCL launch implementation on the paths to those markers (the
+// `__const.<f>.Info` copy of the CompileTimeKernelInfo that
+// handler::setDeviceKernelInfo stores the handler's kernel name from, ...) to
+// copies naming the clone (see LocalKernelCopier::redirectNameReads). `sites`
+// must all belong to `binding` (they share one getter instantiation, so H1-H3
+// are minted once); pass the full launchSites list to specialize a cross-TU
+// functor for this TU, or an agreeing subset to split a kernel launched several
+// ways. `uniqueTag` disambiguates the minted symbol names within the TU.
 //
 // Returns the minted clone, or nullopt if the binding/sites are not a
 // redirectable SYCL launch (not SYCL, no marker call, no name string, or no
@@ -508,6 +512,10 @@ struct LocalKernelCopy {
   std::string name;
   llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
   cir::FuncOp getter;
+  // The original's naming artifacts (its name string, CompileTimeKernelInfo
+  // and getter) and the copies H1, H2 of the first two.
+  cir::GlobalOp nameString, compileTimeInfo, h1, h2;
+  cir::FuncOp originalGetter;
 };
 
 // Makes the device clones and host artifacts of
@@ -529,6 +537,18 @@ public:
   // container, or `cloneName` is taken.
   std::optional<LocalKernelCopy>
   copy(cir::FuncOp getter, llvm::StringRef cloneName, llvm::StringRef suffix);
+  // Once the caller has repointed `markers` (calls of the original getter)
+  // at `copy`'s getter: redirect every other reference to the kernel's
+  // naming artifacts on the launch paths to those markers (the name string,
+  // the CompileTimeKernelInfo, the getter, and the constants that carry
+  // one, such as the `__const.<f>.Info` copy handler::setDeviceKernelInfo
+  // stores the handler's kernel name from) to `copy`'s, through copies
+  // named `<original><suffix>`; then check that no function of those paths
+  // names the original kernel any more. Returns the number of functions
+  // that still do (each remarked: kernel-name-redirect).
+  unsigned redirectNameReads(const LocalKernelCopy &copy,
+                             llvm::ArrayRef<mlir::Operation *> markers,
+                             llvm::StringRef suffix);
 
 private:
   mlir::ModuleOp container;

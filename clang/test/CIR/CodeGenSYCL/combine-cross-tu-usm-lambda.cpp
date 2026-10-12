@@ -77,6 +77,7 @@
 // REDEFINE: %{opts} = -cir-offload-assume-closed-tu
 // RUN: %{merge}
 // RUN: FileCheck %s --check-prefix=CLOSED --input-file=%t/tu1.closed.dev.ll
+// RUN: not grep kernel-name-redirect: %t/*.remarks
 
 #include "combine-canary-mock.h"
 using namespace sycl;
@@ -160,8 +161,10 @@ void tu2_distinct(queue &q) {
 // TU1-HOST-LABEL: define dso_local noundef i32 @main()
 // TU1-HOST: call void @_ZN4sycl3_V15queue6submitI4CopyEENS0_5eventET_.int(
 // TU1-HOST-LABEL: define linkonce_odr void @_ZN4sycl3_V17handler11StoreLambdaI4KLamZNK4CopyclERS1_EUlNS0_2idILi1EEEE_EEvRKT0_(
+// TU1-HOST: call {{.*}}@_ZN4sycl3_V16detail11string_viewaSERKS2_({{.*}}@_ZN4sycl3_V16detail21CompileTimeKernelInfoI4KLamEE)
 // TU1-HOST: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4KLamEERNS1_16DeviceKernelInfoEv()
 // TU1-HOST-LABEL: define internal void @_ZN4sycl3_V17handler11StoreLambdaI4KLamZNK4CopyclERS1_EUlNS0_2idILi1EEEE_EEvRKT0_.int(
+// TU1-HOST: call {{.*}}@_ZN4sycl3_V16detail11string_viewaSERKS2_({{.*}}@_ZN4sycl3_V16detail21CompileTimeKernelInfoI4KLamEE.int)
 // TU1-HOST: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4KLamEERNS1_16DeviceKernelInfoEv.int()
 
 // TU2: tu2_api launches the unstamped KLam, tu2_distinct the copy.

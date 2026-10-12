@@ -61,6 +61,33 @@
 // RUN: %{merge}
 // RUN: FileCheck %s --check-prefix=CLOSED --input-file=%t/tu1.closed.dev.ll
 // RUN: FileCheck %s --check-prefix=CLOSED-HOST --input-file=%t/tu1.closed.host.ll
+// RUN: not grep kernel-name-redirect: %t/tu1.default.remarks %t/tu2.default.remarks \
+// RUN:   %t/tu1.noint.remarks %t/tu1.closed.remarks
+//
+// The real headers' handler::setDeviceKernelInfo (without
+// COMBINE_MOCK_HOST_KERNEL_RESET): the handler's kernel name comes from a
+// `__const` copy of the CompileTimeKernelInfo, which the clone (ipo +
+// closed-TU) and the kernel copy (ipo, internalized) redirect too (T26c).
+// DEFINE: %{rdev} = %clang_cc1 -std=c++17 -fsycl-is-device -triple spir64-unknown-unknown \
+// DEFINE:   -aux-triple x86_64-unknown-linux-gnu -fclangir -I%S/Inputs
+// DEFINE: %{rhost} = %clang_cc1 -std=c++17 -fsycl-is-host -triple x86_64-unknown-linux-gnu \
+// DEFINE:   -aux-triple spir64-unknown-unknown -fclangir -I%S/Inputs
+// DEFINE: %{rmerge} = cir-offload-merge -combine %{targets} -input=%t/real.host.cir \
+// DEFINE:     -input=%t/real.dev.cir %{opts} -output=%t/real.%{m}.cir > %t/real.%{m}.remarks 2>&1 \
+// DEFINE:   && cir-offload-merge -split %{targets} -input=%t/real.%{m}.cir \
+// DEFINE:     -output=%t/real.%{m}.split.host.cir -output=%t/real.%{m}.split.dev.cir \
+// DEFINE:   && %{rhost} -emit-llvm -x cir %t/real.%{m}.split.host.cir -o %t/real.%{m}.host.ll
+// RUN: %{rdev} -emit-cir %s -o %t/real.dev.cir
+// RUN: %{rhost} -emit-cir %s -o %t/real.host.cir
+// REDEFINE: %{m} = ipoclosed
+// REDEFINE: %{opts} = --cir-offload-host-facts=ipo -cir-offload-assume-closed-tu
+// RUN: %{rmerge}
+// RUN: FileCheck %s --check-prefix=REAL-CLOSED --input-file=%t/real.ipoclosed.host.ll
+// REDEFINE: %{m} = ipoopen
+// REDEFINE: %{opts} = --cir-offload-host-facts=ipo
+// RUN: %{rmerge}
+// RUN: FileCheck %s --check-prefix=REAL-OPEN --input-file=%t/real.ipoopen.host.ll
+// RUN: not grep kernel-name-redirect: %t/real.ipoclosed.remarks %t/real.ipoopen.remarks
 
 #include "combine-canary-mock.h"
 using namespace sycl;
@@ -111,6 +138,8 @@ void tu2_api(queue &q) {
 // LINKED: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4AddFEERNS1_16DeviceKernelInfoEv()
 // LINKED-INT-LABEL: define internal void @_ZN4sycl3_V17handler11StoreLambdaI4AddFS3_EEvRKT0_.int(
 // LINKED-INT-NOT: define
+// The handler's kernel name too (T26c).
+// LINKED-INT: call {{.*}}@_ZN4sycl3_V16detail11string_viewaSERKS2_({{.*}}@_ZN4sycl3_V16detail21CompileTimeKernelInfoI4AddFEE.int)
 // LINKED-INT: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4AddFEERNS1_16DeviceKernelInfoEv.int()
 
 // NOINT: remark: kernel-param-noalias: kernel @_ZTS4AddF arg 0 (pointer 'a'): not stamped (the kernel is visible to other TUs; facts this TU derives hold only through an internalized launch path, and launch-path internalization is off)
@@ -124,5 +153,32 @@ void tu2_api(queue &q) {
 // CLOSED-NOT: noalias
 // CLOSED-SAME: {{$}}
 // CLOSED: define weak_odr spir_kernel void @_ZTS4AddF.spec.noalias.0(ptr addrspace(1) noalias {{[^,]*}}, ptr addrspace(1) noalias
+// The clone's name string and CompileTimeKernelInfo; StoreLambda<AddF, AddF>
+// names the clone in the handler and through the getter (T26c).
+// CLOSED-HOST: @[[STR:.str_[0-9]+]] = private constant [25 x i8] c"_ZTS4AddF.spec.noalias.0\00"
+// CLOSED-HOST: @[[CTKI:_ZN4sycl3_V16detail21CompileTimeKernelInfoI4AddFEE_[0-9]+]] = {{.*}} { ptr @[[STR]], i64 24 } }
 // CLOSED-HOST-LABEL: define linkonce_odr void @_ZN4sycl3_V17handler11StoreLambdaI4AddFS3_EEvRKT0_(
+// CLOSED-HOST: call {{.*}}@_ZN4sycl3_V16detail11string_viewaSERKS2_({{.*}}@[[CTKI]])
 // CLOSED-HOST: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4AddFEERNS1_16DeviceKernelInfoEv_{{[0-9]+}}()
+
+// The real headers' shape, clone path: setDeviceKernelInfo<AddF> (whose
+// marker the clone path repoints in place) copies the handler's kernel name
+// from an internal copy of its `__const` Info naming the clone's string.
+// REAL-CLOSED-DAG: @[[INFO:__const._ZN4sycl3_V17handler19setDeviceKernelInfoI4AddFEEvPv.Info_[0-9]+]] = internal constant {{.*}} { ptr @[[STR:.str_[0-9]+]], i64 24 } }
+// REAL-CLOSED-DAG: @[[STR]] = private constant [25 x i8] c"_ZTS4AddF.spec.noalias.0\00"
+// REAL-CLOSED-LABEL: define linkonce_odr void @_ZN4sycl3_V17handler19setDeviceKernelInfoI4AddFEEvPv(
+// REAL-CLOSED: call void @llvm.memcpy{{.*}}(ptr {{.*}}, ptr {{.*}}@[[INFO]], i64 16
+// REAL-CLOSED: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4AddFEERNS1_16DeviceKernelInfoEv_{{[0-9]+}}()
+
+// The real headers' shape, internalized path: the internal copy of
+// setDeviceKernelInfo<AddF> names the kernel copy; the original, the
+// original kernel.
+// REAL-OPEN-DAG: @__const._ZN4sycl3_V17handler19setDeviceKernelInfoI4AddFEEvPv.Info = private constant {{.*}} { ptr @.str, i64 9 } }
+// REAL-OPEN-DAG: @__const._ZN4sycl3_V17handler19setDeviceKernelInfoI4AddFEEvPv.Info.int = internal constant {{.*}} { ptr @.str.int, i64 30 } }
+// REAL-OPEN-DAG: @.str.int = internal constant [31 x i8] c"_ZTS4AddF.int.{{[0-9a-f]+}}\00"
+// REAL-OPEN-LABEL: define linkonce_odr void @_ZN4sycl3_V17handler19setDeviceKernelInfoI4AddFEEvPv(
+// REAL-OPEN: call void @llvm.memcpy{{.*}}(ptr {{.*}}, ptr {{.*}}@__const._ZN4sycl3_V17handler19setDeviceKernelInfoI4AddFEEvPv.Info, i64 16
+// REAL-OPEN: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4AddFEERNS1_16DeviceKernelInfoEv()
+// REAL-OPEN-LABEL: define internal void @_ZN4sycl3_V17handler19setDeviceKernelInfoI4AddFEEvPv.int(
+// REAL-OPEN: call void @llvm.memcpy{{.*}}(ptr {{.*}}, ptr {{.*}}@__const._ZN4sycl3_V17handler19setDeviceKernelInfoI4AddFEEvPv.Info.int, i64 16
+// REAL-OPEN: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4AddFEERNS1_16DeviceKernelInfoEv.int()

@@ -917,7 +917,12 @@ unsigned cir::pruneInternalizedPaths(ModuleOp module,
     return copy && !needed.contains(copy);
   };
   SmallVector<Operation *> unwrap;
+  SmallVector<Operation *> nameReads;
   module.walk([&](Operation *op) {
+    if (op->hasAttr(kInternalizedNameReadAttr)) {
+      nameReads.push_back(op);
+      return;
+    }
     if (op->hasAttr(kInternalizedGuardAttr)) {
       // The true branch calls the copy of the candidate.
       bool drop = false;
@@ -940,6 +945,71 @@ unsigned cir::pruneInternalizedPaths(ModuleOp module,
         addr.setNameAttr(FlatSymbolRefAttr::get(original));
     }
   });
+  // The kernel-name reads redirected with the markers of a kernel copy
+  // (T26c, redirectKernelNameReads): restored with them. The tag maps each
+  // copy the op refers to back to its original, and gives the length a
+  // string_view {name, length} had.
+  SymbolTable symbols(module);
+  for (Operation *op : nameReads) {
+    auto read = op->getAttrOfType<DictionaryAttr>(kInternalizedNameReadAttr);
+    auto getter = read.getAs<StringAttr>("getter");
+    auto back = read.getAs<DictionaryAttr>("refs");
+    if (!getter || !back || !isDropped(getter))
+      continue;
+    op->removeAttr(kInternalizedNameReadAttr);
+    auto string = read.getAs<StringAttr>("string");
+    auto lengths = read.getAs<ArrayAttr>("lengths");
+    AttrTypeReplacer replacer;
+    replacer.addReplacement(
+        [&](FlatSymbolRefAttr ref) -> std::optional<Attribute> {
+          if (auto original = back.getAs<StringAttr>(ref.getValue()))
+            return FlatSymbolRefAttr::get(original);
+          return std::nullopt;
+        });
+    if (string && lengths && lengths.size() == 2)
+      replacer.addReplacement(
+          [&](cir::ConstRecordAttr rec)
+              -> std::optional<std::pair<Attribute, WalkResult>> {
+            auto members = llvm::to_vector(rec.getMembers());
+            int64_t from = cast<IntegerAttr>(lengths[0]).getInt();
+            int64_t to = cast<IntegerAttr>(lengths[1]).getInt();
+            bool changed = false;
+            for (unsigned i = 0; i + 1 < members.size(); ++i) {
+              auto view = dyn_cast<cir::GlobalViewAttr>(members[i]);
+              auto len = dyn_cast<cir::IntAttr>(members[i + 1]);
+              if (!view || !len ||
+                  view.getSymbol().getRootReference() != string ||
+                  len.getSInt() != from)
+                continue;
+              members[i + 1] = cir::IntAttr::get(len.getType(), to);
+              changed = true;
+            }
+            if (!changed)
+              return std::nullopt;
+            return std::make_pair(
+                cir::ConstRecordAttr::get(
+                    cast<cir::RecordType>(rec.getType()),
+                    ArrayAttr::get(op->getContext(), members)),
+                WalkResult::advance());
+          });
+    replacer.replaceElementsIn(op);
+    // A read of the name string itself was retyped to the copy's type, with
+    // a cast back for its users.
+    auto addr = dyn_cast<cir::GetGlobalOp>(op);
+    auto global =
+        addr ? symbols.lookup<cir::GlobalOp>(addr.getName()) : cir::GlobalOp();
+    auto ptrTy = addr ? cast<cir::PointerType>(addr.getType()) : nullptr;
+    if (!global || ptrTy.getPointee() == global.getSymType())
+      continue;
+    addr.getAddr().setType(
+        cir::PointerType::get(global.getSymType(), ptrTy.getAddrSpace()));
+    for (Operation *user : llvm::make_early_inc_range(addr->getUsers()))
+      if (auto cast = dyn_cast<cir::CastOp>(user))
+        if (cast.getType() == addr.getType()) {
+          cast.getResult().replaceAllUsesWith(addr.getAddr());
+          cast.erase();
+        }
+  }
   // Inner guards first (a later candidate's guard is nested in the false
   // branch of an earlier one).
   for (Operation *op : llvm::reverse(unwrap))
@@ -977,5 +1047,6 @@ void cir::stripInternalizationTags(ModuleOp module) {
     op->removeAttr(kInternalizedAttr);
     op->removeAttr(kInternalizedEdgeAttr);
     op->removeAttr(kInternalizedGuardAttr);
+    op->removeAttr(kInternalizedNameReadAttr);
   });
 }

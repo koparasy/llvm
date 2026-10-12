@@ -8,6 +8,7 @@
 
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -21,6 +22,7 @@
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "clang/CIR/Dialect/Passes.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/LaunchPathInternalization.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLHostFacts.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
@@ -3048,6 +3050,10 @@ namespace {
 struct MintedKernelCopy {
   cir::SpecializedKernel spec;
   cir::FuncOp getter;
+  // The originals the copy replaces (the name string, the
+  // CompileTimeKernelInfo) and their copies H1, H2.
+  cir::GlobalOp nameString, compileTimeInfo, h1, h2;
+  cir::FuncOp originalGetter;
 };
 } // namespace
 
@@ -3123,6 +3129,8 @@ static std::optional<MintedKernelCopy> mintSYCLKernelCopy(
   h1.setInitialValueAttr(cir::ConstArrayAttr::get(fullTy, strAttr));
   localize(h1);
   mlir::StringAttr h1Name = hostSyms.insert(h1);
+  minted.nameString = nameStr;
+  minted.h1 = h1;
 
   // 3. The getter this launch marker calls and the CompileTimeKernelInfo it
   // names.
@@ -3141,6 +3149,8 @@ static std::optional<MintedKernelCopy> mintSYCLKernelCopy(
   h2.setInitialValueAttr(h2Init);
   localize(h2);
   mlir::StringAttr h2Name = hostSyms.insert(h2);
+  minted.compileTimeInfo = ctki;
+  minted.h2 = h2;
 
   // 5. Clone the getter's per-instantiation private cluster (the static-local
   // DeviceKernelInfo* singleton and its guard) so the clone lazily registers
@@ -3189,6 +3199,7 @@ static std::optional<MintedKernelCopy> mintSYCLKernelCopy(
 
   // 6. H3: a getter clone whose get_global references are remapped onto H2 and
   // the cloned cluster.
+  minted.originalGetter = getter;
   cir::FuncOp h3 = mlir::cast<cir::FuncOp>(getter->clone());
   localize(h3);
   mlir::StringAttr h3Name = hostSyms.insert(h3);
@@ -3200,6 +3211,370 @@ static std::optional<MintedKernelCopy> mintSYCLKernelCopy(
   (void)h3Name;
   minted.getter = h3;
   return minted;
+}
+
+//===----------------------------------------------------------------------===//
+// The kernel-name reads of a specialized launch path (T26c)
+//===----------------------------------------------------------------------===//
+//
+// The SYCL runtime names a launch twice: by the DeviceKernelInfo the marker
+// returns, and by the name the launch implementation stores in the handler
+// (handler::setDeviceKernelInfo: `constexpr auto Info =
+// CompileTimeKernelInfo<K>; MKernelName = Info.Name;`), and
+// handler::finalize() asserts that the two agree. CIRGen materializes the
+// constexpr local as a private constant `__const.<function>.Info` whose
+// initializer is a copy of the CompileTimeKernelInfo value: a third copy of
+// the kernel name, besides the CompileTimeKernelInfo (H2) and the string
+// (H1). Redirecting the marker alone leaves it, and every other such copy,
+// naming the original kernel.
+//
+// So after the markers of a kernel copy are redirected, every reference to
+// the kernel's naming artifacts in the SYCL launch implementation on the
+// paths to those markers is redirected too:
+//  - the name string, the CompileTimeKernelInfo and the kernel.info getter:
+//    to H1, H2, H3;
+//  - every constant global whose initializer refers (through
+//    #cir.global_view or a symbol reference, transitively) to one of them:
+//    to a copy whose initializer refers to the replacements, with the length
+//    of a string_view {name, length} updated (the clone's name is longer);
+//  - the same in the attributes of the functions' own ops (a constant
+//    record stored directly instead of copied from a `__const` global).
+// The originals are untouched: other launches (this TU's other paths,
+// other TUs) keep using them.
+//
+// Which functions: the functions holding the markers and, transitively,
+// their callers that belong to the SYCL implementation (in namespace sycl,
+// or with a SYCL host-API role), up to the user's code: the SYCL library
+// reads CompileTimeKernelInfo<K> only to launch K (the handler's name, the
+// checks of the kernel's size and parameters). User code above the launch
+// API is not rewritten: a name it reads (e.g. get_kernel_id<K>() for a
+// kernel bundle) is not the launch's, and a by-name launch of the copy
+// would launch it with arguments the analysis did not see.
+//
+// The post-condition, checked after the rewrite: no such function refers to
+// an original naming artifact, to a global carrying one, or calls a
+// function outside the set that does (a remark for each; the lit tests
+// check that none is emitted).
+
+namespace {
+/// The top-level ops of a host module that refer to each symbol.
+using SymbolHolders =
+    llvm::DenseMap<mlir::StringAttr, llvm::SmallVector<mlir::Operation *, 1>>;
+} // namespace
+
+static SymbolHolders collectSymbolHolders(mlir::ModuleOp host) {
+  SymbolHolders holders;
+  if (std::optional<mlir::SymbolTable::UseRange> uses =
+          mlir::SymbolTable::getSymbolUses(&host.getBodyRegion()))
+    for (const mlir::SymbolTable::SymbolUse &use : *uses) {
+      mlir::Operation *holder = use.getUser();
+      while (holder && holder->getParentOp() != host.getOperation())
+        holder = holder->getParentOp();
+      auto &list = holders[use.getSymbolRef().getRootReference()];
+      if (holder && !llvm::is_contained(list, holder))
+        list.push_back(holder);
+    }
+  return holders;
+}
+
+/// Whether \p func is part of the SYCL implementation (namespace sycl, a
+/// lambda in a function of it, or a SYCL host-API role); a copy keeps its
+/// original's name with a suffix.
+static bool isSYCLImplementation(cir::FuncOp func) {
+  if (func->hasAttr(cir::CIRDialect::getSYCLHostAPIAttrName()))
+    return true;
+  llvm::StringRef name = func.getSymName();
+  return name.starts_with("_ZN4sycl") || name.starts_with("_ZNK4sycl") ||
+         name.starts_with("_ZZN4sycl") || name.starts_with("_ZZNK4sycl");
+}
+
+/// Redirect the kernel-name reads of the launch paths to the markers
+/// \p markers of the kernel copy \p minted (see above). With \p local, the
+/// global copies are internal, named `<original><suffix>` and tagged
+/// cir.offload.internalized, and every rewritten op is tagged
+/// kInternalizedNameReadAttr (so that pruneInternalizedPaths can undo it
+/// with the markers when the kernel copy is not used). Returns the number of
+/// post-condition violations (each remarked).
+static unsigned
+redirectKernelNameReads(mlir::ModuleOp host, mlir::SymbolTable &hostSyms,
+                        const SymbolHolders &holders, MintedKernelCopy minted,
+                        llvm::ArrayRef<mlir::Operation *> markers, bool local,
+                        llvm::StringRef suffix) {
+  mlir::MLIRContext *ctx = host.getContext();
+  cir::GlobalOp nameStr = minted.nameString;
+  mlir::StringAttr nameSym = nameStr.getSymNameAttr();
+  uint64_t oldLen = getGlobalStringValue(nameStr).size();
+  uint64_t newLen = minted.spec.name.size();
+  mlir::StringAttr getterCopy = minted.getter.getSymNameAttr();
+
+  // The originals, and the globals that carry one (backward over the
+  // initializers that refer to them).
+  llvm::SmallVector<mlir::StringAttr, 3> originals{
+      nameSym, minted.compileTimeInfo.getSymNameAttr(),
+      minted.originalGetter.getSymNameAttr()};
+  llvm::DenseMap<mlir::StringAttr, mlir::StringAttr> replacement;
+  replacement[originals[0]] = minted.h1.getSymNameAttr();
+  replacement[originals[1]] = minted.h2.getSymNameAttr();
+  replacement[originals[2]] = getterCopy;
+  llvm::DenseMap<mlir::StringAttr, cir::GlobalOp> carriers;
+  {
+    llvm::SmallVector<mlir::StringAttr> work(originals.begin(),
+                                             originals.end());
+    while (!work.empty()) {
+      mlir::StringAttr sym = work.pop_back_val();
+      auto it = holders.find(sym);
+      if (it == holders.end())
+        continue;
+      for (mlir::Operation *holder : it->second)
+        if (auto global = mlir::dyn_cast<cir::GlobalOp>(holder))
+          if (carriers.try_emplace(global.getSymNameAttr(), global).second)
+            work.push_back(global.getSymNameAttr());
+    }
+  }
+  auto isOriginal = [&](mlir::StringAttr sym) {
+    return llvm::is_contained(originals, sym) || carriers.count(sym);
+  };
+
+  // The functions: the marker holders and their SYCL-implementation
+  // callers.
+  llvm::SmallSetVector<mlir::Operation *, 8> scope;
+  for (mlir::Operation *marker : markers)
+    if (auto holder = marker->getParentOfType<cir::FuncOp>())
+      scope.insert(holder);
+  for (unsigned i = 0; i != scope.size(); ++i) {
+    auto func = mlir::cast<cir::FuncOp>(scope[i]);
+    auto it = holders.find(func.getSymNameAttr());
+    if (it == holders.end())
+      continue;
+    for (mlir::Operation *holder : it->second)
+      if (auto caller = mlir::dyn_cast<cir::FuncOp>(holder))
+        if (!caller.isDeclaration() && isSYCLImplementation(caller))
+          scope.insert(caller);
+  }
+
+  // The replacement of a symbol: H1-H3, or the copy of a carrier (made on
+  // first use; null for a carrier that is not a constant). `oldLength`
+  // receives the length a string_view {name, length} had, if one was
+  // updated.
+  std::function<mlir::Attribute(mlir::Attribute, std::optional<uint64_t> &)>
+      rewrite;
+  std::function<mlir::StringAttr(mlir::StringAttr)> replace =
+      [&](mlir::StringAttr sym) -> mlir::StringAttr {
+    if (mlir::StringAttr r = replacement.lookup(sym))
+      return r;
+    cir::GlobalOp global = carriers.lookup(sym);
+    if (!global || !global.getConstant() || !global.getInitialValue())
+      return {};
+    auto copy = mlir::cast<cir::GlobalOp>(global->clone());
+    copy.setLinkage(cir::GlobalLinkageKind::InternalLinkage);
+    copy.setComdat(false);
+    mlir::SymbolTable::setSymbolVisibility(
+        copy, mlir::SymbolTable::Visibility::Private);
+    if (local) {
+      copy.setSymName((global.getSymName() + suffix).str());
+      copy->setAttr(cir::kInternalizedAttr, sym);
+    }
+    mlir::StringAttr name =
+        hostSyms.insert(copy, std::next(mlir::Block::iterator(global)));
+    replacement[sym] = name;
+    std::optional<uint64_t> ignored;
+    copy.setInitialValueAttr(rewrite(*global.getInitialValue(), ignored));
+    return name;
+  };
+  rewrite = [&](mlir::Attribute attr,
+                std::optional<uint64_t> &oldLength) -> mlir::Attribute {
+    mlir::AttrTypeReplacer replacer;
+    replacer.addReplacement(
+        [&](mlir::FlatSymbolRefAttr ref) -> std::optional<mlir::Attribute> {
+          if (!isOriginal(ref.getAttr()))
+            return std::nullopt;
+          mlir::StringAttr to = replace(ref.getAttr());
+          if (!to)
+            return std::nullopt;
+          return mlir::FlatSymbolRefAttr::get(to);
+        });
+    // A string_view {name, length} (a two-member record, or a length that
+    // is the name's): the length of the clone's name.
+    replacer.addReplacement(
+        [&](cir::ConstRecordAttr rec)
+            -> std::optional<std::pair<mlir::Attribute, mlir::WalkResult>> {
+          auto members = llvm::to_vector(rec.getMembers());
+          bool changed = false;
+          for (unsigned i = 0; i + 1 < members.size(); ++i) {
+            auto view = mlir::dyn_cast<cir::GlobalViewAttr>(members[i]);
+            auto len = mlir::dyn_cast<cir::IntAttr>(members[i + 1]);
+            if (!view || !len ||
+                view.getSymbol().getRootReference() != nameSym ||
+                (members.size() != 2 && len.getUInt() != oldLen) ||
+                len.getUInt() == newLen)
+              continue;
+            if (mlir::ArrayAttr indices = view.getIndices())
+              if (llvm::any_of(indices, [](mlir::Attribute index) {
+                    auto i = mlir::dyn_cast<cir::IntAttr>(index);
+                    return !i || i.getSInt() != 0;
+                  }))
+                continue;
+            oldLength = len.getUInt();
+            members[i + 1] = cir::IntAttr::get(len.getType(), newLen);
+            changed = true;
+          }
+          if (!changed)
+            return std::nullopt;
+          return std::make_pair(cir::ConstRecordAttr::get(
+                                    mlir::cast<cir::RecordType>(rec.getType()),
+                                    mlir::ArrayAttr::get(ctx, members)),
+                                mlir::WalkResult::advance());
+        });
+    return replacer.replace(attr);
+  };
+
+  // Rewrite the functions' references. In local mode each rewritten op is
+  // tagged with what undoes it (no symbol reference: the tag must not be a
+  // use of the originals): {getter = H3, refs = {copy = original, ...}[,
+  // string = H1, lengths = [new, old]]}.
+  for (mlir::Operation *op : scope) {
+    auto func = mlir::cast<cir::FuncOp>(op);
+    llvm::SmallSetVector<mlir::Operation *, 4> users;
+    if (std::optional<mlir::SymbolTable::UseRange> uses =
+            mlir::SymbolTable::getSymbolUses(&func.getBody()))
+      for (const mlir::SymbolTable::SymbolUse &use : *uses)
+        if (isOriginal(use.getSymbolRef().getRootReference()))
+          users.insert(use.getUser());
+    for (mlir::Operation *user : users) {
+      llvm::SmallVector<mlir::NamedAttribute, 2> refs;
+      std::optional<uint64_t> oldLength;
+      if (auto addr = mlir::dyn_cast<cir::GetGlobalOp>(user)) {
+        mlir::StringAttr from = addr.getNameAttr().getAttr();
+        mlir::StringAttr to = replace(from);
+        if (!to)
+          continue;
+        addr.setNameAttr(mlir::FlatSymbolRefAttr::get(to));
+        refs.push_back(mlir::NamedAttribute(to, from));
+        // H1 has the clone name's type: retype, cast back for the users.
+        auto global = hostSyms.lookup<cir::GlobalOp>(to);
+        auto ptrTy = mlir::cast<cir::PointerType>(addr.getType());
+        if (global && global.getSymType() != ptrTy.getPointee()) {
+          addr.getAddr().setType(
+              cir::PointerType::get(global.getSymType(), ptrTy.getAddrSpace()));
+          mlir::OpBuilder b(ctx);
+          b.setInsertionPointAfter(addr);
+          auto cast = cir::CastOp::create(b, addr.getLoc(), ptrTy,
+                                          cir::CastKind::bitcast, addr);
+          addr.getAddr().replaceAllUsesExcept(cast, cast);
+        }
+      } else {
+        llvm::SmallVector<mlir::StringAttr, 2> before;
+        if (std::optional<mlir::SymbolTable::UseRange> uses =
+                mlir::SymbolTable::getSymbolUses(user))
+          for (const mlir::SymbolTable::SymbolUse &use : *uses)
+            if (isOriginal(use.getSymbolRef().getRootReference()))
+              before.push_back(use.getSymbolRef().getRootReference());
+        mlir::NamedAttrList attrs(user->getAttrDictionary());
+        bool changed = false;
+        for (mlir::NamedAttribute &attr : attrs) {
+          mlir::Attribute value = rewrite(attr.getValue(), oldLength);
+          if (value != attr.getValue()) {
+            attr.setValue(value);
+            changed = true;
+          }
+        }
+        if (!changed)
+          continue;
+        user->setAttrs(attrs.getDictionary(ctx));
+        for (mlir::StringAttr from : before)
+          if (mlir::StringAttr to = replacement.lookup(from))
+            refs.push_back(mlir::NamedAttribute(to, from));
+      }
+      if (!local)
+        continue;
+      mlir::Builder b(ctx);
+      llvm::sort(refs, [](mlir::NamedAttribute x, mlir::NamedAttribute y) {
+        return x.getName().strref() < y.getName().strref();
+      });
+      refs.erase(
+          std::unique(refs.begin(), refs.end(),
+                      [](mlir::NamedAttribute x, mlir::NamedAttribute y) {
+                        return x.getName() == y.getName();
+                      }),
+          refs.end());
+      llvm::SmallVector<mlir::NamedAttribute, 4> tag{
+          b.getNamedAttr("getter", getterCopy),
+          b.getNamedAttr("refs", b.getDictionaryAttr(refs))};
+      if (oldLength) {
+        tag.push_back(b.getNamedAttr("string", minted.h1.getSymNameAttr()));
+        tag.push_back(b.getNamedAttr(
+            "lengths",
+            b.getI64ArrayAttr({(int64_t)newLen, (int64_t)*oldLength})));
+      }
+      user->setAttr(cir::kInternalizedNameReadAttr, b.getDictionaryAttr(tag));
+    }
+  }
+
+  // The post-condition. A function outside the set "names" the kernel if it
+  // refers to an original or a carrier, or calls one that does.
+  llvm::DenseMap<mlir::Operation *, mlir::StringAttr> namesVia;
+  llvm::DenseSet<mlir::Operation *> visiting;
+  std::function<mlir::StringAttr(cir::FuncOp)> names =
+      [&](cir::FuncOp func) -> mlir::StringAttr {
+    auto it = namesVia.find(func);
+    if (it != namesVia.end())
+      return it->second;
+    if (func.isDeclaration() || !visiting.insert(func).second)
+      return {};
+    mlir::StringAttr found;
+    if (std::optional<mlir::SymbolTable::UseRange> uses =
+            mlir::SymbolTable::getSymbolUses(&func.getBody()))
+      for (const mlir::SymbolTable::SymbolUse &use : *uses) {
+        mlir::StringAttr sym = use.getSymbolRef().getRootReference();
+        if (isOriginal(sym)) {
+          found = sym;
+          break;
+        }
+        auto callee = hostSyms.lookup<cir::FuncOp>(sym);
+        if (callee && callee != func && !scope.contains(callee) &&
+            names(callee)) {
+          found = sym;
+          break;
+        }
+      }
+    visiting.erase(func);
+    namesVia[func] = found;
+    return found;
+  };
+  unsigned violations = 0;
+  for (mlir::Operation *op : scope) {
+    auto func = mlir::cast<cir::FuncOp>(op);
+    std::optional<mlir::SymbolTable::UseRange> uses =
+        mlir::SymbolTable::getSymbolUses(&func.getBody());
+    if (!uses)
+      continue;
+    llvm::SmallSetVector<mlir::StringAttr, 2> direct, through;
+    for (const mlir::SymbolTable::SymbolUse &use : *uses) {
+      mlir::StringAttr sym = use.getSymbolRef().getRootReference();
+      if (isOriginal(sym)) {
+        direct.insert(sym);
+        continue;
+      }
+      auto callee = hostSyms.lookup<cir::FuncOp>(sym);
+      if (callee && !scope.contains(callee) && names(callee))
+        through.insert(sym);
+    }
+    if (direct.empty() && through.empty())
+      continue;
+    ++violations;
+    mlir::InFlightDiagnostic diag = mlir::emitRemark(func.getLoc());
+    diag << "kernel-name-redirect: @" << func.getSymName()
+         << " on a launch path of @" << minted.spec.name
+         << " still names the original kernel @"
+         << getGlobalStringValue(nameStr);
+    for (mlir::StringAttr sym : direct)
+      diag << "; refers to @" << sym.getValue();
+    for (mlir::StringAttr sym : through)
+      diag << "; calls @" << sym.getValue() << ", which names it"
+           << " (through @"
+           << names(hostSyms.lookup<cir::FuncOp>(sym)).getValue() << ")";
+  }
+  return violations;
 }
 
 std::optional<cir::SpecializedKernel> cir::specializeSYCLKernelForLaunches(
@@ -3247,9 +3622,19 @@ std::optional<cir::SpecializedKernel> cir::specializeSYCLKernelForLaunches(
   // TU's or another's) keeps the original. All sites share the kernel's getter
   // instantiation, so they repoint to the one H3.
   auto h3Ref = mlir::FlatSymbolRefAttr::get(minted->getter.getSymNameAttr());
+  llvm::SmallVector<mlir::Operation *, 2> markers;
   for (const cir::LaunchSite &s : sites)
-    if (cir::CallOp siteMarker = s.syclMarkerCall)
+    if (cir::CallOp siteMarker = s.syclMarkerCall) {
       siteMarker.setCalleeAttr(h3Ref);
+      markers.push_back(siteMarker);
+    }
+
+  // 8. Every other read of the kernel's name on the launch paths (T26c).
+  mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
+  mlir::SymbolTable hostSyms(hostModule);
+  redirectKernelNameReads(hostModule, hostSyms,
+                          collectSymbolHolders(hostModule), *minted, markers,
+                          /*local=*/false, /*suffix=*/"");
 
   return std::move(minted->spec);
 }
@@ -3260,17 +3645,7 @@ cir::LocalKernelCopier::LocalKernelCopier(mlir::ModuleOp container)
   for (mlir::ModuleOp dm : cir::getOffloadContainerDeviceModules(container))
     deviceSyms.push_back(std::make_unique<mlir::SymbolTable>(dm));
   // The top-level ops of the host module that refer to each symbol.
-  mlir::ModuleOp host = cir::getOffloadContainerHostModule(container);
-  if (std::optional<mlir::SymbolTable::UseRange> uses =
-          mlir::SymbolTable::getSymbolUses(&host.getBodyRegion()))
-    for (const mlir::SymbolTable::SymbolUse &use : *uses) {
-      mlir::Operation *holder = use.getUser();
-      while (holder && holder->getParentOp() != host.getOperation())
-        holder = holder->getParentOp();
-      auto &list = holders[use.getSymbolRef().getRootReference()];
-      if (holder && !llvm::is_contained(list, holder))
-        list.push_back(holder);
-    }
+  holders = collectSymbolHolders(cir::getOffloadContainerHostModule(container));
 }
 
 cir::LocalKernelCopier::~LocalKernelCopier() = default;
@@ -3328,5 +3703,26 @@ cir::LocalKernelCopier::copy(cir::FuncOp getter, llvm::StringRef cloneName,
   copy.name = minted->spec.name;
   copy.deviceKernels = std::move(minted->spec.deviceKernels);
   copy.getter = minted->getter;
+  copy.nameString = minted->nameString;
+  copy.compileTimeInfo = minted->compileTimeInfo;
+  copy.h1 = minted->h1;
+  copy.h2 = minted->h2;
+  copy.originalGetter = minted->originalGetter;
   return copy;
+}
+
+unsigned cir::LocalKernelCopier::redirectNameReads(
+    const cir::LocalKernelCopy &copy, llvm::ArrayRef<mlir::Operation *> markers,
+    llvm::StringRef suffix) {
+  MintedKernelCopy minted;
+  minted.spec.name = copy.name;
+  minted.getter = copy.getter;
+  minted.nameString = copy.nameString;
+  minted.compileTimeInfo = copy.compileTimeInfo;
+  minted.h1 = copy.h1;
+  minted.h2 = copy.h2;
+  minted.originalGetter = copy.originalGetter;
+  return redirectKernelNameReads(cir::getOffloadContainerHostModule(container),
+                                 hostSyms, holders, minted, markers,
+                                 /*local=*/true, suffix);
 }

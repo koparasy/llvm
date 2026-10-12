@@ -75,6 +75,7 @@
 // REDEFINE: %{opts} = --cir-offload-host-facts=ipo -cir-offload-assume-closed-tu
 // RUN: %{merge}
 // RUN: FileCheck %s --check-prefix=IPOCLOSED-DEV --input-file=%t/tu1.ipoclosed.dev.ll
+// RUN: not grep kernel-name-redirect: %t/*.remarks
 
 #include "combine-canary-mock.h"
 using namespace sycl;
