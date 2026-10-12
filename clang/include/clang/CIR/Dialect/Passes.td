@@ -608,6 +608,46 @@ def OffloadPropagateSYCLKernelArgs
   ];
 }
 
+def OffloadHostDiagnostics
+    : Pass<"cir-offload-host-diagnostics", "mlir::ModuleOp"> {
+  let summary = "Warn on SYCL host-side bugs the host facts prove";
+  let description = [{
+    Runs over a `cir.offload.container` after the passes that read the SYCL
+    host facts, on the same points-to analysis of the host module
+    (SYCLHostFactsCache; no second analysis), and warns where the facts
+    prove a bug at a kernel launch. Each check has a tag, which its warnings
+    carry (`[<tag>]`); `checks` selects them: a comma-separated list of
+    tags, `all` (the default: every check that is on by default) or `none`. A check warns only on a must fact
+    (one known origin of the bad kind, complete, in every calling context
+    the analysis covers); when unsure it stays silent. Analysis only: the
+    pass never changes the module and preserves every analysis.
+
+    Checks:
+      - `sycl-host-ptr-in-kernel`: a pointer the closure of a launch passes
+        to a device kernel that dereferences it points to host memory (a
+        stack variable or a global), which the device cannot access (SYCL
+        2020 sec:usm). The warning is at the kernel's access, with a note at
+        the allocation.
+      - `sycl-host-heap-ptr-in-kernel` (off by default: not in `all`, runs
+        only when named): the same for a host heap allocation (malloc, new,
+        std::allocator; not USM), which only a device with
+        aspect::usm_system_allocations may access.
+  }];
+  let constructor = "mlir::createOffloadHostDiagnosticsPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+  let options = !listconcat(OffloadHostFactsOptions, [
+    Option<"checks", "checks", "std::string", /*default=*/"\"all\"",
+           "The checks to run: a comma-separated list of tags, all or "
+           "none.">,
+  ]);
+  let statistics = [
+    Statistic<"numWarnings", "num-warnings", "Warnings emitted">,
+    Statistic<"numHostFactsBuilt", "host-facts-analyses-built",
+              "Points-to analyses built for the host facts (0 when an "
+              "earlier container pass built the shared one)">,
+  ];
+}
+
 def OffloadDetectHostUniformIntDivisor
     : Pass<"cir-offload-detect-host-uniform-int-divisor",
            "mlir::ModuleOp"> {

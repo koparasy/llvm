@@ -122,6 +122,41 @@ public:
   MemIdentity identityOfClosureField(const pointsto::LaunchRecord &launch,
                                      llvm::StringRef field) const;
 
+  /// The host-only memory a pointer member of a launch's closure points
+  /// into (the sycl-host-ptr-in-kernel diagnostic, HostDiagnostics.cpp).
+  struct HostOnlyMemory {
+    enum class Kind : uint8_t {
+      /// Not known to be host-only memory: `why` says why.
+      Unknown,
+      /// A stack object of a host function.
+      Stack,
+      /// A global variable of the host module.
+      Global,
+      /// A host heap allocation (malloc, operator new, ...; not USM).
+      Heap,
+    };
+    Kind kind = Kind::Unknown;
+    /// The node of the allocation (the root of the subobject tree the
+    /// pointer points into).
+    const pointsto::Node *node = nullptr;
+    std::string why;
+  };
+  /// Whether the pointer member \p path (member names from the closure, as
+  /// cir.sycl_kernel_param records them) of the closure of \p launch can
+  /// only point into host memory of one kind: every value it may hold at
+  /// the launch is one the analysed code computed (rule (b) of the noalias
+  /// rule), points into the node of a host stack object, global or non-USM
+  /// heap allocation (every origin of that kind, no unknown or USM
+  /// contribution), and no null or other constant is stored into it. See
+  /// the .cpp file.
+  /// \p elements, if given, continue the path by element index inside the
+  /// record the member is (a std_layout capture: elements[0] of the
+  /// member's record, elements[1] of that one's, ...).
+  HostOnlyMemory
+  hostOnlyMemoryOfClosureMember(const pointsto::LaunchRecord &launch,
+                                mlir::ArrayAttr path,
+                                llvm::ArrayRef<unsigned> elements = {}) const;
+
   /// The noalias verdict of every candidate field of \p kernel (the
   /// candidates of its device kernels, getSYCLNoAliasCandidates): a field is
   /// no-alias iff at

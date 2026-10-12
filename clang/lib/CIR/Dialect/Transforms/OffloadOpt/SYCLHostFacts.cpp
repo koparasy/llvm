@@ -754,6 +754,166 @@ SYCLHostFacts::identityOfClosureField(const LaunchRecord &launch,
   return id;
 }
 
+// The host-only rule (hostOnlyMemoryOfClosureMember, D1). A pointer member
+// of the closure of a launch must point into host-only memory when:
+//  (a) its slot links to a node (the root of its tree of subobjects) all of
+//      whose origins are of one host kind: a cir.alloca of a host function,
+//      a global variable, or a heap call that is not a USM allocation
+//      (malloc, calloc, operator new, ... through std::allocator: the
+//      generic AllocatorModel; never a usm.* role), and that has no flag
+//      that would let it stand for other memory: not UnknownObj (memory
+//      code we don't see allocated), HasUSM, Ghost or Function; not
+//      Incomplete, MayBeShared or MayOverlap (bottom-up: a caller's context
+//      may make it another object) nor Collapsed. The one exception: the
+//      shared node of a global (never copied, its origins all the global)
+//      may be Incomplete, which says code we don't see may write its
+//      contents, not that it may be other memory;
+//  (b) the value of the slot can only be one the analysed code computed:
+//      unknownValueWhy, as for noalias (no holder of a pointer to the node
+//      is External or Incomplete, the node is not what a caller we don't see
+//      passes);
+//  (c) the stored-value query of the slot at the launch is complete and
+//      holds no constant (in particular no null pointer), and no value
+//      stored is a cir.select (which may pick a null): every value the
+//      field holds is a pointer the analysed code computed into the node.
+// External is not checked: the launch itself makes everything the closure
+// reaches External (applySYCLDeviceWrites), which says the device may store
+// pointers there, not that the value the host captured is unknown; (b) is
+// what excludes unknown values, exactly as for noalias.
+//
+// SOUNDNESS (no false positive). By (b), every value the slot holds at the
+// launch is one the analysed code computed, and the analysis is sound for
+// those: a non-null one points into an object allocated at an origin of the
+// node, all of which are host-only by (a). By (c) no value stored is a
+// constant, so a null pointer could only come from a computed value (an
+// allocation function that failed, a function returning null), which the
+// analysis does not track; that is the one residual case, and a kernel that
+// dereferences such a null pointer is wrong too. In BU mode the record of
+// the launch stands for one calling context (LaunchRecord::ctx); the caller
+// requires the fact at every record of the launch (every covered context).
+SYCLHostFacts::HostOnlyMemory SYCLHostFacts::hostOnlyMemoryOfClosureMember(
+    const LaunchRecord &launch, ArrayAttr path,
+    ArrayRef<unsigned> elements) const {
+  HostOnlyMemory out;
+  auto fail = [&](const Twine &why) {
+    out = HostOnlyMemory();
+    out.why = why.str();
+    return out;
+  };
+  if (!gaveUp.empty())
+    return fail(gaveUp);
+  if (!launch.closure || !launch.closureType)
+    return fail("the launch's closure is not visible");
+  auto member = closureLayout->getField(launch.closureType, path, *layout);
+  if (!member)
+    return fail("the member is not found in the launch's closure");
+  int64_t offset = member->first;
+  Type type = member->second;
+  for (unsigned index : elements) {
+    auto rec = dyn_cast<cir::RecordType>(type);
+    if (!rec || rec.isIncomplete() || rec.isUnion() ||
+        index >= rec.getNumElements())
+      return fail("the member has no element " + Twine(index));
+    offset += static_cast<int64_t>(rec.getElementOffset(*layout, index));
+    type = rec.getElementType(index);
+  }
+  auto ptrTy = dyn_cast<cir::PointerType>(type);
+  if (!ptrTy)
+    return fail("the member is not a pointer");
+  const Graph &graph = analysis->getGraph();
+  Cell at(launch.closure->getNode(), launch.closure->getOffset() + offset);
+  std::optional<Cell> target = graph.lookupLink(at);
+  if (!target)
+    return fail("no pointer the analysis sees is stored in it");
+
+  // (a) The node, and the root of its subobject tree (where the origins
+  // are): every node on the way must be free of the flags that let it stand
+  // for other memory.
+  constexpr NodeFlags unsure = NodeFlags::UnknownObj | NodeFlags::HasUSM |
+                               NodeFlags::Ghost | NodeFlags::Function |
+                               NodeFlags::Incomplete | NodeFlags::MayBeShared |
+                               NodeFlags::MayOverlap | NodeFlags::Collapsed;
+  const Node *node = target->getNode();
+  for (unsigned depth = 0;; ++depth) {
+    std::string id = ("n" + Twine(node->getId())).str();
+    // A global's own node (shared, never copied) is Incomplete when code we
+    // don't see may write the global's contents; that does not make the
+    // node stand for other memory.
+    NodeFlags mask = unsure;
+    if (graph.isShared(node) && !node->getOrigins().empty() &&
+        llvm::all_of(node->getOrigins(), [](const Origin &o) {
+          return o.kind == Origin::Kind::GlobalSym;
+        }))
+      mask = mask & ~NodeFlags::Incomplete;
+    if (hasAny(node->getFlags(), mask))
+      return fail(id + " is " + toString(node->getFlags() & mask));
+    if (!node->getOrigins().empty())
+      break;
+    SmallVector<ParentLink, 1> parents = graph.getParents(node);
+    if (parents.size() != 1 || depth > 16)
+      return fail(id + " has no allocation site the analysis sees");
+    node = parents.front().parent;
+  }
+  std::string id = ("n" + Twine(node->getId())).str();
+  HostOnlyMemory::Kind kind = HostOnlyMemory::Kind::Unknown;
+  for (const Origin &origin : node->getOrigins()) {
+    HostOnlyMemory::Kind here = HostOnlyMemory::Kind::Unknown;
+    switch (origin.kind) {
+    case Origin::Kind::Alloca:
+      if (isa_and_present<cir::AllocaOp>(origin.site))
+        here = HostOnlyMemory::Kind::Stack;
+      break;
+    case Origin::Kind::GlobalSym:
+      if (origin.sym)
+        here = HostOnlyMemory::Kind::Global;
+      break;
+    case Origin::Kind::HeapCall: {
+      // A call of a function the generic allocator models give a fresh
+      // heap object, not a SYCL API (usm.alloc is HasUSM, and no other
+      // SYCL role allocates heap memory the device may access).
+      cir::FuncOp callee = getDirectCallee(origin.site, symbols);
+      if (callee && getRole(callee).empty())
+        here = HostOnlyMemory::Kind::Heap;
+      break;
+    }
+    case Origin::Kind::GhostSite:
+    case Origin::Kind::FuncSym:
+      break;
+    }
+    if (here == HostOnlyMemory::Kind::Unknown)
+      return fail(id + " has an origin that is not host-only memory (" +
+                  formatLocation(origin.site) + ")");
+    if (kind != HostOnlyMemory::Kind::Unknown && kind != here)
+      return fail(id + " merges host memory of different kinds");
+    kind = here;
+  }
+
+  // (b) Only values the analysed code computed.
+  if (std::optional<std::string> why = unknownValueWhy(node, false))
+    return fail(*why);
+  if (node != target->getNode())
+    if (std::optional<std::string> why =
+            unknownValueWhy(target->getNode(), false))
+      return fail(*why);
+
+  // (c) No constant (null) and no select among the values stored.
+  StoredValues values = analysis->getStoredValueQuery().valuesAt(
+      at, layout->getTypeSize(ptrTy).getFixedValue(), launch.call, ptrTy);
+  if (!values.complete)
+    return fail("it may hold a value the analysis does not know: " +
+                explain(values.why));
+  if (!values.consts.empty())
+    return fail("it may hold a constant (a null pointer)");
+  for (Value def : values.defs)
+    if (isa_and_present<cir::SelectOp, cir::TernaryOp>(def.getDefiningOp()))
+      return fail("it may hold the result of a select at " +
+                  formatLocation(def.getDefiningOp()));
+
+  out.kind = kind;
+  out.node = node;
+  return out;
+}
+
 namespace {
 
 /// The row-major linear index of \p index in a range of \p dims (SYCL

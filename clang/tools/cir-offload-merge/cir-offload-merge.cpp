@@ -186,6 +186,17 @@ llvm::cl::opt<unsigned> HostFactsMaxMemoryMB(
     llvm::cl::init(8192), llvm::cl::Hidden,
     llvm::cl::cat(CIROffloadMergeCategory));
 
+// The host diagnostics (cir-offload-host-diagnostics): warnings on SYCL
+// host-side bugs the host facts prove at a launch, by check tag.
+llvm::cl::opt<std::string> HostDiagnostics(
+    "cir-offload-host-diagnostics",
+    llvm::cl::desc("The SYCL host diagnostics to run: a comma-separated list "
+                   "of check tags (sycl-host-ptr-in-kernel, "
+                   "sycl-host-heap-ptr-in-kernel), all (the default: the "
+                   "checks on by default, not sycl-host-heap-ptr-in-kernel) "
+                   "or none"),
+    llvm::cl::init("all"), llvm::cl::cat(CIROffloadMergeCategory));
+
 // Opt-in remarks (mlir::remark, as mlir-opt's --remarks-filter*): the
 // container passes report their decisions under a category each
 // (cir-offload-noalias, cir-offload-kernel-arg-constant, cir-offload-reqd-wg,
@@ -625,6 +636,21 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
     if (!setHostFactsOptions(*propagate))
       return reportError("bad --cir-offload-host-facts options");
     pm.addPass(std::move(propagate));
+  }
+
+  // Warn on the host-side bugs the host facts prove (diagnostics only; the
+  // analysis the passes above share, before the prune drops it).
+  if (llvm::StringRef(HostDiagnostics).trim() != "none") {
+    std::unique_ptr<mlir::Pass> diagnose =
+        mlir::createOffloadHostDiagnosticsPass();
+    if (mlir::failed(diagnose->initializeOptions(
+            getHostFactsPassOptions() + " checks=" + HostDiagnostics,
+            [](const llvm::Twine &message) {
+              reportError(message);
+              return mlir::failure();
+            })))
+      return reportError("bad --cir-offload-host-diagnostics options");
+    pm.addPass(std::move(diagnose));
   }
 
   // Undo the internalized launch paths whose kernel copy got no fact.

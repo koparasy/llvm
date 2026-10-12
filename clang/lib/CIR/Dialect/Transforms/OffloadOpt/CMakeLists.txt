@@ -12,6 +12,7 @@ add_clang_library(MLIRCIROffloadOpt
   StampReqdWorkGroupSize.cpp
   InferKernelParamNoAlias.cpp
   PropagateSYCLKernelArgs.cpp
+  HostDiagnostics.cpp
   DetectHostUniformIntDivisor.cpp
   DetectHostDeviceClosureLayoutMismatch.cpp
 

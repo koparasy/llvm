@@ -1,0 +1,360 @@
+// RUN: cir-opt %s -verify-diagnostics -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{host-facts-closed-tu=true})"
+// RUN: cir-opt %s -verify-diagnostics -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=sycl-host-ptr-in-kernel})"
+//
+// The same input without the expectations: with the check off, or no host
+// facts, nothing is reported; an unknown tag is an error; the pass changes
+// nothing.
+// RUN: sed 's/expected-/xpected-/' %s > %t.cir
+// RUN: cir-opt %t.cir -o %t.none.cir \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=none})" 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=NONE --allow-empty
+// RUN: cir-opt %t.cir -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{host-facts=none})" 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=NONE --allow-empty
+// RUN: not cir-opt %t.cir -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=bogus})" 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=BAD
+// RUN: cir-opt %t.cir -o %t.all.cir 2>&1 \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=all})" \
+// RUN:   | FileCheck %s --check-prefix=ALL
+// RUN: diff %t.none.cir %t.all.cir
+
+// RUN: cir-opt %t.cir -o /dev/null 2>&1 \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=sycl-host-heap-ptr-in-kernel})" \
+// RUN:   | FileCheck %s --check-prefix=HEAP --implicit-check-not=warning:
+// RUN: cir-opt %t.cir -o /dev/null 2>&1 \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=all,sycl-host-heap-ptr-in-kernel})" \
+// RUN:   | FileCheck %s --check-prefix=BOTH
+
+// `all` is the checks on by default: not the heap one.
+// ALL-COUNT-2: warning: kernel argument 'P' points to host memory
+// ALL-NOT: warning:
+// BOTH-COUNT-2: warning: kernel argument 'P' points to host memory
+// BOTH-COUNT-1: warning: kernel argument 'P' points to host heap memory
+// BOTH-NOT: warning:
+// NONE-NOT: warning
+// BAD: unknown host diagnostic 'bogus' (expected all, none or one of: sycl-host-ptr-in-kernel, sycl-host-heap-ptr-in-kernel)
+
+// sycl-host-ptr-in-kernel (cir-offload-host-diagnostics, HostDiagnostics.cpp):
+// a pointer a kernel launch captures that must point to host memory (a stack
+// variable or a global) and that the device kernel dereferences: the device cannot access it (SYCL 2020
+// sec:usm). The host API is reduced to its role-tagged declarations (see
+// sycl-device-writes.cir); each launch @launch_<K> runs the kernel @_ZTS<K>,
+// whose closure has one pointer member P. The diagnostics hold with and
+// without closed-tu (main's locals are complete either way).
+//
+// Positive:
+//  - STACK: P = a local array; the kernel builds its closure object, spills
+//    and reloads its argument, and dereferences P in operator() through its
+//    `this` slot (the -O0 device shape).
+//  - GLOBAL: P = a global array; the kernel passes P to a function that
+//    stores it into the kernel's local object (as a constructor would), and
+//    loads through it. HEAP's kernel accesses P through a function that
+//    returns it.
+//  - HEAP (P = malloc(n)), sycl-host-heap-ptr-in-kernel, off by default (valid
+//    on a device with aspect::usm_system_allocations); FileCheck runs above.
+// Negative (silent):
+//  - USM: P = malloc_shared(n) (usm.alloc).
+//  - NODEREF: P = the local array, but the kernel only compares P with null
+//    and passes it to a declaration.
+//  - UNKNOWN: P = opaque(), memory code we don't see allocated.
+//  - NULL: P = a select between the local array and null.
+//  - MIXED: @launch_helper launches KMIXED with its parameter; main calls it
+//    with the local array and with a USM pointer: the fact does not hold in
+//    every calling context.
+//  - PARAM: @ext_entry, which nothing calls, launches KPARAM with its
+//    parameter: its callers are not seen (open), or there are none (closed).
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_handler = !cir.struct<class "sycl::_V1::handler" {data !cir.ptr<!s8i>}>
+!rec_lam = !cir.struct<"lam" {data !cir.ptr<!f32>}>
+!rec_dlam = !cir.struct<"dlam" {data !cir.ptr<!f32, target_address_space(4)>}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>, cir.triple = "x86_64-unknown-linux-gnu"} {
+    cir.global "private" constant cir_private @s_stack = #cir.const_array<"_ZTS6KSTACK" : !cir.array<!s8i x 11>, trailing_zeros> : !cir.array<!s8i x 12>
+    cir.global "private" constant cir_private @s_global = #cir.const_array<"_ZTS7KGLOBAL" : !cir.array<!s8i x 12>, trailing_zeros> : !cir.array<!s8i x 13>
+    cir.global "private" constant cir_private @s_heap = #cir.const_array<"_ZTS5KHEAP" : !cir.array<!s8i x 10>, trailing_zeros> : !cir.array<!s8i x 11>
+    cir.global "private" constant cir_private @s_usm = #cir.const_array<"_ZTS4KUSM" : !cir.array<!s8i x 9>, trailing_zeros> : !cir.array<!s8i x 10>
+    cir.global "private" constant cir_private @s_noderef = #cir.const_array<"_ZTS8KNODEREF" : !cir.array<!s8i x 13>, trailing_zeros> : !cir.array<!s8i x 14>
+    cir.global "private" constant cir_private @s_unknown = #cir.const_array<"_ZTS8KUNKNOWN" : !cir.array<!s8i x 13>, trailing_zeros> : !cir.array<!s8i x 14>
+    cir.global "private" constant cir_private @s_null = #cir.const_array<"_ZTS5KNULL" : !cir.array<!s8i x 10>, trailing_zeros> : !cir.array<!s8i x 11>
+    cir.global "private" constant cir_private @s_mixed = #cir.const_array<"_ZTS6KMIXED" : !cir.array<!s8i x 11>, trailing_zeros> : !cir.array<!s8i x 12>
+    cir.global "private" constant cir_private @s_param = #cir.const_array<"_ZTS6KPARAM" : !cir.array<!s8i x 11>, trailing_zeros> : !cir.array<!s8i x 12>
+    cir.global "private" constant internal @i_stack = #cir.const_record<{#cir.const_record<{#cir.global_view<@s_stack> : !cir.ptr<!s8i>, #cir.int<11> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @i_global = #cir.const_record<{#cir.const_record<{#cir.global_view<@s_global> : !cir.ptr<!s8i>, #cir.int<12> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @i_heap = #cir.const_record<{#cir.const_record<{#cir.global_view<@s_heap> : !cir.ptr<!s8i>, #cir.int<10> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @i_usm = #cir.const_record<{#cir.const_record<{#cir.global_view<@s_usm> : !cir.ptr<!s8i>, #cir.int<9> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @i_noderef = #cir.const_record<{#cir.const_record<{#cir.global_view<@s_noderef> : !cir.ptr<!s8i>, #cir.int<13> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @i_unknown = #cir.const_record<{#cir.const_record<{#cir.global_view<@s_unknown> : !cir.ptr<!s8i>, #cir.int<13> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @i_null = #cir.const_record<{#cir.const_record<{#cir.global_view<@s_null> : !cir.ptr<!s8i>, #cir.int<10> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @i_mixed = #cir.const_record<{#cir.const_record<{#cir.global_view<@s_mixed> : !cir.ptr<!s8i>, #cir.int<11> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @i_param = #cir.const_record<{#cir.const_record<{#cir.global_view<@s_param> : !cir.ptr<!s8i>, #cir.int<11> : !u64i}> : !rec_sv}> : !rec_ctki
+    // expected-note @below {{the global 'gbuf' the pointer points to is defined here}}
+    cir.global external @gbuf = #cir.zero : !cir.array<!f32 x 64>
+
+    cir.func private @malloc(!u64i) -> !cir.ptr<!s8i>
+    cir.func private @opaque() -> !cir.ptr<!f32>
+    cir.func private @malloc_shared(!u64i) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32}
+
+    // One kernel.info marker and one launch function per kernel.
+    cir.func internal @info_stack() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @i_stack : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @info_global() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @i_global : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @info_heap() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @i_heap : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @info_usm() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @i_usm : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @info_noderef() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @i_noderef : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @info_unknown() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @i_unknown : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @info_null() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @i_null : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @info_mixed() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @i_mixed : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @info_param() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info", cir.sycl_host_api_arg = 0 : i32} {
+      %0 = cir.get_global @i_param : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @launch_stack(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+      %info = cir.call @info_stack() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+    cir.func internal @launch_global(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+      %info = cir.call @info_global() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+    cir.func internal @launch_heap(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+      %info = cir.call @info_heap() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+    cir.func internal @launch_usm(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+      %info = cir.call @info_usm() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+    cir.func internal @launch_noderef(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+      %info = cir.call @info_noderef() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+    cir.func internal @launch_unknown(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+      %info = cir.call @info_unknown() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+    cir.func internal @launch_null(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+      %info = cir.call @info_null() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+    cir.func internal @launch_mixed(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+      %info = cir.call @info_mixed() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+    cir.func internal @launch_param(%h: !cir.ptr<!rec_handler>, %k: !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "handler.kernel", cir.sycl_host_api_arg = 0 : i32} {
+      %info = cir.call @info_param() : () -> !cir.ptr<!s8i>
+      cir.return
+    }
+
+    // Launches KMIXED with whatever its caller passes.
+    cir.func internal @launch_helper(%h: !cir.ptr<!rec_handler>, %p: !cir.ptr<!f32>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %f = cir.get_member %lam[0] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %p, %f : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @launch_mixed(%h, %lam) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+      cir.return
+    }
+
+    // Nothing calls it: its parameter is whatever another TU passes.
+    cir.func @ext_entry(%h: !cir.ptr<!rec_handler>, %p: !cir.ptr<!f32>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam>
+      %f = cir.get_member %lam[0] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %p, %f : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @launch_param(%h, %lam) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+      cir.return
+    }
+
+    cir.func @main(%h: !cir.ptr<!rec_handler>, %n: !u64i, %c: !cir.bool) {
+      // expected-note @below {{the stack variable 'arr' the pointer points to is allocated here}}
+      %arr = cir.alloca "arr" align(16) : !cir.ptr<!cir.array<!f32 x 64>>
+      %local = cir.cast array_to_ptrdecay %arr : !cir.ptr<!cir.array<!f32 x 64>> -> !cir.ptr<!f32>
+
+      // STACK
+      %l0 = cir.alloca "lam_stack" align(8) : !cir.ptr<!rec_lam>
+      %f0 = cir.get_member %l0[0] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %local, %f0 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @launch_stack(%h, %l0) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+
+      // GLOBAL
+      %g = cir.get_global @gbuf : !cir.ptr<!cir.array<!f32 x 64>>
+      %gp = cir.cast array_to_ptrdecay %g : !cir.ptr<!cir.array<!f32 x 64>> -> !cir.ptr<!f32>
+      %l1 = cir.alloca "lam_global" align(8) : !cir.ptr<!rec_lam>
+      %f1 = cir.get_member %l1[0] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %gp, %f1 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @launch_global(%h, %l1) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+
+      // HEAP
+      // HEAP-DAG: {{.*}}.cir:[[#@LINE+1]]:{{[0-9]+}}: note: the heap memory the pointer points to is allocated here
+      %raw = cir.call @malloc(%n) : (!u64i) -> !cir.ptr<!s8i>
+      %hp = cir.cast bitcast %raw : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      %l2 = cir.alloca "lam_heap" align(8) : !cir.ptr<!rec_lam>
+      %f2 = cir.get_member %l2[0] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %hp, %f2 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @launch_heap(%h, %l2) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+
+      // USM
+      %up = cir.call @malloc_shared(%n) : (!u64i) -> !cir.ptr<!f32>
+      %l3 = cir.alloca "lam_usm" align(8) : !cir.ptr<!rec_lam>
+      %f3 = cir.get_member %l3[0] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %up, %f3 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @launch_usm(%h, %l3) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+
+      // NODEREF
+      %l4 = cir.alloca "lam_noderef" align(8) : !cir.ptr<!rec_lam>
+      %f4 = cir.get_member %l4[0] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %local, %f4 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @launch_noderef(%h, %l4) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+
+      // UNKNOWN
+      %op = cir.call @opaque() : () -> !cir.ptr<!f32>
+      %l5 = cir.alloca "lam_unknown" align(8) : !cir.ptr<!rec_lam>
+      %f5 = cir.get_member %l5[0] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %op, %f5 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @launch_unknown(%h, %l5) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+
+      // NULL
+      %null = cir.const #cir.ptr<null> : !cir.ptr<!f32>
+      %sel = cir.select if %c then %local else %null : (!cir.bool, !cir.ptr<!f32>, !cir.ptr<!f32>) -> !cir.ptr<!f32>
+      %l6 = cir.alloca "lam_null" align(8) : !cir.ptr<!rec_lam>
+      %f6 = cir.get_member %l6[0] {name = "P"} : !cir.ptr<!rec_lam> -> !cir.ptr<!cir.ptr<!f32>>
+      cir.store %sel, %f6 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.call @launch_null(%h, %l6) : (!cir.ptr<!rec_handler>, !cir.ptr<!rec_lam>) -> ()
+
+      // MIXED
+      cir.call @launch_helper(%h, %local) : (!cir.ptr<!rec_handler>, !cir.ptr<!f32>) -> ()
+      cir.call @launch_helper(%h, %up) : (!cir.ptr<!rec_handler>, !cir.ptr<!f32>) -> ()
+      cir.return
+    }
+  }
+
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>, cir.triple = "spir64-unknown-unknown"} {
+    cir.func private @use(!cir.ptr<!f32, target_address_space(1)>)
+    cir.func internal @setp(%slot: !cir.ptr<!cir.ptr<!f32, target_address_space(1)>>, %p: !cir.ptr<!f32, target_address_space(1)>) {
+      cir.store %p, %slot : !cir.ptr<!f32, target_address_space(1)>, !cir.ptr<!cir.ptr<!f32, target_address_space(1)>>
+      cir.return
+    }
+    cir.func internal @ident(%p: !cir.ptr<!f32, target_address_space(1)>) -> !cir.ptr<!f32, target_address_space(1)> {
+      cir.return %p : !cir.ptr<!f32, target_address_space(1)>
+    }
+
+    // operator(): reloads `this` from its slot and stores through P.
+    cir.func internal @op_stack(%this: !cir.ptr<!rec_dlam, target_address_space(4)>) {
+      %one = cir.const #cir.fp<1.0> : !f32
+      %slot = cir.alloca "this" align(8) init : !cir.ptr<!cir.ptr<!rec_dlam, target_address_space(4)>>
+      cir.store %this, %slot : !cir.ptr<!rec_dlam, target_address_space(4)>, !cir.ptr<!cir.ptr<!rec_dlam, target_address_space(4)>>
+      %t = cir.load %slot : !cir.ptr<!cir.ptr<!rec_dlam, target_address_space(4)>>, !cir.ptr<!rec_dlam, target_address_space(4)>
+      %m = cir.get_member %t[0] {name = "P"} : !cir.ptr<!rec_dlam, target_address_space(4)> -> !cir.ptr<!cir.ptr<!f32, target_address_space(4)>, target_address_space(4)>
+      %p = cir.load %m : !cir.ptr<!cir.ptr<!f32, target_address_space(4)>, target_address_space(4)>, !cir.ptr<!f32, target_address_space(4)>
+      %i = cir.const #cir.int<3> : !s32i
+      %q = cir.ptr_stride %p, %i : (!cir.ptr<!f32, target_address_space(4)>, !s32i) -> !cir.ptr<!f32, target_address_space(4)>
+      // expected-warning @below {{kernel argument 'P' points to host memory (stack variable) that the device cannot access [sycl-host-ptr-in-kernel]}}
+      cir.store %one, %q : !f32, !cir.ptr<!f32, target_address_space(4)>
+      cir.return
+    }
+    // expected-note @below {{the kernel that captures the pointer is defined here}}
+    cir.func @_ZTS6KSTACK(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      %spill = cir.alloca "_arg_P" align(8) init : !cir.ptr<!cir.ptr<!f32, target_address_space(1)>>
+      %obj = cir.alloca "__SYCLKernel" align(8) init : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      %objg = cir.cast address_space %obj : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_dlam, target_address_space(4)>
+      cir.store %arg0, %spill : !cir.ptr<!f32, target_address_space(1)>, !cir.ptr<!cir.ptr<!f32, target_address_space(1)>>
+      %m = cir.get_member %objg[0] {name = "P"} : !cir.ptr<!rec_dlam, target_address_space(4)> -> !cir.ptr<!cir.ptr<!f32, target_address_space(4)>, target_address_space(4)>
+      %v = cir.load %spill : !cir.ptr<!cir.ptr<!f32, target_address_space(1)>>, !cir.ptr<!f32, target_address_space(1)>
+      %vg = cir.cast address_space %v : !cir.ptr<!f32, target_address_space(1)> -> !cir.ptr<!f32, target_address_space(4)>
+      cir.store %vg, %m : !cir.ptr<!f32, target_address_space(4)>, !cir.ptr<!cir.ptr<!f32, target_address_space(4)>, target_address_space(4)>
+      cir.call @op_stack(%objg) : (!cir.ptr<!rec_dlam, target_address_space(4)>) -> ()
+      cir.return
+    }
+    // expected-note @below {{the kernel that captures the pointer is defined here}}
+    cir.func @_ZTS7KGLOBAL(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      // A callee stores the pointer into the caller's object (a constructor
+      // storing it into `this`), which the kernel then reads.
+      %ref = cir.alloca "ref" align(8) : !cir.ptr<!cir.ptr<!f32, target_address_space(1)>>
+      cir.call @setp(%ref, %arg0) : (!cir.ptr<!cir.ptr<!f32, target_address_space(1)>>, !cir.ptr<!f32, target_address_space(1)>) -> ()
+      %q = cir.load %ref : !cir.ptr<!cir.ptr<!f32, target_address_space(1)>>, !cir.ptr<!f32, target_address_space(1)>
+      // expected-warning @below {{kernel argument 'P' points to host memory (global) that the device cannot access [sycl-host-ptr-in-kernel]}}
+      %x = cir.load %q : !cir.ptr<!f32, target_address_space(1)>, !f32
+      cir.return
+    }
+    // HEAP-DAG: {{.*}}.cir:[[#@LINE+1]]:{{[0-9]+}}: note: the kernel that captures the pointer is defined here
+    cir.func @_ZTS5KHEAP(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      %one = cir.const #cir.fp<1.0> : !f32
+      // Through a function that returns its argument.
+      %p = cir.call @ident(%arg0) : (!cir.ptr<!f32, target_address_space(1)>) -> !cir.ptr<!f32, target_address_space(1)>
+      // HEAP-DAG: {{.*}}.cir:[[#@LINE+1]]:{{[0-9]+}}: warning: kernel argument 'P' points to host heap memory (heap allocation) that the device can access only if it has aspect::usm_system_allocations (SYCL 2020 sec:usm) [sycl-host-heap-ptr-in-kernel]
+      cir.store %one, %p : !f32, !cir.ptr<!f32, target_address_space(1)>
+      cir.return
+    }
+    cir.func @_ZTS4KUSM(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      %one = cir.const #cir.fp<1.0> : !f32
+      cir.store %one, %arg0 : !f32, !cir.ptr<!f32, target_address_space(1)>
+      cir.return
+    }
+    cir.func @_ZTS8KNODEREF(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      %null = cir.const #cir.ptr<null> : !cir.ptr<!f32, target_address_space(1)>
+      %eq = cir.cmp eq %arg0, %null : !cir.ptr<!f32, target_address_space(1)>
+      cir.call @use(%arg0) : (!cir.ptr<!f32, target_address_space(1)>) -> ()
+      cir.return
+    }
+    cir.func @_ZTS8KUNKNOWN(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      %one = cir.const #cir.fp<1.0> : !f32
+      cir.store %one, %arg0 : !f32, !cir.ptr<!f32, target_address_space(1)>
+      cir.return
+    }
+    cir.func @_ZTS5KNULL(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      %one = cir.const #cir.fp<1.0> : !f32
+      cir.store %one, %arg0 : !f32, !cir.ptr<!f32, target_address_space(1)>
+      cir.return
+    }
+    cir.func @_ZTS6KMIXED(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      %one = cir.const #cir.fp<1.0> : !f32
+      cir.store %one, %arg0 : !f32, !cir.ptr<!f32, target_address_space(1)>
+      cir.return
+    }
+    cir.func @_ZTS6KPARAM(%arg0: !cir.ptr<!f32, target_address_space(1)> {cir.sycl_kernel_param = {field = "P", kind = "pointer", path = ["P"]}}) cc(spir_kernel) {
+      %one = cir.const #cir.fp<1.0> : !f32
+      cir.store %one, %arg0 : !f32, !cir.ptr<!f32, target_address_space(1)>
+      cir.return
+    }
+  }
+}
