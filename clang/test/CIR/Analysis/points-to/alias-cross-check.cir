@@ -78,6 +78,8 @@
 // RUN: cir-opt %S/ipo-bu-may-be-shared.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-byval.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-byval.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-func-alias.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-func-alias.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/local-aggregate.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/local-aggregate.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/local-alloca-load-store.cir -test-cir-alias-analysis=use-points-to=1 -o /dev/null 2>/dev/null
@@ -233,6 +235,8 @@
 // RUN: cir-opt %S/ipo-bu-may-be-shared.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-byval.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/ipo-byval.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-func-alias.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
+// RUN: cir-opt %S/ipo-func-alias.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/local-aggregate.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/local-aggregate.cir -test-cir-alias-analysis='use-points-to=1 closed-tu=1 mode=bu' -o /dev/null 2>/dev/null
 // RUN: cir-opt %S/local-alloca-load-store.cir -test-cir-alias-analysis='use-points-to=1 mode=bu' -o /dev/null 2>/dev/null

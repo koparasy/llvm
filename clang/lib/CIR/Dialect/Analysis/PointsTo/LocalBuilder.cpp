@@ -478,6 +478,10 @@ bool LocalBuilder::hasPointers(Type type) {
 
 std::unique_ptr<FunctionGraph> LocalBuilder::build() {
   assert(fg && "build() called twice");
+  // A declaration or an alias (cir::FuncOp::isDeclaration() is false for
+  // one) has no body to build a graph of: the analysis gives calls to it the
+  // unknown-call rule, or binds them to the aliasee.
+  assert(hasFunctionBody(func) && "LocalBuilder needs a function with a body");
   Graph &graph = fg->getGraph();
 
   // Formals: what a caller passes in is not known yet, unless every caller

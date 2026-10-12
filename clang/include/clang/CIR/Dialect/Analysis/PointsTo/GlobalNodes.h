@@ -163,6 +163,20 @@ private:
   bool draining = false;
 };
 
+/// Whether \p func has a body of its own. cir::FuncOp::isDeclaration() is
+/// false for an alias (`alias(@target)`, e.g. a C++ complete-object
+/// constructor or destructor emitted as an alias of the base-object one),
+/// whose body region is empty: a call to it runs the aliasee's body.
+inline bool hasFunctionBody(cir::FuncOp func) {
+  return func && !func.getFunctionBody().empty();
+}
+
+/// The function a call of \p func runs: \p func itself, or the function its
+/// alias chain ends at. A null op if the chain is cyclic or ends at a symbol
+/// that is not a cir.func.
+cir::FuncOp resolveFunctionAlias(cir::FuncOp func,
+                                 mlir::SymbolTableCollection &symbols);
+
 } // namespace cir::pointsto
 
 #endif // CLANG_CIR_DIALECT_ANALYSIS_POINTSTO_GLOBALNODES_H

@@ -194,6 +194,22 @@ void cir::pointsto::walkConstantPointers(Attribute value, int64_t base,
   ConstantWalker{dataLayout, symbolType, fn}.walk(value, base);
 }
 
+cir::FuncOp
+cir::pointsto::resolveFunctionAlias(cir::FuncOp func,
+                                    SymbolTableCollection &symbols) {
+  llvm::SmallPtrSet<Operation *, 4> seen;
+  while (func) {
+    std::optional<StringRef> aliasee = func.getAliasee();
+    if (!aliasee)
+      return func;
+    if (!seen.insert(func).second)
+      return {};
+    func = symbols.lookupNearestSymbolFrom<cir::FuncOp>(
+        func, FlatSymbolRefAttr::get(func.getContext(), *aliasee));
+  }
+  return {};
+}
+
 //===----------------------------------------------------------------------===//
 // GlobalNodes
 //===----------------------------------------------------------------------===//

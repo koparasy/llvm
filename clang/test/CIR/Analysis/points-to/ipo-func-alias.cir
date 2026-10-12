@@ -1,0 +1,95 @@
+// RUN: cir-opt %s -test-cir-points-to=mode=ci -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=CI
+// RUN: cir-opt %s -test-cir-points-to='mode=bu closed-tu=1' -cir-points-to-verify -o /dev/null | FileCheck %s --check-prefix=BU
+// RUN: cir-opt %s -test-cir-alias-analysis='points-to-only=1 mode=bu closed-tu=1' -cir-points-to-verify -o /dev/null 2>&1 | FileCheck %s --check-prefix=AA
+
+// Function aliases (T29). A C++ complete-object constructor is emitted as an
+// alias of the base-object one (-mconstructor-aliases): a cir.func with
+// `alias(@target)` and an empty body, for which cir::FuncOp::isDeclaration()
+// is false. The analysis used to build a graph of the alias and crashed on
+// its missing entry block (HeCBench s3d OptionParser.cpp and 20 more
+// benches). An alias is not analysed itself; a direct call to it is bound to
+// the function its alias chain ends at, so the recursion through @rec_alias
+// is a recursion of @rec.
+
+// CI-LABEL: === TU graph
+// CI-DAG: [[S:n[0-9]+]] [Stack|Incomplete|Summary|Mod|Ref] size=8 origins={stack(cir.alloca 's' {{.*}}), stack(cir.alloca 't' {{.*}})} links={0->[[A:n[0-9]+]]+0}
+// CI-DAG: [[A]] [Stack|Incomplete|Summary] size=4 origins={stack(cir.alloca 'a' {{.*}}), stack(cir.alloca 'b' {{.*}})} links={}
+// CI-DAG: [[X:n[0-9]+]] [Stack|Summary] size=4 origins={stack(cir.alloca 'x' {{.*}})} {{.*}}"recursion"
+// CI-LABEL: === @_ZN1SC2EPi formals=incomplete
+// CI-NEXT: @_ZN1SC2EPi formal #0 -> [[S]]+0
+// CI-NEXT: @_ZN1SC2EPi formal #1 -> [[A]]+0
+// CI-NOT: === @_ZN1SC1EPi
+// CI-NOT: === @twice
+// CI-NOT: === @unused
+// CI-LABEL: === @rec formals=incomplete
+// CI-NEXT: @rec x -> [[X]]+0 complete
+// CI-NOT: === @rec_alias
+// CI-LABEL: === calls
+// CI-NEXT: @rec cir.call @rec_alias -> direct @rec
+// CI-NEXT: @top cir.call @_ZN1SC1EPi -> direct @_ZN1SC2EPi
+// CI-NEXT: @top cir.call @twice -> direct @_ZN1SC2EPi
+// CI-NEXT: @top cir.call @rec -> direct @rec
+
+// BU-LABEL: === TU graph
+// BU-DAG: [[X:n[0-9]+]] [Stack|Summary] size=4 origins={stack(cir.alloca 'x' {{.*}})} {{.*}}"recursion"
+// BU-DAG: [[S:n[0-9]+]] [Stack|Mod|Ref] size=8 origins={stack(cir.alloca 's' {{.*}})} links={0->[[A:n[0-9]+]]+0}
+// BU-DAG: [[T:n[0-9]+]] [Stack|Mod] size=8 origins={stack(cir.alloca 't' {{.*}})} links={0->[[B:n[0-9]+]]+0}
+// BU-DAG: [[A]] [Stack] size=4 origins={stack(cir.alloca 'a' {{.*}})} links={}
+// BU-DAG: [[B]] [Stack] size=4 origins={stack(cir.alloca 'b' {{.*}})} links={}
+// BU-LABEL: === @top formals=complete
+// BU-NEXT: @top s.f -> [[A]]+0 complete
+// BU-NEXT: @top a -> [[A]]+0 complete
+// BU-NEXT: @top b -> [[B]]+0 complete
+// BU-LABEL: === calls
+// BU-NEXT: @rec cir.call @rec_alias -> direct @rec [merged
+// BU-NEXT: @top cir.call @_ZN1SC1EPi -> direct @_ZN1SC2EPi [clone
+// BU-NEXT: @top cir.call @twice -> direct @_ZN1SC2EPi [clone
+// BU-NEXT: @top cir.call @rec -> direct @rec [clone
+
+// AA: s.f#0 <-> a#0: MustAlias
+// AA: s.f#0 <-> b#0: NoAlias
+// AA: a#0 <-> b#0: NoAlias
+
+!s32i = !cir.int<s, 32>
+!rec_S = !cir.struct<"S" {data !cir.ptr<!s32i>}>
+
+module {
+// S::S(int *p) : f(p) {}: the base-object constructor, and the
+// complete-object one as an alias of it (-mconstructor-aliases).
+cir.func @_ZN1SC2EPi(%this: !cir.ptr<!rec_S>, %p: !cir.ptr<!s32i>) {
+  %f = cir.get_member %this[0] {name = "f"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  cir.store %p, %f : !cir.ptr<!s32i>, !cir.ptr<!cir.ptr<!s32i>>
+  cir.return
+}
+cir.func private @_ZN1SC1EPi(!cir.ptr<!rec_S>, !cir.ptr<!s32i>) alias(@_ZN1SC2EPi)
+// An alias of the alias.
+cir.func private @twice(!cir.ptr<!rec_S>, !cir.ptr<!s32i>) alias(@_ZN1SC1EPi)
+// An alias nobody calls.
+cir.func private @unused(!cir.ptr<!rec_S>, !cir.ptr<!s32i>) alias(@_ZN1SC2EPi)
+
+// Recursion through an alias: @rec calls itself under the name @rec_alias.
+cir.func @rec(%n: !s32i) {
+  %x = cir.alloca "x" align(4) : !cir.ptr<!s32i>
+  %x_tag = cir.cast bitcast %x : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "x"}
+  cir.call @rec_alias(%n) : (!s32i) -> ()
+  cir.return
+}
+cir.func private @rec_alias(!s32i) alias(@rec)
+
+cir.func @top() {
+  %s = cir.alloca "s" align(8) : !cir.ptr<!rec_S>
+  %t = cir.alloca "t" align(8) : !cir.ptr<!rec_S>
+  %a = cir.alloca "a" align(4) : !cir.ptr<!s32i>
+  %b = cir.alloca "b" align(4) : !cir.ptr<!s32i>
+  cir.call @_ZN1SC1EPi(%s, %a) : (!cir.ptr<!rec_S>, !cir.ptr<!s32i>) -> ()
+  cir.call @twice(%t, %b) : (!cir.ptr<!rec_S>, !cir.ptr<!s32i>) -> ()
+  %fs = cir.get_member %s[0] {name = "f"} : !cir.ptr<!rec_S> -> !cir.ptr<!cir.ptr<!s32i>>
+  %ps = cir.load %fs : !cir.ptr<!cir.ptr<!s32i>>, !cir.ptr<!s32i>
+  %ps_tag = cir.cast bitcast %ps : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "s.f"}
+  %a_tag = cir.cast bitcast %a : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "a"}
+  %b_tag = cir.cast bitcast %b : !cir.ptr<!s32i> -> !cir.ptr<!s32i> {test.ptr = "b"}
+  %zero = cir.const #cir.int<0> : !s32i
+  cir.call @rec(%zero) : (!s32i) -> ()
+  cir.return
+}
+}

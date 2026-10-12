@@ -207,10 +207,11 @@ Node *PointsToAnalysis::getSymbolNode(FlatSymbolRefAttr sym) const {
   return nullptr;
 }
 
-/// Whether \p func has a body and sits directly in \p module.
+/// Whether \p func has a body and sits directly in \p module. An alias has
+/// no body of its own (isDeclaration() is false for it): it is not analysed,
+/// and a direct call to it is bound to its aliasee (resolveFunctionAlias).
 static bool hasBodyIn(cir::FuncOp func, ModuleOp module) {
-  return func && !func.isDeclaration() &&
-         func->getParentOp() == module.getOperation();
+  return hasFunctionBody(func) && func->getParentOp() == module.getOperation();
 }
 
 bool PointsToAnalysis::isAnalysed(cir::FuncOp func) const {
@@ -701,17 +702,23 @@ void PointsToAnalysis::computeReplacedCalls() {
   }
   stats.numSkippedFunctions = skipped.size();
 
+  // A call to an alias calls its aliasee: the aliasee loses the caller too.
+  auto addUnbound = [&](cir::FuncOp callee) {
+    unboundCallers.insert(callee);
+    if (cir::FuncOp target = resolveFunctionAlias(callee, symbols))
+      unboundCallers.insert(target);
+  };
   for (Operation *call : replacedCalls) {
     auto sym = call->getAttrOfType<FlatSymbolRefAttr>("callee");
     if (auto callee = symbols.lookupNearestSymbolFrom<cir::FuncOp>(call, sym))
-      unboundCallers.insert(callee);
+      addUnbound(callee);
   }
   for (Operation *func : skipped)
     cast<cir::FuncOp>(func).walk([&](CIRCallOpInterface call) {
       if (auto sym = call->getAttrOfType<FlatSymbolRefAttr>("callee"))
         if (auto callee =
                 symbols.lookupNearestSymbolFrom<cir::FuncOp>(call, sym))
-          unboundCallers.insert(callee);
+          addUnbound(callee);
     });
 }
 
@@ -932,6 +939,9 @@ void PointsToAnalysis::buildLocal(cir::FuncOp func, bool formalsComplete) {
     case CallKind::Defined: {
       auto callee = symbols.lookupNearestSymbolFrom<cir::FuncOp>(local.call,
                                                                  local.callee);
+      // A call to an alias runs the body its alias chain ends at.
+      if (callee)
+        callee = resolveFunctionAlias(callee, symbols);
       if (isAnalysed(callee)) {
         call.resolution = CallResolution::Direct;
         call.callee = callee;
@@ -1428,6 +1438,9 @@ bool PointsToAnalysis::markEscapedFunctions() {
   llvm::DenseMap<Operation *, const Reason *> causes;
   auto consider = [&](FlatSymbolRefAttr sym, const Reason *cause) {
     auto func = symbols.lookupNearestSymbolFrom<cir::FuncOp>(module, sym);
+    // The address of an alias is the address of its aliasee.
+    if (func)
+      func = resolveFunctionAlias(func, symbols);
     if (!func)
       return;
     TUFunction *fn = functionMap.lookup(func.getOperation());

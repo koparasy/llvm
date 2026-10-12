@@ -57,6 +57,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/SymbolTable.h"
 #include "clang/CIR/Dialect/Analysis/CIRPointerDecomposition.h"
+#include "clang/CIR/Dialect/Analysis/PointsTo/GlobalNodes.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToModels.h"
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
@@ -475,6 +476,17 @@ static void collectKernelNames(cir::FuncOp callee,
                                SymbolTableCollection *symbols, bool &truncated,
                                unsigned depth = 0) {
   constexpr unsigned kMaxDepth = 16;
+  // A call to an alias runs the body its alias chain ends at (the alias's
+  // own body is empty, but isDeclaration() is false for it). SOUNDNESS: a
+  // chain that ends at no function hides the names it may launch.
+  if (callee && callee.getAliasee()) {
+    SymbolTableCollection local;
+    callee = resolveFunctionAlias(callee, symbols ? *symbols : local);
+    if (!callee) {
+      truncated = true;
+      return;
+    }
+  }
   if (!callee || callee.isDeclaration() || !visited.insert(callee).second)
     return;
   if (depth > kMaxDepth) {
