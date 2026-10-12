@@ -156,7 +156,8 @@ static void collectFileLineCols(mlir::Location loc,
 
 // Whether `fn` is a `detail::HostKernel<...>` constructor: the wrapper CIRGen
 // builds around the user closure, whose second argument is a pointer to the
-// closure record (mirrors KernelBindingTable's isHostKernelCtor).
+// closure record (KernelBindingTable recognizes it by its hostkernel.ctor
+// role).
 static bool isHostKernelCtor(cir::FuncOp fn) {
   llvm::StringRef name = fn.getSymName();
   return name.contains("6detail10HostKernelI") &&

@@ -12,16 +12,11 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OwningOpRef.h"
+#include "mlir/IR/Remarks.h"
 #include "mlir/IR/SymbolTable.h"
-#include "mlir/Interfaces/CallInterfaces.h"
-#include "mlir/Interfaces/DataLayoutInterfaces.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/Inliner.h"
-#include "mlir/Transforms/InliningUtils.h"
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
-#include "clang/CIR/Dialect/Passes.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/LaunchPathInternalization.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLHostFacts.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
@@ -43,9 +38,8 @@ using namespace cir;
 // The symbol tables of the container while a KernelBindingTable is built
 // (the IR of the container does not change then): MLIR's
 // lookupNearestSymbolFrom scans the module on every call, which on a big TU
-// was most of the table's cost. Lookups from ops outside the container (the
-// throwaway clone the trace inlines into, which does change) and outside a
-// table's construction are not cached.
+// was most of the table's cost. Lookups outside a table's construction (the
+// kernel copies of LocalKernelCopier change the container) are not cached.
 namespace {
 struct SymbolCacheScope {
   static thread_local SymbolCacheScope *active;
@@ -259,112 +253,10 @@ static llvm::StringRef getGlobalStringValue(cir::GlobalOp global) {
   return str ? str.getValue() : llvm::StringRef{};
 }
 
-// A mangled name embeds an unnamed closure when it carries the Itanium
-// unnamed-lambda encoding `Ul...E` (closure-type) or clang's `$_` local-lambda
-// spelling. Named free functions (e.g. `__sycl_kernel_vec_add`) and named
-// kernel types never do. This is a name-only fallback for TU-local
-// optimizability: it fires when the kernel NAME is itself an anonymous lambda
-// mangling, but it cannot see a named tag (`parallel_for<class Tag>(lambda)`)
-// whose symbol is `_ZTS<Tag>` even though the closure is a lambda. The closure
-// signal below (isLambdaClosureKernel) supersedes it whenever the device
-// kernel body is available.
-static bool hasAnonymousClosure(llvm::StringRef name) {
-  if (name.contains("$_"))
-    return true;
-  // A closure prefix `Ul` sits at a mangling boundary (after a scope or
-  // substitution terminator), never inside a length-counted source name, so
-  // require the preceding char to be one -- this rejects identifiers like
-  // "Full" or "Ultra".
-  for (size_t pos = name.find("Ul"); pos != llvm::StringRef::npos;
-       pos = name.find("Ul", pos + 2)) {
-    if (pos == 0 || name[pos - 1] == 'E' || name[pos - 1] == '_')
-      return true;
-  }
-  return false;
-}
-
-// Whether a CIR record type NAME denotes a lambda / anonymous closure rather
-// than a spellable class. CIRGen names a record with no C++ identifier (a
-// lambda closure, an anonymous struct) `anon` or `anon.<N>` -- see
-// CIRGenBuilder::getUniqueAnonRecordName -- whereas a named struct/functor
-// keeps its printed qualified name. The AS-lowering pass may prefix an
-// identified record that carries address-space members with `__cir_lowered.`
-// (see TargetLowering.cpp); at the combine stage the device closure has already
-// been through it, so strip that prefix before testing. This is what tells a
-// lambda closure apart from a genuine functor: a functor has a nameable type
-// and could be launched from another TU, so it must stay non-TU-local.
-static bool isAnonymousClosureRecordName(llvm::StringRef name) {
-  name.consume_front("__cir_lowered.");
-  if (name == "anon")
-    return true;
-  if (!name.consume_front("anon."))
-    return false;
-  return !name.empty() && llvm::all_of(name, llvm::isDigit);
-}
-
-// Whether `v`, followed through the offset-0 reinterprets CIRGen inserts on a
-// closure `this` (address-space cast, bitcast, base_class_addr), is passed as
-// the receiver (operand 0) of some call. The kernel object is the one local
-// record whose operator() the entry point invokes, so it is the record alloca
-// reaching a call in receiver position; the SYCL item/id temporaries are passed
-// by value (loaded first), never as a pointer receiver.
-static bool valueFeedsCallReceiver(mlir::Value v) {
-  llvm::SmallVector<mlir::Value, 4> worklist{v};
-  llvm::SmallPtrSet<mlir::Operation *, 8> seen;
-  while (!worklist.empty()) {
-    mlir::Value cur = worklist.pop_back_val();
-    for (mlir::Operation *user : cur.getUsers()) {
-      if (auto call = mlir::dyn_cast<cir::CallOp>(user)) {
-        mlir::OperandRange args = call.getArgOperands();
-        if (!args.empty() && args[0] == cur)
-          return true;
-        continue;
-      }
-      if (mlir::isa<cir::CastOp, cir::BaseClassAddrOp>(user))
-        if (seen.insert(user).second)
-          worklist.push_back(user->getResult(0));
-    }
-  }
-  return false;
-}
-
-// The closure record type a SYCL device kernel reconstructs and invokes, or a
-// null type if the kernel has no closure object (a named free-function kernel,
-// or a minimal fixture with an empty body). The kernel entry point materializes
-// the kernel-object clone as a local alloca and calls its operator(); that
-// alloca -- named `__SYCLKernel` for a lambda or after the functor otherwise --
-// is the sole record alloca reaching a call as its receiver.
-static cir::RecordType getSYCLClosureRecord(cir::FuncOp kernel) {
-  cir::RecordType found;
-  kernel.walk([&](cir::AllocaOp alloca) {
-    if (found)
-      return;
-    auto rec = mlir::dyn_cast<cir::RecordType>(alloca.getAllocaType());
-    if (!rec || !rec.getName())
-      return;
-    if (valueFeedsCallReceiver(alloca.getResult()))
-      found = rec;
-  });
-  return found;
-}
-
-// The TU-local identity test: a kernel is optimizable when its CLOSURE is a
-// lambda (a compiler-generated, TU-unique, unspellable type), regardless of the
-// kernel-name tag. `parallel_for<class Tag>(lambda)` has a named `_ZTS<Tag>`
-// symbol but an anonymous closure record, and is TU-local; a genuine functor
-// (a named struct with operator(), possibly defined in a header and launchable
-// from other TUs) has a nameable closure record and stays conservative. When
-// the device kernel body carries no closure object -- an empty lit fixture, or
-// a free-function kernel -- fall back to the name-only heuristic.
-static bool isLambdaClosureKernel(cir::FuncOp kernel,
-                                  llvm::StringRef symbolName) {
-  if (cir::RecordType closure = getSYCLClosureRecord(kernel))
-    return isAnonymousClosureRecordName(closure.getName().getValue());
-  return hasAnonymousClosure(symbolName);
-}
-
 // The call of the closure's call operator in the SYCL device kernel `kernel`:
-// the call whose receiver is the closure alloca (getSYCLClosureRecord).
+// the call whose receiver is the kernel object, the one named record alloca
+// reaching a call in receiver position (the SYCL item/id temporaries are
+// passed by value, never as a pointer receiver).
 static cir::CallOp findClosureCall(cir::FuncOp kernel) {
   cir::CallOp found;
   kernel.walk([&](cir::AllocaOp alloca) {
@@ -489,7 +381,8 @@ bool cir::isTUUniqueSYCLKernel(mlir::ModuleOp container, cir::FuncOp kernel,
 // any module's `cir.sycl_registered_kernels` attribute -- an array of
 // [user-name, mangled-name] string pairs. Such a kernel is reachable by name
 // across TUs, so it can never be treated as TU-local.
-static bool isRegisteredKernel(mlir::ModuleOp container, llvm::StringRef name) {
+bool cir::isRegisteredSYCLKernel(mlir::ModuleOp container,
+                                 llvm::StringRef name) {
   auto inModule = [&](mlir::ModuleOp mod) {
     auto arr = mod->getAttrOfType<mlir::ArrayAttr>(
         cir::CIRDialect::getSYCLRegisteredKernelsAttrName());
@@ -548,31 +441,43 @@ bool KernelBindingTable::allLaunchSitesVisible(
   });
 }
 
+void cir::emitOffloadRemark(mlir::Location loc, OffloadRemarkKind kind,
+                            llvm::StringRef pass, llvm::StringRef category,
+                            llvm::StringRef function, const llvm::Twine &text) {
+  mlir::MLIRContext *ctx = loc->getContext();
+  if (!ctx->getRemarkEngine())
+    return;
+  auto opts = mlir::remark::RemarkOpts::name(pass).category(category).function(
+      function);
+  std::string message = text.str();
+  switch (kind) {
+  case OffloadRemarkKind::Passed:
+    mlir::remark::passed(loc, opts) << llvm::StringRef(message);
+    return;
+  case OffloadRemarkKind::Missed:
+    mlir::remark::missed(loc, opts) << llvm::StringRef(message);
+    return;
+  case OffloadRemarkKind::Analysis:
+    mlir::remark::analysis(loc, opts) << llvm::StringRef(message);
+    return;
+  }
+}
+
 llvm::StringRef cir::getHostFactsModeName(HostFactsMode mode) {
   switch (mode) {
-  case HostFactsMode::Legacy:
-    return "legacy";
+  case HostFactsMode::None:
+    return "none";
   case HostFactsMode::IPO:
     return "ipo";
-  case HostFactsMode::Both:
-    return "both";
   }
   llvm_unreachable("unknown host-facts mode");
 }
 
 std::optional<HostFactsMode> cir::parseHostFactsMode(llvm::StringRef name) {
   return llvm::StringSwitch<std::optional<HostFactsMode>>(name)
-      .Case("legacy", HostFactsMode::Legacy)
+      .Case("none", HostFactsMode::None)
       .Case("ipo", HostFactsMode::IPO)
-      .Case("both", HostFactsMode::Both)
       .Default(std::nullopt);
-}
-
-std::string cir::formatHostFactsVerdict(llvm::StringRef source,
-                                        const NoAliasDecision &decision) {
-  if (decision.ok)
-    return (source + "=noalias").str();
-  return (source + "=not stamped (" + decision.note + ")").str();
 }
 
 std::string cir::formatSyclGeometry(const SyclGeometry &geometry) {
@@ -623,59 +528,6 @@ std::string cir::getHostFactsAnalysisKey(const HostFactsOptions &options) {
     os << " internalized";
   return out;
 }
-
-bool HostFactsGeometryComparison::disagrees() const {
-  return formatSyclGeometry(legacy) != formatSyclGeometry(ipo);
-}
-
-static std::string formatConstArg(mlir::TypedAttr value) {
-  if (!value)
-    return "none";
-  std::string out;
-  llvm::raw_string_ostream os(out);
-  value.print(os);
-  return out;
-}
-
-std::string
-cir::formatHostFactsComparison(const HostFactsConstComparison &cmp) {
-  std::string out = "kernel " + cmp.kernel + " const-arg " + cmp.field +
-                    " legacy=" + formatConstArg(cmp.legacy) +
-                    " ipo=" + formatConstArg(cmp.ipo);
-  if (!cmp.ipo && !cmp.ipoNote.empty())
-    out += " (" + cmp.ipoNote + ")";
-  return out;
-}
-
-std::string
-cir::formatHostFactsComparison(const HostFactsGeometryComparison &cmp) {
-  std::string out = "kernel " + cmp.kernel +
-                    " geometry legacy=" + formatSyclGeometry(cmp.legacy) +
-                    " ipo=" + formatSyclGeometry(cmp.ipo);
-  if (!cmp.ipoNote.empty())
-    out += " (" + cmp.ipoNote + ")";
-  return out;
-}
-
-std::string
-cir::formatHostFactsDisagreement(const HostFactsConstComparison &cmp) {
-  return "host-facts-disagreement: " + formatHostFactsComparison(cmp);
-}
-
-std::string
-cir::formatHostFactsDisagreement(const HostFactsGeometryComparison &cmp) {
-  return "host-facts-disagreement: " + formatHostFactsComparison(cmp);
-}
-
-std::string cir::formatHostFactsDisagreement(const HostFactsComparison &cmp) {
-  return "host-facts-disagreement: kernel " + cmp.kernel + " field " +
-         cmp.field + " " + formatHostFactsVerdict("legacy", cmp.legacy) + " " +
-         formatHostFactsVerdict("ipo", cmp.ipo);
-}
-
-KernelBindingTable::KernelBindingTable(mlir::ModuleOp container,
-                                       const HostFactsOptions &options)
-    : KernelBindingTable(container, options, nullptr) {}
 
 KernelBindingTable::KernelBindingTable(mlir::ModuleOp container,
                                        const HostFactsOptions &options,
@@ -728,120 +580,61 @@ KernelBindingTable::KernelBindingTable(mlir::ModuleOp container,
   LLVM_DEBUG(print(llvm::dbgs()));
 }
 
-// Operand roles of the runtime launch call
-// `submit_kernel_direct_with_event_impl(event& sret, queue&, nd_range_view&,
-// HostKernelRefBase&, DeviceKernelInfo*, span, PropsHolder&, code_location&,
-// bool)` -- a stable __SYCL_EXPORT ABI, so positions are fixed.
-enum : unsigned {
-  SyclGeometryOperand = 2,        // nd_range_view*
-  SyclClosureOperand = 3,         // HostKernelRefBase*
-  SyclDeviceKernelInfoOperand = 4 // DeviceKernelInfo*
-};
+//===----------------------------------------------------------------------===//
+// SYCL launch recognition (host-API roles)
+//===----------------------------------------------------------------------===//
+//
+// CIRGen tags the SYCL launch API by declaration (cir.sycl_host_api, see
+// CIRGenModule::getSYCLHostAPIRole), so launches are recognized by role, not
+// by mangled name:
+//  - the marker: detail::getDeviceKernelInfo<K>() (kernel.info), which names
+//    the kernel and whose DeviceKernelInfo* result the launch passes on;
+//  - the direct path (the queue shortcuts): the runtime launch
+//    submit_kernel_direct_{with,without}_event_impl (launch.direct_impl),
+//    whose HostKernelRefBase operand wraps the closure;
+//  - the handler path (`q.submit([&](handler &h) { h.parallel_for(...); })`):
+//    handler::setDeviceKernelInfoPtr(this, dki) (handler.set_kernel_info),
+//    whose handler's MHostKernel is reset to a detail::HostKernel built
+//    (hostkernel.ctor) from the closure.
+
+/// The cir.sycl_host_api role of the direct callee of \p call, or empty.
+static llvm::StringRef calleeRole(cir::CallOp call) {
+  if (call.isIndirect())
+    return {};
+  auto fn = lookupSymbol<cir::FuncOp>(call, call.getCalleeAttr());
+  auto role = fn ? fn->getAttrOfType<mlir::StringAttr>(
+                       cir::CIRDialect::getSYCLHostAPIAttrName())
+                 : nullptr;
+  return role ? role.getValue() : llvm::StringRef();
+}
 
 // Whether `call` is the templated `sycl::detail::getDeviceKernelInfo<Kernel>()`
-// launch marker: the template-args ('I') follow the name and it takes no
-// operands. The non-templated overload taking a CompileTimeKernelInfo ref
-// ('...InfoE...') is reached from inside it and is not a marker.
+// launch marker (kernel.info): it takes no operands and returns the
+// DeviceKernelInfo*.
 static bool isGetDeviceKernelInfoCall(cir::CallOp call) {
-  std::optional<llvm::StringRef> callee = call.getCallee();
-  if (!callee)
-    return false;
-  return callee->starts_with("_ZN4sycl3_V16detail19getDeviceKernelInfoI") &&
-         call.getArgOperands().empty() && call->getNumResults() == 1;
+  return call.getArgOperands().empty() && call->getNumResults() == 1 &&
+         calleeRole(call) == "kernel.info";
 }
 
-// Whether `call` is the runtime launch `submit_kernel_direct_with_event_impl`.
-static bool isSubmitKernelDirectImpl(cir::CallOp call) {
-  std::optional<llvm::StringRef> callee = call.getCallee();
-  return callee && callee->starts_with(
-                       "_ZN4sycl3_V136submit_kernel_direct_with_event_impl");
-}
-
-//===----------------------------------------------------------------------===//
-// SYCL handler-submit launch shape
-//===----------------------------------------------------------------------===//
-//
-// The direct `q.parallel_for(...)` shortcut launches through
-// submit_kernel_direct_with_event_impl. The far more common
-// `q.submit([&](handler& h){ h.parallel_for(...); })` form launches through a
-// set of handler methods instead, tied together by the shared `handler* this`:
-//
-//   handler::setDeviceKernelInfo<K>(this, closurePtr):     // templated,
-//   inlined
-//       handler::setKernelFunc(this, closurePtr)
-//       %dki = detail::getDeviceKernelInfo<K>()            // SAME name marker
-//       handler::setDeviceKernelInfoPtr(this, %dki)        // the dki sink
-//   handler::setNDRangeDescriptor(this, nd_range_view)     // the geometry sink
-//
-// setDeviceKernelInfoPtr / setKernelFunc / setNDRangeDescriptor are
-// __SYCL_EXPORT decl-only ABI boundaries, so they survive inlining as calls and
-// their operands can be read directly. The name anchor (getDeviceKernelInfo) is
-// identical to the direct path, so resolveLaunchedNameString is unchanged.
-
-// Whether `call` is `handler::setDeviceKernelInfoPtr(handler,
-// DeviceKernelInfo*)`
-// -- the handler-path sink the marker's result flows into (arg0 is the handler,
-// the join key for the launch's sibling calls).
-static bool isHandlerSetDeviceKernelInfoPtr(cir::CallOp call) {
-  std::optional<llvm::StringRef> callee = call.getCallee();
-  return callee &&
-         callee->starts_with("_ZN4sycl3_V17handler22setDeviceKernelInfoPtr");
-}
-
-// Whether `call` is `handler::setNDRangeDescriptor(handler, nd_range_view)` --
-// the handler-path geometry sink (arg1 is the nd_range_view, same object
-// traceNDRange consumes on the direct path).
-static bool isHandlerSetNDRangeDescriptor(cir::CallOp call) {
-  std::optional<llvm::StringRef> callee = call.getCallee();
-  return callee && callee->contains("7handler20setNDRangeDescriptor");
-}
-
-// The operands of a recovered SYCL launch, from either launch shape. The direct
-// path reads them from fixed positions of the runtime launch call; the handler
-// path recovers them from sibling handler-method calls sharing the handler.
+// The operands of a recovered SYCL launch, from either launch shape.
 namespace {
 struct RecoveredLaunch {
-  cir::CallOp anchor;   // stored as LaunchSite::stubCall (launch-in @caller)
-  mlir::Value geometry; // nd_range_view* operand
+  cir::CallOp anchor; // stored as LaunchSite::stubCall (launch-in @caller)
   mlir::Value
       closure; // HostKernelRef* (direct) / lambda-bearing value (handler)
 };
 } // namespace
 
-// The nd_range_view a handler-path launch feeds setNDRangeDescriptor, found by
-// the shared handler operand.
-static mlir::Value findHandlerNDRangeView(mlir::Value handler) {
-  for (mlir::Operation *user : handler.getUsers()) {
-    auto call = mlir::dyn_cast<cir::CallOp>(user);
-    if (!call || !isHandlerSetNDRangeDescriptor(call))
-      continue;
-    mlir::OperandRange args = call.getArgOperands();
-    if (args.size() >= 2 && args[0] == handler)
-      return args[1];
-  }
-  return {};
-}
-
 // Defined below; follows `v = load(slot)` back to the pointer stored into the
 // slot, so a value reloaded before use resolves to the object it names.
 static mlir::Value stripToPointerObject(mlir::Value v);
 
-// Whether `call` constructs a `detail::HostKernel<...>` -- the wrapper the
-// handler path builds around the user lambda. Its arg1 is the lambda object
-// carrying the capture stores. (`10HostKernelI` is the templated wrapper; it
-// excludes `14HostKernelBase`.)
-static bool isHostKernelCtor(cir::CallOp call) {
-  std::optional<llvm::StringRef> callee = call.getCallee();
-  if (!callee)
-    return false;
-  return callee->contains("6detail10HostKernelI") &&
-         (callee->contains("C1") || callee->contains("C2"));
-}
-
 // Whether `call` is `std::unique_ptr<HostKernelBase>::reset(HostKernelBase*)`
 // -- the write that installs the wrapped kernel into handler.MHostKernel. Its
 // arg1 is the freshly-built HostKernel object (as a HostKernelBase* base
-// pointer).
+// pointer). A standard library method, which carries no SYCL role; used only
+// to recover the closure operand (the closure-layout check), never to
+// recognize a launch.
 static bool isHostKernelReset(cir::CallOp call) {
   std::optional<llvm::StringRef> callee = call.getCallee();
   return callee && callee->contains("HostKernelBase") &&
@@ -853,12 +646,10 @@ static bool isHostKernelReset(cir::CallOp call) {
 // `handler.MHostKernel.reset(new HostKernel<KernelType,...>(lambda))`, so the
 // launch's lambda is reached structurally: the reset writing THIS handler's
 // MHostKernel member gives the freshly-built HostKernel object, and that
-// object's HostKernel constructor took the user lambda as arg1 (the temp
-// carrying the capture stores). Keying off the handler's own member -- rather
-// than scanning the enclosing function for the first HostKernel ctor -- is what
-// disambiguates the launch when several q.submit(handler) sites were inlined
-// into one caller: each has its own handler and its own MHostKernel. Returns
-// the lambda operand; the closure trace strips it to the record object.
+// object's HostKernel constructor (hostkernel.ctor) took the user lambda as
+// arg1. Keying off the handler's own member is what disambiguates the launch
+// when several q.submit(handler) sites share one function: each has its own
+// handler and its own MHostKernel.
 static mlir::Value findHandlerClosure(mlir::Value handler) {
   for (mlir::Operation *hu : handler.getUsers()) {
     auto member = mlir::dyn_cast<cir::GetMemberOp>(hu);
@@ -881,7 +672,7 @@ static mlir::Value findHandlerClosure(mlir::Value handler) {
       hostKernel = stripToPointerObject(hostKernel);
       for (mlir::Operation *hku : hostKernel.getUsers()) {
         auto ctor = mlir::dyn_cast<cir::CallOp>(hku);
-        if (!ctor || !isHostKernelCtor(ctor))
+        if (!ctor || calleeRole(ctor) != "hostkernel.ctor")
           continue;
         mlir::OperandRange ctorArgs = ctor.getArgOperands();
         if (ctorArgs.size() >= 2 && ctorArgs[0] == hostKernel)
@@ -892,13 +683,39 @@ static mlir::Value findHandlerClosure(mlir::Value handler) {
   return {};
 }
 
-// Follow the DeviceKernelInfo* result of a getDeviceKernelInfo call to the
-// launch it drives, recognizing both launch shapes. CIRGen spills the pointer
-// into a stack slot and reloads it before the consuming call, so hop
-// store->slot->load once. Direct path: the pointer reaches
-// submit_kernel_direct_with_event_impl, whose fixed operands carry the geometry
-// and closure. Handler path: it reaches handler::setDeviceKernelInfoPtr, and
-// the geometry/closure are recovered from the sibling handler calls.
+// The closure operand of a launch.direct_impl call: the operand that is (a
+// base-class or reinterpret view of) the detail::HostKernelRef object a
+// hostkernel.ctor call constructed, or null. Found by role, not by position.
+static mlir::Value findDirectClosure(cir::CallOp call) {
+  for (mlir::Value arg : call.getArgOperands()) {
+    mlir::Value obj = stripToPointerObject(arg);
+    for (unsigned i = 0; i < 8; ++i) {
+      if (auto bca = obj.getDefiningOp<cir::BaseClassAddrOp>()) {
+        obj = bca.getSrcAddr();
+        continue;
+      }
+      if (auto cast = obj.getDefiningOp<cir::CastOp>())
+        if (cast.getKind() == cir::CastKind::bitcast ||
+            cast.getKind() == cir::CastKind::address_space) {
+          obj = cast.getSrc();
+          continue;
+        }
+      break;
+    }
+    for (mlir::Operation *user : obj.getUsers()) {
+      auto ctor = mlir::dyn_cast<cir::CallOp>(user);
+      if (ctor && calleeRole(ctor) == "hostkernel.ctor" &&
+          !ctor.getArgOperands().empty() && ctor.getArgOperands()[0] == obj)
+        return arg;
+    }
+  }
+  return {};
+}
+
+// Follow the DeviceKernelInfo* result of a kernel.info marker to the launch it
+// drives, recognizing both launch shapes. CIRGen spills the pointer into a
+// stack slot and reloads it before the consuming call, so hop
+// store->slot->load once.
 static std::optional<RecoveredLaunch>
 recoverLaunch(mlir::Value deviceKernelInfo) {
   llvm::SmallVector<mlir::Value, 2> reachable{deviceKernelInfo};
@@ -915,20 +732,14 @@ recoverLaunch(mlir::Value deviceKernelInfo) {
       auto call = mlir::dyn_cast<cir::CallOp>(user);
       if (!call)
         continue;
-      if (isSubmitKernelDirectImpl(call)) {
-        mlir::OperandRange args = call.getArgOperands();
-        if (args.size() <= SyclDeviceKernelInfoOperand)
-          return std::nullopt;
-        return RecoveredLaunch{call, args[SyclGeometryOperand],
-                               args[SyclClosureOperand]};
-      }
-      if (isHandlerSetDeviceKernelInfoPtr(call)) {
+      llvm::StringRef role = calleeRole(call);
+      if (role == "launch.direct_impl")
+        return RecoveredLaunch{call, findDirectClosure(call)};
+      if (role == "handler.set_kernel_info") {
         mlir::OperandRange args = call.getArgOperands();
         if (args.empty())
           return std::nullopt;
-        mlir::Value handler = args[0];
-        return RecoveredLaunch{call, findHandlerNDRangeView(handler),
-                               findHandlerClosure(handler)};
+        return RecoveredLaunch{call, findHandlerClosure(args[0])};
       }
     }
   return std::nullopt;
@@ -975,618 +786,6 @@ static cir::GlobalOp resolveLaunchedNameString(cir::CallOp call) {
   return nameString;
 }
 
-//===----------------------------------------------------------------------===//
-// SYCL launch-geometry recovery (nd_range global/local work-group sizes)
-//===----------------------------------------------------------------------===//
-//
-// The constant work-group sizes are not SSA-visible at the runtime launch
-// call. CIRGen threads the nd_range object through a chain of launch shims
-//   queue::parallel_for
-//     -> detail::submit_kernel_direct_parallel_for
-//        -> detail::submit_kernel_direct
-//           -> submit_kernel_direct_with_event_impl   (the runtime launch)
-// and the sizes live only in that object's memory, written by the range/array
-// constructors up in the user function. mem2reg/SCCP cannot recover them: the
-// nd_range object's address is taken (the nd_range_view constructor stores
-// interior pointers to its array slots), so it never promotes to SSA.
-//
-// Recovery therefore (1) clones the host module, (2) flattens it so cir.return
-// is a block terminator, (3) force-inlines the launch-shim chain and the
-// geometry constructors into the user function, collapsing everything into one
-// function, then (4) walks the nd_range_view object's memory back to the
-// constant stores. The clone is discarded, so results are plain integers.
-
-// Whether `fn` is a launch shim or a geometry constructor/accessor on the
-// nd_range launch path -- a callee the recovery clone force-inlines. Matched by
-// mangled-name shape so it is dimension-agnostic. Excludes the
-// getDeviceKernelInfo marker (it names the kernel and must survive to identify
-// the launch) and the __SYCL_EXPORT submit_kernel_direct_with_event_impl
-// boundary (decl-only anyway). array::check_dimension, a throwing bounds check
-// off the value path, is left as a call.
-static bool isLaunchChainCallee(cir::FuncOp fn) {
-  // The buffer and accessor API stays a call: its role is how buffer identity
-  // is traced (a buffer constructor also matches the range-constructor shape
-  // below). The launch-path, memory-command and destructor roles do not
-  // change what is inlined here.
-  if (auto role = fn->getAttrOfType<mlir::StringAttr>(
-          CIRDialect::getSYCLHostAPIAttrName()))
-    if ((role.getValue().starts_with("buffer.") ||
-         role.getValue().starts_with("accessor.") ||
-         role.getValue().starts_with("vector.")) &&
-        !role.getValue().ends_with(".dtor"))
-      return false;
-  llvm::StringRef n = fn.getName();
-  if (n.starts_with("_ZN4sycl3_V136submit_kernel_direct_with_event_impl"))
-    return false;
-  if (n.starts_with("_ZN4sycl3_V16detail19getDeviceKernelInfoI"))
-    return false;
-  // queue::parallel_for and the submit_kernel_direct* shims.
-  if (n.contains("submit_kernel_direct") || n.contains("parallel_for"))
-    return true;
-  // The handler-submit launch chain (see the handler-submit shape above):
-  // queue::submit builds the command-group functor object, and the handler
-  // methods below thread the closure/geometry down to the surviving sinks. The
-  // getDeviceKernelInfo marker (excluded first) and the __SYCL_EXPORT decl-only
-  // sinks (setDeviceKernelInfoPtr / setNDRangeDescriptor / setKernelFunc, no
-  // body) are left as calls. The HostKernel wrapper ctor is likewise left as a
-  // call: StoreLambda installs it into handler.MHostKernel, so
-  // findHandlerClosure recovers this launch's lambda by following that member
-  // back to the ctor.
-  if (n.contains("5queue6submit") || n.contains("wrap_kernel") ||
-      n.contains("StoreLambda") || n.contains("setDeviceKernelInfoI") ||
-      n.contains("convertToRangeViewAndSetDescriptor"))
-    return true;
-  // Geometry constructors, dimension-agnostic. The length digits in front of
-  // each name keep "range" from matching inside "nd_range".
-  bool isCtor = n.contains("C1") || n.contains("C2");
-  if (n.contains("nd_range_view") && isCtor)
-    return true;
-  if (n.contains("8nd_rangeILi") && isCtor)
-    return true;
-  if (n.contains("5rangeILi") && isCtor)
-    return true;
-  // detail::array constructor and operator[] (but not check_dimension).
-  if (n.contains("6detail5arrayILi") && (isCtor || n.contains("ixEi")))
-    return true;
-  return false;
-}
-
-// Bridge SYCL's type-erased command-group submit so the launch it performs can
-// be inlined beside the user's allocations and geometry constants.
-//
-// `q.submit(cgf)` stores the command-group functor object and a static
-// `invoker` trampoline into a `type_erased_cgfo_ty`, then hands it to the
-// opaque runtime, which later calls `invoker(&cgf, handler)` ->
-// `cgf.operator()(handler)`. No static call edge runs `operator()` from user
-// code, so a generic inliner cannot reach it and the launch (with its
-// getDeviceKernelInfo marker) never co-locates with the caller's USM
-// allocations / nd_range constants. But the shape is a fixed SYCL contract: for
-// each cgfo constructor on the clone, resolve the functor's `operator()` (via
-// the invoker global the ctor stores) and synthesize the missing edge -- a
-// direct `operator()(cgf, <fresh handler>)` call right after the ctor, tagged
-// so inlineLaunchChain collapses it. The synthesized handler is an unused
-// placeholder: it is only the receiver of the handler-method sinks, whose
-// operands are read for recovery, never its value.
-static void bridgeSubmitCGF(mlir::ModuleOp clone) {
-  mlir::MLIRContext *ctx = clone.getContext();
-  llvm::SmallVector<cir::CallOp> ctors;
-  clone.walk([&](cir::CallOp call) {
-    std::optional<llvm::StringRef> callee = call.getCallee();
-    if (callee && callee->contains("19type_erased_cgfo_tyC2") &&
-        call.getArgOperands().size() >= 2)
-      ctors.push_back(call);
-  });
-
-  for (cir::CallOp ctor : ctors) {
-    auto ctorFn = lookupSymbol<cir::FuncOp>(ctor, ctor.getCalleeAttr());
-    if (!ctorFn)
-      continue;
-    // The invoker trampoline: the (only) func-typed global the ctor stores.
-    cir::FuncOp invoker;
-    ctorFn.walk([&](cir::GetGlobalOp gg) {
-      if (invoker)
-        return;
-      if (auto f = lookupSymbol<cir::FuncOp>(gg, gg.getNameAttr()))
-        invoker = f;
-    });
-    if (!invoker)
-      continue;
-    // operator(): the (only) bodied function the invoker calls.
-    cir::FuncOp cgOperator;
-    invoker.walk([&](cir::CallOp inner) {
-      if (cgOperator || inner.isIndirect())
-        return;
-      auto f = lookupSymbol<cir::FuncOp>(inner, inner.getCalleeAttr());
-      if (f && f.getCallableRegion() && !f.getCallableRegion()->empty())
-        cgOperator = f;
-    });
-    if (!cgOperator || cgOperator.getNumArguments() != 2)
-      continue;
-
-    auto handlerPtrTy =
-        mlir::dyn_cast<cir::PointerType>(cgOperator.getArgumentTypes()[1]);
-    if (!handlerPtrTy)
-      continue;
-    auto parentFn = ctor->getParentOfType<cir::FuncOp>();
-    if (!parentFn || !parentFn.getCallableRegion())
-      continue;
-
-    // The functor object the ctor wraps. Bitcast if the ctor's reference type
-    // differs from operator()'s receiver type.
-    mlir::Value cgf = ctor.getArgOperands()[1];
-    mlir::Type receiverTy = cgOperator.getArgumentTypes()[0];
-
-    mlir::OpBuilder b(ctor);
-    b.setInsertionPointToStart(&parentFn.getCallableRegion()->front());
-    auto placeholder =
-        cir::AllocaOp::create(b, ctor.getLoc(), handlerPtrTy,
-                              "cg.handler.placeholder", b.getI64IntegerAttr(8));
-
-    b.setInsertionPointAfter(ctor);
-    if (cgf.getType() != receiverTy)
-      cgf = cir::CastOp::create(b, ctor.getLoc(), receiverTy,
-                                cir::CastKind::bitcast, cgf);
-    auto invoke = cir::CallOp::create(
-        b, ctor.getLoc(), mlir::FlatSymbolRefAttr::get(cgOperator),
-        cir::VoidType::get(ctx), mlir::ValueRange{cgf, placeholder});
-    invoke->setAttr("cir.sycl.cg_invoke", mlir::UnitAttr::get(ctx));
-    // The command-group functor body is a launch shim for recovery purposes:
-    // the inliner also collapses the launch chain into the ORIGINAL operator()
-    // (its body is region-cloned, not consumed), where the closure captures are
-    // only by-reference parameters with no visible allocation stores. Tag it so
-    // the closure fold skips that copy and folds only the real,
-    // inlined-into-caller site -- mirroring the isLaunchChainCallee exclusion
-    // for the other shims.
-    cgOperator->setAttr("cir.sycl.cg_body", mlir::UnitAttr::get(ctx));
-  }
-}
-
-// Force-inline the launch-shim chain into the user function(s) on `clone`.
-// `clone` must already be flattened. Iterates to a fixpoint because inlining a
-// shim exposes the calls nested inside it. Uses region cloning (not splicing)
-// so a shim called from several sites -- e.g. the range/array constructors that
-// build both the global and local sizes -- stays intact for every site.
-static void inlineLaunchChain(mlir::ModuleOp clone) {
-  mlir::InlinerInterface interface(clone.getContext());
-  mlir::InlinerConfig config;
-  auto cloneCallback = config.getCloneCallback();
-
-  bool changed = true;
-  // The chain is ~4 shims deep plus the geometry ctors; 16 sweeps is plenty and
-  // guards against an unexpected cycle.
-  for (unsigned iter = 0; changed && iter < 16; ++iter) {
-    changed = false;
-    llvm::SmallVector<cir::CallOp> worklist;
-    clone.walk([&](cir::CallOp call) {
-      if (call.isIndirect())
-        return;
-      mlir::FlatSymbolRefAttr callee = call.getCalleeAttr();
-      if (!callee)
-        return;
-      auto fn = lookupSymbol<cir::FuncOp>(call, callee);
-      // The synthetic command-group operator() call (see bridgeSubmitCGF) is
-      // inlined by its tag rather than its name -- the lambda operator() has no
-      // stable mangled shape to match.
-      if (!fn ||
-          (!isLaunchChainCallee(fn) && !call->hasAttr("cir.sycl.cg_invoke")))
-        return;
-      mlir::Region *region = fn.getCallableRegion();
-      if (!region || region->empty())
-        return;
-      worklist.push_back(call);
-    });
-    for (cir::CallOp call : worklist) {
-      auto callee = call.getCalleeAttr();
-      auto fn = lookupSymbol<cir::FuncOp>(call, callee);
-      if (!fn)
-        continue;
-      auto callable = mlir::cast<mlir::CallableOpInterface>(fn.getOperation());
-      auto callInterface =
-          mlir::cast<mlir::CallOpInterface>(call.getOperation());
-      if (mlir::succeeded(
-              mlir::inlineCall(interface, cloneCallback, callInterface,
-                               callable, callable.getCallableRegion(),
-                               /*shouldCloneInlinedRegion=*/true))) {
-        call.erase();
-        changed = true;
-      }
-    }
-  }
-}
-
-// The constant integer `v` holds, seeing through integral/bitcast reinterprets,
-// or nullopt if it is not a compile-time constant integer.
-static std::optional<int64_t> asConstInt(mlir::Value v) {
-  for (unsigned i = 0; i < 16 && v; ++i) {
-    if (auto c = v.getDefiningOp<cir::ConstantOp>()) {
-      if (auto ia = mlir::dyn_cast<cir::IntAttr>(c.getValue()))
-        return ia.getValue().getSExtValue();
-      return std::nullopt;
-    }
-    auto cast = v.getDefiningOp<cir::CastOp>();
-    if (cast && (cast.getKind() == cir::CastKind::integral ||
-                 cast.getKind() == cir::CastKind::bitcast)) {
-      v = cast.getSrc();
-      continue;
-    }
-    return std::nullopt;
-  }
-  return std::nullopt;
-}
-
-namespace {
-/// A memory cell: `size` bytes at byte `offset` into the object `root`
-/// addresses. `root` is an alloca or an opaque pointer value.
-struct MemLoc {
-  mlir::Value root;
-  int64_t offset = 0;
-};
-
-/// Reads back, on the collapsed launch clone, the value the host stored into a
-/// memory cell, through the by-value aggregate copies and by-reference captures
-/// the launch shims build. Cells are byte ranges from the data layout rather
-/// than member names, so a read survives a reinterpret of the object -- e.g.
-/// the x86-64 ABI coercing a 16-byte closure into an anonymous `{ptr, ptr}`
-/// on its way into queue::submit.
-///
-/// The reads are flow-insensitive, so a value is returned only when every
-/// write that may reach the cell agrees on it: a cell with two different
-/// writes, a partially overlapping write, a constructor or assignment run on
-/// an overlapping object, or any call handed a pointer into a strict
-/// subobject overlapping the cell reads as unknown. Writes are found through
-/// every pointer derived from the root, including one spilled to a stack slot
-/// and reloaded. Two kinds of access are assumed to only read: a call (other
-/// than a constructor or assignment) handed the whole object -- on the launch
-/// path those are setKernelFunc, the HostKernel constructor's source operand,
-/// and operator() -- and a pointer stored into an aggregate rather than
-/// spilled to a slot.
-class MemoryReader {
-public:
-  explicit MemoryReader(mlir::ModuleOp module) : dl(module) {}
-
-  /// The root object and constant byte offset `ptr` addresses. Member,
-  /// constant-index element and base-class steps add their offsets;
-  /// reinterprets add none; a pointer loaded from memory is replaced by the
-  /// pointer stored there (a spill slot or a by-reference capture).
-  MemLoc decompose(mlir::Value ptr, unsigned depth = 0) {
-    MemLoc loc{ptr, 0};
-    for (unsigned i = 0; i < 64 && loc.root; ++i) {
-      mlir::Operation *def = loc.root.getDefiningOp();
-      if (!def)
-        break;
-      if (auto gm = mlir::dyn_cast<cir::GetMemberOp>(def)) {
-        auto rec = mlir::dyn_cast<cir::RecordType>(
-            gm.getAddr().getType().getPointee());
-        if (!rec || rec.isUnion())
-          break;
-        loc.offset += rec.getElementOffset(dl, gm.getIndex());
-        loc.root = gm.getAddr();
-        continue;
-      }
-      if (auto ge = mlir::dyn_cast<cir::GetElementOp>(def)) {
-        std::optional<int64_t> idx = asConstInt(ge.getIndex());
-        if (!idx)
-          break;
-        loc.offset += *idx * static_cast<int64_t>(dl.getTypeSize(
-                                 ge.getResult().getType().getPointee()));
-        loc.root = ge.getBase();
-        continue;
-      }
-      if (auto bca = mlir::dyn_cast<cir::BaseClassAddrOp>(def)) {
-        loc.offset += bca.getOffset().getZExtValue();
-        loc.root = bca.getSrcAddr();
-        continue;
-      }
-      if (auto cast = mlir::dyn_cast<cir::CastOp>(def)) {
-        if (cast.getKind() == cir::CastKind::bitcast ||
-            cast.getKind() == cir::CastKind::address_space ||
-            cast.getKind() == cir::CastKind::array_to_ptrdecay) {
-          loc.root = cast.getSrc();
-          continue;
-        }
-        break;
-      }
-      if (auto load = mlir::dyn_cast<cir::LoadOp>(def)) {
-        if (depth > 32)
-          break;
-        mlir::Value stored = loadedValue(load, depth + 1);
-        if (!stored)
-          break;
-        MemLoc inner = decompose(stored, depth + 1);
-        inner.offset += loc.offset;
-        return inner;
-      }
-      break;
-    }
-    return loc;
-  }
-
-  /// The value a load reads, if a unique write of it reaches the loaded cell.
-  mlir::Value loadedValue(cir::LoadOp load, unsigned depth = 0) {
-    mlir::Type ty = load.getResult().getType();
-    return valueAt(decompose(load.getAddr(), depth), dl.getTypeSize(ty), depth);
-  }
-
-  /// The value written into the `size`-byte cell at `loc`, or null when it is
-  /// not determined by a unique write (see the class comment).
-  mlir::Value valueAt(MemLoc loc, uint64_t size, unsigned depth = 0) {
-    if (!loc.root || depth > 32)
-      return {};
-    // A loaded aggregate carries the bytes of the object it was loaded from.
-    if (auto load = loc.root.getDefiningOp<cir::LoadOp>();
-        load && !mlir::isa<cir::PointerType>(load.getResult().getType())) {
-      MemLoc src = decompose(load.getAddr(), depth + 1);
-      src.offset += loc.offset;
-      return valueAt(src, size, depth + 1);
-    }
-
-    mlir::Value result;
-    bool conflict = false;
-    auto merge = [&](mlir::Value v) {
-      if (!v || (result && result != v))
-        conflict = true;
-      else
-        result = v;
-    };
-
-    // Every pointer into the root's storage, with its offset from the root.
-    llvm::SmallVector<std::pair<mlir::Value, int64_t>, 16> aliases{
-        {loc.root, 0}};
-    llvm::SmallPtrSet<mlir::Value, 16> seenAlias{loc.root};
-    for (unsigned ai = 0; ai < aliases.size() && !conflict; ++ai) {
-      auto [ptr, base] = aliases[ai];
-      for (mlir::Operation *user : ptr.getUsers()) {
-        if (mlir::isa<cir::GetMemberOp, cir::GetElementOp, cir::BaseClassAddrOp,
-                      cir::CastOp>(user)) {
-          mlir::Value res = user->getResult(0);
-          if (!mlir::isa<cir::PointerType>(res.getType()))
-            continue;
-          MemLoc sub = decompose(res, depth + 1);
-          if (sub.root != loc.root) {
-            // A step decompose cannot see through (a dynamic index): the
-            // pointer may address any byte of the object.
-            conflict = true;
-            break;
-          }
-          if (seenAlias.insert(res).second)
-            aliases.push_back({res, sub.offset});
-          continue;
-        }
-        int64_t lo = base;
-        if (auto st = mlir::dyn_cast<cir::StoreOp>(user)) {
-          if (st.getAddr() != ptr) {
-            // The pointer itself is spilled: its reloads alias the root too.
-            forEachLoadOf(decompose(st.getAddr(), depth + 1),
-                          [&](cir::LoadOp reload) {
-                            if (seenAlias.insert(reload.getResult()).second)
-                              aliases.push_back({reload.getResult(), base});
-                          });
-            continue;
-          }
-          mlir::Type ty = st.getValue().getType();
-          int64_t hi = lo + dl.getTypeSize(ty);
-          if (!overlaps(lo, hi, loc.offset, size))
-            continue;
-          if (lo == loc.offset && hi - lo == static_cast<int64_t>(size) &&
-              !mlir::isa<cir::RecordType, cir::ArrayType>(ty)) {
-            merge(st.getValue());
-            continue;
-          }
-          if (!covers(lo, hi, loc.offset, size)) {
-            conflict = true;
-            break;
-          }
-          // An enclosing aggregate written whole: read within its source.
-          auto srcLoad = st.getValue().getDefiningOp<cir::LoadOp>();
-          if (!srcLoad) {
-            conflict = true;
-            break;
-          }
-          MemLoc src = decompose(srcLoad.getAddr(), depth + 1);
-          src.offset += loc.offset - lo;
-          merge(valueAt(src, size, depth + 1));
-          continue;
-        }
-        if (auto cp = mlir::dyn_cast<cir::CopyOp>(user)) {
-          if (cp.getDst() != ptr)
-            continue;
-          int64_t hi = lo + dl.getTypeSize(cp.getDst().getType().getPointee());
-          if (!overlaps(lo, hi, loc.offset, size))
-            continue;
-          if (!covers(lo, hi, loc.offset, size)) {
-            conflict = true;
-            break;
-          }
-          MemLoc src = decompose(cp.getSrc(), depth + 1);
-          src.offset += loc.offset - lo;
-          merge(valueAt(src, size, depth + 1));
-          continue;
-        }
-        if (auto call = mlir::dyn_cast<cir::CallOp>(user)) {
-          auto ptrTy = mlir::dyn_cast<cir::PointerType>(ptr.getType());
-          if (!ptrTy)
-            continue;
-          int64_t hi = lo + dl.getTypeSize(ptrTy.getPointee());
-          if (!overlaps(lo, hi, loc.offset, size))
-            continue;
-          bool whole = base == 0 && hi >= rootSize(loc.root);
-          if (!whole || writesReceiver(call, ptr)) {
-            conflict = true;
-            break;
-          }
-        }
-      }
-    }
-    return conflict ? mlir::Value{} : result;
-  }
-
-  /// The constant integer in the `size`-byte cell at `loc`, following a
-  /// stored value that is itself loaded from memory.
-  std::optional<int64_t> constIntAt(MemLoc loc, uint64_t size) {
-    mlir::Value v = valueAt(loc, size);
-    for (unsigned i = 0; i < 16 && v; ++i) {
-      if (std::optional<int64_t> c = asConstInt(v))
-        return c;
-      auto load = v.getDefiningOp<cir::LoadOp>();
-      if (!load)
-        break;
-      v = loadedValue(load);
-    }
-    return std::nullopt;
-  }
-
-  /// The cell of the member named `name` of the record `obj` points at, found
-  /// from a get_member on it.
-  std::optional<MemLoc> memberLoc(mlir::Value obj, llvm::StringRef name) {
-    for (mlir::Operation *u : obj.getUsers())
-      if (auto gm = mlir::dyn_cast<cir::GetMemberOp>(u))
-        if (gm.getName() == name)
-          return decompose(gm.getResult());
-    return std::nullopt;
-  }
-
-  uint64_t sizeOf(mlir::Type ty) const { return dl.getTypeSize(ty); }
-
-  /// The single call that initializes the `size`-byte object at `loc`: a
-  /// constructor run on it, or a call returning into it through `sret`. Null
-  /// when there is no such call, more than one, or any other write overlaps
-  /// the object (a store, a copy, an assignment, a call handed a pointer into
-  /// it). Destructors and calls merely handed the object are not writes.
-  cir::CallOp uniqueInitializer(MemLoc loc, uint64_t size) {
-    if (!loc.root)
-      return {};
-    cir::CallOp init;
-    llvm::SmallVector<std::pair<mlir::Value, int64_t>, 16> aliases{
-        {loc.root, 0}};
-    llvm::SmallPtrSet<mlir::Value, 16> seenAlias{loc.root};
-    for (unsigned ai = 0; ai < aliases.size(); ++ai) {
-      auto [ptr, base] = aliases[ai];
-      for (mlir::Operation *user : ptr.getUsers()) {
-        if (mlir::isa<cir::GetMemberOp, cir::GetElementOp, cir::BaseClassAddrOp,
-                      cir::CastOp>(user)) {
-          mlir::Value res = user->getResult(0);
-          if (!mlir::isa<cir::PointerType>(res.getType()))
-            continue;
-          MemLoc sub = decompose(res);
-          if (sub.root != loc.root)
-            return {};
-          if (seenAlias.insert(res).second)
-            aliases.push_back({res, sub.offset});
-          continue;
-        }
-        if (auto st = mlir::dyn_cast<cir::StoreOp>(user)) {
-          if (st.getAddr() != ptr) {
-            forEachLoadOf(decompose(st.getAddr()), [&](cir::LoadOp reload) {
-              if (seenAlias.insert(reload.getResult()).second)
-                aliases.push_back({reload.getResult(), base});
-            });
-            continue;
-          }
-          if (overlaps(base, base + dl.getTypeSize(st.getValue().getType()),
-                       loc.offset, size))
-            return {};
-          continue;
-        }
-        if (auto cp = mlir::dyn_cast<cir::CopyOp>(user)) {
-          if (cp.getDst() == ptr &&
-              overlaps(base,
-                       base +
-                           dl.getTypeSize(cp.getDst().getType().getPointee()),
-                       loc.offset, size))
-            return {};
-          continue;
-        }
-        auto call = mlir::dyn_cast<cir::CallOp>(user);
-        if (!call)
-          continue;
-        auto ptrTy = mlir::dyn_cast<cir::PointerType>(ptr.getType());
-        if (!ptrTy)
-          continue;
-        int64_t hi = base + dl.getTypeSize(ptrTy.getPointee());
-        if (!overlaps(base, hi, loc.offset, size))
-          continue;
-        cir::FuncOp callee = calleeOf(call);
-        if (callee && callee.isCxxDestructor())
-          continue;
-        bool isReceiver =
-            !call.getArgOperands().empty() && call.getArgOperands()[0] == ptr;
-        bool initializes =
-            isReceiver && callee &&
-            (callee.isCxxConstructor() ||
-             callee.getArgAttr(
-                 0, mlir::LLVM::LLVMDialect::getStructRetAttrName()));
-        if (initializes && base == loc.offset &&
-            hi - base == static_cast<int64_t>(size)) {
-          if (init && init != call)
-            return {};
-          init = call;
-          continue;
-        }
-        // A call handed a pointer covering the whole object (or an enclosing
-        // one) is assumed to only read it, unless it constructs or assigns
-        // the pointee; one handed a pointer into the object may write part
-        // of it.
-        if (!covers(base, hi, loc.offset, size) || writesReceiver(call, ptr))
-          return {};
-      }
-    }
-    return init;
-  }
-
-  static cir::FuncOp calleeOf(cir::CallOp call) {
-    if (call.isIndirect())
-      return {};
-    return lookupSymbol<cir::FuncOp>(call, call.getCalleeAttr());
-  }
-
-private:
-  /// Calls `fn` on every load of exactly the cell `slot`.
-  template <typename Fn> void forEachLoadOf(MemLoc slot, Fn fn) {
-    if (!slot.root)
-      return;
-    // Loads can go through any view of the slot; walk those.
-    llvm::SmallVector<mlir::Value, 8> ptrs{slot.root};
-    for (unsigned i = 0; i < ptrs.size() && i < 64; ++i)
-      for (mlir::Operation *u : ptrs[i].getUsers()) {
-        if (auto load = mlir::dyn_cast<cir::LoadOp>(u)) {
-          MemLoc at = decompose(load.getAddr());
-          if (at.root == slot.root && at.offset == slot.offset)
-            fn(load);
-          continue;
-        }
-        if (mlir::isa<cir::GetMemberOp, cir::GetElementOp, cir::CastOp>(u))
-          ptrs.push_back(u->getResult(0));
-      }
-  }
-
-  /// Whether `call` constructs or assigns the object `ptr` addresses.
-  static bool writesReceiver(cir::CallOp call, mlir::Value ptr) {
-    if (call.getArgOperands().empty() || call.getArgOperands()[0] != ptr)
-      return false;
-    if (call.isIndirect())
-      return true;
-    auto callee = lookupSymbol<cir::FuncOp>(call, call.getCalleeAttr());
-    if (!callee)
-      return true;
-    return callee.isCxxConstructor() || callee.isCxxSpecialAssignment();
-  }
-
-  int64_t rootSize(mlir::Value root) const {
-    auto ptrTy = mlir::dyn_cast<cir::PointerType>(root.getType());
-    return ptrTy ? static_cast<int64_t>(dl.getTypeSize(ptrTy.getPointee())) : 0;
-  }
-
-  static bool overlaps(int64_t lo, int64_t hi, int64_t off, uint64_t size) {
-    return lo < off + static_cast<int64_t>(size) && off < hi;
-  }
-  static bool covers(int64_t lo, int64_t hi, int64_t off, uint64_t size) {
-    return lo <= off && off + static_cast<int64_t>(size) <= hi;
-  }
-
-  mlir::DataLayout dl;
-};
-} // namespace
-
 // Follow a spill slot: `v = load(slot)` where `slot` was `store(ptr, slot)`.
 // Returns the stored pointer, so a value reloaded before the launch resolves to
 // the object it names. CIRGen spills the nd_range_view pointer into a
@@ -1608,575 +807,6 @@ static mlir::Value stripToPointerObject(mlir::Value v) {
     v = found;
   }
   return v;
-}
-
-// Follow a by-value aggregate copy back to the original object: an alloca whose
-// whole-object content is written by `store (load %orig), %alloca` or
-// `cir.copy %orig to %alloca`. handler::setNDRangeDescriptor takes the
-// nd_range_view BY VALUE, so the launch operand is a copy while the field
-// stores (MGlobalSize/MLocalSize/MDims) live on the original; strip to it.
-static mlir::Value stripAggregateCopy(mlir::Value v) {
-  for (unsigned i = 0; i < 8 && v; ++i) {
-    mlir::Value src;
-    for (mlir::Operation *u : v.getUsers()) {
-      if (auto st = mlir::dyn_cast<cir::StoreOp>(u)) {
-        if (st.getAddr() != v)
-          continue;
-        // A whole-object store of a loaded aggregate is a by-value copy.
-        if (auto load = st.getValue().getDefiningOp<cir::LoadOp>())
-          src = load.getAddr();
-      } else if (auto cp = mlir::dyn_cast<cir::CopyOp>(u)) {
-        if (cp.getDst() == v)
-          src = cp.getSrc();
-      }
-    }
-    if (!src)
-      break;
-    v = src;
-  }
-  return v;
-}
-
-// Recover the constant nd_range geometry from the nd_range_view pointer operand
-// of a runtime launch call (on the inlined clone). The view constructor stored
-// interior pointers into its MGlobalSize/MLocalSize fields that alias the
-// nd_range object's array slots; trace those back to the constant stores.
-static SyclGeometry traceNDRange(MemoryReader &reader,
-                                 mlir::Value viewOperand) {
-  SyclGeometry g;
-  // The member names live on the original view object, whose fields the view
-  // constructor wrote; the operand may be a by-value copy of it.
-  mlir::Value view = stripAggregateCopy(stripToPointerObject(viewOperand));
-  if (!view)
-    return g;
-  MemLoc viewLoc = reader.decompose(view);
-
-  auto fieldValue = [&](llvm::StringRef field) -> mlir::Value {
-    for (mlir::Operation *u : view.getUsers()) {
-      auto gm = mlir::dyn_cast<cir::GetMemberOp>(u);
-      if (!gm || gm.getName() != field)
-        continue;
-      MemLoc loc = reader.decompose(gm.getResult());
-      if (loc.root != viewLoc.root)
-        return {};
-      return reader.valueAt(
-          loc, reader.sizeOf(gm.getResult().getType().getPointee()));
-    }
-    return {};
-  };
-
-  unsigned dims = 0;
-  if (mlir::Value d = fieldValue("MDims"))
-    if (auto dv = asConstInt(d))
-      dims = static_cast<unsigned>(*dv);
-  if (dims == 0 || dims > 3)
-    dims = 1;
-  g.dims = dims;
-
-  // Read `dims` consecutive elements of the size array a field points at. The
-  // field holds &common_array[0].
-  auto readSizes =
-      [&](llvm::StringRef field,
-          llvm::SmallVectorImpl<std::optional<int64_t>> &out) -> bool {
-    mlir::Value interior = fieldValue(field);
-    if (!interior)
-      return false;
-    // A plain-range launch stores a null pointer for MLocalSize (no explicit
-    // local work-group size): that field is absent, not unrecovered.
-    if (auto c = interior.getDefiningOp<cir::ConstantOp>())
-      if (auto p = mlir::dyn_cast<cir::ConstPtrAttr>(c.getValue()))
-        if (p.isNullValue())
-          return false;
-    auto ptrTy = mlir::dyn_cast<cir::PointerType>(interior.getType());
-    if (!ptrTy)
-      return false;
-    uint64_t elt = reader.sizeOf(ptrTy.getPointee());
-    MemLoc base = reader.decompose(interior);
-    for (unsigned i = 0; i < dims; ++i) {
-      MemLoc p = base;
-      p.offset += i * elt;
-      out.push_back(reader.constIntAt(p, elt));
-    }
-    return true;
-  };
-
-  bool haveGlobal = readSizes("MGlobalSize", g.global);
-  bool haveLocal = readSizes("MLocalSize", g.local);
-  // A plain-range launch (RoundedRangeKernel) carries no explicit local size;
-  // do not fabricate one.
-  if (!haveLocal)
-    g.local.clear();
-  g.valid = haveGlobal;
-  return g;
-}
-
-//===----------------------------------------------------------------------===//
-// SYCL closure-pointer allocation distinctness (llvm.noalias inference)
-//===----------------------------------------------------------------------===//
-//
-// A device kernel pointer parameter is bound to a closure capture field (see
-// the spir_kernel prologue: arg -> slot -> address_space cast -> store into a
-// cir.get_member of the closure). On the host, the same field is written the
-// captured pointer value. If two captured pointers come from two DISTINCT USM
-// allocations then their device parameters cannot alias, so each may carry
-// `llvm.noalias`. This runs on the same collapsed clone as the geometry
-// recovery: the field stores live in the user function, ahead of the launch
-// chain, so a single inline exposes them.
-
-// Whether `call` is a SYCL USM allocation (malloc_device / malloc_shared /
-// malloc_host). Two distinct such calls return provably non-overlapping
-// storage.
-static bool isUSMAllocCall(cir::CallOp call) {
-  std::optional<llvm::StringRef> callee = call.getCallee();
-  if (!callee)
-    return false;
-  return callee->contains("malloc_device") ||
-         callee->contains("malloc_shared") || callee->contains("malloc_host");
-}
-
-// Follow a captured-pointer field's stored value back to the USM allocation
-// that produced it, seeing through offset-0 reinterprets and through values
-// reloaded from memory -- a spill slot, or a `[&]`-captured pointer read
-// through the closure copies (which is what lets noalias fire on the common
-// q.submit(handler) path, where the USM allocations live in the caller and
-// reach the closure only by reference). Only a value that resolves to a USM
-// allocation call is an allocation identity; pointer arithmetic (a + offset),
-// an opaque parameter, a global or a buffer stops the walk and yields null --
-// conservatively "not a distinct allocation".
-static cir::CallOp resolveUSMAllocation(MemoryReader &reader, mlir::Value v) {
-  for (unsigned i = 0; i < 24 && v; ++i) {
-    mlir::Operation *def = v.getDefiningOp();
-    if (!def)
-      return {};
-    if (auto call = mlir::dyn_cast<cir::CallOp>(def))
-      return isUSMAllocCall(call) ? call : cir::CallOp{};
-    if (auto cast = mlir::dyn_cast<cir::CastOp>(def)) {
-      if (cast.getKind() == cir::CastKind::bitcast ||
-          cast.getKind() == cir::CastKind::address_space) {
-        v = cast.getSrc();
-        continue;
-      }
-      return {};
-    }
-    if (auto load = mlir::dyn_cast<cir::LoadOp>(def)) {
-      v = reader.loadedValue(load);
-      continue;
-    }
-    return {};
-  }
-  return {};
-}
-
-// Peel base_class_addr / bitcast / address_space reinterprets and spill slots
-// off `v` to reach the record object it addresses.
-static mlir::Value stripToRecordObject(mlir::Value v) {
-  for (unsigned i = 0; i < 16 && v; ++i) {
-    v = stripToPointerObject(v);
-    mlir::Operation *def = v.getDefiningOp();
-    if (!def)
-      break;
-    if (auto bca = mlir::dyn_cast<cir::BaseClassAddrOp>(def)) {
-      v = bca.getSrcAddr();
-      continue;
-    }
-    if (auto cast = mlir::dyn_cast<cir::CastOp>(def)) {
-      if (cast.getKind() == cir::CastKind::bitcast ||
-          cast.getKind() == cir::CastKind::address_space) {
-        v = cast.getSrc();
-        continue;
-      }
-    }
-    break;
-  }
-  return v;
-}
-
-// The lambda closure object a runtime launch captures. Direct path: the operand
-// is a HostKernelRefBase*; strip to the HostKernelRef record and take the
-// lambda pointer its constructor stored (constructor arg 1). Handler path: the
-// operand is already the lambda-bearing value (the HostKernel ctor's arg1, see
-// findHandlerClosure), which strips straight to the lambda record and has no
-// HostKernelRef wrapper -- so when no such wrapper ctor is found, the stripped
-// record is itself the closure. Null only if the operand does not reach a
-// record object (e.g. a free-function kernel).
-static mlir::Value traceClosureObject(mlir::Value closureOperand) {
-  mlir::Value hostKernelRef = stripToRecordObject(closureOperand);
-  if (!hostKernelRef)
-    return {};
-  for (mlir::Operation *user : hostKernelRef.getUsers()) {
-    auto call = mlir::dyn_cast<cir::CallOp>(user);
-    if (!call)
-      continue;
-    std::optional<llvm::StringRef> callee = call.getCallee();
-    mlir::OperandRange args = call.getArgOperands();
-    if (!callee || !callee->contains("HostKernelRef") || args.size() < 2 ||
-        args[0] != hostKernelRef)
-      continue;
-    // A HostKernelRef constructor stores the captured lambda (arg 1).
-    if (!(callee->contains("C1") || callee->contains("C2")))
-      continue;
-    return stripToRecordObject(args[1]);
-  }
-  return hostKernelRef;
-}
-
-// The capture fields of a closure object accepted by `wanted` (on the field's
-// type) and the value written into each, read by layout so a field written
-// only through a by-value copy of the closure is found too. A field whose
-// value is not determined by a unique write is reported with a null value.
-template <typename Pred>
-static void collectClosureFields(
-    MemoryReader &reader, mlir::Value closure, Pred wanted,
-    llvm::SmallVectorImpl<std::pair<llvm::StringRef, mlir::Value>> &out) {
-  if (!closure)
-    return;
-  MemLoc closureLoc = reader.decompose(closure);
-  llvm::StringSet<> seen;
-  for (mlir::Operation *user : closure.getUsers()) {
-    auto gm = mlir::dyn_cast<cir::GetMemberOp>(user);
-    if (!gm || !wanted(gm.getResult().getType().getPointee()))
-      continue;
-    if (!seen.insert(gm.getName()).second)
-      continue;
-    MemLoc loc = reader.decompose(gm.getResult());
-    mlir::Value stored;
-    if (loc.root == closureLoc.root)
-      stored = reader.valueAt(
-          loc, reader.sizeOf(gm.getResult().getType().getPointee()));
-    out.emplace_back(gm.getName(), stored);
-  }
-}
-
-//===----------------------------------------------------------------------===//
-// SYCL scalar-capture constant propagation
-//===----------------------------------------------------------------------===//
-//
-// A closure SCALAR capture field (int/float/bool, not a pointer/accessor) is
-// written the captured value on the host. When that value is the SAME
-// compile-time constant at every visible launch site, the device kernel
-// parameter bound to the field can be replaced by the constant. This mirrors
-// the noalias fold above, but over scalar fields, and records the agreed
-// constant attribute rather than a distinctness bit. Runs on the same collapsed
-// clone as the geometry / noalias recovery.
-
-// The scalar constant `v` holds, seeing through integral/bitcast reinterprets
-// CIRGen inserts around a captured scalar, or null if it is not a compile-time
-// scalar constant. Only int/float/bool constants qualify (a pointer/aggregate
-// constant is not a scalar capture we propagate).
-static mlir::TypedAttr asConstScalar(mlir::Value v) {
-  for (unsigned i = 0; i < 16 && v; ++i) {
-    if (auto c = v.getDefiningOp<cir::ConstantOp>()) {
-      mlir::TypedAttr attr = c.getValue();
-      if (mlir::isa<cir::IntAttr, cir::FPAttr, cir::BoolAttr>(attr))
-        return attr;
-      return {};
-    }
-    auto cast = v.getDefiningOp<cir::CastOp>();
-    if (cast && (cast.getKind() == cir::CastKind::integral ||
-                 cast.getKind() == cir::CastKind::bitcast)) {
-      v = cast.getSrc();
-      continue;
-    }
-    return {};
-  }
-  return {};
-}
-
-// The scalar capture fields (int/float/bool, not a pointer/accessor) of a
-// closure object and the value written into each.
-static void collectClosureScalarFields(
-    MemoryReader &reader, mlir::Value closure,
-    llvm::SmallVectorImpl<std::pair<llvm::StringRef, mlir::Value>> &out) {
-  collectClosureFields(
-      reader, closure,
-      [](mlir::Type t) {
-        return mlir::isa<cir::IntType, cir::FPTypeInterface, cir::BoolType>(t);
-      },
-      out);
-}
-
-// Fold one launch site's closure into the running constant-argument agreement
-// for a kernel. A field maps here to the constant it is stored; a field stored
-// a non-constant is simply absent. Agreement is ANDed across sites: a field
-// survives only if present with the SAME constant at this site and every
-// earlier one, so a disagreeing or non-constant store at any site drops it.
-static void foldClosureConstArgs(MemoryReader &reader,
-                                 mlir::Value closureOperand, bool &seenAnySite,
-                                 llvm::StringMap<mlir::TypedAttr> &consts) {
-  mlir::Value closure = traceClosureObject(closureOperand);
-  llvm::SmallVector<std::pair<llvm::StringRef, mlir::Value>, 4> fields;
-  collectClosureScalarFields(reader, closure, fields);
-
-  llvm::StringMap<mlir::TypedAttr> here;
-  for (auto &f : fields) {
-    mlir::TypedAttr c = asConstScalar(f.second);
-    // A field appearing twice, or a non-constant store, is not a clean
-    // single-constant source: drop it for this site.
-    if (!c || here.count(f.first))
-      here[f.first] = nullptr;
-    else
-      here[f.first] = c;
-  }
-
-  if (!seenAnySite) {
-    consts = std::move(here);
-    seenAnySite = true;
-    return;
-  }
-  // AND across sites: keep a field only when it is present with the same
-  // constant here and previously.
-  llvm::StringMap<mlir::TypedAttr> merged;
-  for (auto &e : consts) {
-    mlir::TypedAttr hereVal = here.lookup(e.first());
-    if (e.second && hereVal && e.second == hereVal)
-      merged[e.first()] = e.second;
-  }
-  consts = std::move(merged);
-}
-
-//===----------------------------------------------------------------------===//
-// SYCL accessor buffer identity
-//===----------------------------------------------------------------------===//
-//
-// A device kernel accessor pointer parameter is bound to a closure field
-// holding a sycl::accessor. On the host the field is copy-constructed from the
-// command group's local accessor, which was built from a buffer (accessor(buf,
-// h, mode) or buf.get_access(h, ...)), reached through the command group's
-// by-reference capture. Two accessor parameters cannot alias when their
-// buffers are provably backed by different memory. CIRGen tags the buffer and
-// accessor API by declaration (cir.sycl_host_api), so the trace matches roles,
-// not mangled names.
-//
-// The memory identity of a buffer is:
-//  - buffer(range): fresh storage, identified by the buffer object itself;
-//  - buffer(hostData, range): possibly the host memory itself (use_host_ptr,
-//    or zero-copy on an integrated device), so identified by the allocation
-//    hostData points into -- a std::vector, a new/malloc result, a local
-//    array, or a USM allocation (shared with the USM pointer domain, so it can
-//    alias a USM kernel argument). The spec makes two live buffers over the
-//    same host memory undefined behavior ("Constructing more than one SYCL
-//    buffer managing the same host pointer is still undefined behavior";
-//    host memory must not be "used to construct another buffer ... during the
-//    lifetime of this buffer"), but lifetimes are not tracked here, so this
-//    does not rely on it: buffers over the same allocation share an identity;
-//  - a copy, sub-buffer or reinterpret of another buffer: that buffer's
-//    identity (sub-buffer ranges are not compared);
-//  - anything else -- a buffer reached through a function parameter, a global,
-//    the heap, an interop constructor, or an assignment -- is unknown.
-
-namespace {
-/// The memory a captured pointer or accessor is resolved to: an allocation
-/// identity (the defining op and an offset into it) and its description for
-/// remarks, or, when `op` is null, why it could not be resolved.
-struct MemIdentity {
-  mlir::Operation *op = nullptr;
-  int64_t offset = 0;
-  std::string what;
-
-  static MemIdentity unknown(llvm::Twine why) {
-    MemIdentity id;
-    id.what = why.str();
-    return id;
-  }
-  bool known() const { return op != nullptr; }
-  bool operator==(const MemIdentity &o) const {
-    return op == o.op && offset == o.offset;
-  }
-};
-} // namespace
-
-/// The cir.sycl_host_api role of `call`'s callee, and the operand holding the
-/// role's source-level argument `cir.sycl_host_api_arg` (past `sret` and
-/// `this`).
-static llvm::StringRef hostAPIRole(cir::CallOp call, mlir::Value *roleArg) {
-  cir::FuncOp callee = MemoryReader::calleeOf(call);
-  if (!callee)
-    return {};
-  auto role = callee->getAttrOfType<mlir::StringAttr>(
-      CIRDialect::getSYCLHostAPIAttrName());
-  if (!role)
-    return {};
-  if (roleArg) {
-    unsigned idx = 0;
-    if (auto a = callee->getAttrOfType<mlir::IntegerAttr>(
-            CIRDialect::getSYCLHostAPIArgAttrName()))
-      idx = a.getInt();
-    unsigned first =
-        callee.getArgAttr(0, mlir::LLVM::LLVMDialect::getStructRetAttrName())
-            ? 2  // sret, this
-            : 1; // this
-    mlir::OperandRange args = call.getArgOperands();
-    *roleArg = first + idx < args.size() ? args[first + idx] : mlir::Value{};
-  }
-  return role.getValue();
-}
-
-/// The `this` operand of a method call, past an `sret` result slot.
-static mlir::Value receiverOf(cir::CallOp call) {
-  cir::FuncOp callee = MemoryReader::calleeOf(call);
-  unsigned idx =
-      callee && callee.getArgAttr(
-                    0, mlir::LLVM::LLVMDialect::getStructRetAttrName())
-          ? 1
-          : 0;
-  mlir::OperandRange args = call.getArgOperands();
-  return idx < args.size() ? args[idx] : mlir::Value{};
-}
-
-/// A short name for the object at `loc`, from its alloca, for remarks.
-static std::string objectName(MemLoc loc) {
-  if (auto alloca =
-          loc.root ? loc.root.getDefiningOp<cir::AllocaOp>() : cir::AllocaOp{})
-    return ("'" + alloca.getName() + "'").str();
-  return "<unnamed>";
-}
-
-/// Why the object `loc` addresses is not a visible local: a function
-/// parameter, a global, or memory the trace could not follow.
-static std::string notLocalReason(llvm::StringRef what, MemLoc loc) {
-  if (!loc.root)
-    return (what + " is not visible").str();
-  if (mlir::isa<mlir::BlockArgument>(loc.root))
-    return (what + " is a function parameter").str();
-  if (loc.root.getDefiningOp<cir::GetGlobalOp>())
-    return (what + " is a global").str();
-  if (loc.root.getDefiningOp<cir::CallOp>())
-    return (what + " is on the heap").str();
-  return (what + " is reached through memory the analysis cannot follow").str();
-}
-
-/// The allocation a buffer's host pointer points into.
-static MemIdentity resolveHostAllocation(MemoryReader &reader, mlir::Value ptr,
-                                         llvm::StringRef bufName) {
-  for (unsigned i = 0; i < 24 && ptr; ++i) {
-    mlir::Operation *def = ptr.getDefiningOp();
-    if (!def)
-      break;
-    if (auto cast = mlir::dyn_cast<cir::CastOp>(def)) {
-      if (cast.getKind() == cir::CastKind::bitcast ||
-          cast.getKind() == cir::CastKind::address_space) {
-        ptr = cast.getSrc();
-        continue;
-      }
-      if (cast.getKind() == cir::CastKind::array_to_ptrdecay) {
-        MemLoc arr = reader.decompose(cast.getSrc());
-        if (auto alloca = arr.root ? arr.root.getDefiningOp<cir::AllocaOp>()
-                                   : cir::AllocaOp{}) {
-          MemIdentity id;
-          id.op = alloca;
-          id.what = "local array " + objectName(arr);
-          return id;
-        }
-        break;
-      }
-      break;
-    }
-    if (auto load = mlir::dyn_cast<cir::LoadOp>(def)) {
-      ptr = reader.loadedValue(load);
-      continue;
-    }
-    if (auto call = mlir::dyn_cast<cir::CallOp>(def)) {
-      if (isUSMAllocCall(call)) {
-        MemIdentity id;
-        id.op = call;
-        id.what = "a USM allocation";
-        return id;
-      }
-      std::optional<llvm::StringRef> callee = call.getCallee();
-      if (callee &&
-          (*callee == "_Znwm" || *callee == "_Znam" || *callee == "malloc" ||
-           *callee == "calloc" || *callee == "aligned_alloc")) {
-        MemIdentity id;
-        id.op = call;
-        id.what = "a heap allocation";
-        return id;
-      }
-      if (hostAPIRole(call, nullptr) == "vector.data") {
-        // Distinct std::vector objects own distinct storage.
-        MemLoc vec = reader.decompose(receiverOf(call));
-        auto alloca = vec.root ? vec.root.getDefiningOp<cir::AllocaOp>()
-                               : cir::AllocaOp{};
-        if (!alloca)
-          return MemIdentity::unknown(notLocalReason(
-              ("the std::vector behind buffer " + bufName).str(), vec));
-        MemIdentity id;
-        id.op = alloca;
-        id.offset = vec.offset;
-        id.what = "std::vector " + objectName(vec);
-        return id;
-      }
-    }
-    break;
-  }
-  return MemIdentity::unknown("the host pointer of buffer " + bufName +
-                              " has unknown provenance");
-}
-
-/// The memory identity of the sycl::buffer object `bufPtr` addresses.
-static MemIdentity resolveBufferIdentity(MemoryReader &reader,
-                                         mlir::Value bufPtr, unsigned depth) {
-  MemLoc loc = reader.decompose(bufPtr);
-  std::string name = objectName(loc);
-  if (depth > 8)
-    return MemIdentity::unknown("buffer " + name + " is derived too deeply");
-  auto alloca =
-      loc.root ? loc.root.getDefiningOp<cir::AllocaOp>() : cir::AllocaOp{};
-  auto ptrTy = mlir::dyn_cast<cir::PointerType>(bufPtr.getType());
-  if (!alloca || !ptrTy)
-    return MemIdentity::unknown(notLocalReason("the buffer", loc));
-  cir::CallOp init =
-      reader.uniqueInitializer(loc, reader.sizeOf(ptrTy.getPointee()));
-  if (!init)
-    return MemIdentity::unknown("buffer " + name +
-                                " is not constructed exactly once");
-  mlir::Value arg;
-  llvm::StringRef role = hostAPIRole(init, &arg);
-  if (role == "buffer.alloc") {
-    MemIdentity id;
-    id.op = alloca;
-    id.offset = loc.offset;
-    id.what = "buffer " + name;
-    return id;
-  }
-  if (role == "buffer.host_ptr") {
-    MemIdentity id = resolveHostAllocation(reader, arg, name);
-    if (id.known())
-      id.what = "buffer " + name + " over " + id.what;
-    return id;
-  }
-  if (role == "buffer.copy" || role == "buffer.sub")
-    return arg ? resolveBufferIdentity(reader, arg, depth + 1)
-               : MemIdentity::unknown("buffer " + name + " has no source");
-  if (role == "buffer.reinterpret")
-    return resolveBufferIdentity(reader, receiverOf(init), depth + 1);
-  return MemIdentity::unknown("buffer " + name +
-                              " is built by a constructor the analysis does "
-                              "not model");
-}
-
-/// The memory identity of the buffer behind the sycl::accessor object at
-/// `loc`, through accessor copies back to its construction from a buffer.
-static MemIdentity resolveAccessorIdentity(MemoryReader &reader, MemLoc loc,
-                                           uint64_t size, unsigned depth) {
-  std::string name = objectName(loc);
-  if (depth > 8)
-    return MemIdentity::unknown("accessor " + name + " is copied too deeply");
-  cir::CallOp init = reader.uniqueInitializer(loc, size);
-  if (!init)
-    return MemIdentity::unknown("accessor " + name +
-                                " is not constructed exactly once");
-  mlir::Value arg;
-  llvm::StringRef role = hostAPIRole(init, &arg);
-  if (role == "accessor.copy" && arg)
-    return resolveAccessorIdentity(reader, reader.decompose(arg), size,
-                                   depth + 1);
-  if (role == "accessor.from_buffer" && arg)
-    return resolveBufferIdentity(reader, arg, 0);
-  if (role == "buffer.get_access")
-    return resolveBufferIdentity(reader, receiverOf(init), 0);
-  return MemIdentity::unknown("accessor " + name +
-                              " is built by a constructor the analysis does "
-                              "not model");
 }
 
 // The noalias candidates of a kernel: see SYCLNoAliasCandidates.
@@ -2270,96 +900,6 @@ cir::getSYCLNoAliasCandidates(llvm::ArrayRef<cir::FuncOp> deviceKernels) {
   return merged;
 }
 
-/// The memory a candidate closure field refers to: the USM allocation of a
-/// captured pointer, or the buffer behind a captured accessor.
-static MemIdentity resolveClosureField(MemoryReader &reader,
-                                       mlir::Value closure,
-                                       llvm::StringRef field, bool isAccessor) {
-  MemLoc closureLoc = reader.decompose(closure);
-  for (mlir::Operation *user : closure.getUsers()) {
-    auto gm = mlir::dyn_cast<cir::GetMemberOp>(user);
-    if (!gm || gm.getName() != field)
-      continue;
-    MemLoc loc = reader.decompose(gm.getResult());
-    if (loc.root != closureLoc.root)
-      break;
-    uint64_t size = reader.sizeOf(gm.getResult().getType().getPointee());
-    if (isAccessor)
-      return resolveAccessorIdentity(reader, loc, size, 0);
-    mlir::Value stored = reader.valueAt(loc, size);
-    if (cir::CallOp alloc = resolveUSMAllocation(reader, stored)) {
-      MemIdentity id;
-      id.op = alloc;
-      id.what = "a USM allocation";
-      return id;
-    }
-    return MemIdentity::unknown("pointer '" + field +
-                                "' is not a visible USM allocation");
-  }
-  return MemIdentity::unknown("'" + field +
-                              "' is not found in the launch's closure");
-}
-
-// Fold one launch site's closure into the running noalias verdicts for a
-// kernel. A candidate field (see NoAliasCandidates) is eligible at this site
-// iff its memory is known and distinct from that of every other candidate of
-// the same closure; an unresolved field poisons itself and, being possibly
-// aliasing, every other field. The verdict is ANDed across sites, so a field
-// kept here must have held at every earlier site; the first rejection's
-// reason is kept.
-static void foldClosureNoAlias(MemoryReader &reader, mlir::Value closureOperand,
-                               const NoAliasCandidates &candidates,
-                               bool &seenAnySite,
-                               llvm::StringMap<NoAliasDecision> &decisions) {
-  mlir::Value closure = traceClosureObject(closureOperand);
-  llvm::SmallVector<llvm::StringRef, 4> names;
-  for (const auto &c : candidates.fields)
-    names.push_back(c.first());
-  llvm::sort(names);
-
-  llvm::SmallVector<MemIdentity, 4> ids;
-  for (llvm::StringRef name : names) {
-    ids.push_back(
-        closure ? resolveClosureField(reader, closure, name,
-                                      candidates.fields.lookup(name))
-                : MemIdentity::unknown("the launch's closure is not visible"));
-    LLVM_DEBUG(llvm::dbgs() << "noalias: field '" << name << "' -> "
-                            << (ids.back().known() ? "" : "unknown: ")
-                            << ids.back().what << "\n");
-  }
-
-  llvm::StringMap<NoAliasDecision> here;
-  for (auto [i, name] : llvm::enumerate(names)) {
-    NoAliasDecision &d = here[name];
-    if (!candidates.poison.empty()) {
-      d.note = candidates.poison;
-      continue;
-    }
-    if (!ids[i].known()) {
-      d.note = ids[i].what;
-      continue;
-    }
-    d.ok = true;
-    d.note = ids[i].what;
-    for (auto [j, other] : llvm::enumerate(names)) {
-      if (i == j)
-        continue;
-      if (!ids[j].known()) {
-        d = {false, ("'" + other + "' may alias it: " + ids[j].what).str()};
-        break;
-      }
-      if (ids[j] == ids[i]) {
-        d = {false, ("'" + name + "' and '" + other +
-                     "' use the same memory, " + ids[i].what)
-                        .str()};
-        break;
-      }
-    }
-  }
-
-  andNoAliasDecisions(std::move(here), seenAnySite, decisions);
-}
-
 void cir::andNoAliasDecisions(llvm::StringMap<NoAliasDecision> here,
                               bool &seenAnySite,
                               llvm::StringMap<NoAliasDecision> &decisions) {
@@ -2381,152 +921,6 @@ void cir::andNoAliasDecisions(llvm::StringMap<NoAliasDecision> here,
     merged[e.first()] = std::move(d);
   }
   decisions = std::move(merged);
-}
-
-// Recover per-kernel constant nd_range geometry for the whole container, and
-// (out) the closure capture fields whose USM allocations are pairwise distinct
-// at every launch site. Clones the host module, collapses the launch chain,
-// then for each surviving getDeviceKernelInfo marker resolves the kernel it
-// names and traces the launch it feeds. Keyed by the kernel's _ZTS mangled name
-// so the results map straight onto the SYCL bindings, which are keyed the same.
-static llvm::StringMap<SyclGeometry> computeSYCLGeometry(
-    mlir::ModuleOp container,
-    const llvm::StringMap<NoAliasCandidates> &noAliasCandidates,
-    llvm::StringMap<llvm::StringSet<>> &noAliasFields,
-    llvm::StringMap<llvm::StringMap<std::string>> &noAliasNotes,
-    llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> &constArgs,
-    llvm::StringMap<llvm::SmallVector<std::string, 1>> &factSites) {
-  llvm::StringMap<SyclGeometry> result;
-  // Per-kernel running noalias verdicts, ANDed across the kernel's sites.
-  llvm::StringMap<bool> seenSite;
-  llvm::StringMap<llvm::StringMap<NoAliasDecision>> eligible;
-  // Kernels with a launch in user code whose closure was not recovered: their
-  // verdicts cannot hold at that launch.
-  llvm::StringSet<> unrecoveredSite;
-  // Per-kernel running constant-argument agreement, ANDed across the sites.
-  llvm::StringMap<bool> constSeenSite;
-  llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> constEligible;
-  mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
-
-  // Throwaway clone -- the real emitted module is never mutated.
-  mlir::OwningOpRef<mlir::ModuleOp> clone(
-      mlir::cast<mlir::ModuleOp>(hostModule->clone()));
-
-  // This is a throwaway analysis clone, so exception edges do not matter. Mark
-  // every call nothrow before flattening: otherwise FlattenCFG lowers throwing
-  // calls inside cleanup scopes into cir.try_call terminators, which the
-  // call-based inliner below cannot collapse (the launch shims call each other
-  // from inside cleanup scopes). With nothrow set, the cleanup scopes flatten
-  // to plain control flow and every launch-chain call stays a cir.call.
-  clone->walk([](cir::CallOp call) { call.setNothrow(true); });
-
-  // Flatten so cir.return becomes a block terminator (the inliner's
-  // handleTerminator only rewrites top-level return terminators).
-  mlir::PassManager pm(clone->getContext(), mlir::ModuleOp::getOperationName());
-  pm.addPass(mlir::createCIRFlattenCFGPass());
-  if (mlir::failed(pm.run(*clone)))
-    return result;
-
-  // Synthesize the type-erased-submit call edge (handler path) before inlining,
-  // so the handler-submit launch collapses into the user function too.
-  bridgeSubmitCGF(*clone);
-  inlineLaunchChain(*clone);
-  LLVM_DEBUG(llvm::dbgs() << "collapsed launch clone:\n" << *clone << "\n");
-  MemoryReader reader(*clone);
-
-  clone->walk([&](cir::CallOp call) {
-    if (!isGetDeviceKernelInfoCall(call))
-      return;
-    cir::GlobalOp nameString = resolveLaunchedNameString(call);
-    if (!nameString)
-      return;
-    std::optional<RecoveredLaunch> launch = recoverLaunch(call->getResult(0));
-    llvm::StringRef kernel = getGlobalStringValue(nameString);
-    LLVM_DEBUG(llvm::dbgs()
-               << "launch of " << kernel << ": "
-               << (launch ? "recovered" : "not recovered") << "\n");
-    auto enclosing = call->getParentOfType<cir::FuncOp>();
-    bool inUserCode = enclosing && !isLaunchChainCallee(enclosing) &&
-                      !enclosing->hasAttr("cir.sycl.cg_body");
-    if (inUserCode && (!launch || !launch->closure))
-      unrecoveredSite.insert(kernel);
-    if (!launch)
-      return;
-    SyclGeometry geom = traceNDRange(reader, launch->geometry);
-    result[kernel] = geom;
-    // Whether this launch in user code alone gives a fact (a constant local
-    // size, a distinct field or a constant capture): the user function
-    // holding it, for launch-path internalization.
-    bool factHere =
-        inUserCode && geom.valid && !geom.local.empty() &&
-        llvm::all_of(geom.local, [](const std::optional<int64_t> &d) {
-          return d.has_value();
-        });
-    // Fold this launch's closure into the kernel's noalias eligibility, but
-    // only for the collapsed launch sites in user code. Inlining leaves a copy
-    // of each marker inside the still-present launch-shim bodies too, where the
-    // closure is only a by-reference parameter (a block argument) with no
-    // visible capture stores; folding those would spuriously poison every
-    // field. The real launch sites are the inlined ones in non-shim functions.
-    if (inUserCode && launch->closure) {
-      auto cands = noAliasCandidates.find(kernel);
-      if (cands != noAliasCandidates.end()) {
-        bool seen = seenSite.lookup(kernel);
-        foldClosureNoAlias(reader, launch->closure, cands->second, seen,
-                           eligible[kernel]);
-        seenSite[kernel] = seen;
-      }
-      bool constSeen = constSeenSite.lookup(kernel);
-      foldClosureConstArgs(reader, launch->closure, constSeen,
-                           constEligible[kernel]);
-      constSeenSite[kernel] = constSeen;
-      if (!factHere) {
-        bool first = false;
-        llvm::StringMap<mlir::TypedAttr> consts;
-        foldClosureConstArgs(reader, launch->closure, first, consts);
-        bool any = llvm::any_of(
-            consts, [](const auto &c) { return static_cast<bool>(c.second); });
-        if (!any && cands != noAliasCandidates.end()) {
-          first = false;
-          llvm::StringMap<NoAliasDecision> here;
-          foldClosureNoAlias(reader, launch->closure, cands->second, first,
-                             here);
-          any = llvm::any_of(here, [](const auto &d) { return d.second.ok; });
-        }
-        factHere = any;
-      }
-    }
-    if (factHere) {
-      llvm::SmallVector<std::string, 1> &roots = factSites[kernel];
-      if (!llvm::is_contained(roots, enclosing.getSymName()))
-        roots.push_back(enclosing.getSymName().str());
-    }
-  });
-
-  // Publish the surviving distinct-memory fields per kernel, and the verdict
-  // notes for remarks.
-  for (auto &e : eligible) {
-    bool unrecovered = unrecoveredSite.contains(e.first());
-    llvm::StringSet<> &fields = noAliasFields[e.first()];
-    llvm::StringMap<std::string> &notes = noAliasNotes[e.first()];
-    for (auto &f : e.second) {
-      if (f.second.ok && !unrecovered)
-        fields.insert(f.first());
-      notes[f.first()] = unrecovered && f.second.ok
-                             ? "a launch of the kernel is not recovered"
-                             : f.second.note;
-    }
-  }
-
-  // Publish the surviving agreed-constant scalar fields per kernel.
-  for (auto &e : constEligible) {
-    llvm::StringMap<mlir::TypedAttr> &fields = constArgs[e.first()];
-    for (auto &f : e.second)
-      if (f.second)
-        fields[f.first()] = f.second;
-  }
-
-  return result;
 }
 
 // SYCL binding: there is no host stub and no cu.kernel_name. Bind each device
@@ -2587,16 +981,13 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
       if (binding.deviceKernels.empty()) {
         binding.kind = BindingKind::SYCLName;
         binding.hostNameString = nameString;
-        bool registered = isRegisteredKernel(container, name);
-        // The closed-TU rule, and the open one: no other TU can launch the
-        // kernel (T26b).
-        binding.isTULocalOptimizable =
-            isLambdaClosureKernel(kernel, name) && !registered;
+        binding.isRegistered = isRegisteredSYCLKernel(container, name);
+        // The open rule: no other TU can launch the kernel (T26b).
         if (!getterLocality)
           getterLocality = getSYCLKernelInfoLocality(container);
         binding.isTUUnique =
             isTUUniqueSYCLKernel(container, kernel, name, &*getterLocality) &&
-            !registered;
+            !binding.isRegistered;
       }
       binding.deviceKernels.push_back(kernel);
     });
@@ -2605,9 +996,9 @@ void KernelBindingTable::bindSYCLKernels(mlir::ModuleOp container) {
   recordSYCLLaunchSites(container);
 }
 
-// Records one launch site per host `getDeviceKernelInfo<Kernel>()` marker,
-// resolving the kernel it names through the CompileTimeKernelInfo chain and the
-// runtime launch call it feeds. Bindings already carry their name-strings.
+// Records one launch site per host kernel.info marker, resolving the kernel it
+// names through the CompileTimeKernelInfo chain and the launch call it feeds.
+// Bindings already carry their name-strings.
 void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
   mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
 
@@ -2622,11 +1013,6 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
   if (byNameString.empty())
     return;
 
-  // Recover constant nd_range work-group sizes once for the whole container
-  // (inline the launch-shim chain on a throwaway clone, then trace memory).
-  // Keyed by _ZTS mangled name, the same key the bindings use. The same clone
-  // also yields the closure capture fields backed by pairwise-distinct USM
-  // allocations, so noalias can be inferred without cloning twice.
   // The noalias candidates of each kernel, from its device parameters. Every
   // device copy (multi-arch) must agree on them.
   llvm::StringMap<NoAliasCandidates> noAliasCandidates;
@@ -2635,40 +1021,7 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
       continue;
     noAliasCandidates[binding.first] =
         getSYCLNoAliasCandidates(binding.second.deviceKernels);
-  }
-
-  llvm::StringMap<llvm::StringSet<>> noAliasFields;
-  llvm::StringMap<llvm::StringMap<std::string>> noAliasNotes;
-  llvm::StringMap<llvm::StringMap<mlir::TypedAttr>> constArgs;
-  llvm::StringMap<llvm::SmallVector<std::string, 1>> factSites;
-  // Under HostFactsMode::IPO, applyHostFacts replaces everything the trace
-  // gives (the noalias fields and notes of every kernel with candidates, the
-  // constants and every site's geometry), so the trace is not run: it is the
-  // cost of the table (most of it on big TUs), and the passes build one table
-  // each.
-  llvm::StringMap<SyclGeometry> geometry;
-  if (hostFactsOptions.mode != HostFactsMode::IPO)
-    geometry = computeSYCLGeometry(container, noAliasCandidates, noAliasFields,
-                                   noAliasNotes, constArgs, factSites);
-
-  for (auto &binding : bindings) {
-    if (binding.second.kind != BindingKind::SYCLName)
-      continue;
-    auto it = noAliasFields.find(binding.first);
-    if (it != noAliasFields.end())
-      binding.second.syclNoAliasFields = std::move(it->second);
-    auto nit = noAliasNotes.find(binding.first);
-    if (nit != noAliasNotes.end())
-      binding.second.syclNoAliasNotes = std::move(nit->second);
-    auto candIt = noAliasCandidates.find(binding.first);
-    if (candIt != noAliasCandidates.end())
-      binding.second.syclNoAliasBlocked = candIt->second.poison;
-    auto cit = constArgs.find(binding.first);
-    if (cit != constArgs.end())
-      binding.second.syclConstArgs = std::move(cit->second);
-    auto fit = factSites.find(binding.first);
-    if (fit != factSites.end())
-      binding.second.syclLegacyFactSites = std::move(fit->second);
+    binding.second.syclNoAliasBlocked = noAliasCandidates[binding.first].poison;
   }
 
   hostModule.walk([&](cir::CallOp call) {
@@ -2680,15 +1033,9 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
     auto it = byNameString.find(nameString.getOperation());
     if (it == byNameString.end())
       return;
-    // The launch consumes the DeviceKernelInfo* this marker produced -- either
-    // submit_kernel_direct_with_event_impl (direct) or handler::
-    // setDeviceKernelInfoPtr (handler submit). A marker whose result never
-    // reaches a launch (e.g. inlined away) records nothing rather than a site
-    // with no call. On the real (un-inlined) module the geometry/closure
-    // operands are co-located with the marker only on the direct path; on the
-    // handler path they are recovered on the analysis clone (see
-    // computeSYCLGeometry) and read back from the per-kernel maps below, so
-    // leaving the Values null here is expected.
+    // The launch consumes the DeviceKernelInfo* this marker produced. A
+    // marker whose result never reaches a launch records nothing rather than
+    // a site with no call.
     std::optional<RecoveredLaunch> launch = recoverLaunch(call->getResult(0));
     if (!launch)
       return;
@@ -2699,22 +1046,16 @@ void KernelBindingTable::recordSYCLLaunchSites(mlir::ModuleOp container) {
     site.stubCall = launch->anchor;
     site.syclMarkerCall = call;
     site.syclKernelName = it->second;
-    site.allLaunchesVisible = binding.isTULocalOptimizable;
-    site.syclGeometry = launch->geometry;
     site.syclClosure = launch->closure;
-    auto geomIt = geometry.find(it->second);
-    if (geomIt != geometry.end())
-      site.syclNDRange = geomIt->second;
     binding.launchSites.push_back(site);
   });
 
-  if (hostFactsOptions.mode != HostFactsMode::Legacy)
+  if (hostFactsOptions.mode == HostFactsMode::IPO)
     applyHostFacts(container, noAliasCandidates);
 }
 
-// --cir-offload-host-facts=ipo|both: the noalias verdicts of SYCLHostFacts,
-// which replace the legacy ones (ipo) or are compared with them (both). The
-// candidates and the poison are the same for both sources.
+// --cir-offload-host-facts=ipo: the noalias verdicts, the scalar-capture
+// constants and the geometry of SYCLHostFacts.
 void KernelBindingTable::applyHostFacts(
     mlir::ModuleOp container,
     const llvm::StringMap<SYCLNoAliasCandidates> &candidates) {
@@ -2723,87 +1064,31 @@ void KernelBindingTable::applyHostFacts(
     ownFacts.emplace(container, hostFactsOptions);
   const SYCLHostFacts &facts =
       hostFactsCache ? hostFactsCache->get(hostFactsOptions) : *ownFacts;
-  bool ipoMode = hostFactsOptions.mode == HostFactsMode::IPO;
   for (auto &entry : bindings) {
     KernelBinding &binding = entry.second;
     if (binding.kind != BindingKind::SYCLName)
       continue;
-    // A kernel a pass specialized after the facts were built is asked about
-    // under the name of the kernel it was cloned from (see
-    // SYCLHostFactsCache::recordSpecialization).
-    llvm::StringRef factsName =
-        hostFactsCache ? hostFactsCache->getOriginalKernel(entry.first)
-                       : entry.first;
 
     // The scalar-capture constants.
-    llvm::StringMap<SYCLHostFacts::ConstFact> consts =
-        facts.constantFields(factsName);
-    if (ipoMode) {
-      binding.syclConstArgs.clear();
-      for (auto &c : consts)
-        if (c.second.value)
-          binding.syclConstArgs[c.first()] = c.second.value;
-    } else {
-      llvm::SmallVector<llvm::StringRef, 4> names;
-      for (const auto &c : consts)
-        names.push_back(c.first());
-      llvm::sort(names);
-      for (llvm::StringRef name : names) {
-        HostFactsConstComparison cmp;
-        cmp.kernel = entry.first.str();
-        cmp.field = name.str();
-        cmp.legacy = binding.syclConstArgs.lookup(name);
-        cmp.ipo = consts.lookup(name).value;
-        cmp.ipoNote = consts.lookup(name).note;
-        hostFactsConstComparisons.push_back(std::move(cmp));
-      }
+    for (auto &c : facts.constantFields(entry.first)) {
+      if (c.second.value)
+        binding.syclConstArgs[c.first()] = c.second.value;
+      binding.syclConstNotes[c.first()] = c.second.note;
     }
 
-    // The geometry, the same for every launch site (as the legacy one).
-    SYCLHostFacts::GeometryFact geometry = facts.geometry(factsName);
-    if (ipoMode) {
-      for (LaunchSite &site : binding.launchSites)
-        site.syclNDRange = geometry.geometry;
-    } else {
-      HostFactsGeometryComparison cmp;
-      cmp.kernel = entry.first.str();
-      if (!binding.launchSites.empty())
-        cmp.legacy = binding.launchSites.front().syclNDRange;
-      cmp.ipo = geometry.geometry;
-      cmp.ipoNote = geometry.note;
-      hostFactsGeometryComparisons.push_back(std::move(cmp));
-    }
+    // The geometry, the same for every launch site.
+    SYCLHostFacts::GeometryFact geometry = facts.geometry(entry.first);
+    for (LaunchSite &site : binding.launchSites)
+      site.syclNDRange = geometry.geometry;
+    binding.syclGeometryNote = geometry.note;
 
     auto candIt = candidates.find(entry.first);
     if (candIt == candidates.end() || candIt->second.fields.empty())
       continue;
-    llvm::StringMap<NoAliasDecision> ipo =
-        facts.noAliasFields(factsName, candIt->second);
-    if (hostFactsOptions.mode == HostFactsMode::IPO) {
-      binding.syclNoAliasFields.clear();
-      binding.syclNoAliasNotes.clear();
-      for (auto &d : ipo) {
-        if (d.second.ok)
-          binding.syclNoAliasFields.insert(d.first());
-        binding.syclNoAliasNotes[d.first()] = d.second.note;
-      }
-      continue;
-    }
-    llvm::SmallVector<llvm::StringRef, 4> names;
-    for (const auto &f : candIt->second.fields)
-      names.push_back(f.first());
-    llvm::sort(names);
-    for (llvm::StringRef name : names) {
-      HostFactsComparison cmp;
-      cmp.kernel = entry.first.str();
-      cmp.field = name.str();
-      cmp.legacy.ok = binding.syclNoAliasFields.contains(name);
-      auto noteIt = binding.syclNoAliasNotes.find(name);
-      cmp.legacy.note = noteIt != binding.syclNoAliasNotes.end()
-                            ? noteIt->second
-                            : "no launch of the kernel is recovered";
-      cmp.ipo = ipo.lookup(name);
-      hostFactsComparisons.push_back(std::move(cmp));
+    for (auto &d : facts.noAliasFields(entry.first, candIt->second)) {
+      if (d.second.ok)
+        binding.syclNoAliasFields.insert(d.first());
+      binding.syclNoAliasNotes[d.first()] = d.second.note;
     }
   }
 }
@@ -2839,9 +1124,8 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
     if (binding.second.kind == BindingKind::SYCLName) {
       cir::GlobalOp nameString = binding.second.hostNameString;
       os << "//   host-name @" << nameString.getName() << " (sycl, "
-         << (binding.second.isTULocalOptimizable ? "optimizable"
-                                                 : "conservative")
-         << ")\n";
+         << (binding.second.isTUUnique ? "tu-unique" : "shared")
+         << (binding.second.isRegistered ? ", registered" : "") << ")\n";
       if (!binding.second.syclConstArgs.empty()) {
         // Sorted for deterministic output (StringMap iteration is unordered).
         llvm::SmallVector<llvm::StringRef, 4> names;
@@ -2879,25 +1163,32 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
           !binding.second.launchSites.empty())
         os << "//   no-alias-blocked: " << binding.second.syclNoAliasBlocked
            << "\n";
-      for (const HostFactsComparison &cmp : hostFactsComparisons)
-        if (cmp.kernel == binding.first)
-          os << "//   host-facts " << cmp.field << ": "
-             << formatHostFactsVerdict("legacy", cmp.legacy) << " "
-             << formatHostFactsVerdict("ipo", cmp.ipo) << "\n";
-      for (const HostFactsConstComparison &cmp : hostFactsConstComparisons)
-        if (cmp.kernel == binding.first)
-          os << "//   host-facts const-arg " << cmp.field
-             << ": legacy=" << formatConstArg(cmp.legacy)
-             << " ipo=" << formatConstArg(cmp.ipo)
-             << (cmp.ipo || cmp.ipoNote.empty() ? "" : " (" + cmp.ipoNote + ")")
-             << "\n";
-      for (const HostFactsGeometryComparison &cmp :
-           hostFactsGeometryComparisons)
-        if (cmp.kernel == binding.first)
-          os << "//   host-facts geometry: legacy="
-             << formatSyclGeometry(cmp.legacy)
-             << " ipo=" << formatSyclGeometry(cmp.ipo)
-             << (cmp.ipoNote.empty() ? "" : " (" + cmp.ipoNote + ")") << "\n";
+      if (hostFactsOptions.mode == HostFactsMode::IPO) {
+        // Every scalar-capture candidate with its constant or why none.
+        llvm::SmallVector<llvm::StringRef, 4> names;
+        for (const auto &n : binding.second.syclConstNotes)
+          names.push_back(n.getKey());
+        llvm::sort(names);
+        for (llvm::StringRef n : names) {
+          os << "//   const-arg " << n << ": ";
+          if (mlir::TypedAttr c = binding.second.syclConstArgs.lookup(n))
+            c.print(os);
+          else
+            os << "none";
+          std::string note = binding.second.syclConstNotes.lookup(n);
+          if (!binding.second.syclConstArgs.lookup(n) && !note.empty())
+            os << " (" << note << ")";
+          os << "\n";
+        }
+        if (!binding.second.launchSites.empty()) {
+          os << "//   geometry: "
+             << formatSyclGeometry(
+                    binding.second.launchSites.front().syclNDRange);
+          if (!binding.second.syclGeometryNote.empty())
+            os << " (" << binding.second.syclGeometryNote << ")";
+          os << "\n";
+        }
+      }
     } else {
       cir::FuncOp stub = binding.second.hostStub;
       os << "//   host-stub @" << stub.getName() << "\n";
@@ -2916,12 +1207,11 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
       auto caller = stubCall->getParentOfType<cir::FuncOp>();
       os << "//   launch in @" << caller.getName();
       if (launch.kind == BindingKind::SYCLName) {
-        os << " (sycl, "
-           << (launch.allLaunchesVisible ? "all-visible" : "partial")
-           << "), closure " << (launch.getSYCLClosure() ? "traced" : "none");
-        // Recovered constant nd_range sizes, per dimension. "?" is a dimension
-        // that was not a compile-time constant; an empty local list is a plain
-        // range launch with no explicit work-group size.
+        os << " (sycl), closure "
+           << (launch.getSYCLClosure() ? "traced" : "none");
+        // Constant nd_range sizes, per dimension. "?" is a dimension that is
+        // not a compile-time constant; an empty local list is a plain range
+        // launch with no explicit work-group size.
         const cir::SyclGeometry &geom = launch.getSYCLNDRange();
         auto emit = [&](llvm::StringRef tag,
                         llvm::ArrayRef<std::optional<int64_t>> sizes) {
@@ -2964,37 +1254,11 @@ void KernelBindingTable::print(llvm::raw_ostream &os) const {
     }
     os << "//\n";
   }
-  if (hostFactsOptions.mode == HostFactsMode::Both) {
-    unsigned disagreements = 0;
-    for (const HostFactsComparison &cmp : hostFactsComparisons) {
-      if (!cmp.disagrees())
-        continue;
-      ++disagreements;
-      os << "// " << formatHostFactsDisagreement(cmp) << "\n";
-    }
-    os << "// host-facts-disagreements: " << disagreements << " of "
-       << hostFactsComparisons.size() << " candidate fields\n";
-    unsigned constDisagreements = 0, geometryDisagreements = 0;
-    for (const HostFactsConstComparison &cmp : hostFactsConstComparisons)
-      if (cmp.disagrees()) {
-        ++constDisagreements;
-        os << "// " << formatHostFactsDisagreement(cmp) << "\n";
-      }
-    for (const HostFactsGeometryComparison &cmp : hostFactsGeometryComparisons)
-      if (cmp.disagrees()) {
-        ++geometryDisagreements;
-        os << "// " << formatHostFactsDisagreement(cmp) << "\n";
-      }
-    os << "// host-facts-const-arg-disagreements: " << constDisagreements
-       << " of " << hostFactsConstComparisons.size() << " scalar fields\n";
-    os << "// host-facts-geometry-disagreements: " << geometryDisagreements
-       << " of " << hostFactsGeometryComparisons.size() << " kernels\n";
-  }
   os << "// ----------------------------\n";
 }
 
 //===----------------------------------------------------------------------===//
-// copyKernel: specialize a SYCL kernel by clone-and-redirect
+// Kernel copies (launch-path internalization)
 //===----------------------------------------------------------------------===//
 
 // The CompileTimeKernelInfo global a getDeviceKernelInfo getter reads to name
@@ -3048,7 +1312,10 @@ namespace {
 /// The kernel copy mintSYCLKernelCopy made: the device clones and the getter
 /// copy (H3) the launches are to call.
 struct MintedKernelCopy {
-  cir::SpecializedKernel spec;
+  struct {
+    std::string name;
+    llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
+  } spec;
   cir::FuncOp getter;
   // The originals the copy replaces (the name string, the
   // CompileTimeKernelInfo) and their copies H1, H2.
@@ -3057,11 +1324,11 @@ struct MintedKernelCopy {
 };
 } // namespace
 
-// Steps 1-6 of specializeSYCLKernelForLaunches (see there): the device
-// clones of `deviceKernels` under `cloneName`, the name string (H1), the
-// CompileTimeKernelInfo (H2), the getter's static-local cluster and the
-// getter copy (H3). `getter` may be null (then nothing past H1 is made, as
-// specializeSYCLKernelForLaunches always did). With `local`, the host
+// The kernel copy of LocalKernelCopier::copy (see LocalKernelCopier): the
+// device clones of `deviceKernels` under `cloneName`, the name string (H1),
+// the CompileTimeKernelInfo (H2), the getter's static-local cluster and the
+// getter copy (H3). `getter` may be null (then nothing past H1 is made).
+// With `local`, the host
 // artifacts are internal, named `<original><suffix>` and tagged with
 // cir.offload.internalized (launch-path internalization, T26).
 // `hostTable` (optional) is a symbol table of the host module to insert
@@ -3076,7 +1343,7 @@ static std::optional<MintedKernelCopy> mintSYCLKernelCopy(
   mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
   mlir::MLIRContext *ctx = container.getContext();
   MintedKernelCopy minted;
-  cir::SpecializedKernel &spec = minted.spec;
+  auto &spec = minted.spec;
   spec.name = cloneName.str();
   // A host artifact of a local copy: internal, renamed, tagged.
   auto localize = [&](mlir::Operation *op) {
@@ -3575,68 +1842,6 @@ redirectKernelNameReads(mlir::ModuleOp host, mlir::SymbolTable &hostSyms,
            << names(hostSyms.lookup<cir::FuncOp>(sym)).getValue() << ")";
   }
   return violations;
-}
-
-std::optional<cir::SpecializedKernel> cir::specializeSYCLKernelForLaunches(
-    mlir::ModuleOp container, const cir::KernelBinding &binding,
-    llvm::ArrayRef<cir::LaunchSite> sites, llvm::StringRef uniqueTag) {
-  // Only a SYCL launch we can redirect: it needs at least one marker call (the
-  // redirect edit point), a device kernel to clone, and a host name-string to
-  // re-mint. The mint is driven by the first site's marker; every site in
-  // `sites` shares that kernel's getter instantiation.
-  if (binding.kind != cir::BindingKind::SYCLName || sites.empty() ||
-      !sites.front().syclMarkerCall || binding.deviceKernels.empty() ||
-      !binding.hostNameString)
-    return std::nullopt;
-  const cir::LaunchSite &site = sites.front();
-
-  // A fresh, unique clone name. The name is an arbitrary raw string key
-  // downstream (sycl-post-link enumerates spir_kernels by calling-convention +
-  // getName, no demangling), so ".spec.<tag>" is fine; keep it unique across
-  // every device module's kernel symbols. (MLIR op handles are value wrappers
-  // whose accessors are non-const, so copy out of the const binding first.)
-  cir::FuncOp firstKernel = binding.deviceKernels.front();
-  std::string cloneName = (firstKernel.getName() + ".spec." + uniqueTag).str();
-  auto deviceCollides = [&](llvm::StringRef n) {
-    for (mlir::ModuleOp dm : cir::getOffloadContainerDeviceModules(container))
-      if (mlir::SymbolTable::lookupSymbolIn(dm, n))
-        return true;
-    return false;
-  };
-  for (unsigned n = 0; deviceCollides(cloneName); ++n)
-    cloneName =
-        (firstKernel.getName() + ".spec." + uniqueTag + "." + llvm::Twine(n))
-            .str();
-
-  // Steps 1-6: the device clones and the host artifacts (H1-H3).
-  cir::CallOp marker = site.syclMarkerCall;
-  auto getter = lookupSymbol<cir::FuncOp>(marker, marker.getCalleeAttr());
-  std::optional<MintedKernelCopy> minted = mintSYCLKernelCopy(
-      container, binding.deviceKernels, binding.hostNameString, getter,
-      cloneName, /*local=*/false, /*suffix=*/"");
-  if (!minted)
-    return std::nullopt;
-
-  // 7. H4: redirect every requested launch's marker call at the getter clone,
-  // moving exactly those launches to the clone while every other launch (this
-  // TU's or another's) keeps the original. All sites share the kernel's getter
-  // instantiation, so they repoint to the one H3.
-  auto h3Ref = mlir::FlatSymbolRefAttr::get(minted->getter.getSymNameAttr());
-  llvm::SmallVector<mlir::Operation *, 2> markers;
-  for (const cir::LaunchSite &s : sites)
-    if (cir::CallOp siteMarker = s.syclMarkerCall) {
-      siteMarker.setCalleeAttr(h3Ref);
-      markers.push_back(siteMarker);
-    }
-
-  // 8. Every other read of the kernel's name on the launch paths (T26c).
-  mlir::ModuleOp hostModule = cir::getOffloadContainerHostModule(container);
-  mlir::SymbolTable hostSyms(hostModule);
-  redirectKernelNameReads(hostModule, hostSyms,
-                          collectSymbolHolders(hostModule), *minted, markers,
-                          /*local=*/false, /*suffix=*/"");
-
-  return std::move(minted->spec);
 }
 
 cir::LocalKernelCopier::LocalKernelCopier(mlir::ModuleOp container)

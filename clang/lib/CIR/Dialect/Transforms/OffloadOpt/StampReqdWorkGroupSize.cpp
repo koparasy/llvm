@@ -7,12 +7,14 @@
 //===----------------------------------------------------------------------===//
 //
 // Stamps `cir.reqd_work_group_size` on SYCL device kernels from the host-side
-// constant nd_range local work-group size recovered by KernelBindingTable.
+// constant nd_range local work-group size of SYCLHostFacts (the stored-value
+// queries of the points-to analysis), through KernelBindingTable.
 //
 // When every launch of a kernel uses the same compile-time-constant nd_range
 // local size and no other TU launches it (KernelBinding::stampsInPlace: a
 // TU-unique kernel or the kernel copy of an internalized launch path; under
-// -cir-offload-assume-closed-tu, a lambda closure), that size is a required
+// -cir-offload-assume-closed-tu, a kernel that is not registered), that size
+// is a required
 // work-group size for the device kernel. A kernel other TUs can launch (a
 // lambda in an inline function has one closure type and one weak_odr device
 // kernel for the program) is not stamped: another TU may launch it with
@@ -51,21 +53,6 @@ namespace {
 // Agreement is a property of the whole set of sites, so a plain-range launch
 // (empty local), a runtime local size, or two launches with different locals
 // all forbid stamping a required work-group size on the kernel.
-// The constant local size of one geometry: nullopt if it has none (a plain
-// range launch, an invalid geometry) or a component is not a constant.
-static std::optional<llvm::SmallVector<int32_t, 3>>
-constantLocal(const cir::SyclGeometry &geom) {
-  if (!geom.valid || geom.local.empty())
-    return std::nullopt;
-  llvm::SmallVector<int32_t, 3> cur;
-  for (const std::optional<int64_t> &dim : geom.local) {
-    if (!dim)
-      return std::nullopt;
-    cur.push_back(static_cast<int32_t>(*dim));
-  }
-  return cur;
-}
-
 static std::optional<llvm::SmallVector<int32_t, 3>>
 commonConstantLocal(const cir::KernelBinding &binding) {
   llvm::SmallVector<int32_t, 3> common;
@@ -135,15 +122,17 @@ formatLocal(const std::optional<llvm::SmallVector<int32_t, 3>> &local) {
 void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
   mlir::ModuleOp container = getOperation();
   if (!cir::isOffloadContainer(container))
-    return;
+    return markAllAnalysesPreserved();
   std::optional<cir::HostFactsMode> mode = cir::parseHostFactsMode(hostFacts);
   if (!mode) {
     container.emitError() << "unknown host-facts mode '" << hostFacts
-                          << "' (expected legacy, ipo or both)";
+                          << "' (expected ipo or none)";
     return signalPassFailure();
   }
-  // The legacy table is the cached analysis the other container passes share;
-  // the other modes build their own.
+  if (*mode == cir::HostFactsMode::None)
+    return markAllAnalysesPreserved();
+  // The table and the host facts the container passes share
+  // (SYCLHostFactsCache).
   cir::HostFactsOptions options;
   options.mode = *mode;
   options.assumeClosedTU = hostFactsClosedTU;
@@ -154,58 +143,27 @@ void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
   options.maxSeconds = hostFactsMaxSeconds;
   options.maxMemoryMB = hostFactsMaxMemoryMB;
   options.internalize = hostFactsInternalize;
-  std::optional<cir::KernelBindingTable> ownTable;
-  cir::SYCLHostFactsCache *factsCache = nullptr;
-  if (*mode != cir::HostFactsMode::Legacy) {
-    factsCache = &getAnalysis<cir::SYCLHostFactsCache>();
-    unsigned builtBefore = factsCache->getNumBuilt();
-    ownTable.emplace(container, options, factsCache);
-    numHostFactsBuilt += factsCache->getNumBuilt() - builtBefore;
-    // The budgets that tripped while this table was built (once per
-    // change: the passes share the analysis).
-    if (std::optional<std::string> trips =
-            factsCache->get(options).takeBudgetReport())
-      mlir::emitRemark(container.getLoc())
-          << "host-facts budget trips: " << *trips << " "
-          << cir::formatHostFactsOptions(options);
-  }
-  cir::KernelBindingTable &table =
-      ownTable ? *ownTable : getAnalysis<cir::KernelBindingTable>();
-  if (*mode == cir::HostFactsMode::Both) {
-    // Legacy is the result; report where the two geometries differ, and, for
-    // the census, what each source would stamp.
-    unsigned disagreements = 0;
-    for (const cir::HostFactsGeometryComparison &cmp :
-         table.getHostFactsGeometryComparisons()) {
-      mlir::Location loc = container.getLoc();
-      const cir::KernelBinding *binding = table.lookup(cmp.kernel);
-      if (binding && !binding->deviceKernels.empty())
-        loc = binding->deviceKernels.front()->getLoc();
-      if (cmp.disagrees()) {
-        ++disagreements;
-        mlir::emitRemark(loc) << cir::formatHostFactsDisagreement(cmp);
-      } else if (hostFactsCensus) {
-        mlir::emitRemark(loc)
-            << "host-facts: " << cir::formatHostFactsComparison(cmp);
-      }
-      if (hostFactsCensus && binding) {
-        cir::KernelBinding ipo = *binding;
-        for (cir::LaunchSite &site : ipo.launchSites)
-          site.syclNDRange = cmp.ipo;
-        mlir::emitRemark(loc)
-            << "host-facts: kernel " << cmp.kernel
-            << " reqd-work-group-size legacy="
-            << formatLocal(stampedLocal(*binding, hostFactsClosedTU))
-            << " ipo=" << formatLocal(stampedLocal(ipo, hostFactsClosedTU));
-      }
-    }
+  cir::SYCLHostFactsCache &factsCache = getAnalysis<cir::SYCLHostFactsCache>();
+  unsigned builtBefore = factsCache.getNumBuilt();
+  unsigned tablesBefore = factsCache.getNumTablesBuilt();
+  const cir::KernelBindingTable &table = factsCache.getTable(options);
+  numHostFactsBuilt += factsCache.getNumBuilt() - builtBefore;
+  numTablesBuilt += factsCache.getNumTablesBuilt() - tablesBefore;
+  // The budgets that tripped while the analysis was built (once: the passes
+  // share it).
+  if (std::optional<std::string> trips =
+          factsCache.get(options).takeBudgetReport())
     mlir::emitRemark(container.getLoc())
-        << "host-facts-disagreements: " << disagreements << " of "
-        << table.getHostFactsGeometryComparisons().size()
-        << " kernel geometries " << cir::formatHostFactsOptions(options);
-  }
+        << "host-facts budget trips: " << *trips << " "
+        << cir::formatHostFactsOptions(options);
   mlir::OpBuilder builder(container);
   bool changed = false;
+  auto remark = [](cir::FuncOp kernel, cir::OffloadRemarkKind kind,
+                   const llvm::Twine &text) {
+    cir::emitOffloadRemark(kernel.getLoc(), kind, "StampReqdWorkGroupSize",
+                           cir::kReqdWorkGroupSizeRemarkCategory,
+                           kernel.getName(), text);
+  };
 
   for (const auto &entry : table) {
     const cir::KernelBinding &binding = entry.second;
@@ -215,17 +173,22 @@ void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
     std::optional<llvm::SmallVector<int32_t, 3>> local =
         stampedLocal(binding, hostFactsClosedTU);
     if (!local) {
-      // A kernel other TUs can launch (no closed-TU): say why not.
-      if (binding.kind != cir::BindingKind::SYCLName || hostFactsClosedTU ||
-          binding.stampsInPlace(false) || binding.deviceKernels.empty())
+      // A constant local size the kernel cannot take: say why not.
+      if (binding.kind != cir::BindingKind::SYCLName ||
+          binding.stampsInPlace(hostFactsClosedTU) ||
+          binding.deviceKernels.empty())
         continue;
       if (std::optional<llvm::SmallVector<int32_t, 3>> recovered =
               recoveredLocal(binding)) {
         cir::FuncOp kernel = binding.deviceKernels.front();
-        mlir::emitRemark(kernel.getLoc())
-            << "reqd-work-group-size: kernel @" << kernel.getName() << " "
-            << formatLocal(recovered) << " not stamped ("
-            << cir::getSharedSYCLKernelNote(hostFactsInternalize) << ")";
+        remark(kernel, cir::OffloadRemarkKind::Missed,
+               "reqd-work-group-size: kernel @" + kernel.getName() + " " +
+                   formatLocal(recovered) + " not stamped (" +
+                   (hostFactsClosedTU
+                        ? std::string("the kernel is registered: it may be "
+                                      "launched by name")
+                        : cir::getSharedSYCLKernelNote(hostFactsInternalize)) +
+                   ")");
       }
       continue;
     }
@@ -248,21 +211,19 @@ void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
       }
       kernel->setAttr("cir.reqd_work_group_size", attr);
       changed = true;
-      if (cir::isInternalizedSYCLKernel(kernel)) {
-        cir::noteInternalizedSYCLKernelUse(kernel);
-        mlir::emitRemark(kernel.getLoc())
-            << "reqd-work-group-size: kernel @" << kernel.getName() << " "
-            << formatLocal(local)
-            << cir::describeInternalizedSYCLKernel(kernel);
-      }
+      cir::noteInternalizedSYCLKernelUse(kernel);
+      remark(kernel, cir::OffloadRemarkKind::Passed,
+             "reqd-work-group-size: kernel @" + kernel.getName() + " " +
+                 formatLocal(local) +
+                 cir::describeInternalizedSYCLKernel(kernel));
     }
   }
 
   if (!changed)
     markAllAnalysesPreserved();
   else
-    // SOUNDNESS: see SYCLHostFactsCache: the device-side changes and the
-    // specializations leave the host facts true.
+    // SOUNDNESS: see SYCLHostFactsCache: the device-side changes leave the
+    // host facts and the table true.
     markAnalysesPreserved<cir::SYCLHostFactsCache>();
 }
 

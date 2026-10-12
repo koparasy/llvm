@@ -8,10 +8,9 @@
 //
 // The SYCL facade of the CIR points-to analysis: what the host code tells the
 // combine about the kernels it launches, read from a PointsToAnalysis of the
-// host module with the SYCL plug-in (SYCLPointsToModels.h) instead of from
-// KernelBindingTable's trace of a collapsed launch clone.
+// host module with the SYCL plug-in (SYCLPointsToModels.h).
 //
-// It answers three questions (--cir-offload-host-facts=ipo|both, see
+// It answers three questions (--cir-offload-host-facts=ipo, see
 // HostFactsMode):
 //  - InferKernelParamNoAlias's: which captured USM pointers and accessors of
 //    a kernel's closure refer to memory distinct from every other one, at
@@ -124,8 +123,8 @@ public:
                                      llvm::StringRef field) const;
 
   /// The noalias verdict of every candidate field of \p kernel (the
-  /// candidates of its device kernels, getSYCLNoAliasCandidates), with the
-  /// contract of KernelBindingTable's legacy fold: a field is no-alias iff at
+  /// candidates of its device kernels, getSYCLNoAliasCandidates): a field is
+  /// no-alias iff at
   /// every launch of the kernel its identity is complete and distinct from
   /// that of every other candidate, the kernel is not poisoned, and every
   /// launch of the kernel is a recorded launch with a closure. Each decision
@@ -147,7 +146,7 @@ public:
   };
   /// The scalar fields of \p kernel's closure that its device kernels take
   /// as scalar parameters (kind "scalar", a top-level int, float or bool
-  /// member: the candidates of the legacy fold), with the parameter type.
+  /// member), with the parameter type.
   llvm::StringMap<mlir::Type> getConstCandidates(llvm::StringRef kernel) const;
   /// The constant the scalar closure field \p field holds at \p launch:
   /// the stored values of its cell, complete with exactly one constant.
@@ -305,37 +304,31 @@ private:
 };
 
 /// The SYCLHostFacts of one offload container, built once per set of
-/// analysis options (getHostFactsAnalysisKey) and shared by the container
+/// analysis options (getHostFactsAnalysisKey), and the KernelBindingTable
+/// built on them, once per mode and set of options, shared by the container
 /// passes that read them (StampReqdWorkGroupSize, InferKernelParamNoAlias,
 /// PropagateSYCLKernelArgs): an MLIR analysis of the container
 /// (Pass::getAnalysis), which those passes preserve
 /// (Pass::markAnalysesPreserved) even when they change the container.
 ///
-/// Why their changes leave the facts true. The facts are about the host
-/// module: what the memory a recorded kernel launch reads (its closure and
-/// its range) holds, which allocation each captured pointer or accessor
-/// refers to, and which launches name each kernel. The passes change
-///  - device modules: attributes on kernels (llvm.noalias,
-///    cir.reqd_work_group_size), constants substituted for kernel
-///    parameters, and copies of kernels. None of that is host code;
-///  - the host module, when a pass specializes a kernel for its launches
-///    (specializeSYCLKernelForLaunches): new globals (the name string and
-///    kernel info of the copy, copies of the getter's static locals) and a
-///    copy of the kernel.info getter, which no recorded launch's memory
-///    reaches, and the callee of the launches' kernel.info marker calls,
-///    which now name the copy. The marker's result is the DeviceKernelInfo
-///    pointer the launch passes to the runtime; the launch reads the same
-///    closure and range, so its facts are those of the launch before. What
-///    changes is the kernel name the launch is recorded under: a pass that
-///    specializes a kernel calls recordSpecialization, and the facts of the
-///    copy are read under the original name (getOriginalKernel). The copy's
-///    launches are some of the original's launches, so its facts, ANDed over
-///    all of them, hold for it; and the original keeps a subset of its
-///    launches, for which the same AND holds too.
-/// No pass erases a host op, so the analysis' pointers into the host module
-/// stay valid; the symbol tables it cached only miss the new symbols, which
-/// no fact names. Any other pass that changes the container invalidates the
-/// cache as usual (it does not preserve it).
+/// Why their changes leave the facts and the table true. The facts are about
+/// the host module: what the memory a recorded kernel launch reads (its
+/// closure and its range) holds, which allocation each captured pointer or
+/// accessor refers to, and which launches name each kernel. The table holds
+/// the bindings (each kernel's device functions and host name string), the
+/// launch sites (the kernel.info marker calls, the launch calls and their
+/// closure operands) and those facts. The passes change only device modules:
+/// attributes on kernels (llvm.noalias, cir.reqd_work_group_size) and
+/// constants substituted for the uses of kernel parameters (a cir.const
+/// added at the top of the kernel). None of that is host code, no symbol is
+/// added, renamed or erased, and no device function the table holds is
+/// erased; the candidates (cir.sycl_kernel_param) are unchanged. So every
+/// pointer the analysis and the table hold stays valid and every answer they
+/// give stays what it was. Any other pass that changes the container
+/// invalidates the cache as usual (it does not preserve it); in the
+/// cir-offload-merge pipeline the cache is built after launch-path
+/// internalization and dropped by the prune, which runs after the last
+/// consumer.
 class SYCLHostFactsCache {
 public:
   explicit SYCLHostFactsCache(mlir::Operation *container);
@@ -345,18 +338,18 @@ public:
   /// The facts of the container for the analysis options of \p options (its
   /// mode is not part of the key), built on first use.
   const SYCLHostFacts &get(const HostFactsOptions &options);
-  /// Record that \p clone is a specialization of \p original whose
-  /// launches are some of the original's.
-  void recordSpecialization(llvm::StringRef clone, llvm::StringRef original);
-  /// The kernel \p kernel was specialized from, transitively, or \p kernel.
-  llvm::StringRef getOriginalKernel(llvm::StringRef kernel) const;
+  /// The table of the container with the host facts of \p options (mode
+  /// included), built on first use (from get(options)).
+  const KernelBindingTable &getTable(const HostFactsOptions &options);
   /// The number of analyses built so far (one per key), for tests.
   unsigned getNumBuilt() const { return numBuilt; }
+  /// The number of tables built so far (one per key), for tests.
+  unsigned getNumTablesBuilt() const { return tables.size(); }
 
 private:
   mlir::ModuleOp container;
   std::map<std::string, std::unique_ptr<SYCLHostFacts>> facts;
-  llvm::StringMap<std::string> origins;
+  std::map<std::string, std::unique_ptr<KernelBindingTable>> tables;
   unsigned numBuilt = 0;
 };
 

@@ -4014,13 +4014,14 @@ getSYCLMemoryCommandRole(const CXXMethodDecl *md, bool isHandler,
   return role;
 }
 
-/// The role of a SYCL host API function the offload combine and the points-to
-/// analysis trace buffer and accessor identity and kernel launches through
-/// (see KernelBindingTable), or empty. On the host the SYCL classes carry no
-/// sycl_type attribute, so they are recognized by their declarations
-/// (namespace, class and name, through inline namespaces), never by mangled
-/// name. Roles on internal (sycl::detail or private) glue mark it so it can be
-/// skipped or recorded; the models attach to the spec-defined public API.
+/// The role of a SYCL host API function the points-to analysis models buffer
+/// and accessor identity and kernel launches by (SYCLPointsToModels.h) and the
+/// offload combine recognizes the launches by (KernelBindingTable), or empty.
+/// On the host the SYCL classes carry no sycl_type attribute, so they are
+/// recognized by their declarations (namespace, class and name, through inline
+/// namespaces), never by mangled name. Roles on internal (sycl::detail or
+/// private) glue mark it so it can be skipped or recorded; the models attach to
+/// the spec-defined public API.
 /// Buffer identity:
 ///   buffer.alloc        buffer(range, ...): fresh storage
 ///   buffer.host_ptr     buffer(T *hostData, range, ...): may use hostData

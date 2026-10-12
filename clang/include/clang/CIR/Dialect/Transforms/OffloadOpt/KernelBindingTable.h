@@ -19,6 +19,11 @@
 //     equals the device kernel's symbol, e.g. the string returned by
 //     `FreeFunctionInfoData<Func>::getFunctionName()`). The bridge is that
 //     string, matched by equality against a `cc(spir_kernel)` device func.
+//     The launches are found by the host-API roles CIRGen tags the SYCL
+//     launch API with (cir.sycl_host_api): the kernel.info marker and the
+//     launch call it feeds. The host facts of a SYCL kernel (noalias fields,
+//     scalar-capture constants, launch geometry) come from SYCLHostFacts,
+//     the points-to analysis of the host module.
 //
 // Usable as an MLIR analysis: getAnalysis<KernelBindingTable>() on a pass
 // anchored at the offload container module.
@@ -56,11 +61,9 @@ enum class BindingKind { CUDAStub, SYCLName };
 // global and (optionally) local work-group sizes.
 //
 // The sizes do not survive as SSA constants at the launch call -- CIRGen buries
-// them in the nd_range object's memory behind a chain of launch shims. They are
-// recovered by inlining that shim chain on a throwaway clone of the host module
-// and tracing the nd_range_view object's memory back to the constant stores
-// (see SYCL geometry recovery in KernelBindingTable.cpp). Because the clone is
-// discarded, the result is held as plain integers, not IR values.
+// them in the nd_range object's memory behind a chain of launch shims. The
+// stored-value queries of the points-to analysis recover them
+// (SYCLHostFacts::geometry); the result is held as plain integers.
 //
 // A per-dimension entry is nullopt when that component was not a compile-time
 // constant. `local` is empty for a plain `range` launch (RoundedRangeKernel),
@@ -86,11 +89,12 @@ std::string formatSyclGeometry(const SyclGeometry &geometry);
 // their constants are read back out of the IR on demand, so a descriptor can
 // never report a value the IR has since stopped holding.
 //
-// SYCL: `stubCall` is the runtime launch call
-// (`submit_kernel_direct_with_event_impl`) reached from a
-// `getDeviceKernelInfo<Kernel>()` marker; `syclGeometry`/`syclClosure` are the
-// nd_range_view and HostKernelRef pointer operands of that call. The CUDA
-// geometry accessors do not apply (`hasGeometry()` is false).
+// SYCL: `stubCall` is the launch call (launch.direct_impl, or
+// handler.set_kernel_info on the handler path) a
+// `getDeviceKernelInfo<Kernel>()` marker (kernel.info) feeds; `syclClosure` is
+// the HostKernelRef pointer operand of that call (direct path) or the lambda
+// the handler's HostKernel is built from (handler path). The CUDA geometry
+// accessors do not apply (`hasGeometry()` is false).
 struct LaunchSite {
   BindingKind kind = BindingKind::CUDAStub;
 
@@ -101,31 +105,24 @@ struct LaunchSite {
   // null for SYCL.
   cir::CallOp pushConfigCall;
 
-  // SYCL only. Operands of the runtime launch call, kept as Values so constants
-  // are read back on demand (mirrors the CUDA accessors). Null for CUDA.
-  mlir::Value syclGeometry; // nd_range_view* operand
-  mlir::Value syclClosure;  // HostKernelRef(Base)* operand
+  // SYCL only. The closure operand of the launch, or null (CUDA; not
+  // recovered).
+  mlir::Value syclClosure;
 
   // SYCL only. The `getDeviceKernelInfo<Kernel>()` marker call that names this
   // launch's kernel and whose DeviceKernelInfo* result feeds `stubCall`. This
-  // is the single edit point for redirecting the launch to a specialized clone:
-  // its callee is repointed at a cloned getter naming the clone (see
-  // specializeSYCLKernelForLaunch). Null for CUDA.
+  // is the edit point for redirecting the launch to a kernel copy (launch-path
+  // internalization repoints its callee at the copy's getter). Null for CUDA.
   cir::CallOp syclMarkerCall;
 
-  // SYCL only. The bound _ZTS mangled-name string this launch targets, and
-  // whether every launch of it is visible in this TU (the binding is
-  // TU-local/optimizable) so the combine may const-fold across all sites.
+  // SYCL only. The bound _ZTS mangled-name string this launch targets.
   llvm::StringRef syclKernelName;
-  bool allLaunchesVisible = false;
 
-  // SYCL only. Constant nd_range work-group sizes recovered for this launch by
-  // the geometry-recovery pre-analysis (inline the launch-shim chain on a
-  // throwaway clone, then trace the nd_range object memory). Default-invalid
-  // when recovery did not run or found nothing.
+  // SYCL only. The constant nd_range work-group sizes of the kernel's
+  // launches (SYCLHostFacts::geometry, the same for every launch site of a
+  // kernel). Default-invalid without host facts or when nothing is known.
   SyclGeometry syclNDRange;
 
-  mlir::Value getSYCLGeometry() const { return syclGeometry; }
   mlir::Value getSYCLClosure() const { return syclClosure; }
   const SyclGeometry &getSYCLNDRange() const { return syclNDRange; }
 
@@ -165,27 +162,21 @@ struct LaunchSite {
 // Where KernelBinding::syclNoAliasFields, syclConstArgs and the launch
 // sites' syclNDRange come from (the --cir-offload-host-facts flag of
 // cir-offload-merge):
-//  - Legacy: the KernelBindingTable trace of the collapsed launch clone (the
-//    default);
-//  - IPO: SYCLHostFacts, built on the points-to analysis of the host module;
-//  - Both: both; the result is Legacy's, and every candidate field (and
-//    kernel geometry) on which they differ is recorded
-//    (KernelBindingTable::getHostFactsComparisons, ...ConstComparisons,
-//    ...GeometryComparisons) and reported as a host-facts-disagreement
-//    remark by the pass that uses it.
-enum class HostFactsMode { Legacy, IPO, Both };
+//  - IPO: SYCLHostFacts, built on the points-to analysis of the host module
+//    (the default);
+//  - None: no host facts (nothing is stamped).
+enum class HostFactsMode { None, IPO };
 
-// The name of `mode` as the flag spells it ("legacy", "ipo", "both"), and the
-// mode a name spells, if any.
+// The name of `mode` as the flag spells it ("none", "ipo"), and the mode a
+// name spells, if any.
 llvm::StringRef getHostFactsModeName(HostFactsMode mode);
 std::optional<HostFactsMode> parseHostFactsMode(llvm::StringRef name);
 
-// The points-to analysis behind IPO and Both. By default it is the
+// The points-to analysis behind the host facts. By default it is the
 // bottom-up mode with subobject nodes (and top-down queries); bottomUp =
-// false is the escape hatch to the context-insensitive analysis
-// (--cir-offload-host-facts-ci).
+// false runs the context-insensitive analysis (the passes' host-facts-bu).
 struct HostFactsOptions {
-  HostFactsMode mode = HostFactsMode::Legacy;
+  HostFactsMode mode = HostFactsMode::IPO;
   // The points-to analysis treats every function as having only the callers
   // in the module (PointsToAnalysisOptions::assumeClosedTU). Off by default
   // (plan D2); -cir-offload-assume-closed-tu sets it.
@@ -221,9 +212,9 @@ struct HostFactsOptions {
   // (PointsToAnalysisOptions::localFunctionsClosed). Off by default;
   // cir-offload-merge sets it without closed-tu.
   bool internalize = false;
-  // Whether the open-mode analysis rules of internalize apply (ipo|both).
+  // Whether the open-mode analysis rules of internalize apply.
   bool internalizedOpenMode() const {
-    return internalize && !assumeClosedTU && mode != HostFactsMode::Legacy;
+    return internalize && !assumeClosedTU && mode == HostFactsMode::IPO;
   }
 };
 
@@ -231,8 +222,8 @@ struct HostFactsOptions {
 // as a key for SYCLHostFactsCache.
 std::string getHostFactsAnalysisKey(const HostFactsOptions &options);
 
-// "(closed-tu|open, bu|ci[, subobjects])", the analysis options the
-// host-facts-disagreements remarks name.
+// "(closed-tu|open, bu|ci[, subobjects][, internalized])", the analysis
+// options the host-facts remarks name.
 std::string formatHostFactsOptions(const HostFactsOptions &options);
 
 // Which closure fields of a SYCL kernel are candidates for llvm.noalias, read
@@ -242,8 +233,7 @@ std::string formatHostFactsOptions(const HostFactsOptions &options);
 // nested in a captured struct, a struct holding a pointer, a stream or
 // annotated pointer, a parameter with no recorded field -- may alias the
 // candidates without being proven distinct, so it disables noalias for the
-// whole kernel. Both host-facts sources (legacy and SYCLHostFacts) take their
-// candidates and poison from here.
+// whole kernel. SYCLHostFacts takes its candidates and poison from here.
 struct SYCLNoAliasCandidates {
   llvm::StringMap<bool> fields; // field -> holds an accessor (else a pointer)
   std::string poison;           // why noalias is off for the kernel, if it is
@@ -272,59 +262,6 @@ void andNoAliasDecisions(llvm::StringMap<NoAliasDecision> here,
                          bool &seenAnySite,
                          llvm::StringMap<NoAliasDecision> &decisions);
 
-// One candidate field under --cir-offload-host-facts=both: the legacy and the
-// SYCLHostFacts verdicts. They disagree iff legacyOk != ipoOk.
-struct HostFactsComparison {
-  std::string kernel;
-  std::string field;
-  NoAliasDecision legacy;
-  NoAliasDecision ipo;
-  bool disagrees() const { return legacy.ok != ipo.ok; }
-};
-
-// Under --cir-offload-host-facts=both, the legacy and the SYCLHostFacts
-// constants of one scalar capture field (null: none). They disagree iff the
-// constants differ.
-struct HostFactsConstComparison {
-  std::string kernel;
-  std::string field;
-  mlir::TypedAttr legacy;
-  mlir::TypedAttr ipo;
-  // Why SYCLHostFacts found no constant, or where it found it.
-  std::string ipoNote;
-  bool disagrees() const { return legacy != ipo; }
-};
-
-// Under --cir-offload-host-facts=both, the legacy and the SYCLHostFacts
-// geometry of one kernel. They disagree iff they print differently
-// (formatSyclGeometry).
-struct HostFactsGeometryComparison {
-  std::string kernel;
-  SyclGeometry legacy;
-  SyclGeometry ipo;
-  std::string ipoNote;
-  bool disagrees() const;
-};
-
-// "host-facts-disagreement: kernel K const-arg F legacy=<c|none>
-// ipo=<c|none> (<ipo note>)".
-std::string formatHostFactsDisagreement(const HostFactsConstComparison &cmp);
-// "host-facts-disagreement: kernel K geometry legacy=<g> ipo=<g>
-// (<ipo note>)".
-std::string formatHostFactsDisagreement(const HostFactsGeometryComparison &cmp);
-// The same text without the "host-facts-disagreement: " prefix, for the
-// census remarks.
-std::string formatHostFactsComparison(const HostFactsConstComparison &cmp);
-std::string formatHostFactsComparison(const HostFactsGeometryComparison &cmp);
-
-// "<source>=noalias" or "<source>=not stamped (<note>)", as the remarks and
-// the table print a verdict.
-std::string formatHostFactsVerdict(llvm::StringRef source,
-                                   const NoAliasDecision &decision);
-// The text of the host-facts-disagreement remark for `cmp`:
-// "host-facts-disagreement: kernel K field F legacy=<...> ipo=<...>".
-std::string formatHostFactsDisagreement(const HostFactsComparison &cmp);
-
 // Binding for one kernel, keyed by its device mangled name. A name may resolve
 // in several device modules (multi-arch); the owning module of each kernel is
 // recoverable via k->getParentOfType<mlir::ModuleOp>().
@@ -346,18 +283,10 @@ struct KernelBinding {
   // for CUDA.
   cir::GlobalOp hostNameString;
 
-  // SYCL only: the closed-TU rule (-cir-offload-assume-closed-tu): true iff
-  // the kernel's CLOSURE is a lambda (a compiler-generated, unspellable type)
-  // and it is not by-name/bundle-exposed (absent from
-  // sycl_registered_kernels), so, if every caller is in this TU, its launches
-  // are this TU's and the combine may stamp it in place. This keys on the
-  // closure type, not the kernel-name tag: `parallel_for<class Tag>(lambda)`
-  // has a named `_ZTS<Tag>` symbol but a lambda closure. A genuine functor
-  // (named struct with operator()), a free function, or a registered kernel
-  // is by-name reachable and stays conservative (false). Without closed-TU
-  // the passes use isTUUnique instead (stampsInPlace). Always false for CUDA
-  // (stub-anchored).
-  bool isTULocalOptimizable = false;
+  // SYCL only: the kernel is registered (by-name / bundle-exposed:
+  // cir.sycl_registered_kernels), so the runtime may launch it by name from
+  // anywhere.
+  bool isRegistered = false;
 
   // SYCL only: the open rule: no other TU can launch the kernel
   // (isTUUniqueSYCLKernel: an internalized copy, a closure whose call
@@ -370,19 +299,27 @@ struct KernelBinding {
   bool isTUUnique = false;
 
   // Whether the facts of this TU's launches may be stamped on the kernel in
-  // place: isTULocalOptimizable under closed-TU, else isTUUnique.
+  // place: without closed-TU, isTUUnique. Under the closed-TU assumption
+  // (-cir-offload-assume-closed-tu: every caller of every host function is in
+  // this TU) every launch of a kernel that is not registered is one of this
+  // TU's: another TU could launch it only through the launch functions of its
+  // kernel type (queue::submit, handler::parallel_for<K, ...>, which are this
+  // TU's functions too by the ODR), i.e. as a caller of this TU's functions
+  // that is not in this TU, or by name, which only a registered kernel
+  // allows. So it is stamped in place. Always false for CUDA (stub-anchored).
   bool stampsInPlace(bool assumeClosedTU) const {
-    return assumeClosedTU ? isTULocalOptimizable : isTUUnique;
+    if (kind != BindingKind::SYCLName)
+      return false;
+    return assumeClosedTU ? !isRegistered : isTUUnique;
   }
 
   // SYCL only: names of closure capture fields -- captured USM pointers and
   // global-memory accessors -- whose memory is, at EVERY visible launch site,
-  // a USM allocation (malloc_device / malloc_shared / malloc_host) or the
-  // storage behind a buffer that is provably distinct from the memory of
-  // every other such capture of the same closure. The device kernel pointer
-  // parameter bound to such a field can carry `llvm.noalias`. Empty when
-  // recovery could not prove distinctness (unresolved source, shared base,
-  // pointer arithmetic, buffer of unknown origin -> conservatively out).
+  // an allocation (a USM or heap allocation, a buffer's storage) provably
+  // distinct from the memory of every other such capture of the same closure
+  // (SYCLHostFacts::noAliasFields). The device kernel pointer parameter bound
+  // to such a field can carry `llvm.noalias`. Empty without host facts or
+  // when nothing is proven.
   llvm::StringSet<> syclNoAliasFields;
 
   // SYCL only: for each noalias candidate field, the memory it resolved to if
@@ -393,77 +330,26 @@ struct KernelBinding {
   // pointer or accessor nested in a captured struct), or empty.
   std::string syclNoAliasBlocked;
 
-  // SYCL only, from the legacy trace: the user functions (in module order of
-  // the launches) holding a launch of the kernel that, on its own, gives a
-  // fact (a pairwise-distinct field, a constant capture, a constant local
-  // size). The trace is intraprocedural (the function holding the launch,
-  // after inlining the launch shims and the command group), so a launch in
-  // a copy of a function gives what the launch it was copied from gives: a
-  // kernel without such a launch gets no legacy fact through an internalized
-  // launch path either, and the facts of these launches hold for every
-  // caller of their functions (InternalizeLaunchPaths uses them as roots
-  // under legacy).
-  llvm::SmallVector<std::string, 1> syclLegacyFactSites;
-
   // SYCL only: closure capture fields whose stored SCALAR value is, at EVERY
   // visible launch site, the SAME compile-time constant. Maps the field name to
   // that constant (an int/float/bool cir.const value). The device kernel
   // parameter bound to such a field can have its uses replaced by the constant
-  // (the argument becomes unused; the signature/ABI is preserved). Populated
-  // only for TU-local optimizable bindings; a field whose value is non-constant
-  // at any site, or whose sites disagree, is absent (conservatively out). This
-  // is the scalar analogue of syclNoAliasFields.
+  // (the argument becomes unused; the signature/ABI is preserved). A field
+  // whose value is non-constant at any site, or whose sites disagree, is
+  // absent (SYCLHostFacts::constantFields). This is the scalar analogue of
+  // syclNoAliasFields.
   llvm::StringMap<mlir::TypedAttr> syclConstArgs;
+
+  // SYCL only, with host facts: for every scalar-capture candidate field,
+  // where its constant was found or why none is known; and the same for the
+  // kernel's geometry (SYCLHostFacts::ConstFact, GeometryFact), for remarks
+  // and the table's print.
+  llvm::StringMap<std::string> syclConstNotes;
+  std::string syclGeometryNote;
 
   llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
   llvm::SmallVector<LaunchSite, 2> launchSites;
 };
-
-// A SYCL kernel specialized by cloning ("copyKernel"): a fresh device kernel
-// under a unique _ZTS name plus the host artifacts that name it, minted so that
-// one launch site can be redirected to it while the original stays generic for
-// every other (possibly cross-TU) launch. `deviceKernels` are the device clones
-// (one per arch module, parallel to the source KernelBinding::deviceKernels);
-// an optimization applies its device-side change to these, not to the shared
-// original.
-struct SpecializedKernel {
-  std::string name;
-  llvm::SmallVector<cir::FuncOp, 2> deviceKernels;
-};
-
-// Specialize a SYCL kernel by clone-and-redirect, the residual path for opts
-// whose soundness is not whole-program (a cross-TU functor, or a kernel whose
-// launch sites do not all agree). Mints, in `container`:
-//   - a device spir_kernel clone of each of the binding's device kernels, under
-//     a fresh unique _ZTS name, keeping the original's (external) linkage and
-//     tagged `cir.specialization_private` -- a combine-private "single caller,
-//     safe to mutate in place, do not re-clone" marker, NOT internal linkage
-//     (an internal clone is dead-stripped at sycl-post-link);
-//   - the host artifacts that make the runtime resolve it: a mangled-name
-//   string
-//     global (H1), a CompileTimeKernelInfo clone repointed at that string (H2),
-//     and a getDeviceKernelInfo getter clone plus its per-instantiation
-//     static-local/guard cluster (H3);
-// then repoints the getDeviceKernelInfo marker call of every launch in `sites`
-// at the getter clone (H4), so exactly those launches resolve the clone at
-// runtime while every other launch (this TU's or another's) keeps the generic
-// original; and every other reference to the kernel's naming artifacts in
-// the SYCL launch implementation on the paths to those markers (the
-// `__const.<f>.Info` copy of the CompileTimeKernelInfo that
-// handler::setDeviceKernelInfo stores the handler's kernel name from, ...) to
-// copies naming the clone (see LocalKernelCopier::redirectNameReads). `sites`
-// must all belong to `binding` (they share one getter instantiation, so H1-H3
-// are minted once); pass the full launchSites list to specialize a cross-TU
-// functor for this TU, or an agreeing subset to split a kernel launched several
-// ways. `uniqueTag` disambiguates the minted symbol names within the TU.
-//
-// Returns the minted clone, or nullopt if the binding/sites are not a
-// redirectable SYCL launch (not SYCL, no marker call, no name string, or no
-// device kernel). The KernelBindingTable is not updated in place; rebuild it to
-// see the clone.
-std::optional<SpecializedKernel> specializeSYCLKernelForLaunches(
-    mlir::ModuleOp container, const KernelBinding &binding,
-    llvm::ArrayRef<LaunchSite> sites, llvm::StringRef uniqueTag);
 
 // On a device kernel copy made for an internalized launch path (T26): a
 // dictionary {original = "<K>", roots = ["main", ...]}.
@@ -500,6 +386,9 @@ std::string getSharedSYCLKernelNote(bool internalized);
 bool isTUUniqueSYCLKernel(
     mlir::ModuleOp container, cir::FuncOp kernel, llvm::StringRef name,
     const llvm::StringMap<bool> *getterLocality = nullptr);
+// Whether `name` is a registered (by-name / bundle-exposed) kernel of
+// `container` (cir.sycl_registered_kernels): reachable by name across TUs.
+bool isRegisteredSYCLKernel(mlir::ModuleOp container, llvm::StringRef name);
 // For each kernel name a host kernel.info getter names: whether every such
 // getter has local linkage.
 llvm::StringMap<bool> getSYCLKernelInfoLocality(mlir::ModuleOp container);
@@ -518,12 +407,14 @@ struct LocalKernelCopy {
   cir::FuncOp originalGetter;
 };
 
-// Makes the device clones and host artifacts of
-// specializeSYCLKernelForLaunches (H1-H3) for the kernel a kernel.info getter
-// names, with every host artifact local to this TU: internal linkage, named
-// `<original><suffix>`, tagged cir.offload.internalized (so that no other TU
-// can bind to them, unlike the copies of specializeSYCLKernelForLaunches,
-// whose names are unique only within the TU). The device clones keep the
+// Makes a copy of the kernel a kernel.info getter names: a device spir_kernel
+// clone of each of its device kernels under `cloneName`, and the host
+// artifacts that make the runtime resolve it: a mangled-name string global
+// (H1), a CompileTimeKernelInfo copy naming that string (H2), and a
+// getDeviceKernelInfo getter copy plus its per-instantiation static-local /
+// guard cluster (H3). Every host artifact is local to this TU: internal
+// linkage, named `<original><suffix>`, tagged cir.offload.internalized (so
+// that no other TU can bind to them). The device clones keep the
 // original's linkage (sycl-post-link dead-strips an internal kernel): the
 // clone name must be unique in the program (the caller derives it from a
 // module id). Nothing is redirected: the caller repoints the marker calls it
@@ -558,6 +449,23 @@ private:
       holders;
 };
 
+// The opt-in remarks of the SYCL host-facts passes: mlir::remark remarks
+// (printed only when a remark filter selects them, e.g. cir-opt or
+// cir-offload-merge --remarks-filter=cir-offload-noalias), named by the pass
+// and filtered by category. `text` is the one-line decision and its reason.
+enum class OffloadRemarkKind { Passed, Missed, Analysis };
+inline constexpr llvm::StringLiteral kNoAliasRemarkCategory =
+    "cir-offload-noalias";
+inline constexpr llvm::StringLiteral kKernelArgConstantRemarkCategory =
+    "cir-offload-kernel-arg-constant";
+inline constexpr llvm::StringLiteral kReqdWorkGroupSizeRemarkCategory =
+    "cir-offload-reqd-wg";
+inline constexpr llvm::StringLiteral kInternalizeRemarkCategory =
+    "cir-offload-internalize";
+void emitOffloadRemark(mlir::Location loc, OffloadRemarkKind kind,
+                       llvm::StringRef pass, llvm::StringRef category,
+                       llvm::StringRef function, const llvm::Twine &text);
+
 // The kernel `op` launches, or a null attribute if it is not a launch site.
 // This is what the table records as a launch site, and what a pass must accept
 // when checking that it can see every launch of a stub: the two answers come
@@ -575,16 +483,16 @@ public:
   // `container` is the offload container module, i.e. a module carrying the
   // `cir.offload.container` unit attribute. The host and device modules are
   // recovered from it via the `cir` container helpers.
+  // The bindings and launch sites only: no host facts (HostFactsMode::None).
+  // What getAnalysis<KernelBindingTable>() builds.
   explicit KernelBindingTable(mlir::ModuleOp container)
-      : KernelBindingTable(container, HostFactsOptions()) {}
-  // `options` select where syclNoAliasFields come from (see HostFactsMode).
-  // Only the noalias fields and notes depend on them.
-  KernelBindingTable(mlir::ModuleOp container, const HostFactsOptions &options);
-  // The same, with the SYCLHostFacts of `cache` (built once per container and
-  // set of analysis options, see SYCLHostFactsCache) instead of facts built
+      : KernelBindingTable(container, noFacts(), nullptr) {}
+  // With the host facts `options` select (see HostFactsMode), from the
+  // SYCLHostFacts of `cache` (built once per container and set of analysis
+  // options, see SYCLHostFactsCache) or, without a cache, from facts built
   // for this table alone.
   KernelBindingTable(mlir::ModuleOp container, const HostFactsOptions &options,
-                     SYCLHostFactsCache *cache);
+                     SYCLHostFactsCache *cache = nullptr);
 
   const KernelBinding *lookup(llvm::StringRef kernelName) const;
 
@@ -614,26 +522,14 @@ public:
   const HostFactsOptions &getHostFactsOptions() const {
     return hostFactsOptions;
   }
-  // Under HostFactsMode::Both, the two verdicts of every candidate field of
-  // every SYCL kernel, in binding order and then by field name. Empty in the
-  // other modes.
-  llvm::ArrayRef<HostFactsComparison> getHostFactsComparisons() const {
-    return hostFactsComparisons;
-  }
-  // Under HostFactsMode::Both, the two constants of every scalar capture
-  // field (syclConstArgs) of every SYCL kernel, and the two geometries
-  // (syclNDRange) of every SYCL kernel, in binding order (then by field
-  // name). Empty in the other modes.
-  llvm::ArrayRef<HostFactsConstComparison>
-  getHostFactsConstComparisons() const {
-    return hostFactsConstComparisons;
-  }
-  llvm::ArrayRef<HostFactsGeometryComparison>
-  getHostFactsGeometryComparisons() const {
-    return hostFactsGeometryComparisons;
-  }
 
 private:
+  static HostFactsOptions noFacts() {
+    HostFactsOptions options;
+    options.mode = HostFactsMode::None;
+    return options;
+  }
+
   // Adds the SYCL name-string <-> spir_kernel bindings and their eligibility.
   void bindSYCLKernels(mlir::ModuleOp container);
 
@@ -642,12 +538,10 @@ private:
   // bindSYCLKernels, so every binding already has its name-string.
   void recordSYCLLaunchSites(mlir::ModuleOp container);
 
-  // Under HostFactsMode::IPO or Both, compute the noalias verdicts, the
-  // scalar-capture constants and the geometry with SYCLHostFacts (the
-  // noalias verdicts from the same candidates), and replace the legacy ones
-  // (IPO: syclNoAliasFields/Notes, syclConstArgs, every launch site's
-  // syclNDRange) or record both (Both, the host-facts comparisons). Runs
-  // after the launch sites are recorded.
+  // Under HostFactsMode::IPO, the noalias verdicts, the scalar-capture
+  // constants and the geometry of every SYCL kernel, from SYCLHostFacts
+  // (syclNoAliasFields/Notes, syclConstArgs, every launch site's
+  // syclNDRange). Runs after the launch sites are recorded.
   void applyHostFacts(mlir::ModuleOp container,
                       const llvm::StringMap<SYCLNoAliasCandidates> &candidates);
 
@@ -660,10 +554,6 @@ private:
   mlir::ModuleOp hostModule;
   HostFactsOptions hostFactsOptions;
   SYCLHostFactsCache *hostFactsCache = nullptr;
-  llvm::SmallVector<HostFactsComparison, 0> hostFactsComparisons;
-  llvm::SmallVector<HostFactsConstComparison, 0> hostFactsConstComparisons;
-  llvm::SmallVector<HostFactsGeometryComparison, 0>
-      hostFactsGeometryComparisons;
 };
 
 } // namespace cir

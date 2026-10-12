@@ -3,7 +3,6 @@ add_clang_library(CIRTestAnalysis
   TestCIRPointsTo.cpp
   TestCIRPointsToInstrument.cpp
   TestKernelBindings.cpp
-  TestCopyKernel.cpp
 
   LINK_LIBS PUBLIC
   MLIRCIRAnalysis

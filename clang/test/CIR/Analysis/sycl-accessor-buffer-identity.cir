@@ -1,10 +1,7 @@
-// RUN: cir-opt %s -split-input-file \
-// RUN:   -pass-pipeline="builtin.module(test-print-kernel-bindings)" \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s
-// RUN: cir-opt %s -split-input-file -cir-points-to-verify \
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -split-input-file -cir-points-to-verify \
 // RUN:   -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=IPO
-// RUN: cir-opt %s -split-input-file -cir-points-to-verify \
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -split-input-file -cir-points-to-verify \
 // RUN:   -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=IPO
 
@@ -17,14 +14,14 @@
 // cir.sycl_kernel_param attributes name the closure field behind each
 // parameter.
 //
-// The prefix IPO checks the same cases under --cir-offload-host-facts=ipo
+// The prefix IPO checks the cases under --cir-offload-host-facts=ipo
 // (SYCLHostFacts on the points-to analysis), open and closed-TU (the
 // launches are in main, so the two agree). The inputs also carry the roles
 // CIRGen gives the launch glue, the USM allocation and getDeviceKernelInfo,
 // and a body for std::vector::data, which points-to analyses rather than
-// models; the legacy output is the same without them. IPO agrees with the
-// legacy verdicts on every case but DISTINCT HOST MEMORY, where it is
-// stricter (explained there); it is never looser.
+// models. (The legacy trace these cases were first written for is deleted,
+// T28; it agreed on every case but DISTINCT HOST MEMORY, where points-to is
+// stricter, explained there.)
 
 // -----
 // DISTINCT: three local buffers, each accessed once.
@@ -107,11 +104,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK: no-alias A B C
-// CHECK: no-alias-note A: buffer 'ba'
-// CHECK: no-alias-note B: buffer 'bb'
-// CHECK: no-alias-note C: buffer 'bc'
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO: no-alias A B C
@@ -206,9 +198,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK: no-alias A B C
-// CHECK: no-alias-note A: buffer 'ba' over std::vector 'va'
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // The points-to analysis is stricter here (an explained difference): the
@@ -298,10 +287,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK: no-alias C
-// CHECK: no-alias-note A: 'A' and 'B' use the same memory, buffer 'ba'
-// CHECK: no-alias-note B: 'B' and 'A' use the same memory, buffer 'ba'
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO: no-alias C
@@ -382,10 +367,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK-NOT: no-alias A
-// CHECK: no-alias-note A: 'A' and 'B' use the same memory, buffer 'b1'
-// CHECK: no-alias-note B:
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO-NOT: no-alias A
@@ -469,9 +450,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK-NOT: no-alias A
-// CHECK: no-alias-note A: 'A' and 'B' use the same memory, buffer 'p'
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO-NOT: no-alias A
@@ -551,9 +529,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK-NOT: no-alias A
-// CHECK: no-alias-note A: 'A' and 'B' use the same memory, buffer 'b1'
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO-NOT: no-alias A
@@ -631,10 +606,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK-NOT: no-alias A
-// CHECK: no-alias-note A: 'B' may alias it: the buffer is a function parameter
-// CHECK: no-alias-note B: the buffer is a function parameter
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO-NOT: no-alias A
@@ -725,14 +696,10 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK-NOT: no-alias A
-// CHECK: no-alias-note A: 'A' and 'B' use the same memory, buffer 'ba' over std::vector 'v'
-// CHECK: no-alias-note C: the host pointer of buffer 'bc' has unknown provenance
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // Points-to sees the three host pointers in one node, whose storage this
-// input never allocates: no allocation site (legacy: the same memory).
+// input never allocates: no allocation site.
 // IPO-NOT: no-alias A
 // IPO: no-alias-note A: accessor 'A': the host memory of buffer 'ba' (ghost {{n[0-9]+}}): {{n[0-9]+}} has no allocation site the analysis sees
 
@@ -815,10 +782,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK: no-alias A B P
-// CHECK: no-alias-note B: buffer 'bb' over a USM allocation
-// CHECK: no-alias-note P: a USM allocation
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO: no-alias A B P
@@ -896,9 +859,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK-NOT: no-alias A
-// CHECK: no-alias-note A: 'A' and 'P' use the same memory, buffer 'ba' over a USM allocation
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO-NOT: no-alias A
@@ -979,9 +939,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK-NOT: no-alias A
-// CHECK: no-alias-note B: buffer 'b2' is not constructed exactly once
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // The assignment unifies the two storages: one node, two allocations, so A
@@ -1063,9 +1020,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK: no-alias A B
-// CHECK-NOT: no-alias-note L
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO: no-alias A B
@@ -1145,10 +1099,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK-NOT: no-alias A
-// CHECK: no-alias-note A: captured 'S' holds a nested accessor
-// CHECK: no-alias-blocked: captured 'S' holds a nested accessor
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO-NOT: no-alias A
@@ -1224,9 +1174,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK-NOT: no-alias P
-// CHECK: no-alias-note P: captured struct 'S' holds a pointer
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO-NOT: no-alias P
@@ -1320,9 +1267,6 @@ module attributes {cir.offload.container} {
     }
   }
 }
-// CHECK-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CHECK-NOT: no-alias A
-// CHECK: no-alias-note A: 'A' and 'B' use the same memory, buffer 'ba'
 
 // IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // IPO-NOT: no-alias A

@@ -7,7 +7,7 @@
 //    size 16 by TU1 and 32 by TU2;
 //  - ScaleF: a functor kernel with a scalar member, 2.0 in TU1, a runtime
 //    value in TU2.
-// Before T26b: the default (legacy) host facts specialized ScaleF by clone
+// Before T26b: the then-default legacy host facts specialized ScaleF by clone
 // (`_ZTS6ScaleF.spec.noalias.0.spec.constprop.0`, 2.0 folded; TU2 minted
 // `_ZTS6ScaleF.spec.noalias.0` too, and both repointed the marker in the
 // linkonce_odr StoreLambda<ScaleF, ScaleF>), and ipo without closed-tu and
@@ -15,7 +15,11 @@
 // in place. Now a kernel other TUs can launch gets a constant or a required
 // work-group size only on the kernel copy of an internalized launch path
 // (K.int.<TU1 id>); TU-unique kernels (KGeomMain, a lambda in main) keep
-// theirs in place; the clone path stays under -cir-offload-assume-closed-tu.
+// theirs in place. TU2 has no main; its tu2_api is an open root (T28), whose
+// kernel copies get the facts of its own body: KGeom.int [32], noalias on the
+// one pointer, and no constant (f is tu2_api's parameter). Under
+// -cir-offload-assume-closed-tu every kernel (none registered) is stamped in
+// place (the clone path is deleted, T28).
 //
 // RUN: rm -rf %t && mkdir -p %t
 // DEFINE: %{dev} = %clang_cc1 -std=c++17 -fsycl-is-device -triple spir64-unknown-unknown \
@@ -28,7 +32,7 @@
 // DEFINE: %{v} = tu1
 // DEFINE: %{opts} =
 // DEFINE: %{m} = default
-// DEFINE: %{merge} = cir-offload-merge -combine %{targets} -input=%t/%{v}.host.cir \
+// DEFINE: %{merge} = cir-offload-merge -combine --remarks-filter="cir-offload.*" %{targets} -input=%t/%{v}.host.cir \
 // DEFINE:     -input=%t/%{v}.dev.cir %{opts} -output=%t/%{v}.%{m}.cir > %t/%{v}.%{m}.remarks 2>&1 \
 // DEFINE:   && cir-offload-merge -split %{targets} -input=%t/%{v}.%{m}.cir \
 // DEFINE:     -output=%t/%{v}.%{m}.split.host.cir -output=%t/%{v}.%{m}.split.dev.cir \
@@ -39,12 +43,12 @@
 // RUN: %{dev} -emit-cir -DTU2 %s -o %t/tu2.dev.cir
 // RUN: %{host} -emit-cir -DTU2 %s -o %t/tu2.host.cir
 //
-// The default (legacy host facts, internalized launch paths).
+// The default (points-to host facts, internalized launch paths).
 // RUN: %{merge}
 // RUN: FileCheck %s --check-prefix=DEFAULT --input-file=%t/tu1.default.remarks
 // RUN: FileCheck %s --check-prefix=DEFAULT-DEV --input-file=%t/tu1.default.dev.ll
 //
-// ipo, open, internalized.
+// The same, spelled --cir-offload-host-facts=ipo.
 // REDEFINE: %{m} = ipo
 // REDEFINE: %{opts} = --cir-offload-host-facts=ipo
 // RUN: %{merge}
@@ -58,14 +62,14 @@
 // RUN: FileCheck %s --check-prefix=NOINT --input-file=%t/tu1.iponoint.remarks
 // RUN: FileCheck %s --check-prefix=NOINT-DEV --input-file=%t/tu1.iponoint.dev.ll
 //
-// TU2 (no main: no closed root): nothing for the shared kernels.
+// TU2 (no main): the open root tu2_api.
 // REDEFINE: %{v} = tu2
 // REDEFINE: %{m} = ipo
 // REDEFINE: %{opts} = --cir-offload-host-facts=ipo
 // RUN: %{merge}
 // RUN: FileCheck %s --check-prefix=TU2-DEV --input-file=%t/tu2.ipo.dev.ll
 //
-// Closed-TU (legacy): the clone path; ipo + closed-TU: KGeom in place.
+// Closed-TU: everything in place.
 // REDEFINE: %{v} = tu1
 // REDEFINE: %{m} = closed
 // REDEFINE: %{opts} = -cir-offload-assume-closed-tu
@@ -132,7 +136,7 @@ void tu2_api(queue &q, float f) {
 }
 #endif
 
-// DEFAULT: remark: kernel-arg-constant: kernel @_ZTS6ScaleF.int.{{[0-9a-f]+}} arg 1 ('f'): #cir.fp<2.000000e+00> : !cir.float through the internalized launch path from root @main
+// DEFAULT: kernel-arg-constant: kernel @_ZTS6ScaleF.int.{{[0-9a-f]+}} arg 1 ('f'): #cir.fp<2.000000e+00> : !cir.float through the internalized launch path from root @main
 // DEFAULT-NOT: .spec.
 // DEFAULT-DEV: define weak_odr spir_kernel void @_ZTS6ScaleF(
 // DEFAULT-DEV-NOT: define
@@ -142,26 +146,28 @@ void tu2_api(queue &q, float f) {
 // DEFAULT-DEV: fmul float %{{[0-9]+}}, 2.000000e+00
 // DEFAULT-DEV-NOT: .spec.
 
-// IPO-DAG: remark: reqd-work-group-size: kernel @_ZTS5KGeom.int.{{[0-9a-f]+}} [16] through the internalized launch path from root @main
-// IPO-DAG: remark: kernel-arg-constant: kernel @_ZTS6KScale.int.{{[0-9a-f]+}} arg 1 ('s'): #cir.fp<2.000000e+00> : !cir.float through the internalized launch path from root @main
-// IPO-DAG: remark: kernel-arg-constant: kernel @_ZTS6ScaleF.int.{{[0-9a-f]+}} arg 1 ('f'): #cir.fp<2.000000e+00> : !cir.float through the internalized launch path from root @main
+// IPO-DAG: reqd-work-group-size: kernel @_ZTS5KGeom.int.{{[0-9a-f]+}} [16] through the internalized launch path from root @main
+// IPO-DAG: kernel-arg-constant: kernel @_ZTS6KScale.int.{{[0-9a-f]+}} arg 1 ('s'): #cir.fp<2.000000e+00> : !cir.float through the internalized launch path from root @main
+// IPO-DAG: kernel-arg-constant: kernel @_ZTS6ScaleF.int.{{[0-9a-f]+}} arg 1 ('f'): #cir.fp<2.000000e+00> : !cir.float through the internalized launch path from root @main
 // IPO-DEV-DAG: define weak_odr spir_kernel void @_ZTS5KGeom() local_unnamed_addr #{{[0-9]+}} comdat {
 // IPO-DEV-DAG: define weak_odr spir_kernel void @_ZTS5KGeom.int.{{[0-9a-f]+}}() {{.*}}!reqd_work_group_size
 // IPO-DEV-DAG: define weak_odr spir_kernel void @_ZTS9KGeomMain({{.*}}!reqd_work_group_size
 
-// NOINT-DAG: remark: reqd-work-group-size: kernel @_ZTS5KGeom [16] not stamped (the kernel is visible to other TUs; facts this TU derives hold only through an internalized launch path, and launch-path internalization is off)
-// NOINT-DAG: remark: kernel-arg-constant: kernel @_ZTS6ScaleF arg 1 ('f'): #cir.fp<2.000000e+00> : !cir.float not propagated (the kernel is visible to other TUs; facts this TU derives hold only through an internalized launch path, and launch-path internalization is off)
+// NOINT-DAG: reqd-work-group-size: kernel @_ZTS5KGeom [16] not stamped (the kernel is visible to other TUs; facts this TU derives hold only through an internalized launch path, and launch-path internalization is off)
+// NOINT-DAG: kernel-arg-constant: kernel @_ZTS6ScaleF arg 1 ('f'): #cir.fp<2.000000e+00> : !cir.float not propagated (the kernel is visible to other TUs; facts this TU derives hold only through an internalized launch path, and launch-path internalization is off)
 // NOINT-DEV-DAG: define weak_odr spir_kernel void @_ZTS5KGeom() local_unnamed_addr #{{[0-9]+}} comdat {
 // NOINT-DEV-DAG: define weak_odr spir_kernel void @_ZTS9KGeomMain({{.*}}!reqd_work_group_size
 // NOINT-DEV-NOT: .spec.
 // NOINT-DEV-NOT: 2.000000e+00
 
-// TU2-DEV-NOT: reqd_work_group_size
+// TU2-DEV-DAG: define weak_odr spir_kernel void @_ZTS5KGeom() local_unnamed_addr #{{[0-9]+}} comdat {
+// TU2-DEV-DAG: define weak_odr spir_kernel void @_ZTS5KGeom.int.{{[0-9a-f]+}}() {{.*}}!reqd_work_group_size ![[WG:[0-9]+]] {
+// TU2-DEV-DAG: ![[WG]] = !{i32 32, i32 1, i32 1}
 // TU2-DEV-NOT: 2.000000e+00
-// TU2-DEV-NOT: .int.
 
-// CLOSED-DEV: define weak_odr spir_kernel void @_ZTS6ScaleF.spec.noalias.0.spec.constprop.0(
+// CLOSED-DEV: define weak_odr spir_kernel void @_ZTS6ScaleF(
 // CLOSED-DEV-NOT: define
 // CLOSED-DEV: fmul float %{{[0-9]+}}, 2.000000e+00
+// CLOSED-DEV-NOT: .spec.
 
 // IPOCLOSED-DEV: define weak_odr spir_kernel void @_ZTS5KGeom() {{.*}}!reqd_work_group_size

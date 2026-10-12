@@ -32,9 +32,9 @@ module attributes {cir.offload.container} {
   module @host attributes {cir.offload.kind = #cir.offload<host>} {
     cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
     cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>)
-    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
-    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
       %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
       %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
       cir.return %1 : !cir.ptr<!s8i>
@@ -83,9 +83,9 @@ module attributes {cir.offload.container} {
   module @host attributes {cir.offload.kind = #cir.offload<host>} {
     cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
     cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>)
-    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
-    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
       %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
       %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
       cir.return %1 : !cir.ptr<!s8i>
@@ -139,7 +139,7 @@ module attributes {cir.offload.container} {
     cir.global "private" constant internal @_ZctkiInfo = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<14> : !u64i}> : !rec_sv}> : !rec_ctki
     // The HostKernel<lambda> constructor: arg0 is the wrapper (its type name
     // carries the lambda loc), arg1 is a pointer to the host closure record.
-    cir.func private @_ZN4sycl3_V16detail10HostKernelItestEC2E(!cir.ptr<!rec_wrap>, !cir.ptr<!rec_hlam>)
+    cir.func private @_ZN4sycl3_V16detail10HostKernelItestEC2E(!cir.ptr<!rec_wrap>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
     cir.func @_ZTStestkernel(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i {cir.sycl_kernel_param = {field = "b", kind = "scalar", path = ["b"]}}) cc(spir_kernel) {
@@ -175,9 +175,9 @@ module attributes {cir.offload.container} {
   module @host attributes {cir.offload.kind = #cir.offload<host>} {
     cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
     cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>)
-    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
-    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
       %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
       %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
       cir.return %1 : !cir.ptr<!s8i>
@@ -227,8 +227,8 @@ module attributes {cir.offload.container} {
   module @host attributes {cir.offload.kind = #cir.offload<host>} {
     cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTStestkernel" : !cir.array<!s8i x 14>, trailing_zeros> : !cir.array<!s8i x 15>
     cir.global "private" constant internal @_ZctkiInfo = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<14> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V16detail10HostKernelIrrEC2E(!cir.ptr<!rec_wraprr>, !cir.ptr<!rec_rrk>)
-    cir.func private @_ZN4sycl3_V16detail10HostKernelItestEC2E(!cir.ptr<!rec_wrap>, !cir.ptr<!rec_hlam>)
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIrrEC2E(!cir.ptr<!rec_wraprr>, !cir.ptr<!rec_rrk>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V16detail10HostKernelItestEC2E(!cir.ptr<!rec_wrap>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
     cir.func @_ZTStestkernel(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i {cir.sycl_kernel_param = {field = "b", kind = "scalar", path = ["b"]}}) cc(spir_kernel) {

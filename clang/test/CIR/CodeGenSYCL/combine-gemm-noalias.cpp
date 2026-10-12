@@ -9,7 +9,7 @@
 // RUN:   -aux-triple spir64-unknown-unknown -fclangir -emit-cir %s -o %t/host.cir
 //
 // ipo + closed-tu: A, B and C are noalias.
-// RUN: cir-offload-merge -combine -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
 // RUN:   -input=%t/host.cir -input=%t/dev.cir --cir-offload-host-facts=ipo \
 // RUN:   -cir-offload-assume-closed-tu -output=%t/closed.cir 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=REMARK --implicit-check-not=kernel-name-redirect:
@@ -23,7 +23,7 @@
 // nothing is proven for the kernel their callers in other TUs launch; the
 // path from main is internalized (T26), and the copy of the kernel it
 // launches gets A, B and C noalias.
-// RUN: cir-offload-merge -combine -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
 // RUN:   -input=%t/host.cir -input=%t/dev.cir --cir-offload-host-facts=ipo \
 // RUN:   -output=%t/open.cir 2>&1 | FileCheck %s --check-prefix=OPEN-REMARK \
 // RUN:   --implicit-check-not=kernel-name-redirect:
@@ -45,7 +45,7 @@
 // RUN:   -aux-triple x86_64-unknown-linux-gnu -fclangir -emit-cir -DSAME %s -o %t/same.dev.cir
 // RUN: %clang_cc1 -std=c++17 -fsycl-is-host -triple x86_64-unknown-linux-gnu \
 // RUN:   -aux-triple spir64-unknown-unknown -fclangir -emit-cir -DSAME %s -o %t/same.host.cir
-// RUN: cir-offload-merge -combine -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
 // RUN:   -input=%t/same.host.cir -input=%t/same.dev.cir --cir-offload-host-facts=ipo \
 // RUN:   -cir-offload-assume-closed-tu -output=%t/same.cir 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=SAME-REMARK --implicit-check-not=kernel-name-redirect:
@@ -65,9 +65,9 @@
 // polybench gemm compile with the real headers and libstdc++ is in the T20
 // report.
 
-// REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'A'): noalias
-// REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'B'): noalias
-// REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'C'): noalias
+// REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'A'): noalias
+// REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'B'): noalias
+// REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'C'): noalias
 
 // CLOSED: define {{.*}}spir_kernel void @_ZTS4Gemm(
 // CLOSED-SAME: ptr addrspace(1) noalias {{[^,]*}}%{{[0-9]+}},
@@ -83,7 +83,7 @@
 // OPEN-COPY-SAME: ptr addrspace(1) noalias {{[^,]*}}%{{[0-9]+}},
 // OPEN-COPY-SAME: ptr addrspace(1) noalias {{[^,]*}}%{{[0-9]+}},
 
-// OPEN-REMARK: remark: launch-path-internalization: kernel @_ZTS4Gemm -> @_ZTS4Gemm.int.{{[0-9a-f]+}}
+// OPEN-REMARK: launch-path-internalization: kernel @_ZTS4Gemm -> @_ZTS4Gemm.int.{{[0-9a-f]+}}
 
 // The handler's kernel name (handler::finalize() asserts that it is the
 // name of the DeviceKernelInfo) on the internalized path is the kernel
@@ -101,9 +101,9 @@
 // OPEN-HOST: call void @llvm.memcpy{{.*}}(ptr {{.*}}, ptr {{.*}}@__const._ZN4sycl3_V17handler19setDeviceKernelInfoI4GemmEEvPv.Info.int, i64 16
 // OPEN-HOST: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4GemmEERNS1_16DeviceKernelInfoEv.int()
 
-// SAME-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'A'): not stamped ('A' and 'B' use the same memory{{.*}})
-// SAME-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'B'): not stamped ('B' and 'A' use the same memory{{.*}})
-// SAME-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'C'): noalias
+// SAME-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'A'): not stamped ('A' and 'B' use the same memory{{.*}})
+// SAME-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'B'): not stamped ('B' and 'A' use the same memory{{.*}})
+// SAME-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Gemm arg {{[0-9]+}} (accessor 'C'): noalias
 
 // The kernel captures C, A, B in this order (first use).
 // SAME: define {{.*}}spir_kernel void @_ZTS4Gemm(

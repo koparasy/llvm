@@ -25,7 +25,7 @@
 //
 // RUN: %{dev} -emit-cir %s -o %t/dev.cir
 // RUN: %{host} -emit-cir %s -o %t/host.cir
-// RUN: cir-offload-merge -combine %{targets} -input=%t/host.cir -input=%t/dev.cir \
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" %{targets} -input=%t/host.cir -input=%t/dev.cir \
 // RUN:   --cir-offload-host-facts=ipo -output=%t/out.cir 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=REMARK --implicit-check-not=kernel-name-redirect:
 // RUN: cir-offload-merge -split %{targets} -input=%t/out.cir -output=%t/split.host.cir \
@@ -35,7 +35,7 @@
 //
 // RUN: %{dev} -emit-cir -DNAME_VARIABLE %s -o %t/var.dev.cir
 // RUN: %{host} -emit-cir -DNAME_VARIABLE %s -o %t/var.host.cir
-// RUN: cir-offload-merge -combine %{targets} -input=%t/var.host.cir -input=%t/var.dev.cir \
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" %{targets} -input=%t/var.host.cir -input=%t/var.dev.cir \
 // RUN:   --cir-offload-host-facts=ipo -output=%t/var.cir 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=VAR
 
@@ -82,11 +82,11 @@ int main() {
   return 0;
 }
 
-// REMARK-DAG: remark: launch-path-internalization: kernel @_ZTS2K1 -> @_ZTS2K1.int.{{[0-9a-f]+}}
-// REMARK-DAG: remark: launch-path-internalization: kernel @_ZTS2K2 -> @_ZTS2K2.int.{{[0-9a-f]+}}
-// REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS2K1.int.{{[0-9a-f]+}} arg 0 (pointer 'c'): noalias
-// REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS2K2.int.{{[0-9a-f]+}} arg 0 (pointer 'a'): not stamped
-// REMARK: remark: launch-path-internalization: kept 1 of 2 kernel copies
+// REMARK-DAG: launch-path-internalization: kernel @_ZTS2K1 -> @_ZTS2K1.int.{{[0-9a-f]+}}
+// REMARK-DAG: launch-path-internalization: kernel @_ZTS2K2 -> @_ZTS2K2.int.{{[0-9a-f]+}}
+// REMARK-DAG: kernel-param-noalias: kernel @_ZTS2K1.int.{{[0-9a-f]+}} arg 0 (pointer 'c'): noalias
+// REMARK-DAG: kernel-param-noalias: kernel @_ZTS2K2.int.{{[0-9a-f]+}} arg 0 (pointer 'a'): not stamped
+// REMARK: launch-path-internalization: kept 1 of 2 kernel copies
 
 // K1's names on its path are the copy's; the copy of `two` launches K2 and
 // reads K2's name as the original does.

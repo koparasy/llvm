@@ -272,59 +272,56 @@ def CallConvLowering : Pass<"cir-call-conv-lowering", "mlir::ModuleOp"> {
 }
 
 // The --cir-offload-host-facts options of the container passes that read
-// SYCL host facts from KernelBindingTable (see OffloadInferKernelParamNoAlias
-// for the noalias pass's own copy).
+// the SYCL host facts (SYCLHostFacts, through the KernelBindingTable they
+// share: SYCLHostFactsCache).
 defvar OffloadHostFactsBudgetOptions = [
   Option<"hostFactsBudgetScale", "host-facts-budget-scale", "double",
          /*default=*/"1.0",
-         "Under ipo/both, multiply every budget of the points-to analysis by "
+         "Multiply every budget of the points-to analysis by "
          "this factor (PointsToAnalysisOptions::budgetScale; for tests).">,
   Option<"hostFactsSlice", "host-facts-slice", "bool", /*default=*/"false",
-         "Under ipo/both, analyse only the functions that can matter to a "
+         "Analyse only the functions that can matter to a "
          "kernel launch (PointsToAnalysisOptions::relevanceSlice).">,
   Option<"hostFactsMaxSeconds", "host-facts-max-seconds", "double",
          /*default=*/"120",
-         "Under ipo/both, the wall-clock seconds the points-to analysis may "
+         "The wall-clock seconds the points-to analysis may "
          "take; past it the bottom-up analysis falls back to the "
          "context-insensitive one, and that to no facts (0: no limit).">,
   Option<"hostFactsMaxMemoryMB", "host-facts-max-memory-mb", "unsigned",
          /*default=*/"8192",
-         "Under ipo/both, the memory (MB) the points-to analysis may "
+         "The memory (MB) the points-to analysis may "
          "allocate, with the same fallback (0: no limit).">,
   Option<"hostFactsInternalize", "host-facts-internalize", "bool",
          /*default=*/"false",
          "Without closed-tu: the launch paths were internalized "
-         "(cir-offload-internalize-launch-paths). Under ipo/both the "
-         "points-to analysis then counts local functions whose address only "
-         "analysed code takes as having visible callers "
-         "(PointsToAnalysisOptions::localFunctionsClosed); in every mode the "
-         "remarks of a kernel other TUs can launch say so.">,
+         "(cir-offload-internalize-launch-paths). The points-to analysis then "
+         "counts local functions whose address only analysed code takes as "
+         "having visible callers "
+         "(PointsToAnalysisOptions::localFunctionsClosed), and skips the "
+         "unused ODR functions (skipUnusedODRFunctions); the remarks of a "
+         "kernel other TUs can launch say so.">,
 ];
 
 defvar OffloadHostFactsOptions = !listconcat(OffloadHostFactsBudgetOptions, [
-  Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"legacy\"",
-         "Where the host facts come from: legacy (the KernelBindingTable "
-         "trace), ipo (SYCLHostFacts, from points-to), or both (legacy is "
-         "used; every fact on which they differ gets a "
-         "host-facts-disagreement remark).">,
+  Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"ipo\"",
+         "Where the host facts come from: ipo (SYCLHostFacts, from the "
+         "points-to analysis of the host module; the default) or none (no "
+         "facts: the pass does nothing).">,
   Option<"hostFactsClosedTU", "host-facts-closed-tu", "bool",
          /*default=*/"false",
          "Assume the module holds every caller of every function "
-         "(PointsToAnalysisOptions::assumeClosedTU under ipo/both). In every "
-         "mode, without it a kernel is specialized in place only if no other "
-         "TU can launch it (KernelBinding::isTUUnique) and never by clone; "
-         "with it a lambda kernel is specialized in place and the rest by "
-         "clone.">,
+         "(PointsToAnalysisOptions::assumeClosedTU). Without it a kernel is "
+         "specialized in place only if no other TU can launch it "
+         "(KernelBinding::isTUUnique: a TU-unique kernel, or the kernel copy "
+         "of an internalized launch path); with it every kernel that is not "
+         "registered (KernelBinding::stampsInPlace).">,
   Option<"hostFactsBottomUp", "host-facts-bu", "bool", /*default=*/"true",
-         "Under ipo/both, run the points-to analysis bottom-up (the "
+         "Run the points-to analysis bottom-up (the "
          "default); false runs it context-insensitively.">,
   Option<"hostFactsSubobjects", "host-facts-subobjects", "bool",
          /*default=*/"true",
-         "Under ipo/both, give class, union and array members their own "
+         "Give class, union and array members their own "
          "points-to nodes (the default).">,
-  Option<"hostFactsCensus", "host-facts-census", "bool", /*default=*/"false",
-         "Under both, also emit one host-facts remark per fact on which the "
-         "two sources agree.">,
 ]);
 
 def OffloadDeadKernelElimination
@@ -442,22 +439,20 @@ def OffloadStampReqdWorkGroupSize
     launches all use the same compile-time-constant nd_range local work-group
     size, records that size on the kernel as a `cir.reqd_work_group_size`
     attribute (natural {X,Y,Z} order, length == number of dims), using the
-    host<->device correspondence and recovered geometry from
-    `KernelBindingTable`.
+    host<->device correspondence of `KernelBindingTable` and the geometry of
+    SYCLHostFacts (the stored-value queries of the points-to analysis).
 
-    A kernel is stamped only when it is TU-local/optimizable (every launch is
-    visible in this TU) and every launch site agrees on a fully-constant,
-    non-empty local size. Plain-`range` launches (no explicit local size),
-    runtime local sizes, and disagreeing sites are left untouched. An existing
-    `cir.reqd_work_group_size` is never overridden.
+    A kernel is stamped only when no other TU can launch it
+    (`KernelBinding::stampsInPlace`: a TU-unique kernel or the kernel copy of
+    an internalized launch path) and every launch site agrees on a
+    fully-constant, non-empty local size. Plain-`range` launches (no explicit
+    local size), runtime local sizes, and disagreeing sites are left
+    untouched. An existing `cir.reqd_work_group_size` is never overridden.
+    Each decision is a remark of category `cir-offload-reqd-wg`.
 
     The SYCL-shaped metadata (`!work_group_num_dim` and the reversed/padded
     `!reqd_work_group_size`) is emitted from this attribute later, at LLVM
     lowering.
-
-    The geometry comes from the legacy trace or from SYCLHostFacts
-    (`host-facts`); under `both` the legacy one is used and every kernel whose
-    two geometries differ gets a `host-facts-disagreement:` remark.
   }];
   let constructor = "mlir::createOffloadStampReqdWorkGroupSizePass()";
   let dependentDialects = ["cir::CIRDialect"];
@@ -465,6 +460,9 @@ def OffloadStampReqdWorkGroupSize
   let statistics = [
     Statistic<"numHostFactsBuilt", "host-facts-analyses-built",
               "Points-to analyses built for the host facts (0 when an "
+              "earlier container pass built the shared one)">,
+    Statistic<"numTablesBuilt", "host-facts-tables-built",
+              "Kernel binding tables built with the host facts (0 when an "
               "earlier container pass built the shared one)">
   ];
 }
@@ -479,47 +477,29 @@ def OffloadInferKernelParamNoAlias
     visible launch site, that field is backed by memory (a USM allocation, a
     buffer's storage) provably distinct from every other candidate field of
     the same closure, the parameter cannot alias the others and is stamped
-    `llvm.noalias`, using the host<->device correspondence and the host facts
-    of `KernelBindingTable` (legacy trace or SYCLHostFacts, `host-facts`).
+    `llvm.noalias`, using the host<->device correspondence of
+    `KernelBindingTable` and the host facts of SYCLHostFacts (the points-to
+    analysis of the host module).
 
-    A TU-local/optimizable binding (every launch visible) is annotated in
-    place. A kernel visible to other TUs is specialized by clone: this TU's
-    launches are redirected to a copy, and only the copy is annotated. A
-    parameter that already carries `llvm.noalias` is left alone, as are an
-    accessor's range/offset parameters and its `readonly`. Each candidate
-    parameter gets one `kernel-param-noalias:` remark with the decision and
-    its reason. The LLVM `noalias` param attribute is emitted from this arg
+    A kernel no other TU can launch (`KernelBinding::stampsInPlace`: a
+    TU-unique kernel or the kernel copy of an internalized launch path) is
+    annotated in place; any other kernel is not annotated (its facts reach
+    the kernel copy of an internalized launch path instead). A parameter that
+    already carries `llvm.noalias` is left alone, as are an accessor's
+    range/offset parameters and its `readonly`. Each candidate parameter gets
+    one remark of category `cir-offload-noalias` with the decision and its
+    reason. The LLVM `noalias` param attribute is emitted from this arg
     attribute later, at LLVM lowering.
   }];
   let constructor = "mlir::createOffloadInferKernelParamNoAliasPass()";
   let dependentDialects = ["cir::CIRDialect"];
-  let options = !listconcat([
-    Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"legacy\"",
-           "Where the noalias fields come from: legacy (the "
-           "KernelBindingTable trace), ipo (SYCLHostFacts, from points-to), "
-           "or both (legacy is used; every candidate field on which they "
-           "differ gets a host-facts-disagreement remark).">,
-    Option<"hostFactsClosedTU", "host-facts-closed-tu", "bool",
-           /*default=*/"false",
-           "Under ipo/both, assume the module holds every caller of every "
-           "function (PointsToAnalysisOptions::assumeClosedTU; "
-           "-cir-offload-assume-closed-tu of cir-offload-merge).">,
-    Option<"hostFactsBottomUp", "host-facts-bu", "bool", /*default=*/"true",
-           "Under ipo/both, run the points-to analysis bottom-up "
-           "(PointsToMode::BU, the default); false runs it "
-           "context-insensitively.">,
-    Option<"hostFactsSubobjects", "host-facts-subobjects", "bool",
-           /*default=*/"true",
-           "Under ipo/both, give class, union and array members their own "
-           "points-to nodes (PointsToAnalysisOptions::subobjects, the "
-           "default).">,
-    Option<"hostFactsCensus", "host-facts-census", "bool", /*default=*/"false",
-           "Under both, also emit one host-facts remark per candidate field "
-           "with both verdicts.">,
-  ], OffloadHostFactsBudgetOptions);
+  let options = OffloadHostFactsOptions;
   let statistics = [
     Statistic<"numHostFactsBuilt", "host-facts-analyses-built",
               "Points-to analyses built for the host facts (0 when an "
+              "earlier container pass built the shared one)">,
+    Statistic<"numTablesBuilt", "host-facts-tables-built",
+              "Kernel binding tables built with the host facts (0 when an "
               "earlier container pass built the shared one)">
   ];
 }
@@ -528,29 +508,30 @@ def OffloadInternalizeLaunchPaths
     : Pass<"cir-offload-internalize-launch-paths", "mlir::ModuleOp"> {
   let summary = "Clone the host launch paths of SYCL kernels from closed roots";
   let description = [{
-    Runs over a `cir.offload.container` without `host-facts-closed-tu`, in
-    every host-facts mode (T26, plan 2.8; legacy since T26b). Every host function on a path
-    from a closed root (`main`, the dynamic initializers) to a
-    `kernel.info` marker that another TU could call (external, linkonce_odr,
-    weak) is cloned as an `internal` copy and the path's edges are redirected
-    to the copies (LaunchPathInternalization.h: direct calls, the CGF
-    invoker a `cgfo.ctor` stores, guarded direct calls for indirect calls,
+    Runs over a `cir.offload.container` without `host-facts-closed-tu`
+    (T26, plan 2.8). Every host function on a path from a closed root
+    (`main`, the dynamic initializers) to a `kernel.info` marker that another
+    TU could call (external, linkonce_odr, weak) is cloned as an `internal`
+    copy and the path's edges are redirected to the copies
+    (LaunchPathInternalization.h: direct calls, the CGF invoker a
+    `cgfo.ctor` stores, guarded direct calls for indirect calls,
     std::thread state vtables). The markers of the copies name a new kernel
-    `<K>.int.<module id>` with local host artifacts (copySYCLKernelLocally),
-    so the facts the host-facts passes derive from this TU's callers apply to
-    it and not to the original kernel, which the originals keep launching.
-    Runs before the passes that read the host facts; the analysis they share
-    (SYCLHostFactsCache) is built on the internalized module. Under
-    `host-facts=legacy` (T26b), whose trace reads only the body of the
-    function holding a launch, a kernel none of whose launches gives a
-    legacy fact is skipped, and the functions holding a launch that gives
-    one are roots too (kept in place).
+    `<K>.int.<module id>` with local host artifacts (LocalKernelCopier), so
+    the facts the host-facts passes derive from this TU's callers apply to it
+    and not to the original kernel, which the originals keep launching. A
+    kernel no closed root reaches gets its paths internalized from the open
+    roots (T28): the externally visible functions nothing in the TU uses,
+    kept in place, whose callers the points-to analysis does not see (their
+    formals are Incomplete), so the facts that survive hold for every
+    caller. Runs before the passes that read the host facts; the analysis
+    they share (SYCLHostFactsCache) is built on the internalized module.
+    Remarks of category `cir-offload-internalize`.
   }];
   let constructor = "mlir::createOffloadInternalizeLaunchPathsPass()";
   let dependentDialects = ["cir::CIRDialect"];
   let options = [
-    Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"legacy\"",
-           "The host-facts mode (legacy, ipo or both; checked only).">,
+    Option<"hostFacts", "host-facts", "std::string", /*default=*/"\"ipo\"",
+           "The host-facts mode (ipo, or none: the pass does nothing).">,
     Option<"hostFactsClosedTU", "host-facts-closed-tu", "bool",
            /*default=*/"false",
            "Closed-TU assumption: if set, the pass does nothing.">,
@@ -595,25 +576,24 @@ def OffloadPropagateSYCLKernelArgs
     (int/float/bool) is bound to a closure capture field. When, at every visible
     launch site, that field is written the SAME compile-time constant, the uses
     of the parameter inside the device kernel are replaced by the constant,
-    using the host<->device correspondence and closure-constant analysis from
-    `KernelBindingTable`.
+    using the host<->device correspondence of `KernelBindingTable` and the
+    constants of SYCLHostFacts (the stored-value queries of the points-to
+    analysis).
 
     Only device code is rewritten, and the kernel signature/ABI is left alone:
     the host still passes the argument, which simply becomes unused on the
-    device side. Only TU-local/optimizable bindings (every launch visible) are
-    touched, and the shared device kernel is annotated in place -- never cloned.
-    A parameter that is a pointer/accessor, whose field has no agreed constant,
-    or whose sites disagree, is left untouched.
+    device side. Only kernels no other TU launches
+    (`KernelBinding::stampsInPlace`: a TU-unique kernel or the kernel copy of
+    an internalized launch path) are touched, in place. A parameter that is a
+    pointer/accessor, whose field has no agreed constant, or whose sites
+    disagree, is left untouched. Each decision is a remark of category
+    `cir-offload-kernel-arg-constant`.
 
     The captured value is stored into the closure record and read back inside
     the always_inline operator(), so the branch/arithmetic a captured flag or
     coefficient feeds only folds once the value reaches it: this pass makes the
     closure-field store a constant, and a follow-up device-module mem2reg/SCCP
     (or the device backend's inline + SROA) performs the fold.
-
-    The constants come from the legacy trace or from SYCLHostFacts
-    (`host-facts`); under `both` the legacy ones are used and every field
-    whose two constants differ gets a `host-facts-disagreement:` remark.
   }];
   let constructor = "mlir::createOffloadPropagateSYCLKernelArgsPass()";
   let dependentDialects = ["cir::CIRDialect"];
@@ -621,6 +601,9 @@ def OffloadPropagateSYCLKernelArgs
   let statistics = [
     Statistic<"numHostFactsBuilt", "host-facts-analyses-built",
               "Points-to analyses built for the host facts (0 when an "
+              "earlier container pass built the shared one)">,
+    Statistic<"numTablesBuilt", "host-facts-tables-built",
+              "Kernel binding tables built with the host facts (0 when an "
               "earlier container pass built the shared one)">
   ];
 }

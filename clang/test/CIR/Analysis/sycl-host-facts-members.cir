@@ -1,56 +1,50 @@
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=0 subobjects=0})" \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both bu=0 subobjects=0})" \
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 bu=0 subobjects=0})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo bu=0 subobjects=0})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
-// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=both host-facts-closed-tu=1 host-facts-bu=0 host-facts-subobjects=0' \
-// RUN:   2>&1 | FileCheck %s --check-prefix=PASS-BOTH
-// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=0 host-facts-subobjects=0' \
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=0 host-facts-subobjects=0' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
-// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=PASS-LEGACY
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=1 subobjects=0})" \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both bu=1 subobjects=0})" \
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -cir-offload-infer-kernel-param-noalias='host-facts=none' \
+// RUN:   2>&1 | FileCheck %s --check-prefix=PASS-NONE
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 bu=1 subobjects=0})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo bu=1 subobjects=0})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN-BU
-// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=1 host-facts-subobjects=0' \
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=1 host-facts-subobjects=0' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=1 subobjects=1})" \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
-// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=1 host-facts-subobjects=1' \
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 bu=1 subobjects=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1 host-facts-bu=1 host-facts-subobjects=1' \
 // RUN:   2>&1 | FileCheck %s --check-prefix=PASS-IPO
-// The defaults (bu=1 subobjects=1, what --cir-offload-host-facts=ipo|both
-// runs): the same verdicts as bottom-up.
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1})" \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
-// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both})" \
+// The defaults (bu=1 subobjects=1, what --cir-offload-host-facts=ipo runs):
+// the same verdicts as bottom-up.
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN-BU
-// RUN: cir-opt %s -cir-offload-infer-kernel-param-noalias='host-facts=both host-facts-closed-tu=1' \
-// RUN:   2>&1 | FileCheck %s --check-prefix=PASS-DEFAULT
-// PASS-DEFAULT: remark: host-facts-disagreements: 4 of 4 candidate fields (closed-tu, bu, subobjects)
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -cir-offload-infer-kernel-param-noalias \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=PASS-DEFAULT
+//
+// Two buffers are members of a Bench object built by @setup and reached in
+// @run through `this`, and two USM pointers allocated by @setup into members
+// are read in @run. Under closed-TU points-to binds `this` to main's object
+// and sees two distinct storages and two distinct allocations: all four are
+// no-alias, and the pass stamps them (PASS-IPO). Without closed-TU @setup
+// and @run may have callers in other TUs, their `this` is Incomplete, and
+// nothing is proven (OPEN; the default pass, PASS-DEFAULT, is open and has
+// no internalized paths here). host-facts=none stamps nothing (PASS-NONE).
+// (Until T28 this test compared these verdicts with the deleted legacy
+// trace, which stopped at the parameter and proved none.)
 //
 // Bottom-up (bu=1, T17): the same verdicts. Under closed-TU the launch record
 // in @run's graph is replaced by its copy in @main's graph (every caller of
 // @run copied its graph), where the storages and the USM objects are the ones
 // @setup's copy made. Open, @run may have callers we don't see, its own record
 // is used, and there the objects behind `this` have no allocation site.
-// OPEN-BU: host-facts A: legacy=not stamped ({{.*}}) ipo=not stamped (accessor 'A': {{n[0-9]+}} has no allocation site the analysis sees)
-// OPEN-BU: host-facts P: legacy=not stamped ({{.*}}) ipo=not stamped (pointer 'P': {{n[0-9]+}} has no allocation site the analysis sees)
-// OPEN-BU: host-facts-disagreements: 0 of 4 candidate fields
-
-// --cir-offload-host-facts=both: the legacy and the points-to (SYCLHostFacts)
-// noalias verdicts of every candidate field, the legacy one used. Here they
-// disagree: two buffers are members of a Bench object built by @setup and
-// reached in @run through `this`. The legacy trace stops at the parameter;
-// points-to binds `this` to main's object under closed-TU and sees two
-// distinct storages. Without closed-TU, @setup and @run may have callers in
-// other TUs, their `this` is Incomplete, and the two agree (not stamped).
-//
-// Two USM pointers allocated by @setup into members, read in @run, show the
-// same for the pointer path. The pass prints a host-facts-disagreement remark
-// per differing field and the count, and keeps the legacy result: no
-// llvm.noalias on the kernel (PASS-BOTH). With host-facts=ipo the points-to
-// verdict is used and the USM pointer parameters are stamped (PASS-IPO); the
-// default (legacy) mode prints nothing and stamps nothing (PASS-LEGACY).
+// OPEN-BU-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// OPEN-BU-NOT: no-alias A
+// OPEN-BU: no-alias-note A: accessor 'A': {{n[0-9]+}} has no allocation site the analysis sees
+// OPEN-BU: no-alias-note P: pointer 'P': {{n[0-9]+}} has no allocation site the analysis sees
 
 !s8i = !cir.int<s, 8>
 !u64i = !cir.int<u, 64>
@@ -136,44 +130,27 @@ module attributes {cir.offload.container} {
 }
 
 // The table keeps the legacy verdict (no no-alias line) and prints both.
-// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// BOTH-NOT: no-alias A
-// BOTH: no-alias-note A: the buffer is a function parameter
-// BOTH: no-alias-note P: pointer 'P' is not a visible USM allocation
-// BOTH: host-facts A: legacy=not stamped (the buffer is a function parameter) ipo=noalias
-// BOTH: host-facts B: legacy=not stamped (the buffer is a function parameter) ipo=noalias
-// BOTH: host-facts P: legacy=not stamped (pointer 'P' is not a visible USM allocation) ipo=noalias
-// BOTH: host-facts Q: legacy=not stamped (pointer 'Q' is not a visible USM allocation) ipo=noalias
-// BOTH: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field A legacy=not stamped (the buffer is a function parameter) ipo=noalias
-// BOTH: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field B legacy=not stamped (the buffer is a function parameter) ipo=noalias
-// BOTH: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field P legacy=not stamped (pointer 'P' is not a visible USM allocation) ipo=noalias
-// BOTH: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field Q legacy=not stamped (pointer 'Q' is not a visible USM allocation) ipo=noalias
-// BOTH: host-facts-disagreements: 4 of 4 candidate fields
+// CLOSED-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// CLOSED: no-alias A B P Q
+// CLOSED: no-alias-note A: a buffer (ghost {{n[0-9]+}})
+// CLOSED: no-alias-note B: a buffer (ghost {{n[0-9]+}})
+// CLOSED: no-alias-note P: a USM allocation ({{.*}})
+// CLOSED: no-alias-note Q: a USM allocation ({{.*}})
 
 // OPEN-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// OPEN: host-facts A: legacy=not stamped ({{.*}}) ipo=not stamped (accessor 'A': a handle of storage {{n[0-9]+}} ({{n[0-9]+}}) may be assigned by code we don't see: it is parameter #0 of @setup, which may have callers that are not analysed ({{.*}}))
-// OPEN: host-facts P: legacy=not stamped ({{.*}}) ipo=not stamped (pointer 'P': a pointer to {{n[0-9]+}} is held in {{n[0-9]+}}, which code we don't see may write: it is parameter #0 of @setup, {{.*}})
-// OPEN-NOT: host-facts-disagreement:
-// OPEN: host-facts-disagreements: 0 of 4 candidate fields
+// OPEN-NOT: no-alias A
+// OPEN: no-alias-note A: accessor 'A': a handle of storage {{n[0-9]+}} ({{n[0-9]+}}) may be assigned by code we don't see: it is parameter #0 of @setup, which may have callers that are not analysed ({{.*}})
+// OPEN: no-alias-note P: pointer 'P': a pointer to {{n[0-9]+}} is held in {{n[0-9]+}}, which code we don't see may write: it is parameter #0 of @setup, {{.*}}
 
-// PASS-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field A legacy=not stamped ({{.*}}) ipo=noalias
-// PASS-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field B legacy=not stamped ({{.*}}) ipo=noalias
-// PASS-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field P legacy=not stamped ({{.*}}) ipo=noalias
-// PASS-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field Q legacy=not stamped ({{.*}}) ipo=noalias
-// PASS-BOTH: remark: host-facts-disagreements: 4 of 4 candidate fields (closed-tu, ci)
-// PASS-BOTH-NOT: llvm.noalias
+// PASS-NONE-NOT: kernel-param-noalias
+// PASS-NONE-NOT: llvm.noalias
+// PASS-DEFAULT: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (accessor 'A'): not stamped (accessor 'A': {{.*}})
+// PASS-DEFAULT-NOT: ): noalias
 
-// With host-facts=ipo both accessor pointer parameters and both USM pointer
-// parameters are stamped (the accessor ranges are not), one remark each.
-// PASS-IPO: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (accessor 'A'): noalias (a buffer (ghost {{n[0-9]+}}))
-// PASS-IPO: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 2 (accessor 'B'): noalias (a buffer (ghost {{n[0-9]+}}))
-// PASS-IPO: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 4 (pointer 'P'): noalias (a USM allocation ({{.*}}))
-// PASS-IPO: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 5 (pointer 'Q'): noalias (a USM allocation ({{.*}}))
+// PASS-IPO: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (accessor 'A'): noalias (a buffer (ghost {{n[0-9]+}}))
+// PASS-IPO: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 2 (accessor 'B'): noalias (a buffer (ghost {{n[0-9]+}}))
+// PASS-IPO: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 4 (pointer 'P'): noalias (a USM allocation ({{.*}}))
+// PASS-IPO: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 5 (pointer 'Q'): noalias (a USM allocation ({{.*}}))
 // PASS-IPO-NOT: remark
 // PASS-IPO: cir.func @_ZTSZ4mainEUlvE_({{.*}}field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}, llvm.noalias}, %arg1: {{[^%]*}}path = ["A"]}}, {{.*}}field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}, llvm.noalias}, %arg3: {{[^%]*}}path = ["B"]}}, {{.*}}field = "P", kind = "pointer", path = ["P"]}, llvm.noalias}, {{.*}}field = "Q", kind = "pointer", path = ["Q"]}, llvm.noalias})
 
-// PASS-LEGACY-NOT: ): noalias
-// PASS-LEGACY: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (accessor 'A'): not stamped (the buffer is a function parameter)
-// PASS-LEGACY-COUNT-2: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg {{[0-9]}} ({{.*}}): not stamped
-// PASS-LEGACY: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 5 (pointer 'Q'): not stamped (pointer 'Q' is not a visible USM allocation)
-// PASS-LEGACY-NOT: ): noalias

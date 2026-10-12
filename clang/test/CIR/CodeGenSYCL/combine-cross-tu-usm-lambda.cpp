@@ -6,18 +6,21 @@
 // two distinct malloc_device pointers, TU2's tu2_api with the same pointer
 // twice (and TU2's tu2_distinct with two distinct ones). The facts TU1 derives (noalias on d and s) are an AND over TU1's
 // launches only, so they must not be stamped on KLam: the device link keeps
-// one KLam for both TUs' launches. Before T26b the default (legacy) host
-// facts stamped KLam in place ("the closure is a lambda"). Now:
+// one KLam for both TUs' launches. Before T26b the then-default legacy host
+// facts stamped KLam in place ("the closure is a lambda"). Now (the
+// points-to host facts, the default since T28):
 //  - the default internalizes TU1's launch path from main and stamps the
 //    kernel copy KLam.int.<TU1 id>, which only TU1's internal copies launch;
 //    KLam stays unstamped;
-//  - TU2 has no main, but the legacy facts are read off the body of the
-//    function holding the launch alone: tu2_distinct is a root of its own
-//    path and launches KLam.int.<TU2 id>; tu2_api launches KLam;
+//  - TU2 has no main; tu2_api and tu2_distinct are open roots (T28): both
+//    call TU2's internal copies, which launch the one kernel copy
+//    KLam.int.<TU2 id>, whose facts are an AND over both launches: tu2_api
+//    passes the same pointer twice, so the copy gets nothing and the prune
+//    drops it (one kernel copy per kernel and TU; the deleted legacy facts
+//    gave tu2_distinct's launch a copy of its own);
 //  - TU-unique kernels stay stamped in place: KLocal (a lambda in a functor
 //    of an unnamed namespace) and KMain (a lambda in main);
-//  - with --cir-offload-internalize-launch-paths=false, KLam gets nothing,
-//    with a remark saying why;
+//  - with --cir-offload-internalize-launch-paths=false nothing is proven;
 //  - -cir-offload-assume-closed-tu keeps the closed-TU rule (a lambda is
 //    stamped in place).
 // The device modules of the two TUs are linked (llvm-link; nothing is run).
@@ -33,7 +36,7 @@
 // DEFINE: %{v} = tu1
 // DEFINE: %{opts} =
 // DEFINE: %{m} = default
-// DEFINE: %{merge} = cir-offload-merge -combine %{targets} -input=%t/%{v}.host.cir \
+// DEFINE: %{merge} = cir-offload-merge -combine --remarks-filter="cir-offload.*" %{targets} -input=%t/%{v}.host.cir \
 // DEFINE:     -input=%t/%{v}.dev.cir %{opts} -output=%t/%{v}.%{m}.cir > %t/%{v}.%{m}.remarks 2>&1 \
 // DEFINE:   && cir-offload-merge -split %{targets} -input=%t/%{v}.%{m}.cir \
 // DEFINE:     -output=%t/%{v}.%{m}.split.host.cir -output=%t/%{v}.%{m}.split.dev.cir \
@@ -45,7 +48,7 @@
 // RUN: %{dev} -emit-cir -DTU2 %s -o %t/tu2.dev.cir
 // RUN: %{host} -emit-cir -DTU2 %s -o %t/tu2.host.cir
 //
-// The default (legacy host facts, internalized launch paths).
+// The default (points-to host facts, internalized launch paths).
 // RUN: %{merge}
 // RUN: FileCheck %s --check-prefix=TU1-REMARK --input-file=%t/tu1.default.remarks
 // RUN: FileCheck %s --check-prefix=TU1-DEV --input-file=%t/tu1.default.dev.ll
@@ -66,13 +69,13 @@
 // RUN: FileCheck %s --check-prefix=NOINT --input-file=%t/tu1.noint.remarks
 // RUN: FileCheck %s --check-prefix=NOINT-DEV --input-file=%t/tu1.noint.dev.ll
 //
-// The same under ipo (open, internalized).
+// The same, spelled --cir-offload-host-facts=ipo.
 // REDEFINE: %{m} = ipo
 // REDEFINE: %{opts} = --cir-offload-host-facts=ipo
 // RUN: %{merge}
 // RUN: FileCheck %s --check-prefix=TU1-DEV --input-file=%t/tu1.ipo.dev.ll
 //
-// Closed-TU: the closed-TU rule, KLam stamped in place.
+// Closed-TU: KLam (not registered) stamped in place.
 // REDEFINE: %{m} = closed
 // REDEFINE: %{opts} = -cir-offload-assume-closed-tu
 // RUN: %{merge}
@@ -127,10 +130,7 @@ void tu2_api(queue &q) {
   float *x = malloc_device<float>(64, q);
   q.submit(Copy{x, x});
 }
-// ... and distinct here: the legacy facts of this launch are read off this
-// function's body alone, so they hold for any caller of it: it is a root of
-// its own launch path (kept in place, external), which launches the copy
-// KLam.int.<TU2 id>.
+// ... and distinct here, but both launch the one kernel copy of TU2.
 void tu2_distinct(queue &q) {
   float *x = malloc_device<float>(64, q);
   float *y = malloc_device<float>(64, q);
@@ -138,14 +138,14 @@ void tu2_distinct(queue &q) {
 }
 #endif
 
-// TU1-REMARK-DAG: remark: launch-path-internalization: kernel @_ZTS4KLam -> @_ZTS4KLam.int.[[ID:[0-9a-f]+]] for 1 launch marker through the internalized launch path from root @main
-// TU1-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4KLam arg 0 (pointer 'd'): not stamped
-// TU1-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4KLam arg 1 (pointer 's'): not stamped
-// TU1-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4KLam.int.[[ID]] arg 0 (pointer 'd'): noalias (a USM allocation) through the internalized launch path from root @main
-// TU1-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4KLam.int.[[ID]] arg 1 (pointer 's'): noalias (a USM allocation) through the internalized launch path from root @main
-// TU1-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS6KLocal arg 0 (pointer 'd'): noalias (a USM allocation)
-// TU1-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS5KMain arg 0 (pointer 'a'): noalias (a USM allocation)
-// TU1-REMARK-DAG: remark: launch-path-internalization: kept 1 of 1 kernel copies
+// TU1-REMARK-DAG: launch-path-internalization: kernel @_ZTS4KLam -> @_ZTS4KLam.int.[[ID:[0-9a-f]+]] for 1 launch marker through the internalized launch path from root @main
+// TU1-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4KLam arg 0 (pointer 'd'): not stamped
+// TU1-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4KLam arg 1 (pointer 's'): not stamped
+// TU1-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4KLam.int.[[ID]] arg 0 (pointer 'd'): noalias (a USM allocation ({{.*}})) through the internalized launch path from root @main
+// TU1-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4KLam.int.[[ID]] arg 1 (pointer 's'): noalias (a USM allocation ({{.*}})) through the internalized launch path from root @main
+// TU1-REMARK-DAG: kernel-param-noalias: kernel @_ZTS6KLocal arg 0 (pointer 'd'): noalias (a USM allocation ({{.*}}))
+// TU1-REMARK-DAG: kernel-param-noalias: kernel @_ZTS5KMain arg 0 (pointer 'a'): noalias (a USM allocation ({{.*}}))
+// TU1-REMARK-DAG: launch-path-internalization: kept 1 of 1 kernel copies
 
 // TU1's device module: the shared KLam is not stamped, its copy is; the
 // TU-unique kernels are stamped in place.
@@ -167,25 +167,33 @@ void tu2_distinct(queue &q) {
 // TU1-HOST: call {{.*}}@_ZN4sycl3_V16detail11string_viewaSERKS2_({{.*}}@_ZN4sycl3_V16detail21CompileTimeKernelInfoI4KLamEE.int)
 // TU1-HOST: call {{.*}}@_ZN4sycl3_V16detail19getDeviceKernelInfoI4KLamEERNS1_16DeviceKernelInfoEv.int()
 
-// TU2: tu2_api launches the unstamped KLam, tu2_distinct the copy.
-// TU2-REMARK: remark: launch-path-internalization: kernel @_ZTS4KLam -> @_ZTS4KLam.int.[[ID2:[0-9a-f]+]] for 1 launch marker through the internalized launch path from root @_Z12tu2_distinctRN4sycl3_V15queueE
+// TU2: both open roots reach the one copy, which gets nothing (tu2_api's
+// pointers are the same allocation); the prune restores the original paths.
+// TU2-REMARK: launch-path-internalization: kernel @_ZTS4KLam -> @_ZTS4KLam.int.[[ID2:[0-9a-f]+]] for 1 launch marker through the internalized launch path from root @_Z7tu2_apiRN4sycl3_V15queueE, @_Z12tu2_distinctRN4sycl3_V15queueE
+// TU2-REMARK: kernel-param-noalias: kernel @_ZTS4KLam.int.[[ID2]] arg 0 (pointer 'd'): not stamped ('d' and 's' use the same memory, {{.*}} in @_Z7tu2_apiRN4sycl3_V15queueE))
+// TU2-REMARK: launch-path-internalization: kept 0 of 1 kernel copies
 // TU2-DEV: define weak_odr spir_kernel void @_ZTS4KLam(
 // TU2-DEV-NOT: noalias
 // TU2-DEV-SAME: {{$}}
-// TU2-DEV: define weak_odr spir_kernel void @_ZTS4KLam.int.{{[0-9a-f]+}}(ptr addrspace(1) noalias {{[^,]*}}, ptr addrspace(1) noalias
+// TU2-DEV-NOT: KLam.int
 // TU2-HOST-LABEL: define dso_local void @_Z7tu2_apiRN4sycl3_V15queueE(
 // TU2-HOST: call void @_ZN4sycl3_V15queue6submitI4CopyEENS0_5eventET_(
 // TU2-HOST-LABEL: define dso_local void @_Z12tu2_distinctRN4sycl3_V15queueE(
-// TU2-HOST: call void @_ZN4sycl3_V15queue6submitI4CopyEENS0_5eventET_.int(
+// TU2-HOST: call void @_ZN4sycl3_V15queue6submitI4CopyEENS0_5eventET_(
 
-// The one KLam of the program carries no noalias; each TU's copy is its own.
+// The one KLam of the program carries no noalias; TU1's copy is its own.
 // LINKED: define weak_odr spir_kernel void @_ZTS4KLam(
 // LINKED-NOT: noalias
 // LINKED-SAME: {{$}}
-// LINKED-COUNT-2: define weak_odr spir_kernel void @_ZTS4KLam.int.{{[0-9a-f]+}}(ptr addrspace(1) noalias
+// LINKED-COUNT-1: define weak_odr spir_kernel void @_ZTS4KLam.int.{{[0-9a-f]+}}(ptr addrspace(1) noalias
+// LINKED-NOT: KLam.int
 
-// NOINT-DAG: remark: kernel-param-noalias: kernel @_ZTS4KLam arg 0 (pointer 'd'): not stamped (the kernel is visible to other TUs; facts this TU derives hold only through an internalized launch path, and launch-path internalization is off)
-// NOINT-DAG: remark: kernel-param-noalias: kernel @_ZTS6KLocal arg 0 (pointer 'd'): noalias (a USM allocation)
+// Without internalization the points-to facts are open: the launch paths
+// below main go through linkonce functions whose formals are Incomplete, so
+// nothing is proven, not even for the TU-unique kernels.
+// NOINT-DAG: kernel-param-noalias: kernel @_ZTS4KLam arg 0 (pointer 'd'): not stamped
+// NOINT-DAG: kernel-param-noalias: kernel @_ZTS6KLocal arg 0 (pointer 'd'): not stamped
+// NOINT-NOT: ): noalias
 // NOINT-DEV: define weak_odr spir_kernel void @_ZTS4KLam(
 // NOINT-DEV-NOT: noalias
 // NOINT-DEV-SAME: {{$}}

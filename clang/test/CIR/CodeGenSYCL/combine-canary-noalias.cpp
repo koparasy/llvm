@@ -20,7 +20,7 @@
 // DEFINE: %{targets} = -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown
 // DEFINE: %{pipe} = %{dev} -emit-cir %{flags} %s -o %t/%{v}.dev.cir \
 // DEFINE:   && %{host} -emit-cir %{flags} %s -o %t/%{v}.host.cir \
-// DEFINE:   && cir-offload-merge -combine %{targets} -input=%t/%{v}.host.cir \
+// DEFINE:   && cir-offload-merge -combine --remarks-filter="cir-offload.*" %{targets} -input=%t/%{v}.host.cir \
 // DEFINE:        -input=%t/%{v}.dev.cir --cir-offload-host-facts=ipo \
 // DEFINE:        -cir-offload-assume-closed-tu -output=%t/%{v}.cir > %t/%{v}.remarks 2>&1 \
 // DEFINE:   && cir-offload-merge -split %{targets} -input=%t/%{v}.cir \
@@ -218,16 +218,16 @@ int main() {
 // ALIAS-SAME: ptr addrspace(1) noundef readonly align 4 %4,
 // ALIAS-SAME: ptr addrspace(1) noalias noundef readonly align 4 %8,
 
-// ALIAS-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Sink arg 0 (accessor 'C'): not stamped ('C' and 'A' use the same memory
-// ALIAS-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Sink arg 4 (accessor 'A'): not stamped ('A' and 'C' use the same memory
-// ALIAS-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Sink arg 8 (accessor 'B'): noalias
+// ALIAS-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Sink arg 0 (accessor 'C'): not stamped ('C' and 'A' use the same memory
+// ALIAS-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Sink arg 4 (accessor 'A'): not stamped ('A' and 'C' use the same memory
+// ALIAS-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Sink arg 8 (accessor 'B'): noalias
 
 // -DUSM2: pointers C, A, B.
 // USM: define {{.*}}spir_kernel void @_ZTS4Sink(ptr addrspace(1) noundef align 4 %0, ptr addrspace(1) noundef align 4 %1, ptr addrspace(1) noalias noundef align 4 %2)
 
-// USM-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Sink arg 0 (pointer 'C'): not stamped ('C' and 'A' use the same memory, a USM allocation
-// USM-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Sink arg {{[0-9]+}} ({{accessor|pointer}} 'A'): not stamped ('A' and 'C' use the same memory, {{.*}}a USM allocation
-// USM-REMARK-DAG: remark: kernel-param-noalias: kernel @_ZTS4Sink arg {{[0-9]+}} (pointer 'B'): noalias (a USM allocation
+// USM-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Sink arg 0 (pointer 'C'): not stamped ('C' and 'A' use the same memory, a USM allocation
+// USM-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Sink arg {{[0-9]+}} ({{accessor|pointer}} 'A'): not stamped ('A' and 'C' use the same memory, {{.*}}a USM allocation
+// USM-REMARK-DAG: kernel-param-noalias: kernel @_ZTS4Sink arg {{[0-9]+}} (pointer 'B'): noalias (a USM allocation
 
 // -DUSMBUF: pointer C, accessor A, pointer B.
 // USMBUF: define {{.*}}spir_kernel void @_ZTS4Sink(ptr addrspace(1) noundef align 4 %0, ptr addrspace(1) noundef readonly align 4 %1,

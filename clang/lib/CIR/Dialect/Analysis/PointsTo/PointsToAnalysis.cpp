@@ -641,6 +641,34 @@ void PointsToAnalysis::computeReplacedCalls() {
     auto parent = user->getParentOfType<cir::FuncOp>();
     return parent && skipped.contains(parent);
   };
+  // Whether the body of an ODR function names a function with local
+  // linkage (an internalized copy its launch paths were redirected to, T28):
+  // a call another TU binds to it then runs code of this TU that its own
+  // copy would not, so the ODR argument of skipUnusedODRFunctions does not
+  // apply and the body is analysed.
+  llvm::DenseMap<Operation *, bool> namesLocalFunction;
+  auto callsLocal = [&](cir::FuncOp func) {
+    auto [it, inserted] = namesLocalFunction.try_emplace(func, false);
+    if (!inserted)
+      return it->second;
+    bool found = false;
+    func.walk([&](Operation *op) {
+      for (NamedAttribute attr : op->getAttrs()) {
+        attr.getValue().walk([&](FlatSymbolRefAttr ref) {
+          if (found)
+            return;
+          if (auto target =
+                  symbols.lookupNearestSymbolFrom<cir::FuncOp>(op, ref))
+            found = cir::isLocalLinkage(target.getLinkage());
+        });
+        if (found)
+          return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    namesLocalFunction[func] = found;
+    return found;
+  };
   bool changed = true;
   while (changed) {
     changed = false;
@@ -652,7 +680,7 @@ void PointsToAnalysis::computeReplacedCalls() {
       bool odrUnused = false;
       if (options.skipUnusedODRFunctions && isODR(func) &&
           !func->hasAttr("global_ctor_priority") &&
-          !func->hasAttr("global_dtor_priority")) {
+          !func->hasAttr("global_dtor_priority") && !callsLocal(func)) {
         odrUnused = llvm::all_of(otherUsersOf.lookup(func.getSymNameAttr()),
                                  inSkipped) &&
                     (noCalls || llvm::all_of(it->second, [&](Operation *call) {

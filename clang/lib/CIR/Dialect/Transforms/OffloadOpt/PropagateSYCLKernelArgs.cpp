@@ -11,12 +11,12 @@
 //
 // A spir_kernel scalar parameter is bound to the closure capture field CIRGen
 // recorded for it in `cir.sycl_kernel_param` (see SYCLKernelParams.h).
-// KernelBindingTable already
-// resolved, on the host side, which scalar capture fields hold the SAME
-// compile-time constant at every launch site -- see KernelBinding::
-// syclConstArgs. This pass maps each device scalar parameter to its field and,
-// when that field has an agreed constant, replaces the parameter's uses with a
-// materialized cir.const of that value.
+// KernelBindingTable already resolved, on the host side, which scalar capture
+// fields hold the SAME compile-time constant at every launch site -- see
+// KernelBinding::syclConstArgs, from SYCLHostFacts (the stored-value queries
+// of the points-to analysis). This pass maps each device scalar parameter to
+// its field and, when that field has an agreed constant, replaces the
+// parameter's uses with a materialized cir.const of that value.
 //
 // The kernel signature/ABI is untouched: the host still passes the argument,
 // the argument simply becomes unused on the device side. Soundness: every
@@ -25,8 +25,8 @@
 // This is the scalar analogue of the noalias inference pass
 // (InferKernelParamNoAlias.cpp) and follows its rules: in place for a kernel
 // no other TU launches (or a kernel copy of an internalized launch path);
-// without -cir-offload-assume-closed-tu nothing for a kernel other TUs can
-// launch (a remark per field); under it, a clone for the closed-TU residual.
+// nothing for a kernel other TUs can launch (a remark per field). One remark
+// per decision (category cir-offload-kernel-arg-constant).
 //
 // The headline win (a captured flag that gates a branch folding away) is
 // realized later: the captured value is stored into the closure record, read
@@ -66,15 +66,17 @@ struct OffloadPropagateSYCLKernelArgsPass
 void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
   mlir::ModuleOp container = getOperation();
   if (!cir::isOffloadContainer(container))
-    return;
+    return markAllAnalysesPreserved();
   std::optional<cir::HostFactsMode> mode = cir::parseHostFactsMode(hostFacts);
   if (!mode) {
     container.emitError() << "unknown host-facts mode '" << hostFacts
-                          << "' (expected legacy, ipo or both)";
+                          << "' (expected ipo or none)";
     return signalPassFailure();
   }
-  // The legacy table is the cached analysis the other container passes share;
-  // the other modes build their own.
+  if (*mode == cir::HostFactsMode::None)
+    return markAllAnalysesPreserved();
+  // The table and the host facts the container passes share
+  // (SYCLHostFactsCache).
   cir::HostFactsOptions options;
   options.mode = *mode;
   options.assumeClosedTU = hostFactsClosedTU;
@@ -85,45 +87,19 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
   options.maxSeconds = hostFactsMaxSeconds;
   options.maxMemoryMB = hostFactsMaxMemoryMB;
   options.internalize = hostFactsInternalize;
-  std::optional<cir::KernelBindingTable> ownTable;
-  cir::SYCLHostFactsCache *factsCache = nullptr;
-  if (*mode != cir::HostFactsMode::Legacy) {
-    factsCache = &getAnalysis<cir::SYCLHostFactsCache>();
-    unsigned builtBefore = factsCache->getNumBuilt();
-    ownTable.emplace(container, options, factsCache);
-    numHostFactsBuilt += factsCache->getNumBuilt() - builtBefore;
-    // The budgets that tripped while this table was built (once per
-    // change: the passes share the analysis).
-    if (std::optional<std::string> trips =
-            factsCache->get(options).takeBudgetReport())
-      mlir::emitRemark(container.getLoc())
-          << "host-facts budget trips: " << *trips << " "
-          << cir::formatHostFactsOptions(options);
-  }
-  cir::KernelBindingTable &table =
-      ownTable ? *ownTable : getAnalysis<cir::KernelBindingTable>();
-  if (*mode == cir::HostFactsMode::Both) {
-    // Legacy is the result; report where the two sources differ.
-    unsigned disagreements = 0;
-    for (const cir::HostFactsConstComparison &cmp :
-         table.getHostFactsConstComparisons()) {
-      mlir::Location loc = container.getLoc();
-      if (const cir::KernelBinding *binding = table.lookup(cmp.kernel))
-        if (!binding->deviceKernels.empty())
-          loc = binding->deviceKernels.front()->getLoc();
-      if (cmp.disagrees()) {
-        ++disagreements;
-        mlir::emitRemark(loc) << cir::formatHostFactsDisagreement(cmp);
-      } else if (hostFactsCensus) {
-        mlir::emitRemark(loc)
-            << "host-facts: " << cir::formatHostFactsComparison(cmp);
-      }
-    }
+  cir::SYCLHostFactsCache &factsCache = getAnalysis<cir::SYCLHostFactsCache>();
+  unsigned builtBefore = factsCache.getNumBuilt();
+  unsigned tablesBefore = factsCache.getNumTablesBuilt();
+  const cir::KernelBindingTable &table = factsCache.getTable(options);
+  numHostFactsBuilt += factsCache.getNumBuilt() - builtBefore;
+  numTablesBuilt += factsCache.getNumTablesBuilt() - tablesBefore;
+  // The budgets that tripped while the analysis was built (once: the passes
+  // share it).
+  if (std::optional<std::string> trips =
+          factsCache.get(options).takeBudgetReport())
     mlir::emitRemark(container.getLoc())
-        << "host-facts-disagreements: " << disagreements << " of "
-        << table.getHostFactsConstComparisons().size()
-        << " scalar capture fields " << cir::formatHostFactsOptions(options);
-  }
+        << "host-facts budget trips: " << *trips << " "
+        << cir::formatHostFactsOptions(options);
   bool changed = false;
 
   // Replace each scalar kernel parameter bound to an agreed-constant capture
@@ -155,11 +131,16 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
         // match the parameter (an unexpected reinterpret), is left alone.
         if (!value || value.getType() != arg.getType())
           continue;
+        std::string text;
+        llvm::raw_string_ostream os(text);
+        os << "kernel-arg-constant: kernel @" << kernel.getName() << " arg "
+           << arg.getArgNumber() << " ('" << field << "'): " << value;
         if (!notApplied.empty()) {
-          mlir::emitRemark(kernel.getLoc())
-              << "kernel-arg-constant: kernel @" << kernel.getName() << " arg "
-              << arg.getArgNumber() << " ('" << field << "'): " << value
-              << " not propagated (" << notApplied << ")";
+          os << " not propagated (" << notApplied << ")";
+          cir::emitOffloadRemark(
+              kernel.getLoc(), cir::OffloadRemarkKind::Missed,
+              "PropagateSYCLKernelArgs", cir::kKernelArgConstantRemarkCategory,
+              kernel.getName(), text);
           continue;
         }
 
@@ -169,20 +150,18 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
             cir::ConstantOp::create(builder, kernel.getLoc(), value);
         arg.replaceAllUsesWith(constant);
         did = true;
-        if (cir::isInternalizedSYCLKernel(kernel)) {
-          cir::noteInternalizedSYCLKernelUse(kernel);
-          mlir::emitRemark(kernel.getLoc())
-              << "kernel-arg-constant: kernel @" << kernel.getName() << " arg "
-              << arg.getArgNumber() << " ('" << field << "'): " << value
-              << cir::describeInternalizedSYCLKernel(kernel);
-        }
+        cir::noteInternalizedSYCLKernelUse(kernel);
+        os << cir::describeInternalizedSYCLKernel(kernel);
+        cir::emitOffloadRemark(kernel.getLoc(), cir::OffloadRemarkKind::Passed,
+                               "PropagateSYCLKernelArgs",
+                               cir::kKernelArgConstantRemarkCategory,
+                               kernel.getName(), text);
       }
     }
     return did;
   };
 
   std::string sharedNote = cir::getSharedSYCLKernelNote(hostFactsInternalize);
-  unsigned specTag = 0;
   for (const auto &entry : table) {
     const cir::KernelBinding &binding = entry.second;
 
@@ -196,34 +175,22 @@ void OffloadPropagateSYCLKernelArgsPass::runOnOperation() {
       // No other TU launches the kernel (or closed-TU is assumed): safe to
       // fold the constant into the shared device kernel in place.
       changed |= applyConstArgs(binding.deviceKernels, binding.syclConstArgs);
-    } else if (!hostFactsClosedTU) {
-      // Another TU can launch the kernel with another value: not in place,
-      // and not by clone (see InferKernelParamNoAlias); the kernel copies of
-      // the internalized paths get the facts.
-      applyConstArgs(binding.deviceKernels, binding.syclConstArgs, sharedNote);
     } else {
-      // Closed-TU residual: the shared kernel is a functor / by-name
-      // reachable, so a launch this table does not describe could pass a
-      // different argument. Specialize by clone -- redirect this TU's
-      // launches to a fresh kernel and fold the constant only into the
-      // clone, leaving the generic original for unseen launches.
-      auto spec = cir::specializeSYCLKernelForLaunches(
-          container, binding, binding.launchSites,
-          "constprop." + std::to_string(specTag++));
-      if (spec) {
-        if (factsCache)
-          factsCache->recordSpecialization(spec->name, entry.first);
-        applyConstArgs(spec->deviceKernels, binding.syclConstArgs);
-        changed = true; // The clone + redirect mutated the IR regardless.
-      }
+      // Another TU can launch the kernel with another value: not in place;
+      // the kernel copies of the internalized paths get the facts.
+      applyConstArgs(binding.deviceKernels, binding.syclConstArgs,
+                     hostFactsClosedTU
+                         ? llvm::StringRef("the kernel is registered: it may "
+                                           "be launched by name")
+                         : llvm::StringRef(sharedNote));
     }
   }
 
   if (!changed)
     markAllAnalysesPreserved();
   else
-    // SOUNDNESS: see SYCLHostFactsCache: the device-side changes and the
-    // specializations leave the host facts true.
+    // SOUNDNESS: see SYCLHostFactsCache: the device-side changes leave the
+    // host facts and the table true.
     markAnalysesPreserved<cir::SYCLHostFactsCache>();
 }
 

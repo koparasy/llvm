@@ -9,9 +9,7 @@
 //
 // This file declares the stored-value queries of the CIR points-to analysis:
 // what values a memory cell of the points-to graph may hold, over every write
-// the module makes to it. It generalizes the MemoryReader of the legacy
-// KernelBindingTable (valueAt, uniqueInitializer), which works on an inlined
-// copy of the launch path, to the interprocedural graph, with no inlining.
+// the module makes to it, on the interprocedural graph, with no inlining.
 //
 //  - StoredValueIndex: every write of the module, indexed by the node it
 //    writes (and by each ancestor of that node in its tree of subobjects), and

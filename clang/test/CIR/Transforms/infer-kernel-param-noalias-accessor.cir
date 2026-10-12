@@ -1,31 +1,23 @@
-// The closed-TU rule (-cir-offload-assume-closed-tu): a lambda in place, a
-// kernel by clone. Without it (T26b), a kernel no other TU can launch in
-// place and the others not at all (OPEN).
-// RUN: cir-opt %s -split-input-file \
-// RUN:   -cir-offload-infer-kernel-param-noalias='host-facts-closed-tu=1' \
-// RUN:   2>/dev/null | FileCheck %s
-// RUN: cir-opt %s -split-input-file \
-// RUN:   -cir-offload-infer-kernel-param-noalias='host-facts-closed-tu=1' \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
-// RUN: cir-opt %s -split-input-file \
+// The closed-TU rule (-cir-offload-assume-closed-tu): every kernel that is
+// not registered, in place. Without it (T26b), a kernel no other TU can
+// launch in place and the others not at all (OPEN).
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -split-input-file \
 // RUN:   -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1' \
 // RUN:   2>/dev/null | FileCheck %s
-// RUN: cir-opt %s -split-input-file \
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -split-input-file \
 // RUN:   -cir-offload-infer-kernel-param-noalias='host-facts=ipo host-facts-closed-tu=1' \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
-// RUN: cir-opt %s -split-input-file -cir-offload-infer-kernel-param-noalias \
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -split-input-file -cir-offload-infer-kernel-param-noalias \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
-// RUN: cir-opt %s -split-input-file \
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -split-input-file \
 // RUN:   -cir-offload-infer-kernel-param-noalias='host-facts=ipo' \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
 
 // llvm.noalias on SYCL accessor pointer parameters. The host proves that the
-// accessors a kernel captures are backed by pairwise-distinct buffers (legacy
-// KernelBindingTable trace, or SYCLHostFacts under host-facts=ipo); the pass
-// finds the device parameter of each field through cir.sycl_kernel_param
-// (kind = "accessor", accessor_part = "ptr") and stamps it, in place for a
-// TU-local lambda kernel, on a clone (copyKernel) for a kernel visible to
-// other TUs. The accessors' range parameters and an existing readonly are left
+// accessors a kernel captures are backed by pairwise-distinct buffers
+// (SYCLHostFacts); the pass finds the device parameter of each field through
+// cir.sycl_kernel_param (kind = "accessor", accessor_part = "ptr") and stamps
+// it in place. The accessors' range parameters and an existing readonly are left
 // alone; one kernel-param-noalias remark per candidate parameter reports the
 // decision. The host buffer/accessor API is reduced to declarations carrying
 // the CIRGen roles, as in Analysis/sycl-accessor-buffer-identity.cir. The
@@ -86,10 +78,9 @@ module attributes {cir.offload.container} {
     }
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
-    // REMARK: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (accessor 'A'): noalias (buffer 'ba'{{.*}})
-    // REMARK: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 2 (accessor 'B'): noalias (buffer 'bb'{{.*}})
-    // REMARK: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 4 (accessor 'C'): noalias (buffer 'bc'{{.*}})
-    // REMARK-NOT: remark
+    // REMARK: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (accessor 'A'): noalias (buffer 'ba'{{.*}})
+    // REMARK: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 2 (accessor 'B'): noalias (buffer 'bb'{{.*}})
+    // REMARK: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 4 (accessor 'C'): noalias (buffer 'bc'{{.*}})
     // CHECK: cir.func @_ZTSZ4mainEUlvE_(
     // CHECK-SAME: %arg0: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {{{[^}]*}}field = "A"{{[^}]*}}}, llvm.noalias}
     // CHECK-SAME: %arg1: !cir.ptr<{{[^>]*}}> {cir.sycl_kernel_param = {{{[^}]*}}}}
@@ -156,9 +147,9 @@ module attributes {cir.offload.container} {
     }
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
-    // REMARK: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (accessor 'A'): not stamped ('A' and 'B' use the same memory, buffer 'ba'{{.*}})
-    // REMARK: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 2 (accessor 'B'): not stamped ('B' and 'A' use the same memory, buffer 'ba'{{.*}})
-    // REMARK: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 4 (accessor 'C'): noalias (buffer 'bc'{{.*}})
+    // REMARK: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 0 (accessor 'A'): not stamped ('A' and 'B' use the same memory, buffer 'ba'{{.*}})
+    // REMARK: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 2 (accessor 'B'): not stamped ('B' and 'A' use the same memory, buffer 'ba'{{.*}})
+    // REMARK: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg 4 (accessor 'C'): noalias (buffer 'bc'{{.*}})
     // CHECK: cir.func @_ZTSZ4mainEUlvE_(
     // CHECK-SAME: field = "A"{{[^}]*}}}}, %arg1
     // CHECK-SAME: field = "B"{{[^}]*}}}, llvm.readonly}, %arg3
@@ -170,9 +161,10 @@ module attributes {cir.offload.container} {
 }
 
 // -----
-// CLONE: a named kernel is visible to other TUs, so the shared kernel stays
-// generic and the launch is redirected to a stamped clone. C already carries
-// llvm.noalias (a restrict capture) and is reported as such.
+// NAMED: a named kernel. Under closed-TU it is stamped in place (until T28 the
+// launch was redirected to a stamped clone, `.spec.noalias.0`; that path is
+// deleted). C already carries llvm.noalias (a restrict capture) and is
+// reported as such.
 
 !s8i = !cir.int<s, 8>
 !u64i = !cir.int<u, 64>
@@ -224,19 +216,16 @@ module attributes {cir.offload.container} {
     }
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
-    // REMARK: remark: kernel-param-noalias: kernel @_Z9accKernelv.spec.noalias.0 arg 0 (accessor 'A'): noalias (buffer 'ba'{{.*}})
-    // REMARK: remark: kernel-param-noalias: kernel @_Z9accKernelv.spec.noalias.0 arg 2 (accessor 'B'): noalias (buffer 'bb'{{.*}})
-    // REMARK: remark: kernel-param-noalias: kernel @_Z9accKernelv.spec.noalias.0 arg 4 (accessor 'C'): already noalias
-    // CHECK: cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv_{{[0-9]+}}()
+    // REMARK: kernel-param-noalias: kernel @_Z9accKernelv arg 0 (accessor 'A'): noalias (buffer 'ba'{{.*}})
+    // REMARK: kernel-param-noalias: kernel @_Z9accKernelv arg 2 (accessor 'B'): noalias (buffer 'bb'{{.*}})
+    // REMARK: kernel-param-noalias: kernel @_Z9accKernelv arg 4 (accessor 'C'): already noalias
+    // CHECK: cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv()
     // The kernel.info getter naming _Z9accKernelv is internal: no other TU
     // can launch it, so open mode stamps it in place.
-    // OPEN: remark: kernel-param-noalias: kernel @_Z9accKernelv arg 0 (accessor 'A'): noalias (buffer 'ba'{{.*}})
-    // OPEN: remark: kernel-param-noalias: kernel @_Z9accKernelv arg 2 (accessor 'B'): noalias (buffer 'bb'{{.*}})
+    // OPEN: kernel-param-noalias: kernel @_Z9accKernelv arg 0 (accessor 'A'): noalias (buffer 'ba'{{.*}})
+    // OPEN: kernel-param-noalias: kernel @_Z9accKernelv arg 2 (accessor 'B'): noalias (buffer 'bb'{{.*}})
     // OPEN-NOT: .spec.
     // CHECK-LABEL: cir.func @_Z9accKernelv(
-    // CHECK-SAME: field = "A"{{[^}]*}}}}, %arg1
-    // CHECK-SAME: field = "B"{{[^}]*}}}, llvm.readonly}, %arg3
-    // CHECK: cir.func @_Z9accKernelv.spec.noalias.0(
     // CHECK-SAME: field = "A"{{[^}]*}}}, llvm.noalias}, %arg1
     // CHECK-SAME: field = "B"{{[^}]*}}}, llvm.noalias, llvm.readonly}, %arg3
     // CHECK-SAME: field = "C"{{[^}]*}}}, llvm.noalias}, %arg5

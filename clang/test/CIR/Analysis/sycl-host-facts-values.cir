@@ -1,32 +1,31 @@
-// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1})" \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
-// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 subobjects=0})" \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=BOTH
-// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both})" \
+// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 subobjects=0})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=OPEN
-// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=both closed-tu=1 bu=0 subobjects=0})" \
+// RUN: cir-opt %s -cir-points-to-verify -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 bu=0 subobjects=0})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=CI
 // RUN: cir-opt %s -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=TABLE-IPO
 // RUN: cir-opt %s -cir-offload-propagate-sycl-kernel-args='host-facts=ipo host-facts-closed-tu=1' \
 // RUN:   | FileCheck %s --check-prefix=PROP-IPO
-// RUN: cir-opt %s -cir-offload-propagate-sycl-kernel-args \
-// RUN:   | FileCheck %s --check-prefix=PROP-LEGACY
-// RUN: cir-opt %s -cir-offload-propagate-sycl-kernel-args='host-facts=both host-facts-closed-tu=1' \
-// RUN:   2>&1 | FileCheck %s --check-prefix=PROP-BOTH
+// RUN: cir-opt %s -cir-offload-propagate-sycl-kernel-args='host-facts=none' \
+// RUN:   | FileCheck %s --check-prefix=PROP-NONE
 // RUN: cir-opt %s -cir-offload-stamp-reqd-work-group-size='host-facts=ipo host-facts-closed-tu=1' \
 // RUN:   | FileCheck %s --check-prefix=STAMP-IPO
-// RUN: cir-opt %s -cir-offload-stamp-reqd-work-group-size \
-// RUN:   | FileCheck %s --check-prefix=STAMP-LEGACY
-// RUN: cir-opt %s -cir-offload-stamp-reqd-work-group-size='host-facts=both host-facts-closed-tu=1 host-facts-census=1' \
-// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=STAMP-BOTH
+// RUN: cir-opt %s -cir-offload-stamp-reqd-work-group-size='host-facts=none' \
+// RUN:   | FileCheck %s --check-prefix=STAMP-NONE
+// RUN: cir-opt %s --remarks-filter=cir-offload-reqd-wg -cir-offload-stamp-reqd-work-group-size='host-facts=ipo host-facts-closed-tu=1' \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=STAMP-REMARK
 
 // Kernel-argument constants and launch geometry from the stored-value
-// queries (T23, SYCLHostFacts::constantField and geometry), behind
-// --cir-offload-host-facts: ipo replaces KernelBinding::syclConstArgs and the
-// launch sites' syclNDRange, both keeps the legacy ones and remarks where
-// they differ. The legacy trace recovers neither here (the closure and the
-// geometry of the handler path are inside the launch functions' bodies).
+// queries (T23, SYCLHostFacts::constantField and geometry): the table prints,
+// per kernel, every scalar-capture candidate with its constant or why none is
+// known, and the geometry with why a component is not known; the passes
+// propagate and stamp them. (Until T28 this test also compared them with the
+// deleted legacy trace, which recovered neither: the closure and the geometry
+// of the handler path are inside the launch functions' bodies.)
 //
 //  - K1: launched twice with n = 7 over nd_range(1024, 64): the constant 7
 //    and the geometry, every launch agreeing (stamped, propagated);
@@ -37,8 +36,7 @@
 //    s = this->size: 42 and global=[2048] local=[64] under bottom-up with
 //    closed-TU (the record of @bench_run is replaced by its copy in @main's
 //    graph, every caller of @bench_run having copied it); open, @bench_run and
-//    @bench_ctor may have other callers: neither is known (the "geometry
-//    none" case);
+//    @bench_ctor may have other callers: neither is known;
 //  - K4: a model call (buffer::get_range, through sret) overwrites the range
 //    whose element is then captured (9 before the call), and the global range
 //    of the nd_range (1024 before the call): neither is known, the local size
@@ -48,49 +46,42 @@
 // In the CI mode (bu=0), @ndr_ctor's formals hold every caller's operands
 // and one node stands for every nd_range: no geometry.
 
-// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// BOTH:   host-facts const-arg n: legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
-// BOTH-NEXT:   host-facts geometry: legacy=none ipo=global=[1024] local=[64]
-// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE0_
-// BOTH:   host-facts const-arg n: legacy=none ipo=none (the launches disagree: 7 at {{.*}}, 8 at {{.*}})
-// BOTH-NEXT:   host-facts geometry: legacy=none ipo=global=[1024] local=[?] (the launches disagree on the local size at {{.*}})
-// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE1_
-// BOTH:   host-facts const-arg n: legacy=none ipo=#cir.int<42> : !cir.int<s, 32>
-// BOTH-NEXT:   host-facts geometry: legacy=none ipo=global=[2048] local=[64]
-// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE2_
-// BOTH:   host-facts const-arg m: legacy=none ipo=none ('m' at the launch at {{.*}}: it holds a value computed at run time ({{.*}}): it is an escaped pointer ("written with an unknown value") ({{.*}}))
-// BOTH-NEXT:   host-facts geometry: legacy=none ipo=global=[?] local=[64] (component 0: it may hold a value the analysis does not know: it is an escaped pointer ("written with an unknown value") ({{.*}}))
-// BOTH-LABEL: // - kernel _ZTSZ4mainEUlvE3_
-// BOTH:   host-facts const-arg n: legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
-// BOTH-NEXT:   host-facts geometry: legacy=none ipo=global=[?] local=[?] (component 0: {{.*}}"written with an unknown value"{{.*}})
-// BOTH: // host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ const-arg n legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
-// BOTH-NEXT: // host-facts-disagreement: kernel _ZTSZ4mainEUlvE1_ const-arg n legacy=none ipo=#cir.int<42> : !cir.int<s, 32>
-// BOTH-NEXT: // host-facts-disagreement: kernel _ZTSZ4mainEUlvE3_ const-arg n legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
-// BOTH-NEXT: // host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ geometry legacy=none ipo=global=[1024] local=[64]
-// BOTH: // host-facts-const-arg-disagreements: 3 of 5 scalar fields
-// BOTH-NEXT: // host-facts-geometry-disagreements: 5 of 5 kernels
+// CLOSED-LABEL: // - kernel _ZTSZ4mainEUlvE_
+// CLOSED:   const-arg n: #cir.int<7> : !cir.int<s, 32>
+// CLOSED-NEXT:   geometry: global=[1024] local=[64]
+// CLOSED-LABEL: // - kernel _ZTSZ4mainEUlvE0_
+// CLOSED:   const-arg n: none (the launches disagree: 7 at {{.*}}, 8 at {{.*}})
+// CLOSED-NEXT:   geometry: global=[1024] local=[?] (the launches disagree on the local size at {{.*}})
+// CLOSED-LABEL: // - kernel _ZTSZ4mainEUlvE1_
+// CLOSED:   const-arg n: #cir.int<42> : !cir.int<s, 32>
+// CLOSED-NEXT:   geometry: global=[2048] local=[64]
+// CLOSED-LABEL: // - kernel _ZTSZ4mainEUlvE2_
+// CLOSED:   const-arg m: none ('m' at the launch at {{.*}}: it holds a value computed at run time ({{.*}}): it is an escaped pointer ("written with an unknown value") ({{.*}}))
+// CLOSED-NEXT:   geometry: global=[?] local=[64] (component 0: it may hold a value the analysis does not know: it is an escaped pointer ("written with an unknown value") ({{.*}}))
+// CLOSED-LABEL: // - kernel _ZTSZ4mainEUlvE3_
+// CLOSED:   const-arg n: #cir.int<7> : !cir.int<s, 32>
+// CLOSED-NEXT:   geometry: global=[?] local=[?] (component 0: {{.*}}"written with an unknown value"{{.*}})
 
 // OPEN-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// OPEN:   host-facts const-arg n: legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
-// OPEN-NEXT:   host-facts geometry: legacy=none ipo=global=[1024] local=[64]
+// OPEN:   const-arg n: #cir.int<7> : !cir.int<s, 32>
+// OPEN-NEXT:   geometry: global=[1024] local=[64]
 // OPEN-LABEL: // - kernel _ZTSZ4mainEUlvE1_
-// OPEN:   host-facts const-arg n: legacy=none ipo=none ('n' at the launch at {{.*}}: it holds a value computed at run time ({{.*}}): it is parameter #0 of @bench_run, which may have callers that are not analysed ({{.*}}))
-// OPEN-NEXT:   host-facts geometry: legacy=none ipo=global=[?] local=[?] (component 0: it may hold a value the analysis does not know: it is parameter #0 of @bench_run, which may have callers that are not analysed ({{.*}}))
+// OPEN:   const-arg n: none ('n' at the launch at {{.*}}: it holds a value computed at run time ({{.*}}): it is parameter #0 of @bench_run, which may have callers that are not analysed ({{.*}}))
+// OPEN-NEXT:   geometry: global=[?] local=[?] (component 0: it may hold a value the analysis does not know: it is parameter #0 of @bench_run, which may have callers that are not analysed ({{.*}}))
 
 // CI-LABEL: // - kernel _ZTSZ4mainEUlvE_
-// CI:   host-facts const-arg n: legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
-// CI-NEXT:   host-facts geometry: legacy=none ipo=global=[?] local=[?] ({{.*}})
+// CI:   const-arg n: #cir.int<7> : !cir.int<s, 32>
+// CI-NEXT:   geometry: global=[?] local=[?] ({{.*}})
 // CI-LABEL: // - kernel _ZTSZ4mainEUlvE1_
-// CI:   host-facts const-arg n: legacy=none ipo=none ({{.*}})
-// CI-NEXT:   host-facts geometry: legacy=none ipo=global=[?] local=[?] ({{.*}})
+// CI:   const-arg n: none ({{.*}})
+// CI-NEXT:   geometry: global=[?] local=[?] ({{.*}})
 
-// The ipo table: the constants and the geometry of every launch site.
 // TABLE-IPO-LABEL: // - kernel _ZTSZ4mainEUlvE_
 // TABLE-IPO:   const-args n=#cir.int<7> : !cir.int<s, 32>
-// TABLE-IPO:   launch in @pf_K1 (sycl, all-visible), closure none, global=[1024], local=[64]
+// TABLE-IPO:   launch in @pf_K1 (sycl), closure none, global=[1024], local=[64]
 // TABLE-IPO-LABEL: // - kernel _ZTSZ4mainEUlvE0_
 // TABLE-IPO-NOT: const-args
-// TABLE-IPO:   launch in @pf_K2 (sycl, all-visible), closure none, global=[1024], local=[?]
+// TABLE-IPO:   launch in @pf_K2 (sycl), closure none, global=[1024], local=[?]
 
 // PROP-IPO-LABEL: cir.func @_ZTSZ4mainEUlvE_(
 // PROP-IPO-NEXT:    %[[C:.*]] = cir.const #cir.int<7> : !s32i
@@ -102,16 +93,9 @@
 // PROP-IPO-LABEL: cir.func @_ZTSZ4mainEUlvE2_(
 // PROP-IPO:         cir.store %arg0, {{.*}} : !u64i, !cir.ptr<!u64i>
 
-// PROP-LEGACY-LABEL: module @device_sycl_spir64
-// PROP-LEGACY-NOT: cir.const #cir.int<7>
-// PROP-LEGACY-NOT: cir.const #cir.int<42>
-
-// PROP-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ const-arg n legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
-// PROP-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE1_ const-arg n legacy=none ipo=#cir.int<42> : !cir.int<s, 32>
-// PROP-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE3_ const-arg n legacy=none ipo=#cir.int<7> : !cir.int<s, 32>
-// PROP-BOTH: remark: host-facts-disagreements: 3 of 5 scalar capture fields (closed-tu, bu, subobjects)
-// PROP-BOTH-LABEL: module @device_sycl_spir64
-// PROP-BOTH-NOT: cir.const #cir.int<7>
+// PROP-NONE-LABEL: module @device_sycl_spir64
+// PROP-NONE-NOT: cir.const #cir.int<7>
+// PROP-NONE-NOT: cir.const #cir.int<42>
 
 // STAMP-IPO: cir.func @_ZTSZ4mainEUlvE_({{.*}}cir.reqd_work_group_size = [64 : i32]
 // STAMP-IPO-NOT: reqd_work_group_size
@@ -119,15 +103,12 @@
 // STAMP-IPO: cir.func @_ZTSZ4mainEUlvE2_({{.*}}cir.reqd_work_group_size = [64 : i32]
 // STAMP-IPO-NOT: reqd_work_group_size
 
-// STAMP-LEGACY-NOT: reqd_work_group_size
+// STAMP-NONE-NOT: reqd_work_group_size
 
-// STAMP-BOTH: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ geometry legacy=none ipo=global=[1024] local=[64]
-// STAMP-BOTH: remark: host-facts: kernel _ZTSZ4mainEUlvE_ reqd-work-group-size legacy=none ipo=[64]
-// STAMP-BOTH: remark: host-facts: kernel _ZTSZ4mainEUlvE0_ reqd-work-group-size legacy=none ipo=none
-// STAMP-BOTH: remark: host-facts: kernel _ZTSZ4mainEUlvE1_ reqd-work-group-size legacy=none ipo=[64]
-// STAMP-BOTH: remark: host-facts: kernel _ZTSZ4mainEUlvE3_ reqd-work-group-size legacy=none ipo=none
-// STAMP-BOTH: remark: host-facts-disagreements: 5 of 5 kernel geometries (closed-tu, bu, subobjects)
-
+// STAMP-REMARK: Remark="reqd-work-group-size: kernel @_ZTSZ4mainEUlvE_ [64]"
+// STAMP-REMARK: Remark="reqd-work-group-size: kernel @_ZTSZ4mainEUlvE1_ [64]"
+// STAMP-REMARK: Remark="reqd-work-group-size: kernel @_ZTSZ4mainEUlvE2_ [64]"
+// STAMP-REMARK-NOT: reqd-work-group-size: kernel @_ZTSZ4mainEUlvE0_
 !s8i = !cir.int<s, 8>
 !s32i = !cir.int<s, 32>
 !u64i = !cir.int<u, 64>

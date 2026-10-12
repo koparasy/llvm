@@ -42,7 +42,7 @@ module attributes {cir.offload.container} {
 // BIND: KernelBindingTable
 // BIND-NEXT: size 1 empty false
 // BIND-NEXT: kernel _Z21__sycl_kernel_vec_addPKfS0_Pf
-// BIND-NEXT: host-name @.str (sycl, conservative)
+// BIND-NEXT: host-name @.str (sycl, shared)
 // BIND-NEXT: device @device_sycl_spir64 : @_Z21__sycl_kernel_vec_addPKfS0_Pf
 // BIND-NEXT: <no launch site>
 

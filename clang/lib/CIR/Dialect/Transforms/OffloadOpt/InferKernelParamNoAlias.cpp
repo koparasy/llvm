@@ -16,29 +16,24 @@
 // closure qualify (getSYCLNoAliasField). KernelBindingTable already resolved,
 // on the host side, which capture fields are backed at every launch site by
 // pairwise-distinct memory (USM allocations, buffer storages) -- see
-// KernelBinding::syclNoAliasFields, from the legacy trace or from SYCLHostFacts
-// (--cir-offload-host-facts). This pass maps each device parameter to its field
-// and stamps `llvm.noalias` on the parameters whose field is in that set. An
-// accessor's other parameters (ranges, offset) and its `readonly` are left
-// alone. One `kernel-param-noalias:` remark per candidate parameter reports
-// the decision and its reason.
+// KernelBinding::syclNoAliasFields, from SYCLHostFacts, the points-to analysis
+// of the host module (--cir-offload-host-facts). This pass maps each device
+// parameter to its field and stamps `llvm.noalias` on the parameters whose
+// field is in that set. An accessor's other parameters (ranges, offset) and
+// its `readonly` are left alone. One remark per candidate parameter (category
+// cir-offload-noalias, see emitOffloadRemark) reports the decision and its
+// reason.
 //
 // Where the facts go. The device kernel is one weak_odr definition for the
 // whole program, and syclNoAliasFields ANDs the distinctness over this TU's
 // launches only, so the shared kernel is annotated in place only when no
 // other TU can launch it (KernelBinding::stampsInPlace: isTUUnique, which
-// includes the kernel copies of internalized launch paths, T26). Otherwise:
-//  - without -cir-offload-assume-closed-tu, nothing is stamped (remark: the
-//    kernel is visible to other TUs); the facts reach the kernel copy of an
-//    internalized launch path instead (cir-offload-internalize-launch-paths,
-//    which runs before this pass in every host-facts mode);
-//  - under -cir-offload-assume-closed-tu (this TU is the program), the closed
-//    rule applies: a lambda closure is stamped in place, and the residual --
-//    a functor or a by-name-reachable kernel -- is specialized by clone: mint
-//    a fresh kernel (copyKernel), redirect this TU's launches to it, and
-//    annotate the clone. The clone's names are unique only in this TU and the
-//    redirect rewrites markers inside shared linkonce launch functions, which
-//    is sound only under that assumption.
+// includes the kernel copies of internalized launch paths, T26; under
+// -cir-offload-assume-closed-tu, any kernel that is not registered).
+// Otherwise nothing is stamped (the remark says the kernel is visible to
+// other TUs); the facts reach the kernel copy of an internalized launch path
+// instead (cir-offload-internalize-launch-paths, which runs before this
+// pass).
 //
 //===----------------------------------------------------------------------===//
 
@@ -80,71 +75,40 @@ struct OffloadInferKernelParamNoAliasPass
 void OffloadInferKernelParamNoAliasPass::runOnOperation() {
   mlir::ModuleOp container = getOperation();
   if (!cir::isOffloadContainer(container))
-    return;
+    return markAllAnalysesPreserved();
   std::optional<cir::HostFactsMode> mode = cir::parseHostFactsMode(hostFacts);
   if (!mode) {
     container.emitError() << "unknown host-facts mode '" << hostFacts
-                          << "' (expected legacy, ipo or both)";
+                          << "' (expected ipo or none)";
     return signalPassFailure();
   }
-  // The legacy table is the cached analysis the other container passes share;
-  // the other modes build their own (only the noalias fields differ), on the
-  // host facts the container passes share (SYCLHostFactsCache).
-  std::optional<cir::KernelBindingTable> ownTable;
-  cir::SYCLHostFactsCache *factsCache = nullptr;
-  if (*mode != cir::HostFactsMode::Legacy) {
-    cir::HostFactsOptions options;
-    options.mode = *mode;
-    options.assumeClosedTU = hostFactsClosedTU;
-    options.bottomUp = hostFactsBottomUp;
-    options.subobjects = hostFactsSubobjects;
-    options.budgetScale = hostFactsBudgetScale;
-    options.relevanceSlice = hostFactsSlice;
-    options.maxSeconds = hostFactsMaxSeconds;
-    options.maxMemoryMB = hostFactsMaxMemoryMB;
-    options.internalize = hostFactsInternalize;
-    factsCache = &getAnalysis<cir::SYCLHostFactsCache>();
-    unsigned builtBefore = factsCache->getNumBuilt();
-    ownTable.emplace(container, options, factsCache);
-    numHostFactsBuilt += factsCache->getNumBuilt() - builtBefore;
-    // The budgets that tripped while this table was built (once per
-    // change: the passes share the analysis).
-    if (std::optional<std::string> trips =
-            factsCache->get(options).takeBudgetReport())
-      mlir::emitRemark(container.getLoc())
-          << "host-facts budget trips: " << *trips << " "
-          << cir::formatHostFactsOptions(options);
-  }
-  cir::KernelBindingTable &table =
-      ownTable ? *ownTable : getAnalysis<cir::KernelBindingTable>();
-  if (*mode == cir::HostFactsMode::Both) {
-    // Legacy is the result; report where the two sources differ.
-    unsigned disagreements = 0;
-    for (const cir::HostFactsComparison &cmp :
-         table.getHostFactsComparisons()) {
-      mlir::Location loc = container.getLoc();
-      if (const cir::KernelBinding *binding = table.lookup(cmp.kernel))
-        if (!binding->deviceKernels.empty())
-          loc = binding->deviceKernels.front()->getLoc();
-      if (cmp.disagrees()) {
-        ++disagreements;
-        mlir::emitRemark(loc) << cir::formatHostFactsDisagreement(cmp);
-      } else if (hostFactsCensus) {
-        mlir::emitRemark(loc)
-            << "host-facts: kernel " << cmp.kernel << " field " << cmp.field
-            << " " << cir::formatHostFactsVerdict("legacy", cmp.legacy) << " "
-            << cir::formatHostFactsVerdict("ipo", cmp.ipo);
-      }
-    }
+  if (*mode == cir::HostFactsMode::None)
+    return markAllAnalysesPreserved();
+  // The table and the host facts the container passes share
+  // (SYCLHostFactsCache).
+  cir::HostFactsOptions options;
+  options.mode = *mode;
+  options.assumeClosedTU = hostFactsClosedTU;
+  options.bottomUp = hostFactsBottomUp;
+  options.subobjects = hostFactsSubobjects;
+  options.budgetScale = hostFactsBudgetScale;
+  options.relevanceSlice = hostFactsSlice;
+  options.maxSeconds = hostFactsMaxSeconds;
+  options.maxMemoryMB = hostFactsMaxMemoryMB;
+  options.internalize = hostFactsInternalize;
+  cir::SYCLHostFactsCache &factsCache = getAnalysis<cir::SYCLHostFactsCache>();
+  unsigned builtBefore = factsCache.getNumBuilt();
+  unsigned tablesBefore = factsCache.getNumTablesBuilt();
+  const cir::KernelBindingTable &table = factsCache.getTable(options);
+  numHostFactsBuilt += factsCache.getNumBuilt() - builtBefore;
+  numTablesBuilt += factsCache.getNumTablesBuilt() - tablesBefore;
+  // The budgets that tripped while the analysis was built (once: the passes
+  // share it).
+  if (std::optional<std::string> trips =
+          factsCache.get(options).takeBudgetReport())
     mlir::emitRemark(container.getLoc())
-        << "host-facts-disagreements: " << disagreements << " of "
-        << table.getHostFactsComparisons().size() << " candidate fields ("
-        << (hostFactsClosedTU ? "closed-tu" : "open")
-        << (hostFactsBottomUp ? ", bu" : ", ci")
-        << (hostFactsSubobjects ? ", subobjects" : "")
-        << (hostFactsInternalize && !hostFactsClosedTU ? ", internalized" : "")
-        << ")";
-  }
+        << "host-facts budget trips: " << *trips << " "
+        << cir::formatHostFactsOptions(options);
   mlir::MLIRContext *ctx = &getContext();
   llvm::StringRef noAliasName = mlir::LLVM::LLVMDialect::getNoAliasAttrName();
   bool changed = false;
@@ -193,43 +157,46 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
         // (classifySYCLKernelParams): no decision to report.
         if (isLocalPointer(arg.getType()))
           continue;
-        auto remark = [&]() {
-          mlir::InFlightDiagnostic diag = mlir::emitRemark(kernel.getLoc());
-          diag << "kernel-param-noalias: kernel @" << kernel.getName()
-               << " arg " << argNo << " ("
-               << (isAccessor ? "accessor" : "pointer") << " '" << field
-               << "'): ";
-          return diag;
+        std::string text;
+        llvm::raw_string_ostream os(text);
+        os << "kernel-param-noalias: kernel @" << kernel.getName() << " arg "
+           << argNo << " (" << (isAccessor ? "accessor" : "pointer") << " '"
+           << field << "'): ";
+        auto remark = [&](cir::OffloadRemarkKind kind) {
+          cir::emitOffloadRemark(
+              kernel.getLoc(), kind, "InferKernelParamNoAlias",
+              cir::kNoAliasRemarkCategory, kernel.getName(), text);
         };
         // Already noalias (e.g. a restrict-qualified capture): leave it.
         if (kernel.getArgAttr(argNo, noAliasName)) {
-          remark() << "already noalias";
+          os << "already noalias";
+          remark(cir::OffloadRemarkKind::Analysis);
           continue;
         }
         std::string note = noteFor(binding, field);
         if (!stamp || !binding.syclNoAliasFields.contains(field)) {
-          remark() << "not stamped ("
-                   << (notStamped.empty() ? llvm::StringRef(note) : notStamped)
-                   << ")";
+          os << "not stamped ("
+             << (notStamped.empty() ? llvm::StringRef(note) : notStamped)
+             << ")";
+          remark(cir::OffloadRemarkKind::Missed);
           continue;
         }
         kernel.setArgAttr(argNo, noAliasName, mlir::UnitAttr::get(ctx));
         cir::noteInternalizedSYCLKernelUse(kernel);
         did = true;
-        mlir::InFlightDiagnostic diag = remark();
-        diag << "noalias";
+        os << "noalias";
         if (!note.empty())
-          diag << " (" << note << ")";
-        diag << cir::describeInternalizedSYCLKernel(kernel);
+          os << " (" << note << ")";
+        os << cir::describeInternalizedSYCLKernel(kernel);
+        remark(cir::OffloadRemarkKind::Passed);
       }
     }
     return did;
   };
 
   // Without closed-TU the remark names whether the launch paths were
-  // internalized (in every host-facts mode, T26b).
+  // internalized.
   std::string sharedNote = cir::getSharedSYCLKernelNote(hostFactsInternalize);
-  unsigned specTag = 0;
   for (const auto &entry : table) {
     const cir::KernelBinding &binding = entry.second;
     if (binding.kind != cir::BindingKind::SYCLName)
@@ -246,40 +213,23 @@ void OffloadInferKernelParamNoAliasPass::runOnOperation() {
       // No other TU launches the kernel (or closed-TU is assumed): safe to
       // annotate the shared device kernel in place.
       changed |= decide(binding.deviceKernels, binding, /*stamp=*/true, "");
-    } else if (!hostFactsClosedTU) {
-      // Another TU can launch the kernel, with other pointers: this TU's
-      // facts do not hold for it. Not by clone either: the clone path would
-      // repoint the markers inside the shared launch functions, which other
-      // TUs' launches run too, under names unique only in this TU. This TU's
-      // facts hold for the kernel copies of the internalized paths.
-      decide(binding.deviceKernels, binding, /*stamp=*/false, sharedNote);
     } else {
-      // Closed-TU residual: the shared kernel is a functor / by-name
-      // reachable, so a launch this table does not describe could pass
-      // aliasing pointers. Specialize by clone -- redirect this TU's launches
-      // to a fresh kernel and annotate only the clone, leaving the generic
-      // original for unseen launches.
-      auto spec = cir::specializeSYCLKernelForLaunches(
-          container, binding, binding.launchSites,
-          "noalias." + std::to_string(specTag++));
-      if (spec) {
-        if (factsCache)
-          factsCache->recordSpecialization(spec->name, entry.first);
-        decide(spec->deviceKernels, binding, /*stamp=*/true, "");
-        changed = true; // The clone + redirect mutated the IR regardless.
-      } else {
-        decide(binding.deviceKernels, binding, /*stamp=*/false,
-               "the kernel is visible to other TUs and its launches cannot be "
-               "redirected to a clone");
-      }
+      // Another TU can launch the kernel, with other pointers: this TU's
+      // facts do not hold for it, but for the kernel copies of the
+      // internalized paths. Under closed-TU, a registered kernel: the
+      // runtime may launch it by name.
+      decide(binding.deviceKernels, binding, /*stamp=*/false,
+             hostFactsClosedTU ? "the kernel is registered: it may be "
+                                 "launched by name"
+                               : llvm::StringRef(sharedNote));
     }
   }
 
   if (!changed)
     markAllAnalysesPreserved();
   else
-    // SOUNDNESS: see SYCLHostFactsCache: the stamps and the specializations
-    // leave the host facts true.
+    // SOUNDNESS: see SYCLHostFactsCache: the stamps leave the host facts and
+    // the table true.
     markAnalysesPreserved<cir::SYCLHostFactsCache>();
 }
 

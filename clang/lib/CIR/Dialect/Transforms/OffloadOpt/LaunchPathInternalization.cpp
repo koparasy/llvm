@@ -78,8 +78,8 @@ public:
     numOps.resize(funcs.size(), 0);
     root.resize(funcs.size(), false);
     for (auto [i, func] : llvm::enumerate(funcs)) {
-      root[i] =
-          isClosedRoot(func) || (options.extraRoot && options.extraRoot(func));
+      root[i] = (options.closedRoots && isClosedRoot(func)) ||
+                (options.extraRoot && options.extraRoot(func));
       func.walk([&](Operation *) { ++numOps[i]; });
     }
     collectVTableSlots();
@@ -809,16 +809,20 @@ cir::internalizeLaunchPaths(ModuleOp module, ArrayRef<cir::FuncOp> sinkFuncs,
     }
     std::string why;
     llvm::raw_string_ostream os(why);
+    StringRef what = options.closedRoots ? "closed root" : "root";
     if (!seen[s]) {
-      os << "no closed root (main, a dynamic initializer) reaches it";
+      os << "no " << what;
+      if (options.closedRoots)
+        os << " (main, a dynamic initializer)";
+      os << " reaches it";
     } else if (via[s] >= 0) {
       const Edge &blocked = g.edges[via[s]];
-      os << "it is reached from a closed root only through the address of @"
+      os << "it is reached from a " << what << " only through the address of @"
          << g.funcs[blocked.to].getSymName() << " taken in @"
          << g.funcs[blocked.from].getSymName()
          << ", which code we don't see may call or compare";
     } else {
-      os << "its paths from a closed root are not redirectable";
+      os << "its paths from a " << what << " are not redirectable";
     }
     result.unreached.push_back({g.funcs[s], why});
   }

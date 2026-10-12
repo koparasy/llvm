@@ -27,6 +27,7 @@
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
+#include "mlir/IR/Remarks.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
@@ -96,19 +97,17 @@ llvm::cl::opt<bool> DisableCirPropKernelArgs(
 llvm::cl::opt<std::string> HostFacts(
     "cir-offload-host-facts",
     llvm::cl::desc("Where the SYCL host facts (noalias fields, scalar "
-                   "capture constants, nd_range geometry) come from: legacy "
-                   "(the KernelBindingTable trace, the default), ipo "
-                   "(points-to), or both (legacy is used; disagreements are "
-                   "remarks)"),
-    llvm::cl::init("legacy"), llvm::cl::cat(CIROffloadMergeCategory));
+                   "capture constants, nd_range geometry) come from: ipo "
+                   "(the points-to analysis of the host module, the default) "
+                   "or none"),
+    llvm::cl::init("ipo"), llvm::cl::cat(CIROffloadMergeCategory));
 // Plan D2: the host points-to analysis may assume that every caller of every
 // host function is in this TU. Off by default: a function another TU can call
 // (external, linkonce_odr, weak) then has Incomplete formals.
 llvm::cl::opt<bool> AssumeClosedTU(
     "cir-offload-assume-closed-tu",
     llvm::cl::desc("Assume every caller of every host function is in this TU "
-                   "(the points-to analysis behind "
-                   "--cir-offload-host-facts=ipo|both)"),
+                   "(the points-to analysis behind the SYCL host facts)"),
     llvm::cl::cat(CIROffloadMergeCategory));
 // The old spelling, kept for scripts.
 llvm::cl::alias
@@ -121,9 +120,10 @@ llvm::cl::alias
 // functions other TUs could call on a path from main to a launch are cloned
 // as internal copies that launch a specialized copy of the kernel, which the
 // facts this TU derives then hold for. Without closed-TU a kernel other TUs
-// can launch gets no fact in place, so this is how such a kernel gets one,
-// in every host-facts mode (T26b). On by default; with
-// -cir-offload-assume-closed-tu nothing changes.
+// can launch gets no fact in place, so this is how such a kernel gets one
+// (T26b); a kernel no closed root reaches is internalized from the open roots
+// (T28). On by default; with -cir-offload-assume-closed-tu nothing is
+// internalized.
 llvm::cl::opt<bool> InternalizeLaunchPaths(
     "cir-offload-internalize-launch-paths",
     llvm::cl::desc("Without -cir-offload-assume-closed-tu, internalize the "
@@ -141,60 +141,75 @@ llvm::cl::opt<uint64_t> InternalizeMaxOps(
                    "internalization makes per TU"),
     llvm::cl::init(400000), llvm::cl::Hidden,
     llvm::cl::cat(CIROffloadMergeCategory));
-// The points-to analysis of --cir-offload-host-facts=ipo|both is the
-// bottom-up mode (T17) with subobject nodes (T17b) and top-down queries
-// (T18). --cir-offload-host-facts-ci is the escape hatch to the
-// context-insensitive analysis; -bu=false and -subobjects=false turn the two
-// parts off one by one.
+// The points-to analysis of the host facts is the bottom-up mode (T17) with
+// subobject nodes (T17b) and top-down queries (T18); -bu=false and
+// -subobjects=false turn the two parts off one by one (hidden: the
+// context-insensitive analysis is not a supported configuration of the
+// combine; the passes' host-facts-bu=0 exercises it in tests).
 llvm::cl::opt<bool> HostFactsBottomUp(
     "cir-offload-host-facts-bu",
-    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, run the points-to "
-                   "analysis bottom-up (context-sensitive; the default)"),
+    llvm::cl::desc("Run the points-to analysis of the SYCL host facts "
+                   "bottom-up (context-sensitive; the default)"),
     llvm::cl::init(true), llvm::cl::Hidden,
     llvm::cl::cat(CIROffloadMergeCategory));
-llvm::cl::opt<bool> HostFactsCI(
-    "cir-offload-host-facts-ci",
-    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, run the points-to "
-                   "analysis context-insensitively (overrides "
-                   "--cir-offload-host-facts-bu)"),
-    llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
 llvm::cl::opt<bool> HostFactsSubobjects(
     "cir-offload-host-facts-subobjects",
-    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, give class, union "
-                   "and array members their own points-to nodes (the "
+    llvm::cl::desc("Give class, union and array members their own points-to "
+                   "nodes in the analysis of the SYCL host facts (the "
                    "default)"),
     llvm::cl::init(true), llvm::cl::Hidden,
     llvm::cl::cat(CIROffloadMergeCategory));
-llvm::cl::opt<bool> HostFactsCensus(
-    "cir-offload-host-facts-census",
-    llvm::cl::desc("Under --cir-offload-host-facts=both, also remark both "
-                   "verdicts of every candidate field"),
-    llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
 // The budgets of the points-to analysis (T19): a factor on all of them (for
 // stress tests), the relevance slice, and the whole-analysis guard.
 llvm::cl::opt<double> HostFactsBudgetScale(
     "cir-offload-host-facts-budget-scale",
     llvm::cl::desc("Multiply every budget of the points-to analysis behind "
-                   "--cir-offload-host-facts=ipo|both by this factor"),
+                   "the SYCL host facts by this factor"),
     llvm::cl::init(1.0), llvm::cl::Hidden,
     llvm::cl::cat(CIROffloadMergeCategory));
 llvm::cl::opt<bool> HostFactsSlice(
     "cir-offload-host-facts-slice",
-    llvm::cl::desc("Under --cir-offload-host-facts=ipo|both, analyse only the "
+    llvm::cl::desc("Under the SYCL host facts, analyse only the "
                    "host functions that can matter to a kernel launch"),
     llvm::cl::Hidden, llvm::cl::cat(CIROffloadMergeCategory));
 llvm::cl::opt<double> HostFactsMaxSeconds(
     "cir-offload-host-facts-max-seconds",
     llvm::cl::desc("The wall-clock seconds the points-to analysis behind "
-                   "--cir-offload-host-facts=ipo|both may take (0: no limit)"),
+                   "the SYCL host facts may take (0: no limit)"),
     llvm::cl::init(120), llvm::cl::Hidden,
     llvm::cl::cat(CIROffloadMergeCategory));
 llvm::cl::opt<unsigned> HostFactsMaxMemoryMB(
     "cir-offload-host-facts-max-memory-mb",
     llvm::cl::desc("The memory (MB) the points-to analysis behind "
-                   "--cir-offload-host-facts=ipo|both may allocate (0: no "
+                   "the SYCL host facts may allocate (0: no "
                    "limit)"),
     llvm::cl::init(8192), llvm::cl::Hidden,
+    llvm::cl::cat(CIROffloadMergeCategory));
+
+// Opt-in remarks (mlir::remark, as mlir-opt's --remarks-filter*): the
+// container passes report their decisions under a category each
+// (cir-offload-noalias, cir-offload-kernel-arg-constant, cir-offload-reqd-wg,
+// cir-offload-internalize, cir-offload-dke, ...), printed as remarks only for
+// the categories a filter (a regex) selects.
+llvm::cl::opt<std::string> RemarksFilter(
+    "remarks-filter",
+    llvm::cl::desc("Show the remarks of the categories this regex matches "
+                   "(every kind)"),
+    llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<std::string> RemarksFilterPassed(
+    "remarks-filter-passed",
+    llvm::cl::desc("Show the passed remarks of the categories this regex "
+                   "matches"),
+    llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<std::string> RemarksFilterMissed(
+    "remarks-filter-missed",
+    llvm::cl::desc("Show the missed remarks of the categories this regex "
+                   "matches"),
+    llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<std::string> RemarksFilterAnalysis(
+    "remarks-filter-analyse",
+    llvm::cl::desc("Show the analysis remarks of the categories this regex "
+                   "matches"),
     llvm::cl::cat(CIROffloadMergeCategory));
 
 struct InputTarget {
@@ -371,10 +386,9 @@ void registerDialects(mlir::DialectRegistry &registry) {
                   mlir::memref::MemRefDialect, mlir::LLVM::LLVMDialect,
                   mlir::DLTIDialect, mlir::omp::OpenMPDialect>();
   cir::omp::registerOpenMPExtensions(registry);
-  // The KernelBindingTable analysis (built by the offload-container passes)
-  // uses MLIR's generic inliner for SYCL launch-geometry recovery; its
-  // InlinerInterface collection requires every loaded dialect that promised a
-  // DialectInlinerInterface to have registered one. LLVM and Func promise it.
+  // MLIR's generic inliner, if a pass uses it, requires every loaded dialect
+  // that promised a DialectInlinerInterface to have registered one. LLVM and
+  // Func promise it.
   cir::registerInlinerInterface(registry);
 }
 
@@ -506,10 +520,8 @@ static std::string getHostFactsPassOptions() {
   auto flag = [](bool on) { return on ? "true" : "false"; };
   std::string options = "host-facts=" + HostFacts;
   options += " host-facts-closed-tu=" + std::string(flag(AssumeClosedTU));
-  options +=
-      " host-facts-bu=" + std::string(flag(HostFactsBottomUp && !HostFactsCI));
+  options += " host-facts-bu=" + std::string(flag(HostFactsBottomUp));
   options += " host-facts-subobjects=" + std::string(flag(HostFactsSubobjects));
-  options += " host-facts-census=" + std::string(flag(HostFactsCensus));
   options += " host-facts-budget-scale=" + std::to_string(HostFactsBudgetScale);
   options += " host-facts-slice=" + std::string(flag(HostFactsSlice));
   options += " host-facts-max-seconds=" + std::to_string(HostFactsMaxSeconds);
@@ -761,6 +773,31 @@ int main(int argc, char **argv) {
   // pipeline's closure-layout check emits *warnings*, so register a handler
   // that surfaces every severity to stderr, prefixed with its source location
   // (a real file:line:col, since CIRGen emits the input .cir with debug locs).
+  // The opt-in remarks, printed through the handler below.
+  {
+    mlir::remark::RemarkCategories cats;
+    auto set = [](std::optional<std::string> &slot, const std::string &value) {
+      if (!value.empty())
+        slot = value;
+    };
+    // --remarks-filter selects every kind (the engine builds a filter per
+    // kind, each from `all` and the kind's own regex).
+    set(cats.all, RemarksFilter);
+    set(cats.passed,
+        RemarksFilterPassed.empty() ? RemarksFilter : RemarksFilterPassed);
+    set(cats.missed,
+        RemarksFilterMissed.empty() ? RemarksFilter : RemarksFilterMissed);
+    set(cats.analysis,
+        RemarksFilterAnalysis.empty() ? RemarksFilter : RemarksFilterAnalysis);
+    set(cats.failed, RemarksFilter);
+    if (cats.all || cats.passed || cats.missed || cats.analysis)
+      if (mlir::failed(mlir::remark::enableOptimizationRemarks(
+              context, nullptr,
+              std::make_unique<mlir::remark::RemarkEmittingPolicyAll>(), cats,
+              /*printAsEmitRemarks=*/true)))
+        return reportError("cannot enable the remarks");
+  }
+
   context.getDiagEngine().registerHandler([](mlir::Diagnostic &diag) {
     llvm::StringRef severity;
     switch (diag.getSeverity()) {

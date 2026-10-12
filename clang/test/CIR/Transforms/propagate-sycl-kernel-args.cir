@@ -1,15 +1,19 @@
 // The closed-TU rule (-cir-offload-assume-closed-tu): these fixtures'
-// kernels are stamped in place as lambdas, or specialized by clone.
-// RUN: cir-opt %s -split-input-file \
+// kernels, none registered, are stamped in place.
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -split-input-file \
 // RUN:   -pass-pipeline="builtin.module(cir-offload-propagate-sycl-kernel-args{host-facts-closed-tu=1},builtin.module(mem2reg,sccp,cir-simplify))" \
 // RUN:   | FileCheck %s
-// Without it (T26b), only a kernel no other TU can launch is stamped,
-// in place, and nothing is specialized by clone.
-// RUN: cir-opt %s -split-input-file -cir-offload-propagate-sycl-kernel-args -o /dev/null 2>&1 \
+// Without it (T26b), only a kernel no other TU can launch is stamped, in
+// place: every kernel.info getter of these fixtures is internal (they carry
+// the roles CIRGen gives the launch API), so every kernel is TU-unique and
+// gets the closed verdicts.
+// RUN: cir-opt %s --remarks-filter="cir-offload.*" -split-input-file -cir-offload-propagate-sycl-kernel-args -o /dev/null 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=OPEN
-// OPEN: remark: kernel-arg-constant: kernel @_ZTSZ4mainEUlvE_ arg 0 ('flag'): #cir.int<1> : !cir.int<s, 32> not propagated (the kernel is visible to other TUs; facts this TU derives hold only through an internalized launch path, and launch-path internalization is off)
-// OPEN: remark: kernel-arg-constant: kernel @_ZTS9MyFunctor arg 0 ('flag'): #cir.int<1> : !cir.int<s, 32> not propagated (the kernel is visible to other TUs;
-// OPEN-NOT: .spec.
+// OPEN: kernel-arg-constant: kernel @_ZTSZ4mainEUlvE_ arg 0 ('flag'): #cir.int<1> : !cir.int<s, 32>"
+// OPEN: kernel-arg-constant: kernel @_ZTSZ4mainEUlvE_ arg 1 ('coeff'): #cir.int<7> : !cir.int<s, 32>"
+// OPEN: kernel-arg-constant: kernel @_ZTSZ4mainEUlvE_ arg 1 ('coeff'): #cir.int<7> : !cir.int<s, 32>"
+// OPEN: kernel-arg-constant: kernel @_ZTS9MyFunctor arg 0 ('flag'): #cir.int<1> : !cir.int<s, 32>"
+// OPEN-NOT: not propagated
 
 // A SYCL captured SCALAR that is the SAME compile-time constant at every visible
 // launch is propagated into the device kernel body. The propagation pass maps
@@ -34,9 +38,9 @@ module attributes {cir.offload.container} {
   module @host attributes {cir.offload.kind = #cir.offload<host>} {
     cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
     cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>)
-    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
-    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
       %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
       %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
       cir.return %1 : !cir.ptr<!s8i>
@@ -124,9 +128,9 @@ module attributes {cir.offload.container} {
   module @host attributes {cir.offload.kind = #cir.offload<host>} {
     cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
     cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>)
-    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
-    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
       %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
       %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
       cir.return %1 : !cir.ptr<!s8i>
@@ -186,9 +190,9 @@ module attributes {cir.offload.container} {
   module @host attributes {cir.offload.kind = #cir.offload<host>} {
     cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
     cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>)
-    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
-    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
       %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
       %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
       cir.return %1 : !cir.ptr<!s8i>
@@ -248,13 +252,11 @@ module attributes {cir.offload.container} {
 
 // -----
 
-// Non-TU-local kernel: a genuine named functor closure (spellable type,
-// launchable from other TUs) is not folded in place. The captures are
-// compile-time constants on the host, so the pass specializes by clone
-// (copyKernel): it mints a fresh kernel with the constants propagated, redirects
-// this TU's launch to it, and leaves the shared original generic (parameters
-// still the block arguments) for launches this TU cannot see. The only change
-// from the first case is the kernel's mangled name and closure type.
+// A genuine named functor closure (spellable type). Under closed-TU every
+// launch of a kernel that is not registered is this TU's, so the constants
+// are propagated in place. (Until T28 it was specialized by a clone,
+// `.spec.constprop.0`; that path is deleted.) The only change from the first
+// case is the kernel's mangled name and closure type.
 
 !s8i = !cir.int<s, 8>
 !s32i = !cir.int<s, 32>
@@ -268,9 +270,9 @@ module attributes {cir.offload.container} {
   module @host attributes {cir.offload.kind = #cir.offload<host>} {
     cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTS9MyFunctor" : !cir.array<!s8i x 14>, trailing_zeros> : !cir.array<!s8i x 15>
     cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<14> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>)
-    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>)
-    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> {
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_lam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
       %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
       %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
       cir.return %1 : !cir.ptr<!s8i>
@@ -294,23 +296,13 @@ module attributes {cir.offload.container} {
     }
   }
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
-    // This TU's launch marker is repointed at a cloned getter (numeric suffix).
-    // CHECK: cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv_{{[0-9]+}}()
-    //
-    // The shared original stays generic: parameters are still the block
-    // arguments, nothing propagated.
+    // The launch marker is not redirected and no clone is made: the
+    // constant flag/coeff are propagated into the kernel in place.
+    // CHECK: cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv()
     // CHECK-LABEL: cir.func @_ZTS9MyFunctor(
-    // CHECK: cir.store %arg0, %{{.*}}
-    // CHECK: cir.store %arg1, %{{.*}}
-    // CHECK: cir.store %arg2, %{{.*}}
-    // CHECK: cir.cast int_to_bool %arg0
-    //
-    // The specialized clone carries the combine-private provenance marker and
-    // has the constant flag/coeff propagated in.
-    // CHECK: cir.func @_ZTS9MyFunctor.spec.constprop.0(
-    // CHECK-SAME: attributes {cir.specialization_private}
     // CHECK-DAG: cir.const #cir.int<1> : !s32i
     // CHECK-DAG: cir.const #cir.int<7> : !s32i
+    // CHECK-NOT: .spec.
     cir.func @_ZTS9MyFunctor(%arg0: !s32i {cir.sycl_kernel_param = {field = "flag", kind = "scalar", path = ["flag"]}}, %arg1: !s32i {cir.sycl_kernel_param = {field = "coeff", kind = "scalar", path = ["coeff"]}}, %arg2: !s32i {cir.sycl_kernel_param = {field = "n", kind = "scalar", path = ["n"]}}, %out: !cir.ptr<!s32i, target_address_space(1)>) cc(spir_kernel) {
       %clos = cir.alloca "lam" align(8) : !cir.ptr<!rec_lam> {cir.sycl_kernel_object}
       %sflag = cir.alloca "flag.addr" align(4) : !cir.ptr<!s32i>

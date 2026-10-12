@@ -120,25 +120,23 @@
 // rejects every kernel; a record without a closure rejects the kernel it
 // names; a kernel.info marker in an analysed function that does not feed a
 // recorded launch is a launch path no model records, and rejects the kernel
-// it names. This matches the legacy trace, which folds every launch it
-// recovers in user code and rejects a kernel with a user-code launch whose
-// closure it does not recover; like it, the launches are this TU's: the
-// consumer stamps a kernel in place only if no other TU launches it
-// (KernelBinding::stampsInPlace). Facts that depend on the callers of
+// it names. The launches are this TU's: the consumer stamps a kernel in
+// place only if no other TU launches it (KernelBinding::stampsInPlace), and
+// otherwise only the kernel copy of an internalized launch path
+// (InternalizeLaunchPaths.cpp). Facts that depend on the callers of
 // an externally callable function are Incomplete unless closed-TU is
 // assumed (D2), and (b) rejects them.
 //
 // The constant rule (constantField). A candidate is a scalar closure field
 // a device kernel takes as a scalar parameter (cir.sycl_kernel_param kind
-// "scalar", a top-level int, float or bool member: the legacy fold's
-// candidates). At a launch, its value is what the stored-value queries say
-// the field's cell of the launch's closure holds (StoredValueQuery::valuesAt
-// over the launch record's cell: in BU mode the record in the graph of an
-// uncovered caller whose copies cover every execution, as for noalias); it
-// is a constant if that answer is complete with exactly one constant and no
-// def. The kernel's constant is the one every launch gives: every launch
-// known (as for noalias), each with a closure, all giving the same
-// constant.
+// "scalar", a top-level int, float or bool member). At a launch, its value is
+// what the stored-value queries say the field's cell of the launch's closure
+// holds (StoredValueQuery::valuesAt over the launch record's cell: in BU mode
+// the record in the graph of an uncovered caller whose copies cover every
+// execution, as for noalias); it is a constant if that answer is complete with
+// exactly one constant and no def. The kernel's constant is the one every
+// launch gives: every launch known (as for noalias), each with a closure, all
+// giving the same constant.
 //
 // SOUNDNESS. The runtime copies the closure when the launch call runs (PI
 // 17660-17672), and the kernel's parameter is initialized from that copy;
@@ -156,18 +154,17 @@
 // The geometry rule (geometry). The launch models record the geometry
 // operand of a launch (LaunchRecord::geometry): a range or nd_range the
 // launch function takes by value, or the detail::nd_range_view the runtime
-// glue takes over one. Like the legacy trace (traceNDRange), the global size
-// is the range, or the nd_range's globalSize (the view's MGlobalSize), the
-// local size the nd_range's localSize (the view's MLocalSize; none for a
-// range, or a view whose MLocalSize is only ever null), and the offset is
-// not read. Each component is a constant if the stored-value queries prove
-// one for its cell; through a view, if the pointer slot only holds addresses
-// of objects (never null) that the analysis sees completely, and the cell it
-// points to holds one constant. The dimensions are the type's (the view's
-// MDims, if constant). The kernel's geometry is the AND over its launches:
-// every launch known, each with a geometry; a component is known if every
-// launch gives the same constant, and a local size is known only if every
-// launch has one. A launch that may run one of several kernels (the
+// glue takes over one. The global size is the range, or the nd_range's
+// globalSize (the view's MGlobalSize), the local size the nd_range's localSize
+// (the view's MLocalSize; none for a range, or a view whose MLocalSize is only
+// ever null), and the offset is not read. Each component is a constant if the
+// stored-value queries prove one for its cell; through a view, if the pointer
+// slot only holds addresses of objects (never null) that the analysis sees
+// completely, and the cell it points to holds one constant. The dimensions are
+// the type's (the view's MDims, if constant). The kernel's geometry is the AND
+// over its launches: every launch known, each with a geometry; a component is
+// known if every launch gives the same constant, and a local size is known only
+// if every launch has one. A launch that may run one of several kernels (the
 // range-rounding __pf_kernel_wrapper of a range launch) gives no global
 // size: the runtime may round it up. A launch whose geometry operand is one
 // of several ranges (parallel_for_work_group) has none recorded.
@@ -413,14 +410,14 @@ const SYCLHostFacts &SYCLHostFactsCache::get(const HostFactsOptions &options) {
   return *entry;
 }
 
-void SYCLHostFactsCache::recordSpecialization(StringRef clone,
-                                              StringRef original) {
-  origins[clone] = getOriginalKernel(original).str();
-}
-
-StringRef SYCLHostFactsCache::getOriginalKernel(StringRef kernel) const {
-  auto it = origins.find(kernel);
-  return it == origins.end() ? kernel : StringRef(it->second);
+const KernelBindingTable &
+SYCLHostFactsCache::getTable(const HostFactsOptions &options) {
+  std::unique_ptr<KernelBindingTable> &entry =
+      tables[getHostFactsModeName(options.mode).str() + " " +
+             getHostFactsAnalysisKey(options)];
+  if (!entry)
+    entry = std::make_unique<KernelBindingTable>(container, options, this);
+  return *entry;
 }
 
 void SYCLHostFacts::collectDeviceKernels(Operation *scope) {

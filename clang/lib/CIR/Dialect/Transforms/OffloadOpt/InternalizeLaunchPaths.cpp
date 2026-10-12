@@ -39,14 +39,10 @@
 // all clean already needs no copy (isTUUniqueSYCLKernel lets the passes
 // stamp it in place).
 //
-// Legacy host facts (T26b). Without closed-TU a kernel other TUs can launch
-// gets no fact in place, in every host-facts mode, so this pass runs under
-// legacy too. The legacy trace reads only the body of the function holding a
-// launch (after inlining the launch shims and the command group), so its
-// facts do not depend on that function's callers: a kernel with no launch
-// that gives a fact is skipped, and the functions holding one are roots of
-// their own paths (KernelBinding::syclLegacyFactSites), which recovers the
-// launches of a library TU without main.
+// Open roots (T28). A kernel no closed root reaches (a TU without main) gets
+// its paths internalized from the externally visible functions nothing in the
+// TU uses, whose callers are all code we don't see: see
+// internalizeFromOpenRoots for the rule and its soundness argument.
 //
 // Ordering. This runs before the host-facts passes: the analysis they share
 // (SYCLHostFactsCache) is built on the internalized module, so its soundness
@@ -67,6 +63,7 @@
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/LaunchPathInternalization.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/MD5.h"
 
@@ -170,19 +167,172 @@ std::string noFactPossibleWhy(llvm::ArrayRef<cir::FuncOp> kernels) {
   return "no noalias candidate, scalar capture or nd_range launch";
 }
 
+/// The symbols \p host uses outside their own bodies, or std::nullopt if
+/// the uses cannot be enumerated.
+std::optional<llvm::DenseSet<StringAttr>> getUsedSymbols(ModuleOp host) {
+  std::optional<SymbolTable::UseRange> uses =
+      SymbolTable::getSymbolUses(&host.getBodyRegion());
+  if (!uses)
+    return std::nullopt;
+  llvm::DenseSet<StringAttr> used;
+  for (const SymbolTable::SymbolUse &use : *uses) {
+    StringAttr name = use.getSymbolRef().getRootReference();
+    auto parent = use.getUser()->getParentOfType<cir::FuncOp>();
+    if (!parent || parent.getSymNameAttr() != name)
+      used.insert(name);
+  }
+  return used;
+}
+
+/// Whether \p func can be an open root: a definition another TU can call
+/// (external, linkonce_odr, weak, weak_odr linkage; not
+/// available_externally, whose body this TU does not provide) that nothing
+/// in the module uses (no call, address or initializer names it, except its
+/// own body), so its callers are all in code we don't see. \p used: the
+/// symbols the module used outside their own bodies before any path was
+/// internalized (the originals the closed roots' copies replace are not
+/// roots).
+bool isOpenRoot(cir::FuncOp func, const llvm::DenseSet<StringAttr> &used) {
+  if (func.isDeclaration() || cir::isLocalLinkage(func.getLinkage()) ||
+      func.getLinkage() == cir::GlobalLinkageKind::AvailableExternallyLinkage ||
+      cir::isClosedRoot(func) || func->hasAttr(cir::kInternalizedAttr))
+    return false;
+  return !used.contains(func.getSymNameAttr());
+}
+
+/// Open roots (T28). A kernel no closed root reaches (a library TU without
+/// main: s3d's S3D.cpp; a launch only an external entry point reaches) may
+/// still get facts that hold for every caller: internalize its paths from
+/// the open roots (isOpenRoot), kept in place like closed roots, whose
+/// copies and kernel copy K.int then have the open root as their only
+/// caller.
+///
+/// SOUNDNESS. The facts at K.int's launches are the points-to analysis'
+/// facts at launches reached only from open roots R. R is externally
+/// visible, so the analysis treats it as having callers we don't see: its
+/// formals are Incomplete (UnknownCaller), and so is what they reach;
+/// nameable globals are External; and the noalias, constant and geometry
+/// rules (SYCLHostFacts.cpp) accept a fact only if it does not depend on
+/// Incomplete or External memory or on a formal's targets. What survives
+/// depends only on what R's analysed subtree does itself: allocations made
+/// inside it, constants it stores, its own control flow. That holds for any
+/// call of R:
+///  - a call from code we don't see bound to our copy of R runs this body
+///    (an inline R has the same body in every TU, C++20 [basic.def.odr]p14),
+///    with unknown arguments and unknown global state, which the analysis
+///    already assumed; it reaches K.int only through R's redirected edges;
+///  - a call the linker binds to another TU's copy of R (linkonce, weak)
+///    runs that copy, which launches the original K, unstamped;
+///  - the copies of R's subtree are local, called only by R and by each
+///    other (localFunctionsClosed): no other path reaches them. R itself is
+///    analysed even if it is an unused ODR function (skipUnusedODRFunctions
+///    keeps a body that names a local function: it can run code of this TU
+///    that a foreign copy would not).
+/// So the kernel K.int, which no other TU names, has at every launch the
+/// facts the analysis proved.
+///
+/// Only the sinks no closed root reaches (phase 1) are planned here, with
+/// copies of their own: a kernel a closed root reaches keeps the facts its
+/// closed-root contexts give, which an open root's Incomplete context would
+/// weaken (one K.int per kernel, ANDed over its launches). A kernel no other
+/// TU can launch (KernelBinding::isTUUnique) is not planned: the passes
+/// stamp it in place over all of its launches, which include those an open
+/// root reaches.
+void internalizeFromOpenRoots(
+    ModuleOp container, ModuleOp host,
+    const cir::InternalizationOptions &closedOptions,
+    llvm::function_ref<llvm::StringRef(cir::FuncOp)> kernelName,
+    const std::optional<llvm::DenseSet<StringAttr>> &used,
+    cir::InternalizationResult &result) {
+  if (result.unreached.empty())
+    return;
+  llvm::StringMap<bool> locality = cir::getSYCLKernelInfoLocality(container);
+  llvm::StringMap<cir::FuncOp> deviceKernel;
+  for (ModuleOp dm : cir::getOffloadContainerDeviceModules(container))
+    for (auto kernel : dm.getOps<cir::FuncOp>())
+      if (!kernel.isDeclaration() &&
+          kernel.getCallingConv() == cir::CallingConv::SpirKernel)
+        deviceKernel.try_emplace(kernel.getSymName(), kernel);
+  SmallVector<cir::FuncOp> sinks;
+  SmallVector<std::pair<cir::FuncOp, std::string>> unreached;
+  for (auto &[sink, why] : result.unreached) {
+    llvm::StringRef name = kernelName(sink);
+    cir::FuncOp kernel = deviceKernel.lookup(name);
+    if (kernel &&
+        cir::isTUUniqueSYCLKernel(container, kernel, name, &locality) &&
+        !cir::isRegisteredSYCLKernel(container, name)) {
+      unreached.push_back({sink, why});
+      continue;
+    }
+    sinks.push_back(sink);
+  }
+  if (sinks.empty() || !used)
+    return;
+  cir::InternalizationOptions options = closedOptions;
+  options.closedRoots = false;
+  options.extraRoot = [&](cir::FuncOp func) { return isOpenRoot(func, *used); };
+  options.maxFunctions = closedOptions.maxFunctions > result.numCloned
+                             ? closedOptions.maxFunctions - result.numCloned
+                             : 0;
+  options.maxOps = closedOptions.maxOps > result.numOps
+                       ? closedOptions.maxOps - result.numOps
+                       : 0;
+  cir::InternalizationResult open =
+      cir::internalizeLaunchPaths(host, sinks, options);
+  // Why neither kind of root reaches a sink: the closed roots' reason, then
+  // the open roots'.
+  llvm::DenseMap<Operation *, std::string> closedWhy;
+  for (auto &[sink, why] : result.unreached)
+    closedWhy[sink] = why;
+  for (auto &[sink, why] : open.unreached)
+    unreached.push_back(
+        {sink, closedWhy.lookup(sink) + "; " +
+                   (StringRef(why).starts_with("no root reaches it")
+                        ? std::string("no open root (an externally visible "
+                                      "function nothing in this TU uses) "
+                                      "reaches it either")
+                        : why)});
+  result.unreached = std::move(unreached);
+  for (cir::InternalizationResult::Sink &sink : open.sinks)
+    result.sinks.push_back(std::move(sink));
+  for (cir::FuncOp sink : open.skipped)
+    result.skipped.push_back(sink);
+  if (result.budgetWhy.empty())
+    result.budgetWhy = open.budgetWhy;
+  for (auto &[original, copy] : open.copies)
+    result.copies.try_emplace(original, copy);
+  result.numCloned += open.numCloned;
+  result.numInPlace += open.numInPlace;
+  result.numGuards += open.numGuards;
+  result.numVTables += open.numVTables;
+  result.numRedirected += open.numRedirected;
+  result.numOps += open.numOps;
+  result.numUnvouchedAddresses += open.numUnvouchedAddresses;
+}
+
 struct OffloadInternalizeLaunchPathsPass
     : public impl::OffloadInternalizeLaunchPathsBase<
           OffloadInternalizeLaunchPathsPass> {
   void runOnOperation() override;
 };
 
+/// The analysis remark of the pass (category cir-offload-internalize).
+void noteRemark(Location loc, const llvm::Twine &text) {
+  cir::emitOffloadRemark(loc, cir::OffloadRemarkKind::Analysis,
+                         "InternalizeLaunchPaths",
+                         cir::kInternalizeRemarkCategory, "", text);
+}
+
 void OffloadInternalizeLaunchPathsPass::runOnOperation() {
   ModuleOp container = getOperation();
   std::optional<cir::HostFactsMode> mode = cir::parseHostFactsMode(hostFacts);
-  // Every host-facts mode: the legacy trace reads the copies' launches as it
-  // reads the originals' (it inlines the launch shims by name, and a copy
-  // keeps its original's name with a suffix).
-  if (!cir::isOffloadContainer(container) || !mode || hostFactsClosedTU)
+  if (!mode) {
+    container.emitError() << "unknown host-facts mode '" << hostFacts
+                          << "' (expected ipo or none)";
+    return signalPassFailure();
+  }
+  if (!cir::isOffloadContainer(container) ||
+      *mode == cir::HostFactsMode::None || hostFactsClosedTU)
     return markAllAnalysesPreserved();
   ModuleOp host = cir::getOffloadContainerHostModule(container);
   if (!host)
@@ -204,44 +354,6 @@ void OffloadInternalizeLaunchPathsPass::runOnOperation() {
     else
       ++numNoFact;
   }
-  // Legacy host facts: the trace is intraprocedural (it reads the function
-  // holding a launch, after inlining the launch shims and the command
-  // group), so a launch in a copy gives exactly what the launch it was copied
-  // from gives, whoever calls it. So:
-  //  - a kernel none of whose launches gives a fact on its own gets none
-  //    through a copy either: skip it;
-  //  - the functions holding a launch that does are roots too, kept in place
-  //    (an external one included): the kernel copy they then launch has
-  //    facts that hold at each of its launches for any caller, and no other
-  //    TU names it. (An external root that the linker replaces by another
-  //    TU's copy launches the original kernel, unstamped.)
-  //  - a kernel no other TU can launch (KernelBinding::isTUUnique) is
-  //    stamped in place over all its launches, as before: no copy (no
-  //    duplicate device kernel).
-  // The legacy table is the shared analysis, usually already built.
-  unsigned numNoLegacyFact = 0, numTUUnique = 0;
-  llvm::StringSet<> legacyRoots;
-  if (*mode == cir::HostFactsMode::Legacy) {
-    const cir::KernelBindingTable &table =
-        getAnalysis<cir::KernelBindingTable>();
-    for (auto &[name, kernels] : deviceKernels) {
-      if (!possible.contains(name))
-        continue;
-      const cir::KernelBinding *binding = table.lookup(name);
-      if (binding && binding->isTUUnique) {
-        possible.erase(name);
-        ++numTUUnique;
-        continue;
-      }
-      if (binding && !binding->syclLegacyFactSites.empty()) {
-        for (const std::string &root : binding->syclLegacyFactSites)
-          legacyRoots.insert(root);
-        continue;
-      }
-      possible.erase(name);
-      ++numNoLegacyFact;
-    }
-  }
   // The kernel each getter names (looked up once, with symbol tables).
   SymbolTableCollection symbols;
   llvm::DenseMap<Operation *, std::string> kernelOf;
@@ -257,31 +369,21 @@ void OffloadInternalizeLaunchPathsPass::runOnOperation() {
         possible.contains(kernelName(func)))
       sinks.push_back(func);
   if (numNoFact)
-    emitRemark(container.getLoc())
-        << "launch-path-internalization: " << numNoFact << " kernel"
-        << (numNoFact == 1 ? "" : "s")
-        << " skipped: no fact is possible (no noalias candidate, scalar "
-           "capture or nd_range launch)";
-  if (numNoLegacyFact)
-    emitRemark(container.getLoc())
-        << "launch-path-internalization: " << numNoLegacyFact << " kernel"
-        << (numNoLegacyFact == 1 ? "" : "s")
-        << " skipped: no launch gives a legacy host fact";
-  if (numTUUnique)
-    emitRemark(container.getLoc())
-        << "launch-path-internalization: " << numTUUnique << " kernel"
-        << (numTUUnique == 1 ? "" : "s")
-        << " skipped: stamped in place (no other TU can launch "
-        << (numTUUnique == 1 ? "it" : "them") << ")";
+    noteRemark(
+        container.getLoc(),
+        "launch-path-internalization: " + llvm::Twine(numNoFact) + " kernel" +
+            (numNoFact == 1 ? "" : "s") +
+            " skipped: no fact is possible (no noalias candidate, scalar "
+            "capture or nd_range launch)");
   if (sinks.empty())
     return markAllAnalysesPreserved();
 
   std::string moduleId = getUniqueModuleId(host);
   if (moduleId.empty()) {
-    emitRemark(container.getLoc())
-        << "launch-path-internalization: none (the host module has no "
-           "strong external definition to derive a program-unique kernel "
-           "name from)";
+    noteRemark(container.getLoc(),
+               "launch-path-internalization: none (the host module has no "
+               "strong external definition to derive a program-unique kernel "
+               "name from)");
     return markAllAnalysesPreserved();
   }
 
@@ -289,25 +391,27 @@ void OffloadInternalizeLaunchPathsPass::runOnOperation() {
   options.vouchAddress = isVouchedInvokerAddress;
   options.maxFunctions = maxFunctions;
   options.maxOps = maxOps;
-  if (!legacyRoots.empty())
-    options.extraRoot = [&](cir::FuncOp func) {
-      return legacyRoots.contains(func.getSymName());
-    };
+  // The open roots are the functions nothing used before the closed roots'
+  // paths were copied.
+  std::optional<llvm::DenseSet<StringAttr>> used = getUsedSymbols(host);
   cir::InternalizationResult result =
       cir::internalizeLaunchPaths(host, sinks, options);
+  // Open roots: the sinks no closed root reaches.
+  internalizeFromOpenRoots(container, host, options, kernelName, used, result);
   numCopies += result.numCloned;
   if (!result.skipped.empty()) {
-    InFlightDiagnostic diag = emitRemark(container.getLoc());
-    diag << "launch-path-internalization budget: " << result.budgetWhy
-         << "; not internalized:";
+    std::string text =
+        "launch-path-internalization budget: " + result.budgetWhy +
+        "; not internalized:";
     for (cir::FuncOp sink : result.skipped)
-      diag << " " << kernelName(sink);
+      text += (" " + kernelName(sink)).str();
+    noteRemark(container.getLoc(), text);
   }
 
   for (auto &[sink, why] : result.unreached)
-    emitRemark(sink.getLoc())
-        << "launch-path-internalization: kernel @" << kernelName(sink)
-        << " not internalized (" << why << ")";
+    noteRemark(sink.getLoc(), "launch-path-internalization: kernel @" +
+                                  kernelName(sink) + " not internalized (" +
+                                  why + ")");
 
   // A kernel copy per marker reached through a copy.
   MLIRContext *ctx = &getContext();
@@ -321,9 +425,10 @@ void OffloadInternalizeLaunchPathsPass::runOnOperation() {
     std::optional<cir::LocalKernelCopy> copy =
         copier.copy(sink.sink, name, ".int");
     if (!copy) {
-      emitRemark(sink.sink.getLoc())
-          << "launch-path-internalization: kernel " << kernel
-          << " not specialized (its kernel info has an unexpected shape)";
+      noteRemark(
+          sink.sink.getLoc(),
+          "launch-path-internalization: kernel " + kernel +
+              " not specialized (its kernel info has an unexpected shape)");
       continue;
     }
     for (Operation *op : sink.calls) {
@@ -347,19 +452,23 @@ void OffloadInternalizeLaunchPathsPass::runOnOperation() {
       device->setAttr(cir::kInternalizedKernelAttr, info);
     ++numKernels;
     ++numKernelCopies;
-    emitRemark(copy->deviceKernels.front().getLoc())
-        << "launch-path-internalization: kernel @" << kernel << " -> @"
-        << copy->name << " for " << sink.calls.size() << " launch marker"
-        << (sink.calls.size() == 1 ? "" : "s")
-        << cir::describeInternalizedSYCLKernel(copy->deviceKernels.front());
+    noteRemark(
+        copy->deviceKernels.front().getLoc(),
+        "launch-path-internalization: kernel @" + kernel + " -> @" +
+            copy->name + " for " + llvm::Twine(sink.calls.size()) +
+            " launch marker" + (sink.calls.size() == 1 ? "" : "s") +
+            cir::describeInternalizedSYCLKernel(copy->deviceKernels.front()));
   }
-  emitRemark(container.getLoc())
-      << "launch-path-internalization: " << numKernels << " kernel"
-      << (numKernels == 1 ? "" : "s") << " specialized, " << result.numCloned
-      << " function copies (" << result.numOps << " ops), " << result.numInPlace
-      << " clean in place, " << result.numGuards << " guarded calls, "
-      << result.numVTables << " vtable copies; " << result.skipped.size()
-      << " kernel" << (result.skipped.size() == 1 ? "" : "s") << " over budget";
+  noteRemark(container.getLoc(),
+             "launch-path-internalization: " + llvm::Twine(numKernels) +
+                 " kernel" + (numKernels == 1 ? "" : "s") + " specialized, " +
+                 llvm::Twine(result.numCloned) + " function copies (" +
+                 llvm::Twine(result.numOps) + " ops), " +
+                 llvm::Twine(result.numInPlace) + " clean in place, " +
+                 llvm::Twine(result.numGuards) + " guarded calls, " +
+                 llvm::Twine(result.numVTables) + " vtable copies; " +
+                 llvm::Twine(result.skipped.size()) + " kernel" +
+                 (result.skipped.size() == 1 ? "" : "s") + " over budget");
 }
 
 struct OffloadPruneInternalizedLaunchPathsPass
@@ -411,10 +520,11 @@ void OffloadPruneInternalizedLaunchPathsPass::runOnOperation() {
       kernel->removeAttr(cir::kInternalizedKernelAttr);
       kernel->removeAttr(cir::kInternalizedUsedAttr);
     }
-  emitRemark(container.getLoc())
-      << "launch-path-internalization: kept " << used.size() << " of "
-      << used.size() + unused.size() << " kernel copies, erased " << erased
-      << " host copies";
+  noteRemark(container.getLoc(), "launch-path-internalization: kept " +
+                                     llvm::Twine(used.size()) + " of " +
+                                     llvm::Twine(used.size() + unused.size()) +
+                                     " kernel copies, erased " +
+                                     llvm::Twine(erased) + " host copies");
 }
 
 } // namespace

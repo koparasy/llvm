@@ -16,7 +16,7 @@
 // DEFINE: %{targets} = -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown
 // DEFINE: %{pipe} = %{dev} -emit-cir %{flags} %s -o %t/%{v}.dev.cir \
 // DEFINE:   && %{host} -emit-cir %{flags} %s -o %t/%{v}.host.cir \
-// DEFINE:   && cir-offload-merge -combine %{targets} -input=%t/%{v}.host.cir \
+// DEFINE:   && cir-offload-merge -combine --remarks-filter="cir-offload.*" %{targets} -input=%t/%{v}.host.cir \
 // DEFINE:        -input=%t/%{v}.dev.cir --cir-offload-host-facts=ipo \
 // DEFINE:        -cir-offload-assume-closed-tu -output=%t/%{v}.cir \
 // DEFINE:   && cir-offload-merge -split %{targets} -input=%t/%{v}.cir \

@@ -35,7 +35,6 @@ void registerTestCIRAliasAnalysisPass();
 void registerTestCIRPointsToPass();
 void registerTestCIRPointsToInstrumentPass();
 void registerPrintKernelBindingsPass();
-void registerCopyKernelPass();
 } // namespace cir::test
 #endif
 
@@ -57,7 +56,6 @@ int main(int argc, char **argv) {
   cir::test::registerTestCIRPointsToPass();
   cir::test::registerTestCIRPointsToInstrumentPass();
   cir::test::registerPrintKernelBindingsPass();
-  cir::test::registerCopyKernelPass();
 #endif
   registry.insert<mlir::memref::MemRefDialect, mlir::LLVM::LLVMDialect>();
 

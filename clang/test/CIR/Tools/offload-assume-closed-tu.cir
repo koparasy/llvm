@@ -1,74 +1,66 @@
 // -cir-offload-assume-closed-tu (plan D2, off by default) reaches the
-// points-to analysis behind --cir-offload-host-facts=ipo|both: the
-// host-facts summary remark names the mode, and the verdicts change. The input
-// is sycl-host-facts-both.cir's (two buffers and two USM pointers built by
-// @setup into members of a Bench object, launched by @run through `this`).
-// --cir-offload-host-facts=ipo|both runs the bottom-up points-to analysis
-// with subobject nodes; --cir-offload-host-facts-ci is the escape hatch to
-// the context-insensitive one.
+// points-to analysis behind the SYCL host facts, and the verdicts change. The
+// input is Analysis/sycl-host-facts-members.cir's (two buffers and two USM
+// pointers built by @setup into members of a Bench object, launched by @run
+// through `this`). The host facts run the bottom-up points-to analysis with
+// subobject nodes; the hidden --cir-offload-host-facts-bu=false runs the
+// context-insensitive one (the --cir-offload-host-facts-ci flag is deleted,
+// T28: nothing needed it).
 
 // RUN: rm -rf %t && split-file %s %t
-// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" -input=%t/host.cir -input=%t/device.cir \
 // RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
-// RUN:   --cir-offload-host-facts=both --cir-offload-internalize-launch-paths=false \
+// RUN:   --cir-offload-internalize-launch-paths=false \
 // RUN:   -output=%t/open.cir 2>&1 | FileCheck %s --check-prefix=OPEN
-// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN: FileCheck %s --check-prefix=IR-OPEN --input-file=%t/open.cir
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" -input=%t/host.cir -input=%t/device.cir \
 // RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
-// RUN:   --cir-offload-host-facts=both -output=%t/open-int.cir 2>&1 | FileCheck %s --check-prefix=OPEN-INT
-// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -output=%t/open-int.cir 2>&1 | FileCheck %s --check-prefix=OPEN-INT
+// RUN: FileCheck %s --check-prefix=IR-OPEN-INT --input-file=%t/open-int.cir
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" -input=%t/host.cir -input=%t/device.cir \
 // RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
-// RUN:   --cir-offload-host-facts=both -cir-offload-assume-closed-tu -output=%t/closed.cir 2>&1 | FileCheck %s --check-prefix=CLOSED
-// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -cir-offload-assume-closed-tu -output=%t/closed.cir 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: FileCheck %s --check-prefix=IR-CLOSED --input-file=%t/closed.cir
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" -input=%t/host.cir -input=%t/device.cir \
 // RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
-// RUN:   --cir-offload-host-facts=both --cir-offload-host-facts-closed-tu -output=%t/alias.cir 2>&1 | FileCheck %s --check-prefix=CLOSED
-// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   --cir-offload-host-facts-closed-tu -output=%t/alias.cir 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" -input=%t/host.cir -input=%t/device.cir \
 // RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
-// RUN:   --cir-offload-host-facts=both -cir-offload-assume-closed-tu --cir-offload-host-facts-ci \
-// RUN:   -output=%t/ci.cir 2>&1 | FileCheck %s --check-prefix=CI
-// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -cir-offload-assume-closed-tu --cir-offload-host-facts-bu=false \
+// RUN:   -output=%t/ci.cir 2>&1 | FileCheck %s --check-prefix=CLOSED
+// RUN: cir-offload-merge -combine --remarks-filter="cir-offload.*" -input=%t/host.cir -input=%t/device.cir \
 // RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
-// RUN:   --cir-offload-host-facts=ipo -cir-offload-assume-closed-tu -output=%t/ipo.cir
-// RUN: FileCheck %s --check-prefix=IPO --input-file=%t/ipo.cir
-// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
-// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
-// RUN:   --cir-offload-host-facts=ipo --cir-offload-internalize-launch-paths=false \
-// RUN:   -output=%t/ipo-open.cir
-// RUN: FileCheck %s --check-prefix=IPO-OPEN --input-file=%t/ipo-open.cir
-// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
-// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
-// RUN:   --cir-offload-host-facts=ipo -output=%t/ipo-open-int.cir
-// RUN: FileCheck %s --check-prefix=IPO-OPEN-INT --input-file=%t/ipo-open-int.cir
+// RUN:   --cir-offload-host-facts=none -output=%t/none.cir 2>&1 | FileCheck %s --allow-empty --check-prefix=NONE
+// RUN: FileCheck %s --check-prefix=IR-OPEN --input-file=%t/none.cir
 
 // Open, without launch-path internalization: @setup and @run may have
-// callers in other TUs; legacy and points-to agree (nothing stamped).
-// OPEN-NOT: host-facts-disagreement:
-// OPEN: remark: host-facts-disagreements: 0 of 4 candidate fields (open, bu, subobjects)
+// callers in other TUs, so nothing is proven.
+// OPEN-COUNT-4: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg {{[0-9]}} ({{.*}}): not stamped ({{.*}} has no allocation site the analysis sees)
+// OPEN-NOT: ): noalias
+// IR-OPEN-NOT: llvm.noalias
 
-// Open, internalized (T26): @run is copied as an internal @run.int that
-// main calls, and it launches a copy of the kernel; points-to proves the
-// copy's four fields from main's objects, and the original kernel, which
-// other TUs' calls of @run launch, stays unproven. Under both, legacy is
-// used, so nothing is stamped and the prune pass drops the copies.
-// OPEN-INT: remark: launch-path-internalization: kernel @_ZTSZ4mainEUlvE_ -> @_ZTSZ4mainEUlvE_.int.[[ID:[0-9a-f]+]] for 1 launch marker through the internalized launch path from root @main
-// OPEN-INT-NOT: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field
-// OPEN-INT-COUNT-4: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_.int.[[ID]] field {{[ABPQ]}} legacy=not stamped ({{.*}}) ipo=noalias
-// OPEN-INT: remark: host-facts-disagreements: 4 of 8 candidate fields (open, bu, subobjects, internalized)
-// OPEN-INT: remark: launch-path-internalization: kept 0 of 1 kernel copies
+// Open, internalized (T26, the default): @run is copied as an internal
+// @run.int that main calls, and it launches a copy of the kernel; points-to
+// proves the copy's four fields from main's objects, and the original
+// kernel, which other TUs' calls of @run launch, stays unproven.
+// OPEN-INT: launch-path-internalization: kernel @_ZTSZ4mainEUlvE_ -> @_ZTSZ4mainEUlvE_.int.[[ID:[0-9a-f]+]] for 1 launch marker through the internalized launch path from root @main
+// OPEN-INT-COUNT-4: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg {{[0-9]}} ({{.*}}): not stamped
+// OPEN-INT-COUNT-4: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_.int.[[ID]] arg {{[0-9]}} ({{.*}}): noalias ({{.*}}) through the internalized launch path from root @main
+// OPEN-INT: launch-path-internalization: kept 1 of 1 kernel copies
+// IR-OPEN-INT: cir.func @_ZTSZ4mainEUlvE_(
+// IR-OPEN-INT-NOT: llvm.noalias
+// IR-OPEN-INT-SAME: {{$}}
+// IR-OPEN-INT: cir.func @_ZTSZ4mainEUlvE_.int.{{[0-9a-f]+}}({{.*}}field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}, llvm.noalias}, {{.*}}field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}, llvm.noalias}, {{.*}}field = "P", kind = "pointer", path = ["P"]}, llvm.noalias}, {{.*}}field = "Q", kind = "pointer", path = ["Q"]}, llvm.noalias})
 
-// Closed TU: points-to sees @main's objects, legacy stops at `this`.
-// CLOSED-COUNT-4: remark: host-facts-disagreement: kernel _ZTSZ4mainEUlvE_ field {{[ABPQ]}} legacy=not stamped ({{.*}}) ipo=noalias
-// CLOSED: remark: host-facts-disagreements: 4 of 4 candidate fields (closed-tu, bu, subobjects)
+// Closed TU (bottom-up and CI): points-to sees @main's objects; the kernel
+// is stamped in place, nothing is internalized.
+// CLOSED-NOT: launch-path-internalization
+// CLOSED-COUNT-4: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE_ arg {{[0-9]}} ({{.*}}): noalias
+// CLOSED-NOT: launch-path-internalization
+// IR-CLOSED: cir.func @_ZTSZ4mainEUlvE_({{.*}}field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}, llvm.noalias}, {{.*}}field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}, llvm.noalias}, {{.*}}field = "P", kind = "pointer", path = ["P"]}, llvm.noalias}, {{.*}}field = "Q", kind = "pointer", path = ["Q"]}, llvm.noalias})
 
-// CI: host-facts-disagreements: 4 of 4 candidate fields (closed-tu, ci, subobjects)
-
-// ipo stamps the two accessor pointer and two USM pointer parameters under
-// closed-tu only.
-// IPO: cir.func @_ZTSZ4mainEUlvE_({{.*}}field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}, llvm.noalias}, {{.*}}field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}, llvm.noalias}, {{.*}}field = "P", kind = "pointer", path = ["P"]}, llvm.noalias}, {{.*}}field = "Q", kind = "pointer", path = ["Q"]}, llvm.noalias})
-// IPO-OPEN-NOT: llvm.noalias
-// IPO-OPEN-INT: cir.func @_ZTSZ4mainEUlvE_(
-// IPO-OPEN-INT-NOT: llvm.noalias
-// IPO-OPEN-INT-SAME: {{$}}
-// IPO-OPEN-INT: cir.func @_ZTSZ4mainEUlvE_.int.{{[0-9a-f]+}}({{.*}}field = "A", init_arg = 0 : i32, kind = "accessor", path = ["A"]}, llvm.noalias}, {{.*}}field = "B", init_arg = 0 : i32, kind = "accessor", path = ["B"]}, llvm.noalias}, {{.*}}field = "P", kind = "pointer", path = ["P"]}, llvm.noalias}, {{.*}}field = "Q", kind = "pointer", path = ["Q"]}, llvm.noalias})
+// No host facts: no remark, nothing stamped.
+// NONE-NOT: kernel-param-noalias
 
 //--- host.cir
 !s8i = !cir.int<s, 8>

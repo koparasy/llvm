@@ -1,20 +1,20 @@
 // The budgets of the points-to analysis behind the SYCL host facts, on the
 // container of sycl-host-facts-values.cir.
 //
-// RUN: cir-opt %S/sycl-host-facts-values.cir -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1})" \
+// RUN: cir-opt %S/sycl-host-facts-values.cir --remarks-filter="cir-offload.*" -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=NORMAL
-// RUN: cir-opt %S/sycl-host-facts-values.cir -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 slice=1})" \
+// RUN: cir-opt %S/sycl-host-facts-values.cir --remarks-filter="cir-offload.*" -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 slice=1})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=NORMAL
-// RUN: cir-opt %S/sycl-host-facts-values.cir -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 budget-scale=0.000001})" \
+// RUN: cir-opt %S/sycl-host-facts-values.cir --remarks-filter="cir-offload.*" -pass-pipeline="builtin.module(test-print-kernel-bindings{host-facts=ipo closed-tu=1 budget-scale=0.000001})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=TINY
-// RUN: cir-opt %S/sycl-host-facts-values.cir -pass-pipeline="builtin.module(cir-offload-infer-kernel-param-noalias{host-facts=ipo host-facts-closed-tu=1 host-facts-budget-scale=0.000001})" \
+// RUN: cir-opt %S/sycl-host-facts-values.cir --remarks-filter="cir-offload.*" -pass-pipeline="builtin.module(cir-offload-infer-kernel-param-noalias{host-facts=ipo host-facts-closed-tu=1 host-facts-budget-scale=0.000001})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=REMARK
-// RUN: cir-opt %S/sycl-host-facts-values.cir -pass-pipeline="builtin.module(cir-offload-infer-kernel-param-noalias{host-facts=ipo host-facts-closed-tu=1 host-facts-max-seconds=0.000000001})" \
+// RUN: cir-opt %S/sycl-host-facts-values.cir --remarks-filter="cir-offload.*" -pass-pipeline="builtin.module(cir-offload-infer-kernel-param-noalias{host-facts=ipo host-facts-closed-tu=1 host-facts-max-seconds=0.000000001})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=GUARD
-// RUN: cir-opt %S/sycl-host-facts-values.cir -mlir-pass-statistics \
+// RUN: cir-opt %S/sycl-host-facts-values.cir --remarks-filter="cir-offload.*" -mlir-pass-statistics \
 // RUN:   -pass-pipeline="builtin.module(cir-offload-stamp-reqd-work-group-size{host-facts=ipo host-facts-closed-tu=1},cir-offload-infer-kernel-param-noalias{host-facts=ipo host-facts-closed-tu=1},cir-offload-propagate-sycl-kernel-args{host-facts=ipo host-facts-closed-tu=1})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=SHARED
-// RUN: cir-opt %S/sycl-host-facts-values.cir -mlir-pass-statistics \
+// RUN: cir-opt %S/sycl-host-facts-values.cir --remarks-filter="cir-offload.*" -mlir-pass-statistics \
 // RUN:   -pass-pipeline="builtin.module(cir-offload-stamp-reqd-work-group-size{host-facts=ipo host-facts-closed-tu=1},cir-offload-infer-kernel-param-noalias{host-facts=ipo},cir-offload-propagate-sycl-kernel-args{host-facts=ipo host-facts-closed-tu=1})" \
 // RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=KEYED
 
@@ -49,7 +49,7 @@
 // GUARD: remark: host-facts: the bottom-up points-to analysis gave up: the analysis ran past its time limit {{.*}}; using the context-insensitive analysis
 // GUARD: remark: host-facts: the points-to analysis gave up: the analysis ran past its time limit {{.*}}; no host facts
 // GUARD: remark: host-facts budget trips: gave-up(
-// GUARD: remark: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE1_ arg 1 (pointer 'p'): not stamped (the points-to analysis gave up: the analysis ran past its time limit
+// GUARD: kernel-param-noalias: kernel @_ZTSZ4mainEUlvE1_ arg 1 (pointer 'p'): not stamped (the points-to analysis gave up: the analysis ran past its time limit
 
 // One analysis for the three container passes (SYCLHostFactsCache), kept
 // across the passes that change the container.

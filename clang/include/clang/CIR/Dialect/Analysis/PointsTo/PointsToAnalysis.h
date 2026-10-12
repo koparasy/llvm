@@ -198,9 +198,12 @@ struct PointsToAnalysisOptions {
   /// TU's own copy, which can name no internal-linkage entity of this TU
   /// (C++20 [basic.def.odr]p14): code we don't see, which the analysis
   /// already covers (nameable globals are External, what reaches unknown
-  /// code is External). Off by default; the SYCL host facts set it with
-  /// launch-path internalization (T26), which leaves the originals of the
-  /// copied functions uncalled.
+  /// code is External). An ODR function whose body names a local-linkage
+  /// function (a launch-path root kept in place that calls internalized
+  /// copies, T28) is analysed: a call bound to it runs code of this TU.
+  /// Off by default; the SYCL host facts set it with launch-path
+  /// internalization (T26), which leaves the originals of the copied
+  /// functions uncalled.
   bool skipUnusedODRFunctions = false;
   /// Subobject nodes (PointsToGraph.h): every member of class, union or
   /// array type a cir.get_member names gets its own child node, so that a
