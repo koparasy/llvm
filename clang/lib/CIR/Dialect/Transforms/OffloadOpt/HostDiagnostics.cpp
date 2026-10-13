@@ -95,12 +95,56 @@
 // function) still warns, e.g. `if (onDevice) q.memcpy(d, s, n); else
 // memcpy(d, s, n);` in a helper only ever given device memory.
 //
+// sycl-buffer-same-host-ptr. SYCL 2020 sec:buffer: "Constructing more than
+// one SYCL buffer managing the same host pointer is still undefined
+// behavior" (PI 5358-5359), and sec:buf-sync-rules: a buffer built from a
+// hostData pointer "will use this host memory for its full lifetime", and
+// "if it is used to construct another buffer or image during the lifetime of
+// this buffer, then the results are undefined" (PI 6010-6014); that holds
+// for const hostData too (the read-only case, PI 6023-6028, is a sub-case of
+// the same rule: "the host memory must still be kept available for use by
+// SYCL"). The host facts already assume it (HostFactsOptions::
+// assumeSpecHostPtrUB: two storages over one host pointer are distinct).
+// A sub-buffer (PI 5596-5604), a copy and a reinterpreted buffer (PI
+// 5356-5357) share the storage of the buffer they are made from and are
+// not constructions over host memory (other roles): exempt. The check: two
+// calls A and B of a buffer.host_ptr constructor in one host function (not
+// the SYCL implementation) such that
+//  - B runs after A in the same straight-line execution: in their innermost
+//    common block A's ancestor comes before B's, and the way from that
+//    block down to each only enters the body of a cir.scope or
+//    cir.cleanup.scope and, on B's side only, the try region of a cir.try
+//    (no branch or loop; if A threw into a handler, B could still run; with
+//    exceptions on, each construction sits in a cleanup scope of its own for
+//    its temporaries);
+//  - A's buffer is alive when B runs: A constructs a local variable (a
+//    cir.alloca) every other use of which (through casts) runs after B, is a
+//    SYCL call that keeps the buffer (accessor and get_access, queries,
+//    set_write_back, set_final_data, host access, sub-buffers), or is a
+//    destructor that runs before A (an earlier object of the variable);
+//    anything else (its destructor, an assignment, a copy or move, a user
+//    function, an escape) that may run before B rejects the pair. Its own
+//    destructor runs in the cleanup of the scope, after B;
+//  - the two hostData operands must point into the same object:
+//    decomposePointer gives both the same base value, with constant byte
+//    offsets; or both bases are loads of one local slot that only loads and
+//    stores use, in the straight-line code of A and B, with no store that
+//    may run between the two loads; or SYCLHostFacts::hostMemoryOfBuffer gives
+//    both the same object (one origin, not a summary, a value the analysed code
+//    computed), at offsets it knows;
+//  - their bytes overlap: equal offsets ("the same host pointer"), or both
+//    sizes known (sizeof(T) * a constant range) and the byte ranges
+//    intersect. A buffer of no bytes is never reported.
+// The warning is at B, with a note at A and one at the allocation, if known.
+//
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "clang/CIR/Dialect/Analysis/CIRPointerDecomposition.h"
 #include "clang/CIR/Dialect/Analysis/PointsTo/PointsToAnalysis.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/Passes.h"
@@ -180,12 +224,14 @@ struct HostDiagnosticCheck {
 void checkHostPtrInKernel(DiagnosticContext &dc);
 void checkHostHeapPtrInKernel(DiagnosticContext &dc);
 void checkHostDerefDeviceUSM(DiagnosticContext &dc);
+void checkBufferSameHostPtr(DiagnosticContext &dc);
 
 /// The checks, in the order they run.
 constexpr HostDiagnosticCheck kChecks[] = {
     {"sycl-host-ptr-in-kernel", checkHostPtrInKernel, true},
     {"sycl-host-heap-ptr-in-kernel", checkHostHeapPtrInKernel, false},
     {"sycl-host-deref-device-usm", checkHostDerefDeviceUSM, true},
+    {"sycl-buffer-same-host-ptr", checkBufferSameHostPtr, true},
 };
 
 //===----------------------------------------------------------------------===//
@@ -1180,6 +1226,382 @@ void checkHostDerefDeviceUSM(DiagnosticContext &dc) {
             check(func, op, operand, callee, access);
     });
   }
+}
+
+//===----------------------------------------------------------------------===//
+// sycl-buffer-same-host-ptr
+//===----------------------------------------------------------------------===//
+
+/// The ops from the outermost one in \p func's body down to \p op: the
+/// ancestor of \p op in each enclosing block, outermost first.
+llvm::SmallVector<mlir::Operation *, 8> ancestorChain(mlir::Operation *op) {
+  llvm::SmallVector<mlir::Operation *, 8> chain;
+  for (; op && !mlir::isa<cir::FuncOp>(op); op = op->getParentOp())
+    chain.push_back(op);
+  std::reverse(chain.begin(), chain.end());
+  return chain;
+}
+
+/// Whether \p op runs after \p b in every execution of their innermost common
+/// block in which \p b runs: \p op's ancestor there comes after \p b's, or
+/// \p op is in the cleanup region of a cir.cleanup.scope (a handler of a
+/// cir.try) whose body (try region) holds \p b. False when unsure.
+bool runsAfter(mlir::Operation *op, mlir::Operation *b) {
+  llvm::SmallVector<mlir::Operation *, 8> x = ancestorChain(op);
+  llvm::SmallVector<mlir::Operation *, 8> y = ancestorChain(b);
+  size_t k = 0;
+  while (k < x.size() && k < y.size() && x[k] == y[k])
+    ++k;
+  if (k == x.size() || k == y.size())
+    return false; // One holds the other.
+  if (x[k]->getBlock() == y[k]->getBlock())
+    return y[k]->isBeforeInBlock(x[k]);
+  if (k == 0)
+    return false;
+  mlir::Operation *parent = x[k - 1];
+  mlir::Region *rx = x[k]->getParentRegion(), *ry = y[k]->getParentRegion();
+  if (auto cleanup = mlir::dyn_cast<cir::CleanupScopeOp>(parent))
+    return ry == &cleanup.getBodyRegion() && rx == &cleanup.getCleanupRegion();
+  if (auto tryOp = mlir::dyn_cast<cir::TryOp>(parent))
+    return ry == &tryOp.getTryRegion() && rx != ry;
+  return false;
+}
+
+/// Whether the region \p region (of \p parent) runs straight through when
+/// its op does: the one block of the body of a cir.scope or
+/// cir.cleanup.scope, or of the try region of a cir.try.
+bool isStraightLineRegion(mlir::Region *region, mlir::Operation *parent) {
+  if (!region || !parent || !region->hasOneBlock())
+    return false;
+  if (auto scope = mlir::dyn_cast<cir::ScopeOp>(parent))
+    return region == &scope.getScopeRegion();
+  if (auto cleanup = mlir::dyn_cast<cir::CleanupScopeOp>(parent))
+    return region == &cleanup.getBodyRegion();
+  if (auto tryOp = mlir::dyn_cast<cir::TryOp>(parent))
+    return region == &tryOp.getTryRegion();
+  return false;
+}
+
+/// Whether \p b runs after \p a, in the same straight-line code: in their
+/// innermost common block, the ancestor of \p a comes before that of \p b,
+/// and every region on the way from that block down to \p a and to \p b is
+/// straight-line (isStraightLineRegion; no try region on the way to \p a). Then
+/// whenever \p b runs, \p a ran before it in the same execution of that block,
+/// and nothing between them branches or loops (an exception leaves the block:
+/// \p b does not run).
+bool sameStraightLine(mlir::Operation *a, mlir::Operation *b) {
+  llvm::SmallVector<mlir::Operation *, 8> x = ancestorChain(a);
+  llvm::SmallVector<mlir::Operation *, 8> y = ancestorChain(b);
+  size_t k = 0;
+  while (k < x.size() && k < y.size() && x[k] == y[k])
+    ++k;
+  if (k == x.size() || k == y.size() || x[k]->getBlock() != y[k]->getBlock() ||
+      !x[k]->isBeforeInBlock(y[k]))
+    return false;
+  // Not into a try region on a's side: if a throws and a handler catches
+  // it, b may still run.
+  for (size_t i = k + 1; i < x.size(); ++i)
+    if (!isStraightLineRegion(x[i]->getParentRegion(), x[i - 1]) ||
+        mlir::isa<cir::TryOp>(x[i - 1]))
+      return false;
+  for (size_t i = k + 1; i < y.size(); ++i)
+    if (!isStraightLineRegion(y[i]->getParentRegion(), y[i - 1]))
+      return false;
+  return true;
+}
+
+/// Whether \p op runs before \p a in every execution of their innermost
+/// common block: its ancestor there comes first.
+bool runsBefore(mlir::Operation *op, mlir::Operation *a) {
+  llvm::SmallVector<mlir::Operation *, 8> x = ancestorChain(op);
+  llvm::SmallVector<mlir::Operation *, 8> y = ancestorChain(a);
+  size_t k = 0;
+  while (k < x.size() && k < y.size() && x[k] == y[k])
+    ++k;
+  return k < x.size() && k < y.size() && x[k]->getBlock() == y[k]->getBlock() &&
+         x[k]->isBeforeInBlock(y[k]);
+}
+
+/// The SYCL calls that may take a buffer's address and keep the buffer
+/// alive: they neither destroy nor reassign it.
+bool keepsBuffer(llvm::StringRef role) {
+  return llvm::is_contained({"accessor.from_buffer", "buffer.get_access",
+                             "buffer.query", "buffer.set_write_back",
+                             "buffer.set_final_data", "buffer.host_access",
+                             "buffer.sub"},
+                            role);
+}
+
+/// The users of \p value and of the casts of it (transitively).
+void collectUsers(mlir::Value value,
+                  llvm::SmallVectorImpl<mlir::Operation *> &out,
+                  unsigned depth = 0) {
+  for (mlir::Operation *user : value.getUsers()) {
+    if (auto cast = mlir::dyn_cast<cir::CastOp>(user);
+        cast && depth < 8 && mlir::isa<cir::PointerType>(cast.getType())) {
+      collectUsers(cast.getResult(), out, depth + 1);
+      continue;
+    }
+    if (!llvm::is_contained(out, user))
+      out.push_back(user);
+  }
+}
+
+void checkBufferSameHostPtr(DiagnosticContext &dc) {
+  using BufferHostMemory = cir::SYCLHostFacts::BufferHostMemory;
+  mlir::DataLayout layout(dc.host);
+  auto roleOf = [&](mlir::Operation *op) -> llvm::StringRef {
+    auto call = mlir::dyn_cast<cir::CallOp>(op);
+    if (!call || call.isIndirect())
+      return {};
+    auto sym = op->getAttrOfType<mlir::FlatSymbolRefAttr>("callee");
+    auto callee = sym ? dc.symbols.lookupNearestSymbolFrom<cir::FuncOp>(op, sym)
+                      : cir::FuncOp();
+    auto role = callee ? callee->getAttrOfType<mlir::StringAttr>(
+                             cir::CIRDialect::getSYCLHostAPIAttrName())
+                       : mlir::StringAttr();
+    return role ? role.getValue() : llvm::StringRef();
+  };
+
+  // Why A's buffer may not be alive when B runs, or std::nullopt.
+  auto notAliveWhy = [&](cir::CallOp a,
+                         mlir::Operation *b) -> std::optional<std::string> {
+    if (a.getArgOperands().empty())
+      return std::string("no buffer object");
+    mlir::Value handle = a.getArgOperands().front();
+    while (auto cast = handle.getDefiningOp<cir::CastOp>())
+      handle = cast.getSrc();
+    auto alloca = handle.getDefiningOp<cir::AllocaOp>();
+    if (!alloca)
+      return std::string("the first buffer is not a local variable");
+    llvm::SmallVector<mlir::Operation *, 8> users;
+    collectUsers(alloca.getResult(), users);
+    for (mlir::Operation *user : users) {
+      if (user == a.getOperation() || runsAfter(user, b))
+        continue;
+      llvm::StringRef role = roleOf(user);
+      if (keepsBuffer(role))
+        continue;
+      // The destructor of an earlier object of the variable (a loop), and
+      // the start of the variable's lifetime.
+      if ((role == "buffer.dtor" || mlir::isa<cir::LifetimeStartOp>(user)) &&
+          runsBefore(user, a))
+        continue;
+      return ("the first buffer is used before the second construction by " +
+              (role.empty() ? user->getName().getStringRef() : role) + " at " +
+              formatFileLine(user->getLoc()))
+          .str();
+    }
+    return std::nullopt;
+  };
+
+  // The slot a pointer is loaded from, if only loads and stores of it use it
+  // (a local variable whose address does not escape).
+  auto onlyLoadedSlot = [&](mlir::Value base) -> cir::LoadOp {
+    auto load = base.getDefiningOp<cir::LoadOp>();
+    if (!load)
+      return {};
+    auto alloca = load.getAddr().getDefiningOp<cir::AllocaOp>();
+    if (!alloca)
+      return {};
+    for (mlir::Operation *user : alloca.getResult().getUsers()) {
+      // The lifetime markers neither write nor let the address escape.
+      if (mlir::isa<cir::LoadOp, cir::LifetimeStartOp, cir::LifetimeEndOp>(
+              user))
+        continue;
+      if (auto store = mlir::dyn_cast<cir::StoreOp>(user);
+          store && store.getValue() != alloca.getResult())
+        continue;
+      return {};
+    }
+    return load;
+  };
+
+  // The base and constant offset of the pointer \p value, following the
+  // loads of a slot (onlyLoadedSlot) that one store writes, in straight-line
+  // code before the load: the load gives the value that store stored in the
+  // same execution (a value defined in a loop is not visible outside it).
+  struct Resolved {
+    mlir::Value base;
+    std::optional<int64_t> offset;
+  };
+  auto resolve = [&](mlir::Value value) -> Resolved {
+    cir::PointerDecomposition d = cir::decomposePointer(value, layout);
+    Resolved out{d.base, d.offset};
+    for (unsigned depth = 0; depth < 8 && out.offset; ++depth) {
+      cir::LoadOp load = onlyLoadedSlot(out.base);
+      if (!load)
+        break;
+      cir::StoreOp store;
+      unsigned stores = 0;
+      for (mlir::Operation *user : load.getAddr().getUsers())
+        if (auto st = mlir::dyn_cast<cir::StoreOp>(user)) {
+          store = st;
+          ++stores;
+        }
+      if (stores != 1 || !sameStraightLine(store, load))
+        break;
+      cir::PointerDecomposition next =
+          cir::decomposePointer(store.getValue(), layout);
+      int64_t sum;
+      if (!next.offset ||
+          __builtin_add_overflow(*out.offset, *next.offset, &sum)) {
+        out.offset.reset();
+        break;
+      }
+      out = {next.base, sum};
+    }
+    return out;
+  };
+
+  // Why the loads \p l1 and \p l2 of one slot may read different values:
+  // they are not in one straight-line execution, or a store to the slot may
+  // run between them.
+  auto storeBetweenWhy = [&](cir::LoadOp l1,
+                             cir::LoadOp l2) -> std::optional<std::string> {
+    if (l1 != l2 && sameStraightLine(l2, l1))
+      std::swap(l1, l2);
+    if (l1 != l2 && !sameStraightLine(l1, l2))
+      return std::string("the loads of the host pointer are not in one "
+                         "straight-line execution");
+    for (mlir::Operation *user : l1.getAddr().getUsers()) {
+      if (!mlir::isa<cir::StoreOp>(user) || runsBefore(user, l1) ||
+          runsAfter(user, l2))
+        continue;
+      return "the host pointer may be reassigned at " +
+             formatFileLine(user->getLoc());
+    }
+    return std::nullopt;
+  };
+
+  dc.host.walk([&](cir::FuncOp func) {
+    if (func.isDeclaration() || isSYCLImplementation(func))
+      return;
+    llvm::SmallVector<cir::CallOp, 4> ctors;
+    func.walk([&](cir::CallOp call) {
+      if (roleOf(call) == "buffer.host_ptr")
+        ctors.push_back(call);
+    });
+    if (ctors.size() < 2)
+      return;
+    llvm::DenseMap<mlir::Operation *, BufferHostMemory> memory;
+    auto memoryOf = [&](cir::CallOp call) -> const BufferHostMemory & {
+      auto it = memory.find(call);
+      if (it == memory.end())
+        it = memory.try_emplace(call, dc.facts.hostMemoryOfBuffer(call)).first;
+      return it->second;
+    };
+    for (cir::CallOp b : ctors) {
+      for (cir::CallOp a : ctors) {
+        if (a == b || !sameStraightLine(a, b))
+          continue;
+        const BufferHostMemory &ma = memoryOf(a);
+        const BufferHostMemory &mb = memoryOf(b);
+        if (!ma.hostData || !mb.hostData)
+          continue;
+        auto debug = [&](const llvm::Twine &verdict) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "buffer-same-host-ptr: @" << func.getSymName() << " "
+                     << formatFileLine(a.getLoc()) << " -> "
+                     << formatFileLine(b.getLoc()) << ": " << verdict << "\n");
+          (void)verdict;
+        };
+        // The same object: one base value, one only-loaded slot with no
+        // store in between, or one object of the points-to graph.
+        Resolved pa = resolve(ma.hostData);
+        Resolved pb = resolve(mb.hostData);
+        std::optional<int64_t> offA, offB;
+        std::string why;
+        if (pa.base == pb.base) {
+          offA = pa.offset;
+          offB = pb.offset;
+          why = "the same value";
+        } else if (cir::LoadOp la = onlyLoadedSlot(pa.base)) {
+          cir::LoadOp lb = onlyLoadedSlot(pb.base);
+          if (lb && lb.getAddr() == la.getAddr()) {
+            if (std::optional<std::string> w = storeBetweenWhy(la, lb)) {
+              why = *w;
+            } else {
+              offA = pa.offset;
+              offB = pb.offset;
+              why = "loads of one local variable";
+            }
+          }
+        }
+        const cir::pointsto::Node *object = nullptr;
+        if (!offA || !offB) {
+          if (ma.node && ma.node == mb.node) {
+            offA = ma.offset;
+            offB = mb.offset;
+            object = ma.node;
+            why = "one object";
+          } else if (why.empty()) {
+            why = !ma.node ? ma.why : !mb.node ? mb.why : "different objects";
+          }
+        } else {
+          object = ma.node && ma.node == mb.node ? ma.node : nullptr;
+        }
+        if (!offA || !offB) {
+          debug("not the same memory: " + why);
+          continue;
+        }
+        // The bytes overlap: the same host pointer, or intersecting ranges.
+        if ((ma.bytes && *ma.bytes == 0) || (mb.bytes && *mb.bytes == 0)) {
+          debug("a buffer of no bytes");
+          continue;
+        }
+        if (*offA != *offB) {
+          if (!ma.bytes || !mb.bytes) {
+            debug("different offsets, sizes not known");
+            continue;
+          }
+          auto endOf = [](int64_t off, uint64_t n) -> std::optional<int64_t> {
+            int64_t end;
+            if (n > static_cast<uint64_t>(INT64_MAX) ||
+                __builtin_add_overflow(off, static_cast<int64_t>(n), &end))
+              return std::nullopt;
+            return end;
+          };
+          std::optional<int64_t> endA = endOf(*offA, *ma.bytes);
+          std::optional<int64_t> endB = endOf(*offB, *mb.bytes);
+          if (!endA || !endB || *endA <= *offB || *endB <= *offA) {
+            debug("disjoint bytes");
+            continue;
+          }
+        }
+        if (std::optional<std::string> w = notAliveWhy(a, b)) {
+          debug("the first buffer may not be alive: " + *w);
+          continue;
+        }
+        debug("overlapping host memory (" + why + ")");
+        std::string where = formatFileLine(a.getLoc());
+        if (where.empty())
+          where = "an unknown location";
+        std::optional<mlir::InFlightDiagnostic> diag = dc.warn(
+            b.getLoc(), "buffer constructed over host memory already owned "
+                        "by the buffer at " +
+                            where + " [sycl-buffer-same-host-ptr]");
+        if (!diag)
+          break;
+        diag->attachNote(a.getLoc())
+            << "the buffer that owns the host memory is constructed here and "
+               "is still alive; constructing another buffer over its host "
+               "memory during its lifetime is undefined behavior (SYCL 2020 "
+               "sec:buf-sync-rules)";
+        if (object) {
+          const cir::pointsto::Origin &origin = object->getOrigins().front();
+          mlir::Location loc =
+              origin.site ? origin.site->getLoc() : dc.container.getLoc();
+          if (origin.kind == cir::pointsto::Origin::Kind::GlobalSym)
+            if (mlir::Operation *global =
+                    dc.symbols.lookupSymbolIn(dc.host, origin.sym))
+              loc = global->getLoc();
+          diag->attachNote(loc) << "the host memory is allocated here";
+        }
+        break; // One warning per construction.
+      }
+    }
+  });
 }
 
 //===----------------------------------------------------------------------===//

@@ -1,0 +1,622 @@
+// RUN: cir-opt %s -verify-diagnostics -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=sycl-buffer-same-host-ptr})"
+// RUN: sed 's/CLOSED-xpected-/expected-/' %s > %t.closed.cir
+// RUN: cir-opt %t.closed.cir -verify-diagnostics -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{host-facts-closed-tu=true})"
+//
+// The same input without the expectations: with the check off (or only the
+// other checks), or no host facts, nothing is reported; the pass changes
+// nothing.
+// RUN: sed 's/expected-/xpected-/' %s > %t.cir
+// RUN: cir-opt %t.cir -o %t.none.cir \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=none})" 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=NONE --allow-empty
+// RUN: cir-opt %t.cir -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=sycl-host-ptr-in-kernel,sycl-host-heap-ptr-in-kernel,sycl-host-deref-device-usm})" 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=NONE --allow-empty
+// RUN: cir-opt %t.cir -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{host-facts=none})" 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=NONE --allow-empty
+// RUN: cir-opt %t.cir -o %t.all.cir 2>&1 \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=all})" \
+// RUN:   | FileCheck %s --check-prefix=ALL
+// RUN: diff %t.none.cir %t.all.cir
+
+// `all` includes the check: the 7 warnings below.
+// ALL-COUNT-7: warning: buffer constructed over host memory already owned by the buffer at {{.*}} [sycl-buffer-same-host-ptr]
+// ALL-NOT: warning:
+// NONE-NOT: warning
+
+// sycl-buffer-same-host-ptr (cir-offload-host-diagnostics,
+// HostDiagnostics.cpp): a buffer(hostData, range) constructed over host
+// memory that must overlap the host memory of a buffer constructed before it
+// in the same straight-line code and still alive, which is undefined
+// behavior (SYCL 2020 sec:buffer PI 5358-5359, sec:buf-sync-rules PI
+// 6010-6014). The buffer API is reduced to its role-tagged declarations.
+// The heap allocations below are in externally visible functions, so in
+// open mode they may be summaries (several activations): the note at the
+// allocation is only given under closed-tu (CLOSED-xpected).
+//
+// Positive:
+//  - SAMEVAL: one malloc result, two buffers; a query of the first buffer
+//    in between, which keeps it.
+//  - OVERLAP: a stack array, and a ptr_stride into it whose bytes overlap.
+//  - SLOT: two loads of one local variable (the -O0 shape), the second in a
+//    nested cir.scope.
+//  - GLOBAL: two cir.get_global of one internal global: one object of the
+//    points-to graph.
+//  - TRY: the second construction in the try region of a cir.try.
+//  - COPYSLOT: the pointer copied into a second variable: each load is
+//    followed to the one store of its variable.
+//  - OWNSCOPE: each construction in a cleanup scope of its own (the
+//    destructor of a temporary argument), as CIRGen emits with exceptions.
+// Negative (silent):
+//  - DISJOINT: the two halves of a stack array.
+//  - SEQUENTIAL: the first buffer is destroyed before the second is made.
+//  - CONSUMED / COPIED: the first buffer is given to a user function (which
+//    may destroy or reassign it) or copied (or moved) before the second.
+//  - BRANCH / AINIF: the second (first) construction is conditional (not
+//    straight-line).
+//  - COPYCOND: the copy only on one path (the second variable also holds
+//    another allocation).
+//  - ATRY: the first construction in a try region, the second after it.
+//  - REASSIGN: the variable holding the host pointer is stored in between.
+//  - ESCAPED: that variable's address escapes before the second load.
+//  - EMPTY: buffers of no elements.
+//  - TWOALLOC / UNKNOWN: two allocations; two results of an unknown call.
+//  - SUB: a sub-buffer of the first buffer is not a construction over host
+//    memory.
+//  - PARAMS: two parameters of an externally visible function.
+//  - SYCLIMPL: the SYCL implementation is exempt.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!rec_range = !cir.struct<"sycl::_V1::range<1>" {data !cir.array<!u64i x 1>}>
+!rec_id = !cir.struct<"sycl::_V1::id<1>" {data !cir.array<!u64i x 1>}>
+!rec_buf = !cir.struct<class "sycl::_V1::buffer<float, 1>" {data !cir.ptr<!s8i>, data !u64i}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>, cir.triple = "x86_64-unknown-linux-gnu"} {
+    // expected-note @below {{the host memory is allocated here}}
+    cir.global internal @g = #cir.zero : !cir.array<!f32 x 64>
+    cir.func private @malloc(!u64i) -> !cir.ptr<!s8i>
+    cir.func private @opaque() -> !cir.ptr<!f32>
+    cir.func private @consume(!cir.ptr<!rec_buf>)
+    cir.func private @cond() -> !cir.bool
+    cir.func private @buf_ctor(!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.host_ptr"}
+    cir.func private @buf_sub(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_id>, !cir.ptr<!rec_range>) attributes {cir.sycl_host_api = "buffer.sub"}
+    cir.func private @buf_copy(!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.copy"}
+    cir.func private @buf_dtor(!cir.ptr<!rec_buf>) attributes {cir.sycl_host_api = "buffer.dtor"}
+    cir.func private @buf_query(!cir.ptr<!rec_buf>) -> !u64i attributes {cir.sycl_host_api = "buffer.query"}
+    cir.func private @_ZN4sycl3_V16detail6helperEPf(%p: !cir.ptr<!f32>)
+    // SAMEVAL: one malloc result, two buffers; a query of the first in between.
+    cir.func @sameval() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      // CLOSED-xpected-note @below {{the host memory is allocated here}}
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      // expected-note @below {{the buffer that owns the host memory is constructed here}}
+      cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.cleanup.scope {
+        %q = cir.call @buf_query(%a) : (!cir.ptr<!rec_buf>) -> !u64i
+        // expected-warning @below {{buffer constructed over host memory already owned by the buffer at}}
+        cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // OVERLAP: a stack array and an overlapping part of it (bytes [128, 192) of [0, 256)).
+    cir.func @overlap() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %r2 = cir.alloca "r2" align(8) : !cir.ptr<!rec_range>
+      %r2.n = cir.const #cir.int<16> : !u64i
+      %r2.p = cir.cast bitcast %r2 : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r2.n, %r2.p : !u64i, !cir.ptr<!u64i>
+      %arr = cir.alloca "arr" align(16) : !cir.ptr<!cir.array<!f32 x 64>>
+      %p = cir.cast array_to_ptrdecay %arr : !cir.ptr<!cir.array<!f32 x 64>> -> !cir.ptr<!f32>
+      %c32 = cir.const #cir.int<32> : !s32i
+      %p32 = cir.ptr_stride %p, %c32 : (!cir.ptr<!f32>, !s32i) -> !cir.ptr<!f32>
+      // expected-note @below {{the buffer that owns the host memory is constructed here}}
+      cir.call @buf_ctor(%a, %p, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.cleanup.scope {
+        // expected-warning @below {{buffer constructed over host memory already owned by the buffer at}}
+        cir.call @buf_ctor(%b, %p32, %r2) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // SLOT: two loads of one local variable, in a nested scope.
+    cir.func @slot() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      // CLOSED-xpected-note @below {{the host memory is allocated here}}
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      %s = cir.alloca "s" align(8) : !cir.ptr<!cir.ptr<!f32>>
+      cir.store %h, %s : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %l1 = cir.load %s : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      // expected-note @below {{the buffer that owns the host memory is constructed here}}
+      cir.call @buf_ctor(%a, %l1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.cleanup.scope {
+        cir.scope {
+          %l2 = cir.load %s : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+          // expected-warning @below {{buffer constructed over host memory already owned by the buffer at}}
+          cir.call @buf_ctor(%b, %l2, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        }
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // GLOBAL: two addresses of one internal global (one object).
+    cir.func @global() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %r2 = cir.alloca "r2" align(8) : !cir.ptr<!rec_range>
+      %r2.n = cir.const #cir.int<8> : !u64i
+      %r2.p = cir.cast bitcast %r2 : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r2.n, %r2.p : !u64i, !cir.ptr<!u64i>
+      %g1 = cir.get_global @g : !cir.ptr<!cir.array<!f32 x 64>>
+      %p1 = cir.cast array_to_ptrdecay %g1 : !cir.ptr<!cir.array<!f32 x 64>> -> !cir.ptr<!f32>
+      %g2 = cir.get_global @g : !cir.ptr<!cir.array<!f32 x 64>>
+      %p2 = cir.cast array_to_ptrdecay %g2 : !cir.ptr<!cir.array<!f32 x 64>> -> !cir.ptr<!f32>
+      // expected-note @below {{the buffer that owns the host memory is constructed here}}
+      cir.call @buf_ctor(%a, %p1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.cleanup.scope {
+        // expected-warning @below {{buffer constructed over host memory already owned by the buffer at}}
+        cir.call @buf_ctor(%b, %p2, %r2) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // TRY: the second construction in the try region of a cir.try.
+    cir.func @intry() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      // CLOSED-xpected-note @below {{the host memory is allocated here}}
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      // expected-note @below {{the buffer that owns the host memory is constructed here}}
+      cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.cleanup.scope {
+        cir.try {
+          // expected-warning @below {{buffer constructed over host memory already owned by the buffer at}}
+          cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+          cir.yield
+        } catch all (%eh : !cir.eh_token) {
+          %ct, %ex = cir.begin_catch %eh : !cir.eh_token -> (!cir.catch_token, !cir.ptr<!cir.void>)
+          cir.end_catch %ct : !cir.catch_token
+          cir.yield
+        }
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // OWNSCOPE: each construction in a cleanup scope of its own (the
+    // destructor of a temporary argument), as with exceptions on.
+    cir.func @ownscope() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %t = cir.alloca "t" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      // CLOSED-xpected-note @below {{the host memory is allocated here}}
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.cleanup.scope {
+        // expected-note @below {{the buffer that owns the host memory is constructed here}}
+        cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        cir.yield
+      } cleanup all {
+        cir.call @buf_dtor(%t) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.cleanup.scope {
+        cir.cleanup.scope {
+          // expected-warning @below {{buffer constructed over host memory already owned by the buffer at}}
+          cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+          cir.yield
+        } cleanup all {
+          cir.call @buf_dtor(%t) : (!cir.ptr<!rec_buf>) -> ()
+          cir.yield
+        }
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // AINIF: the first construction is conditional.
+    cir.func @ainif() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      %c = cir.call @cond() : () -> !cir.bool
+      cir.if %c {
+        cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      }
+      cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.return
+    }
+    // COPYSLOT: the pointer copied into a second variable (one store each,
+    // with lifetime markers, as CIRGen emits at -O0 with exceptions).
+    cir.func @copyslot() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %sz = cir.const #cir.int<256> : !u64i
+      %s1 = cir.alloca "s1" align(8) : !cir.ptr<!cir.ptr<!f32>>
+      %s2 = cir.alloca "s2" align(8) : !cir.ptr<!cir.ptr<!f32>>
+      cir.lifetime.start %s1 : !cir.ptr<!cir.ptr<!f32>>
+      // CLOSED-xpected-note @below {{the host memory is allocated here}}
+      %m = cir.call @malloc(%sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.store %h, %s1 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.lifetime.start %s2 : !cir.ptr<!cir.ptr<!f32>>
+      %v = cir.load %s1 : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.store %v, %s2 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.lifetime.start %a : !cir.ptr<!rec_buf>
+      %l1 = cir.load %s1 : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      // expected-note @below {{the buffer that owns the host memory is constructed here}}
+      cir.call @buf_ctor(%a, %l1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.cleanup.scope {
+        %l2 = cir.load %s2 : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+        // expected-warning @below {{buffer constructed over host memory already owned by the buffer at}}
+        cir.call @buf_ctor(%b, %l2, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.lifetime.end %s2 : !cir.ptr<!cir.ptr<!f32>>
+      cir.return
+    }
+    // COPYCOND: the second variable holds another allocation, overwritten
+    // with the pointer only on one path.
+    cir.func @copycond() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %sz = cir.const #cir.int<256> : !u64i
+      %s1 = cir.alloca "s1" align(8) : !cir.ptr<!cir.ptr<!f32>>
+      %s2 = cir.alloca "s2" align(8) : !cir.ptr<!cir.ptr<!f32>>
+      %m = cir.call @malloc(%sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      %m2 = cir.call @malloc(%sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h2 = cir.cast bitcast %m2 : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.store %h, %s1 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      cir.store %h2, %s2 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %c = cir.call @cond() : () -> !cir.bool
+      cir.if %c {
+        %v = cir.load %s1 : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+        cir.store %v, %s2 : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      }
+      %l1 = cir.load %s1 : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %l1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %l2 = cir.load %s2 : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.call @buf_ctor(%b, %l2, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.return
+    }
+    // ATRY: the first construction in a try region, the second after the
+    // try: if the first throws and is caught, the second still runs.
+    cir.func @atry() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %sz = cir.const #cir.int<256> : !u64i
+      %m = cir.call @malloc(%sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.scope {
+        cir.try {
+          cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+          cir.yield
+        } catch all (%eh : !cir.eh_token) {
+          %ct, %ex = cir.begin_catch %eh : !cir.eh_token -> (!cir.catch_token, !cir.ptr<!cir.void>)
+          cir.end_catch %ct : !cir.catch_token
+          cir.yield
+        }
+      }
+      cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.return
+    }
+    // DISJOINT: the two halves of a stack array.
+    cir.func @disjoint() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<32> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %arr = cir.alloca "arr" align(16) : !cir.ptr<!cir.array<!f32 x 64>>
+      %p = cir.cast array_to_ptrdecay %arr : !cir.ptr<!cir.array<!f32 x 64>> -> !cir.ptr<!f32>
+      %c32 = cir.const #cir.int<32> : !s32i
+      %p32 = cir.ptr_stride %p, %c32 : (!cir.ptr<!f32>, !s32i) -> !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %p, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.cleanup.scope {
+        cir.call @buf_ctor(%b, %p32, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // SEQUENTIAL: the first buffer is destroyed before the second is made.
+    cir.func @sequential() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+      cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.return
+    }
+    // CONSUMED: the first buffer is given to a user function before the second.
+    cir.func @consumed() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.call @consume(%a) : (!cir.ptr<!rec_buf>) -> ()
+      cir.cleanup.scope {
+        cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // COPIED: the first buffer is copied (or moved) before the second.
+    cir.func @copied() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %c = cir.alloca "c" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.call @buf_copy(%c, %a) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>) -> ()
+      cir.cleanup.scope {
+        cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // BRANCH: the second construction is conditional.
+    cir.func @branch() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %c = cir.call @cond() : () -> !cir.bool
+      cir.if %c {
+        cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      }
+      cir.return
+    }
+    // REASSIGN: the variable holding the host pointer is stored in between.
+    cir.func @reassign() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      %h2.sz = cir.const #cir.int<256> : !u64i
+      %h2.m = cir.call @malloc(%h2.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h2 = cir.cast bitcast %h2.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      %s = cir.alloca "s" align(8) : !cir.ptr<!cir.ptr<!f32>>
+      cir.store %h, %s : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %l1 = cir.load %s : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %l1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.store %h2, %s : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %l2 = cir.load %s : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.call @buf_ctor(%b, %l2, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.return
+    }
+    // ESCAPED: the variable holding the host pointer escapes (another pointer may be stored there).
+    cir.func @escaped() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      %s = cir.alloca "s" align(8) : !cir.ptr<!cir.ptr<!f32>>
+      cir.store %h, %s : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %sc = cir.cast bitcast %s : !cir.ptr<!cir.ptr<!f32>> -> !cir.ptr<!rec_buf>
+      %l1 = cir.load %s : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %l1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.call @consume(%sc) : (!cir.ptr<!rec_buf>) -> ()
+      %l2 = cir.load %s : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      cir.cleanup.scope {
+        cir.call @buf_ctor(%b, %l2, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // EMPTY: buffers of no elements.
+    cir.func @empty() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<0> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.cleanup.scope {
+        cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+        cir.yield
+      } cleanup normal {
+        cir.call @buf_dtor(%a) : (!cir.ptr<!rec_buf>) -> ()
+        cir.yield
+      }
+      cir.return
+    }
+    // TWOALLOC / UNKNOWN: two allocations; two results of an unknown call.
+    cir.func @twoalloc() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %c = cir.alloca "c" align(8) : !cir.ptr<!rec_buf>
+      %d = cir.alloca "d" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      %h2.sz = cir.const #cir.int<256> : !u64i
+      %h2.m = cir.call @malloc(%h2.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h2 = cir.cast bitcast %h2.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.call @buf_ctor(%b, %h2, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      %u1 = cir.call @opaque() : () -> !cir.ptr<!f32>
+      %u2 = cir.call @opaque() : () -> !cir.ptr<!f32>
+      cir.call @buf_ctor(%c, %u1, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.call @buf_ctor(%d, %u2, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.return
+    }
+    // SUB: a sub-buffer of the first buffer is not a construction over host memory.
+    cir.func @sub() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<8> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      %i = cir.alloca "i" align(8) : !cir.ptr<!rec_id>
+      cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.call @buf_sub(%b, %a, %i, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!rec_buf>, !cir.ptr<!rec_id>, !cir.ptr<!rec_range>) -> ()
+      cir.return
+    }
+    // PARAMS: two parameters of an externally visible function.
+    cir.func @params(%p: !cir.ptr<!f32>, %q: !cir.ptr<!f32>) {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      cir.call @buf_ctor(%a, %p, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.call @buf_ctor(%b, %q, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.return
+    }
+    // SYCLIMPL: the SYCL implementation is exempt.
+    cir.func internal @_ZN4sycl3_V16detail4implEv() {
+      %a = cir.alloca "a" align(8) : !cir.ptr<!rec_buf>
+      %b = cir.alloca "b" align(8) : !cir.ptr<!rec_buf>
+      %r = cir.alloca "r" align(8) : !cir.ptr<!rec_range>
+      %r.n = cir.const #cir.int<64> : !u64i
+      %r.p = cir.cast bitcast %r : !cir.ptr<!rec_range> -> !cir.ptr<!u64i>
+      cir.store %r.n, %r.p : !u64i, !cir.ptr<!u64i>
+      %h.sz = cir.const #cir.int<256> : !u64i
+      %h.m = cir.call @malloc(%h.sz) : (!u64i) -> !cir.ptr<!s8i>
+      %h = cir.cast bitcast %h.m : !cir.ptr<!s8i> -> !cir.ptr<!f32>
+      cir.call @buf_ctor(%a, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.call @buf_ctor(%b, %h, %r) : (!cir.ptr<!rec_buf>, !cir.ptr<!f32>, !cir.ptr<!rec_range>) -> ()
+      cir.return
+    }
+  }
+
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>, cir.triple = "spir64-unknown-unknown"} {
+  }
+}

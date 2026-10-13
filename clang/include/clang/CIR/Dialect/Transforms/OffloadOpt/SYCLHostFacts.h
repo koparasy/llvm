@@ -179,6 +179,32 @@ public:
   /// pointers to. See the .cpp file.
   DeviceUSMMemory deviceUSMOfPointer(mlir::Value ptr) const;
 
+  /// The host memory a buffer(hostData, range, ...) construction (a call of
+  /// a buffer.host_ptr constructor) is built over (the
+  /// sycl-buffer-same-host-ptr diagnostic, HostDiagnostics.cpp).
+  struct BufferHostMemory {
+    /// The hostData operand, if the call has the expected shape.
+    mlir::Value hostData;
+    /// The bytes the buffer manages, sizeof(T) times the range's elements
+    /// (T: the pointee of hostData), if the range is constant.
+    std::optional<uint64_t> bytes;
+    /// The object hostData must point into in every execution of the call,
+    /// at byte `offset` of it: the root of a subobject tree that stands for
+    /// one object at a time (see the .cpp file); null if not known, `why`
+    /// says why.
+    const pointsto::Node *node = nullptr;
+    int64_t offset = 0;
+    std::string why;
+  };
+  /// The host memory of the buffer.host_ptr constructor call \p call, an op
+  /// of an analysed host function: the hostData operand, the bytes the
+  /// buffer manages, and the one object and offset hostData must point to
+  /// (one origin, not a summary, no unknown, incomplete, may-be-shared,
+  /// may-overlap, collapsed or array contribution, not reachable from a
+  /// formal of a function's own graph, and a value only the analysed code
+  /// computed). See the .cpp file.
+  BufferHostMemory hostMemoryOfBuffer(mlir::Operation *call) const;
+
   /// The noalias verdict of every candidate field of \p kernel (the
   /// candidates of its device kernels, getSYCLNoAliasCandidates): a field is
   /// no-alias iff at

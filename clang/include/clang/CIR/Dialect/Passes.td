@@ -641,6 +641,13 @@ def OffloadHostDiagnostics
         sec:usm). The SYCL implementation and the host instantiation of
         kernel bodies are exempt. The warning is at the access, with a note
         at the allocation.
+      - `sycl-buffer-same-host-ptr`: a buffer(hostData, range) constructed
+        over host memory that must overlap the host memory of another one,
+        constructed before it in the same straight-line code and not yet
+        destroyed (undefined behavior, SYCL 2020 sec:buffer and
+        sec:buf-sync-rules). Sub-buffers, copies and reinterpreted buffers
+        are exempt. The warning is at the second construction, with a note
+        at the first one and at the allocation.
   }];
   let constructor = "mlir::createOffloadHostDiagnosticsPass()";
   let dependentDialects = ["cir::CIRDialect"];

@@ -1042,6 +1042,139 @@ SYCLHostFacts::deviceUSMOfPointer(Value ptr) const {
   return out;
 }
 
+// The buffer host-memory rule (hostMemoryOfBuffer, D3). The hostData operand
+// p of a buffer(hostData, range, ...) construction C, a value of an analysed
+// function F, must point to byte o of one object X when, in F's own graph:
+//  (a) pointsTo(p) is one cell, and the way from its node up to the root of
+//      its subobject tree is pure (each node below the root has no origin
+//      and one parent) and exact (no array or collapsed node on it), which
+//      gives the offset o in the root;
+//  (b) no node on that way has UnknownObj, Ghost, Function, Incomplete,
+//      MayBeShared, MayOverlap or Collapsed, and the root has exactly one
+//      origin, a stack object, a global or a heap allocation, and is not a
+//      Summary (markSummaries: no other object of that origin may be live at
+//      the same time: no loop, recursion, re-entry or second activation of a
+//      heap allocation's function);
+//  (c) no node on that way is reachable from a formal of a function's own
+//      graph (BU, getFormalReach; see the device-USM rule (b));
+//  (d) the pointer value can only be one the analysed code computed:
+//      unknownValueWhy, as for noalias (External is allowed, for the reason
+//      given at the host-only rule).
+// SOUNDNESS. By (d) the value of p is one the analysed code computed, for
+// which the analysis is sound: it points into an object of the root's one
+// origin, at offset o (an exact pure way: the analysed code's offsets, which
+// no unknown code made). By (b) at most one such object is live at any time,
+// and a buffer is built over live memory (PI 5334-5337: hostData points to
+// the buffer's bytes; a dangling hostData is undefined behavior already). So
+// two such constructions whose operands both get the root X are over the
+// same object, at the offsets each gives, in any execution in which both of
+// them run while that object lives; the caller requires them in one
+// straight-line execution of one function (HostDiagnostics.cpp).
+SYCLHostFacts::BufferHostMemory
+SYCLHostFacts::hostMemoryOfBuffer(Operation *op) const {
+  BufferHostMemory out;
+  auto fail = [&](const Twine &why) {
+    out.node = nullptr;
+    out.offset = 0;
+    out.why = why.str();
+    return out;
+  };
+  auto call = dyn_cast_if_present<CIRCallOpInterface>(op);
+  cir::FuncOp ctor = getDirectCallee(op, symbols);
+  if (!call || !ctor || getRole(ctor) != "buffer.host_ptr")
+    return fail("not a buffer(hostData, range) construction");
+  unsigned self =
+      ctor.getNumArguments() && ctor.getArgAttr(0, "llvm.sret") ? 1 : 0;
+  if (self + 1 >= call.getNumArgOperands())
+    return fail("the construction has an unexpected shape");
+  Value host = call.getArgOperand(self + 1);
+  auto ptrTy = dyn_cast<cir::PointerType>(host.getType());
+  if (!ptrTy)
+    return fail("hostData is not a pointer");
+  out.hostData = host;
+  // The bytes: sizeof(T) * the range's elements, if every component of the
+  // range is a constant.
+  if (self + 2 < call.getNumArgOperands()) {
+    Value range = call.getArgOperand(self + 2);
+    auto rangePtr = dyn_cast<cir::PointerType>(range.getType());
+    std::optional<RangeShape> shape =
+        rangePtr ? getRangeShape(rangePtr.getPointee(), *layout) : std::nullopt;
+    std::optional<int64_t> elem =
+        getTypeSizeInBytes(ptrTy.getPointee(), *layout);
+    if (shape && elem && *elem > 0) {
+      uint64_t bytes = static_cast<uint64_t>(*elem);
+      for (unsigned d = 0; d < shape->dims; ++d) {
+        std::optional<uint64_t> c = rangeComponent(range, d, op);
+        if (!c || __builtin_mul_overflow(bytes, *c, &bytes)) {
+          bytes = 0;
+          shape.reset();
+          break;
+        }
+      }
+      if (shape)
+        out.bytes = bytes;
+    }
+  }
+  if (!gaveUp.empty())
+    return fail(gaveUp);
+  auto func = op->getParentOfType<cir::FuncOp>();
+  if (!func || !analysis->getFunction(func))
+    return fail("not in an analysed function");
+  ObjectSet set = analysis->pointsTo(host);
+  if (set.cells.size() != 1)
+    return fail(set.cells.empty() ? "hostData points to nothing the analysis "
+                                    "sees"
+                                  : "hostData may point to several objects");
+  const Graph &graph = analysis->getGraph();
+  Cell cell = set.cells.front().resolve();
+  const Node *start = cell.getNode();
+  const Node *node = start;
+  int64_t offset = cell.getOffset();
+  constexpr NodeFlags unsure = NodeFlags::UnknownObj | NodeFlags::Ghost |
+                               NodeFlags::Function | NodeFlags::Incomplete |
+                               NodeFlags::MayBeShared | NodeFlags::MayOverlap |
+                               NodeFlags::Collapsed;
+  const llvm::DenseSet<const Node *> &reach = getFormalReach();
+  // (a)-(c) The way up to the root.
+  for (unsigned depth = 0;; ++depth) {
+    std::string id = ("n" + Twine(node->getId())).str();
+    if (hasAny(node->getFlags(), unsure))
+      return fail(id + " is " + toString(node->getFlags() & unsure));
+    if (node->isArray())
+      return fail(id + " is an array: its offsets are not exact");
+    if (reach.contains(node))
+      return fail(id + " is reachable from a formal of a function's own " +
+                  "graph");
+    if (!node->getOrigins().empty())
+      break;
+    SmallVector<ParentLink, 1> parents = graph.getParents(node);
+    if (parents.size() != 1 || depth > 16)
+      return fail(id + " has no allocation site the analysis sees");
+    offset = parents.front().offset + (offset - parents.front().childOffset);
+    node = parents.front().parent;
+  }
+  std::string id = ("n" + Twine(node->getId())).str();
+  if (node->getOrigins().size() != 1)
+    return fail(id + mergedSuffix(node) + " is not one object");
+  if (node->hasFlags(NodeFlags::Summary))
+    return fail(id + " may stand for several live objects: " +
+                explain(node->getReason(NodeFlags::Summary)));
+  const Origin &origin = node->getOrigins().front();
+  if (origin.kind != Origin::Kind::Alloca &&
+      origin.kind != Origin::Kind::GlobalSym &&
+      origin.kind != Origin::Kind::HeapCall)
+    return fail(id + " is not a stack object, global or heap allocation");
+  // (d) Only values the analysed code computed.
+  if (std::optional<std::string> why = unknownValueWhy(node, false))
+    return fail(*why);
+  if (start != node)
+    if (std::optional<std::string> why = unknownValueWhy(start, false))
+      return fail(*why);
+  out.node = node;
+  out.offset = offset;
+  return out;
+}
+
 const llvm::DenseSet<const Node *> &SYCLHostFacts::getFormalReach() const {
   if (formalReach)
     return *formalReach;

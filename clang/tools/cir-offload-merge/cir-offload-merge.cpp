@@ -193,7 +193,8 @@ llvm::cl::opt<std::string> HostDiagnostics(
     llvm::cl::desc("The SYCL host diagnostics to run: a comma-separated list "
                    "of check tags (sycl-host-ptr-in-kernel, "
                    "sycl-host-heap-ptr-in-kernel, "
-                   "sycl-host-deref-device-usm), all (the default: the "
+                   "sycl-host-deref-device-usm, "
+                   "sycl-buffer-same-host-ptr), all (the default: the "
                    "checks on by default, not sycl-host-heap-ptr-in-kernel) "
                    "or none"),
     llvm::cl::init("all"), llvm::cl::cat(CIROffloadMergeCategory));
