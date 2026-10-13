@@ -86,6 +86,21 @@ pointsto::GhostField getSYCLFinalField();
 /// through.
 pointsto::GhostField getSYCLKernelField();
 
+/// The kinds of USM allocation (SYCL 2020 sec:usm, table.usm.allocs).
+enum class SYCLUSMKind : uint8_t { Host, Device, Shared };
+
+/// The kind of USM allocation the call \p call of a usm.alloc function
+/// makes: the callee's `cir.sycl_usm_kind` (malloc_device, aligned_alloc_host,
+/// ...), or for sycl::malloc / sycl::aligned_alloc the constant `usm::alloc`
+/// operand its `cir.sycl_usm_kind_arg` names (host = 0, device = 1,
+/// shared = 2; a cir.const, through integral casts). std::nullopt if
+/// \p call does not call a usm.alloc function, or the kind is not known
+/// (the operand is not a constant, or names usm::alloc::unknown).
+/// \p symbols, if given, are the symbol tables to look the callee up in.
+std::optional<SYCLUSMKind>
+getSYCLUSMAllocKind(mlir::Operation *call,
+                    mlir::SymbolTableCollection *symbols = nullptr);
+
 /// Register the SYCL host API models (see the file comment) by role.
 void registerSYCLPointsToModels(pointsto::PointsToModelRegistry &registry);
 

@@ -66,6 +66,8 @@ def CIR_Dialect : Dialect {
     static llvm::StringRef getSYCLHostAPIAttrName() { return "cir.sycl_host_api"; }
     static llvm::StringRef getSYCLHostAPIArgAttrName() { return "cir.sycl_host_api_arg"; }
     static llvm::StringRef getSYCLHostAPIArg2AttrName() { return "cir.sycl_host_api_arg2"; }
+    static llvm::StringRef getSYCLUSMKindAttrName() { return "cir.sycl_usm_kind"; }
+    static llvm::StringRef getSYCLUSMKindArgAttrName() { return "cir.sycl_usm_kind_arg"; }
     static llvm::StringRef getDontCallErrorAttrName() { return "dontcall-error"; }
     static llvm::StringRef getDontCallWarnAttrName() { return "dontcall-warn"; }
     static llvm::StringRef getSrcLocAttrName() { return "cir.srcloc"; }

@@ -68,6 +68,33 @@
 // may instead be used" for shared allocations (PI 11359-11368, 3643-3647),
 // so it is not a bug on every device; the message says so.
 //
+// sycl-host-deref-device-usm. SYCL 2020 sec:usm, table.usm.allocs: a device
+// allocation is "Allocations in device memory that are not accessible by
+// the host" (PI 11283-11288), and "attempting to dereference a USM pointer
+// on the host or on a device in violation of these rules results in
+// undefined behavior" (PI 11265-11268); the host reaches device memory only
+// through the queue and handler memory commands (memcpy, copy, memset,
+// fill), which the device runs. The check: every load, store, copy, atomic
+// or libc memory op (cir.libc.memcpy/memmove/memset/memchr, and calls of the
+// C memcpy/memmove/memset/memcmp declarations) in an analysed host function
+// whose address operand must point into device USM memory
+// (SYCLHostFacts::deviceUSMOfPointer: in every covered calling context, a
+// node every origin of which is a malloc_device / aligned_alloc_device call
+// or a sycl::malloc / aligned_alloc call with a constant
+// usm::alloc::device). Exempt: the SYCL implementation (namespace sycl or a
+// SYCL role, which include the queue and handler memory commands), the
+// methods of a kernel's closure type and the functions only they call (a
+// kernel's body, which the host never runs), and a function that asks the
+// runtime for a pointer's kind (sycl::get_pointer_type: its accesses may be
+// guarded by the answer). The warning is at the access, with a note at
+// each allocation.
+// Limitation: the check is not path-sensitive. The must fact is about which
+// memory the pointer points to, not whether the access runs: an access the
+// program guards by a runtime test of its own (a flag saying "device
+// pointer", a kind check other than sycl::get_pointer_type in the same
+// function) still warns, e.g. `if (onDevice) q.memcpy(d, s, n); else
+// memcpy(d, s, n);` in a helper only ever given device memory.
+//
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/BuiltinOps.h"
@@ -89,8 +116,10 @@
 #include "llvm/ADT/StringSet.h"
 
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Path.h"
 
 #include <deque>
+#include <map>
 #include <set>
 #include <tuple>
 
@@ -150,11 +179,13 @@ struct HostDiagnosticCheck {
 
 void checkHostPtrInKernel(DiagnosticContext &dc);
 void checkHostHeapPtrInKernel(DiagnosticContext &dc);
+void checkHostDerefDeviceUSM(DiagnosticContext &dc);
 
 /// The checks, in the order they run.
 constexpr HostDiagnosticCheck kChecks[] = {
     {"sycl-host-ptr-in-kernel", checkHostPtrInKernel, true},
     {"sycl-host-heap-ptr-in-kernel", checkHostHeapPtrInKernel, false},
+    {"sycl-host-deref-device-usm", checkHostDerefDeviceUSM, true},
 };
 
 //===----------------------------------------------------------------------===//
@@ -765,6 +796,390 @@ void checkHostPtrInKernel(DiagnosticContext &dc) {
 
 void checkHostHeapPtrInKernel(DiagnosticContext &dc) {
   checkHostMemoryInKernel(dc, /*heap=*/true);
+}
+
+//===----------------------------------------------------------------------===//
+// sycl-host-deref-device-usm
+//===----------------------------------------------------------------------===//
+
+/// Whether \p func is part of the SYCL implementation: a SYCL host-API role,
+/// or namespace sycl (a lambda in a function of it too; a launch-path copy
+/// keeps its original's name with a suffix).
+bool isSYCLImplementation(cir::FuncOp func) {
+  if (func->hasAttr(cir::CIRDialect::getSYCLHostAPIAttrName()))
+    return true;
+  llvm::StringRef name = func.getSymName();
+  return name.starts_with("_ZN4sycl") || name.starts_with("_ZNK4sycl") ||
+         name.starts_with("_ZZN4sycl") || name.starts_with("_ZZNK4sycl");
+}
+
+/// The C library functions that read or write through every pointer
+/// argument (when called as declarations; CIRGen usually emits the
+/// cir.libc ops for them instead).
+bool isLibcMemoryFunction(llvm::StringRef name) {
+  return llvm::is_contained({"memcpy", "memmove", "memset", "memcmp"}, name);
+}
+
+/// "file:line" of \p loc (the first file location in it), or "".
+std::string formatFileLine(mlir::Location loc) {
+  std::string out;
+  loc->walk([&](mlir::Location inner) {
+    auto file = mlir::dyn_cast<mlir::FileLineColLoc>(inner);
+    if (!file)
+      return mlir::WalkResult::advance();
+    out = (llvm::sys::path::filename(file.getFilename().getValue()) + ":" +
+           llvm::Twine(file.getLine()))
+              .str();
+    return mlir::WalkResult::interrupt();
+  });
+  return out;
+}
+
+/// Whether a host function accesses memory through one of its pointer
+/// parameters: a load, store, copy, atomic or libc memory op whose address
+/// is the parameter or derived from it (casts, cir.ptr_stride,
+/// cir.get_member, cir.get_element, base and derived class addresses), also
+/// after a spill to a local slot and a reload (the -O0 shape of every
+/// parameter), or in a function it passes the pointer to that does so
+/// (functions with a body only; not the SYCL implementation but its value
+/// types). A select of the pointer, an escape into memory other than a
+/// local slot, or a call of a declaration is not followed: "no access"
+/// then, a missed warning. The body is the one the TU runs: a definition
+/// that another TU cannot replace (external, internal, or ODR, whose
+/// definitions are the same in every TU).
+class HostAccessSummary {
+public:
+  explicit HostAccessSummary(mlir::SymbolTableCollection &symbols)
+      : symbols(symbols) {}
+
+  /// Whether \p func is a method of a SYCL value type (sycl::vec and its
+  /// detail::vec_base storage, sycl::marray, sycl::half), plain host code.
+  static bool isSYCLValueType(cir::FuncOp func) {
+    llvm::StringRef name = func.getSymName();
+    for (llvm::StringRef prefix :
+         {"_ZN4sycl3_V13vec", "_ZNK4sycl3_V13vec", "_ZN4sycl3_V16marray",
+          "_ZNK4sycl3_V16marray", "_ZN4sycl3_V16detail8vec_base",
+          "_ZNK4sycl3_V16detail8vec_base", "_ZN4sycl3_V16detail9half_impl4half",
+          "_ZNK4sycl3_V16detail9half_impl4half"})
+      if (name.starts_with(prefix))
+        return true;
+    return false;
+  }
+
+  /// The first op of \p func (or a function it calls) that accesses memory
+  /// through its parameter \p index, or null.
+  mlir::Operation *accessThrough(cir::FuncOp func, unsigned index,
+                                 unsigned depth = 0) {
+    auto key = std::make_pair(func.getOperation(), index);
+    if (auto it = memo.find(key); it != memo.end())
+      return it->second;
+    memo[key] = nullptr; // A recursive call: no access (yet).
+    mlir::Operation *found = nullptr;
+    if (depth < 8 && eligible(func) && index < func.getNumArguments() &&
+        !func.getBody().empty())
+      found = walk(func.getArgument(index), depth);
+    memo[key] = found;
+    return found;
+  }
+
+private:
+  bool eligible(cir::FuncOp func) {
+    if (func.isDeclaration() ||
+        func->hasAttr(cir::CIRDialect::getSYCLHostAPIAttrName()))
+      return false;
+    if (isSYCLImplementation(func) && !isSYCLValueType(func))
+      return false;
+    switch (func.getLinkage()) {
+    case cir::GlobalLinkageKind::ExternalLinkage:
+    case cir::GlobalLinkageKind::AvailableExternallyLinkage:
+    case cir::GlobalLinkageKind::LinkOnceODRLinkage:
+    case cir::GlobalLinkageKind::WeakODRLinkage:
+    case cir::GlobalLinkageKind::InternalLinkage:
+    case cir::GlobalLinkageKind::PrivateLinkage:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  mlir::Operation *walk(mlir::Value start, unsigned depth) {
+    llvm::SmallVector<mlir::Value, 8> work{start};
+    llvm::DenseSet<mlir::Value> seen{start};
+    auto add = [&](mlir::Value v) {
+      if (seen.insert(v).second)
+        work.push_back(v);
+    };
+    for (unsigned steps = 0; !work.empty() && steps < 4096; ++steps) {
+      mlir::Value value = work.pop_back_val();
+      for (mlir::OpOperand &use : value.getUses()) {
+        mlir::Operation *user = use.getOwner();
+        if (auto store = mlir::dyn_cast<cir::StoreOp>(user)) {
+          if (store.getAddr() == value)
+            return user;
+          // Spilled to a local slot: its loads give the pointer back.
+          if (auto slot = store.getAddr().getDefiningOp<cir::AllocaOp>())
+            for (mlir::Operation *slotUser : slot->getUsers())
+              if (auto load = mlir::dyn_cast<cir::LoadOp>(slotUser))
+                add(load.getResult());
+          continue;
+        }
+        if (auto cast = mlir::dyn_cast<cir::CastOp>(user)) {
+          if (cast.getKind() == cir::CastKind::bitcast ||
+              cast.getKind() == cir::CastKind::address_space ||
+              cast.getKind() == cir::CastKind::array_to_ptrdecay)
+            add(cast.getResult());
+          continue;
+        }
+        if (auto stride = mlir::dyn_cast<cir::PtrStrideOp>(user)) {
+          if (stride.getBase() == value)
+            add(stride.getResult());
+          continue;
+        }
+        if (auto element = mlir::dyn_cast<cir::GetElementOp>(user)) {
+          if (element.getBase() == value)
+            add(element.getResult());
+          continue;
+        }
+        if (mlir::isa<cir::GetMemberOp, cir::BaseClassAddrOp,
+                      cir::DerivedClassAddrOp>(user)) {
+          add(user->getResult(0));
+          continue;
+        }
+        if (auto call = mlir::dyn_cast<cir::CallOp>(user)) {
+          std::optional<llvm::StringRef> name = call.getCallee();
+          cir::FuncOp callee =
+              name ? symbols.lookupNearestSymbolFrom<cir::FuncOp>(
+                         call, mlir::StringAttr::get(call.getContext(), *name))
+                   : cir::FuncOp();
+          if (!callee)
+            continue;
+          if (callee.isDeclaration()) {
+            if (isLibcMemoryFunction(callee.getSymName()))
+              return user;
+            continue;
+          }
+          for (auto [i, operand] : llvm::enumerate(call.getArgOperands()))
+            if (operand == value)
+              if (mlir::Operation *inner = accessThrough(callee, i, depth + 1))
+                return inner;
+          continue;
+        }
+        if (mlir::isa<cir::CIRCallOpInterface>(user))
+          continue;
+        if (auto effects =
+                mlir::dyn_cast<mlir::MemoryEffectOpInterface>(user)) {
+          llvm::SmallVector<mlir::MemoryEffects::EffectInstance, 2> list;
+          effects.getEffectsOnValue(value, list);
+          for (const auto &effect : list)
+            if (mlir::isa<mlir::MemoryEffects::Read,
+                          mlir::MemoryEffects::Write>(effect.getEffect()))
+              return user;
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  mlir::SymbolTableCollection &symbols;
+  std::map<std::pair<mlir::Operation *, unsigned>, mlir::Operation *> memo;
+};
+
+void checkHostDerefDeviceUSM(DiagnosticContext &dc) {
+  const cir::pointsto::PointsToAnalysis &analysis = dc.facts.getAnalysis();
+
+  // The functions exempt: the SYCL implementation, a function that asks for
+  // a pointer's USM kind, and the kernels' bodies (the methods of a launch's
+  // closure type, and what only they call).
+  llvm::DenseSet<mlir::Type> closureTypes;
+  for (const cir::pointsto::LaunchRecord &launch : analysis.getAllLaunches())
+    if (launch.closureType)
+      closureTypes.insert(launch.closureType);
+  llvm::DenseSet<mlir::Operation *> exempt, kernelBodies;
+  auto calleeOf = [&](mlir::Operation *op) -> cir::FuncOp {
+    auto call = mlir::dyn_cast<cir::CIRCallOpInterface>(op);
+    if (!call || call.isIndirect())
+      return {};
+    auto sym = op->getAttrOfType<mlir::FlatSymbolRefAttr>("callee");
+    return sym ? dc.symbols.lookupNearestSymbolFrom<cir::FuncOp>(op, sym)
+               : cir::FuncOp();
+  };
+  for (const auto &fn : analysis.getFunctions()) {
+    cir::FuncOp func = fn->func;
+    if (isSYCLImplementation(func)) {
+      exempt.insert(func);
+      continue;
+    }
+    bool asksKind = false;
+    func.walk([&](mlir::Operation *op) {
+      cir::FuncOp callee = calleeOf(op);
+      if (callee && isSYCLImplementation(callee) &&
+          callee.getSymName().contains("16get_pointer_type")) {
+        asksKind = true;
+        return mlir::WalkResult::interrupt();
+      }
+      return mlir::WalkResult::advance();
+    });
+    if (asksKind)
+      exempt.insert(func);
+  }
+  // Kernel bodies: a method of a closure type (its `this`), then, to a
+  // fixpoint, a function every use of which is in a kernel body.
+  for (const auto &fn : analysis.getFunctions()) {
+    cir::FuncOp func = fn->func;
+    if (!func.getNumArguments())
+      continue;
+    auto ptrTy = mlir::dyn_cast<cir::PointerType>(func.getArgumentTypes()[0]);
+    if (ptrTy && closureTypes.contains(ptrTy.getPointee()))
+      kernelBodies.insert(func);
+  }
+  if (!kernelBodies.empty()) {
+    // The functions each symbol is used in (calls, address-of), once.
+    llvm::DenseMap<mlir::StringAttr, llvm::SmallVector<mlir::Operation *, 2>>
+        usersOf;
+    if (std::optional<mlir::SymbolTable::UseRange> uses =
+            mlir::SymbolTable::getSymbolUses(&dc.host.getBodyRegion()))
+      for (const mlir::SymbolTable::SymbolUse &use : *uses) {
+        mlir::Operation *user = use.getUser();
+        auto func = mlir::isa<cir::FuncOp>(user)
+                        ? mlir::cast<cir::FuncOp>(user)
+                        : user->getParentOfType<cir::FuncOp>();
+        auto &list = usersOf[use.getSymbolRef().getRootReference()];
+        mlir::Operation *holder = func ? func.getOperation() : user;
+        if (!llvm::is_contained(list, holder))
+          list.push_back(holder);
+      }
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (const auto &fn : analysis.getFunctions()) {
+        cir::FuncOp func = fn->func;
+        if (kernelBodies.contains(func))
+          continue;
+        auto it = usersOf.find(func.getSymNameAttr());
+        if (it == usersOf.end() || it->second.empty())
+          continue;
+        if (llvm::all_of(it->second, [&](mlir::Operation *user) {
+              return kernelBodies.contains(user);
+            })) {
+          kernelBodies.insert(func);
+          changed = true;
+        }
+      }
+    }
+  }
+
+  // The pointer operands \p op reads or writes memory through.
+  auto accessedPointers = [&](mlir::Operation *op,
+                              llvm::SmallVectorImpl<mlir::Value> &out) {
+    if (mlir::isa<cir::CIRCallOpInterface>(op)) {
+      cir::FuncOp callee = calleeOf(op);
+      if (callee && callee.isDeclaration() &&
+          isLibcMemoryFunction(callee.getSymName()))
+        for (mlir::Value operand : op->getOperands())
+          if (mlir::isa<cir::PointerType>(operand.getType()))
+            out.push_back(operand);
+      return;
+    }
+    auto effects = mlir::dyn_cast<mlir::MemoryEffectOpInterface>(op);
+    if (!effects)
+      return;
+    llvm::SmallVector<mlir::MemoryEffects::EffectInstance, 4> list;
+    effects.getEffects(list);
+    for (const auto &effect : list) {
+      mlir::Value value = effect.getValue();
+      if (!value || !mlir::isa<cir::PointerType>(value.getType()) ||
+          !mlir::isa<mlir::MemoryEffects::Read, mlir::MemoryEffects::Write>(
+              effect.getEffect()))
+        continue;
+      if (!llvm::is_contained(out, value))
+        out.push_back(value);
+    }
+  };
+
+  // Warn at \p at about the access of \p ptr (in \p func), if it must
+  // point into device USM memory; \p callee, \p access: the access is in
+  // that callee (a call site lifted from it, see below).
+  HostAccessSummary summary(dc.symbols);
+  auto check = [&](cir::FuncOp func, mlir::Operation *at, mlir::Value ptr,
+                   cir::FuncOp callee, mlir::Operation *access) {
+    cir::SYCLHostFacts::DeviceUSMMemory memory =
+        dc.facts.deviceUSMOfPointer(ptr);
+    // -debug-only: the verdict of every access that may reach USM memory
+    // (the others are the bulk of a TU's accesses).
+    LLVM_DEBUG({
+      if (memory.reachesUSM)
+        llvm::dbgs() << "host-deref-device-usm: @" << func.getSymName() << " "
+                     << at->getName() << " at " << at->getLoc() << ": "
+                     << (memory.nodes.empty() ? memory.why
+                                              : std::string("device USM"))
+                     << (callee ? (" (in @" + callee.getSymName() + ")").str()
+                                : std::string())
+                     << "\n";
+    });
+    if (memory.nodes.empty())
+      return;
+    // The allocation sites, for the text and the notes.
+    llvm::SmallVector<mlir::Operation *, 4> sites;
+    for (const cir::pointsto::Node *node : memory.nodes)
+      for (const cir::pointsto::Origin &origin : node->getOrigins())
+        if (origin.site && !llvm::is_contained(sites, origin.site))
+          sites.push_back(origin.site);
+    if (sites.empty())
+      return;
+    std::string where = formatFileLine(sites.front()->getLoc());
+    if (where.empty())
+      where = "an unknown location";
+    if (sites.size() > 1)
+      where += " (and " + std::to_string(sites.size() - 1) + " other site" +
+               (sites.size() > 2 ? "s" : "") + ")";
+    std::string text = "host access to device USM memory allocated at " +
+                       where + " [sycl-host-deref-device-usm]";
+    std::optional<mlir::InFlightDiagnostic> diag = dc.warn(at->getLoc(), text);
+    if (!diag)
+      return;
+    if (callee && access)
+      diag->attachNote(access->getLoc())
+          << "the called function accesses the memory here";
+    for (mlir::Operation *site : llvm::ArrayRef(sites).take_front(4))
+      diag->attachNote(site->getLoc())
+          << "the device USM memory is allocated here; device allocations "
+             "are not accessible on the host (SYCL 2020 sec:usm)";
+  };
+
+  for (const auto &fn : analysis.getFunctions()) {
+    cir::FuncOp func = fn->func;
+    if (exempt.contains(func) || kernelBodies.contains(func))
+      continue;
+    func.walk([&](mlir::Operation *op) {
+      llvm::SmallVector<mlir::Value, 2> pointers;
+      accessedPointers(op, pointers);
+      for (mlir::Value ptr : pointers)
+        check(func, op, ptr, {}, nullptr);
+      // A call of a function whose own accesses the check cannot judge,
+      // because its formals are incomplete (an ODR or externally visible
+      // function: other TUs may call it), or because it is exempt but a
+      // SYCL value type (sycl::vec, half, marray: their methods are plain
+      // host code): if the callee accesses memory through a pointer
+      // argument, the access is judged at the call, where the argument is
+      // known.
+      auto call = mlir::dyn_cast<cir::CallOp>(op);
+      if (!call)
+        return;
+      cir::FuncOp callee = calleeOf(op);
+      if (!callee || callee.isDeclaration() || kernelBodies.contains(callee))
+        return;
+      if (isSYCLImplementation(callee) &&
+          !HostAccessSummary::isSYCLValueType(callee))
+        return;
+      const cir::pointsto::TUFunction *tuCallee = analysis.getFunction(callee);
+      if (tuCallee && tuCallee->formalsComplete &&
+          !isSYCLImplementation(callee))
+        return; // Judged in the callee, in its calling contexts.
+      for (auto [i, operand] : llvm::enumerate(call.getArgOperands()))
+        if (mlir::isa<cir::PointerType>(operand.getType()))
+          if (mlir::Operation *access = summary.accessThrough(callee, i))
+            check(func, op, operand, callee, access);
+    });
+  }
 }
 
 //===----------------------------------------------------------------------===//

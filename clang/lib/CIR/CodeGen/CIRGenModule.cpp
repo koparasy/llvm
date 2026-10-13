@@ -3956,6 +3956,31 @@ static int paramIndexOfClass(const FunctionDecl *fd,
   return -1;
 }
 
+/// The kind of USM allocation a usm.alloc function `fd` makes (SYCL 2020
+/// sec:usm.malloc, the allocation kinds of table.usm.allocs): "device",
+/// "shared" or "host" for the malloc_<kind> and aligned_alloc_<kind> forms;
+/// for sycl::malloc and sycl::aligned_alloc, which take the kind as a
+/// `usm::alloc` argument, the empty string with `kindIndex` set to the
+/// source-level index of that parameter (-1 if there is none).
+static llvm::StringRef getSYCLUSMAllocKind(const FunctionDecl *fd,
+                                           int &kindIndex) {
+  kindIndex = -1;
+  if (!fd->getIdentifier())
+    return {};
+  llvm::StringRef name = fd->getName();
+  for (llvm::StringRef kind : {"device", "shared", "host"})
+    if (name.ends_with(("_" + kind).str()))
+      return kind;
+  for (const ParmVarDecl *param : fd->parameters())
+    if (const EnumDecl *ed = param->getType()->getAsEnumDecl();
+        ed && ed->getIdentifier() && ed->getName() == "alloc" &&
+        isNamespacePath(ed->getDeclContext(), {"sycl", "usm"})) {
+      kindIndex = param->getFunctionScopeIndex();
+      break;
+    }
+  return {};
+}
+
 /// Whether parameter \p index of `fd` is a pointer.
 static bool isPointerParam(const FunctionDecl *fd, unsigned index) {
   return index < fd->getNumParams() &&
@@ -4089,7 +4114,10 @@ getSYCLMemoryCommandRole(const CXXMethodDecl *md, bool isHandler,
 ///   usm.alloc           sycl::malloc_{device,shared,host}, sycl::malloc and
 ///                       the aligned_alloc* forms, also in
 ///                       ext::oneapi::experimental (memory pools); arg: the
-///                       size or count
+///                       size or count; the allocation kind in
+///                       `cir.sycl_usm_kind` ("device", "shared", "host") or,
+///                       for the forms taking a usm::alloc, the index of that
+///                       parameter in `cir.sycl_usm_kind_arg`
 ///   usm.free            sycl::free; arg 0, the pointer
 /// Explicit memory commands (arg: the destination; for a copy, arg2 the
 /// source; a pointer parameter unless the role names an accessor; the
@@ -4408,6 +4436,16 @@ cir::FuncOp CIRGenModule::getOrCreateCIRFunction(
       if (srcIndex)
         funcOp->setAttr(cir::CIRDialect::getSYCLHostAPIArg2AttrName(),
                         builder.getI32IntegerAttr(*srcIndex));
+      if (role == "usm.alloc") {
+        int kindIndex = -1;
+        llvm::StringRef kind = getSYCLUSMAllocKind(funcDecl, kindIndex);
+        if (!kind.empty())
+          funcOp->setAttr(cir::CIRDialect::getSYCLUSMKindAttrName(),
+                          builder.getStringAttr(kind));
+        else if (kindIndex >= 0)
+          funcOp->setAttr(cir::CIRDialect::getSYCLUSMKindArgAttrName(),
+                          builder.getI32IntegerAttr(kindIndex));
+      }
     }
   }
 

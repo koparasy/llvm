@@ -157,6 +157,28 @@ public:
                                 mlir::ArrayAttr path,
                                 llvm::ArrayRef<unsigned> elements = {}) const;
 
+  /// The device USM allocations a host pointer must point into (the
+  /// sycl-host-deref-device-usm diagnostic, HostDiagnostics.cpp).
+  struct DeviceUSMMemory {
+    /// The allocation nodes (the roots of the subobject trees the pointer
+    /// points into), one per calling context the answer covers; empty if
+    /// the pointer is not known to point only into device USM: `why` says
+    /// why.
+    llvm::SmallVector<const pointsto::Node *, 2> nodes;
+    std::string why;
+    /// Whether some node the pointer may point into (or its subobject
+    /// root) is a USM allocation: the near misses -debug-only reports.
+    bool reachesUSM = false;
+  };
+  /// Whether the host pointer \p ptr, a value of an analysed host function,
+  /// can only point into device USM allocations: in every calling context
+  /// the analysis covers, it points into a node every origin of which is a
+  /// usm.alloc call of kind device (getSYCLUSMAllocKind), with no unknown,
+  /// incomplete, may-be-shared, may-overlap or collapsed contribution, that
+  /// no caller we don't see can pass in and that only analysed code holds
+  /// pointers to. See the .cpp file.
+  DeviceUSMMemory deviceUSMOfPointer(mlir::Value ptr) const;
+
   /// The noalias verdict of every candidate field of \p kernel (the
   /// candidates of its device kernels, getSYCLNoAliasCandidates): a field is
   /// no-alias iff at
@@ -258,6 +280,12 @@ private:
   /// object or a global) accepts, or std::nullopt.
   std::optional<std::string> notOneAllocationWhy(const pointsto::Node *node,
                                                  bool storage, bool host) const;
+  /// BU mode: the nodes of the functions' own graphs reachable from their
+  /// formals, and every parent of each (deviceUSMOfPointer and
+  /// hostOnlyMemoryOfClosureMember); built on first
+  /// use.
+  const llvm::DenseSet<const pointsto::Node *> &getFormalReach() const;
+  mutable std::optional<llvm::DenseSet<const pointsto::Node *>> formalReach;
   /// A short name of the allocation of \p node, for notes.
   std::string describeAllocation(const pointsto::Node *node) const;
   /// The part of a storage a view (`$view` ghost node) gives access to.

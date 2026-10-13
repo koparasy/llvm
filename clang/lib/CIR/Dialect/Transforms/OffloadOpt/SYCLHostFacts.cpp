@@ -776,6 +776,12 @@ SYCLHostFacts::identityOfClosureField(const LaunchRecord &launch,
 //      holds no constant (in particular no null pointer), and no value
 //      stored is a cir.select (which may pick a null): every value the
 //      field holds is a pointer the analysed code computed into the node.
+//  (d) BU mode: no node on the way from the slot's target to the root is
+//      reachable from a formal of a function's own graph (getFormalReach):
+//      a record kept in a function's own graph (getLaunches keeps it when
+//      a caller is bound context-insensitively) has formal nodes whose
+//      origins are only what those callers pass, not what the callers that
+//      copied the graph pass (see the device-USM rule, (b)).
 // External is not checked: the launch itself makes everything the closure
 // reaches External (applySYCLDeviceWrites), which says the device may store
 // pointers there, not that the value the host captured is unknown; (b) is
@@ -834,8 +840,15 @@ SYCLHostFacts::HostOnlyMemory SYCLHostFacts::hostOnlyMemoryOfClosureMember(
                                NodeFlags::Incomplete | NodeFlags::MayBeShared |
                                NodeFlags::MayOverlap | NodeFlags::Collapsed;
   const Node *node = target->getNode();
+  const llvm::DenseSet<const Node *> &reach = getFormalReach();
   for (unsigned depth = 0;; ++depth) {
     std::string id = ("n" + Twine(node->getId())).str();
+    // (d) Not reachable from a formal of a function's own graph (BU): its
+    // origins miss what the callers that copied the graph pass (see the
+    // device-USM rule below).
+    if (reach.contains(node))
+      return fail(id + " is reachable from a formal of a function's own " +
+                  "graph");
     // A global's own node (shared, never copied) is Incomplete when code we
     // don't see may write the global's contents; that does not make the
     // node stand for other memory.
@@ -912,6 +925,153 @@ SYCLHostFacts::HostOnlyMemory SYCLHostFacts::hostOnlyMemoryOfClosureMember(
   out.kind = kind;
   out.node = node;
   return out;
+}
+
+// The device-USM rule (deviceUSMOfPointer, D2). A host pointer value p of
+// an analysed function F must point into device USM memory when, for every
+// cell of pointsToInContexts(p) (F's own graph, or, F covered, the leaves of
+// its calling contexts: every execution of F is in one of them):
+//  (a) the cell's node, and every node up to the root of its subobject tree
+//      (where the origins are), has none of UnknownObj, Ghost, Function,
+//      Incomplete, MayBeShared, MayOverlap or Collapsed, and the root has
+//      HasUSM and at least one origin, every one a usm.alloc call of kind
+//      device (getSYCLUSMAllocKind: the callee's malloc_device /
+//      aligned_alloc_device form, or a constant usm::alloc::device operand);
+//  (b) no node on that way is reachable from a formal of a function's own
+//      graph (BU mode, getFormalReach). A copy of F's graph in a caller's
+//      graph unifies the copy's formals with the caller's actuals there, not
+//      in F's own graph, whose formal nodes hold only what the callers bound
+//      context-insensitively pass: its origins are not every object the
+//      formal may point to. A node no formal reaches holds only what F's own
+//      code (and its callees') allocated;
+//  (c) the pointer value can only be one the analysed code computed:
+//      unknownValueWhy, as for noalias and the host-only rule (no holder of
+//      a pointer to the node is External or Incomplete, the node is not what
+//      a caller we don't see passes).
+// External is allowed, for the reason given at the host-only rule: a launch
+// makes every allocation its closure reaches External, which does not change
+// which allocation a pointer the host computed points into.
+//
+// SOUNDNESS (no false positive). By (c) and the soundness of the analysis
+// for the values it computes, a non-null runtime value of p points into an
+// object allocated at an origin of one of the cells' roots (the leaves cover
+// every execution of F; (b) excludes the nodes whose origins miss what a
+// copying caller passes), and by (a) each such origin is a device USM
+// allocation. A null p is not an object: an access through it is wrong too.
+// Steensgaard unification only adds origins, so a pointer that may also
+// point to other memory on some path (a select, a phi, a reassignment, a
+// helper called with both) has an origin of another kind and is rejected.
+SYCLHostFacts::DeviceUSMMemory
+SYCLHostFacts::deviceUSMOfPointer(Value ptr) const {
+  DeviceUSMMemory out;
+  bool reachesUSM = false;
+  auto fail = [&](const Twine &why) {
+    out = DeviceUSMMemory();
+    out.why = why.str();
+    out.reachesUSM = reachesUSM;
+    return out;
+  };
+  if (!gaveUp.empty())
+    return fail(gaveUp);
+  if (!isa<cir::PointerType>(ptr.getType()))
+    return fail("not a pointer");
+  auto func = ptr.getParentRegion()
+                  ? ptr.getParentRegion()->getParentOfType<cir::FuncOp>()
+                  : cir::FuncOp();
+  if (!func || !analysis->getFunction(func))
+    return fail("not a value of an analysed function");
+  ObjectSet set = analysis->pointsToInContexts(ptr);
+  if (set.cells.empty())
+    return fail("it points to nothing the analysis sees");
+
+  const Graph &graph = analysis->getGraph();
+  for (Cell cell : set.cells)
+    for (const Node *node = cell.getNode(); node && !reachesUSM;) {
+      reachesUSM = node->hasFlags(NodeFlags::HasUSM);
+      if (!node->getOrigins().empty())
+        break;
+      SmallVector<ParentLink, 1> parents = graph.getParents(node);
+      node = parents.size() == 1 ? parents.front().parent : nullptr;
+    }
+  const llvm::DenseSet<const Node *> &reach = getFormalReach();
+  constexpr NodeFlags unsure = NodeFlags::UnknownObj | NodeFlags::Ghost |
+                               NodeFlags::Function | NodeFlags::Incomplete |
+                               NodeFlags::MayBeShared | NodeFlags::MayOverlap |
+                               NodeFlags::Collapsed;
+  for (Cell cell : set.cells) {
+    const Node *start = cell.resolve().getNode();
+    const Node *node = start;
+    // (a), (b) The way up to the root of the subobject tree.
+    for (unsigned depth = 0;; ++depth) {
+      std::string id = ("n" + Twine(node->getId())).str();
+      if (hasAny(node->getFlags(), unsure))
+        return fail(id + " is " + toString(node->getFlags() & unsure));
+      if (reach.contains(node))
+        return fail(id + " is reachable from a formal of a function's own " +
+                    "graph");
+      if (!node->getOrigins().empty())
+        break;
+      SmallVector<ParentLink, 1> parents = graph.getParents(node);
+      if (parents.size() != 1 || depth > 16)
+        return fail(id + " has no allocation site the analysis sees");
+      node = parents.front().parent;
+    }
+    std::string id = ("n" + Twine(node->getId())).str();
+    if (!node->hasFlags(NodeFlags::HasUSM))
+      return fail(id + " is not a USM allocation");
+    for (const Origin &origin : node->getOrigins()) {
+      std::optional<SYCLUSMKind> kind =
+          origin.kind == Origin::Kind::HeapCall
+              ? getSYCLUSMAllocKind(origin.site, &symbols)
+              : std::nullopt;
+      if (kind != SYCLUSMKind::Device)
+        return fail(id + " has an origin that is not a device USM " +
+                    "allocation of known kind (" + formatLocation(origin.site) +
+                    ")");
+    }
+    // (c) Only values the analysed code computed.
+    if (std::optional<std::string> why = unknownValueWhy(node, false))
+      return fail(*why);
+    if (start != node)
+      if (std::optional<std::string> why = unknownValueWhy(start, false))
+        return fail(*why);
+    if (!llvm::is_contained(out.nodes, node))
+      out.nodes.push_back(node);
+  }
+  out.reachesUSM = true;
+  return out;
+}
+
+const llvm::DenseSet<const Node *> &SYCLHostFacts::getFormalReach() const {
+  if (formalReach)
+    return *formalReach;
+  formalReach.emplace();
+  // CI mode: every call is bound to its callee's own graph, whose formals so
+  // hold what every caller passes; nothing to exclude.
+  if (analysis->getMode() != PointsToMode::BU)
+    return *formalReach;
+  const Graph &graph = analysis->getGraph();
+  SmallVector<const Node *, 64> work;
+  auto add = [&](const Node *node) {
+    if (formalReach->insert(node).second)
+      work.push_back(node);
+  };
+  for (const auto &fn : analysis->getFunctions()) {
+    for (const std::optional<Cell> &formal : fn->formals)
+      if (formal && formal->getNode())
+        add(formal->resolve().getNode());
+    for (const std::optional<AggregateSlots> &slots : fn->formalSlots)
+      if (slots)
+        for (const auto &slot : *slots)
+          if (slot.second.getNode())
+            add(slot.second.resolve().getNode());
+  }
+  while (!work.empty()) {
+    const Node *node = work.pop_back_val();
+    graph.forEachSuccessor(
+        node, [&](Node *next) { add(next); }, /*allParents=*/true);
+  }
+  return *formalReach;
 }
 
 namespace {

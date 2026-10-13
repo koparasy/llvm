@@ -632,6 +632,15 @@ def OffloadHostDiagnostics
         only when named): the same for a host heap allocation (malloc, new,
         std::allocator; not USM), which only a device with
         aspect::usm_system_allocations may access.
+      - `sycl-host-deref-device-usm`: a host load, store, copy or libc
+        memory access (or a call of a function that accesses its pointer
+        argument, when the callee's own accesses cannot be judged) through a
+        pointer that must point into a device USM allocation (malloc_device,
+        aligned_alloc_device, sycl::malloc with a constant
+        usm::alloc::device), which the host cannot access (SYCL 2020
+        sec:usm). The SYCL implementation and the host instantiation of
+        kernel bodies are exempt. The warning is at the access, with a note
+        at the allocation.
   }];
   let constructor = "mlir::createOffloadHostDiagnosticsPass()";
   let dependentDialects = ["cir::CIRDialect"];

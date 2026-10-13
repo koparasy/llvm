@@ -66,6 +66,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/MathExtras.h"
 
 #include <algorithm>
@@ -513,6 +514,67 @@ static void collectKernelNames(cir::FuncOp callee,
   });
 }
 
+std::optional<SYCLUSMKind>
+cir::getSYCLUSMAllocKind(Operation *call, SymbolTableCollection *symbols) {
+  auto callOp = dyn_cast_if_present<CIRCallOpInterface>(call);
+  if (!callOp)
+    return std::nullopt;
+  cir::FuncOp callee = lookupCallee(
+      call, call->getAttrOfType<FlatSymbolRefAttr>("callee"), symbols);
+  if (getRole(callee) != "usm.alloc")
+    return std::nullopt;
+  auto fromCode = [](int64_t code) -> std::optional<SYCLUSMKind> {
+    // usm::alloc (usm_enums.hpp): host = 0, device = 1, shared = 2,
+    // unknown = 3.
+    switch (code) {
+    case 0:
+      return SYCLUSMKind::Host;
+    case 1:
+      return SYCLUSMKind::Device;
+    case 2:
+      return SYCLUSMKind::Shared;
+    default:
+      return std::nullopt;
+    }
+  };
+  if (auto kind = callee->getAttrOfType<StringAttr>(
+          CIRDialect::getSYCLUSMKindAttrName()))
+    return llvm::StringSwitch<std::optional<SYCLUSMKind>>(kind.getValue())
+        .Case("host", SYCLUSMKind::Host)
+        .Case("device", SYCLUSMKind::Device)
+        .Case("shared", SYCLUSMKind::Shared)
+        .Default(std::nullopt);
+  auto index = callee->getAttrOfType<IntegerAttr>(
+      CIRDialect::getSYCLUSMKindArgAttrName());
+  if (!index)
+    return std::nullopt;
+  // The source-level index is the operand index: these are free functions
+  // returning a pointer (no `this`, no `sret`) whose parameters before the
+  // kind (sizes, an alignment, a queue, device or context by reference) are
+  // one operand each. Check the operand is an integer all the same.
+  uint64_t i = index.getValue().getZExtValue();
+  if (hasSRet(callee) || i >= callOp.getNumArgOperands())
+    return std::nullopt;
+  Value operand = callOp.getArgOperand(i);
+  if (!isa<cir::IntType>(operand.getType()))
+    return std::nullopt;
+  for (unsigned depth = 0; depth < 4; ++depth) {
+    if (auto cast = operand.getDefiningOp<cir::CastOp>()) {
+      if (cast.getKind() != cir::CastKind::integral)
+        return std::nullopt;
+      operand = cast.getSrc();
+      continue;
+    }
+    break;
+  }
+  auto constant = operand.getDefiningOp<cir::ConstantOp>();
+  auto value =
+      constant ? dyn_cast<cir::IntAttr>(constant.getValue()) : cir::IntAttr();
+  if (!value)
+    return std::nullopt;
+  return fromCode(value.getSInt());
+}
+
 std::string cir::getSYCLKernelInfoName(cir::FuncOp kernelInfo,
                                        SymbolTableCollection *symbols) {
   std::string result;
@@ -879,7 +941,10 @@ protected:
 /// usm.alloc: SPEC (PI 11550-11560, and the malloc_shared/malloc_host/malloc
 /// and aligned_alloc forms after it): "Returns a pointer to the newly
 /// allocated memory": a fresh allocation, disjoint from every live object.
-/// It is HasUSM: device code may access it.
+/// It is HasUSM: device code may access it. The kind of the allocation
+/// (device, shared, host) is not recorded on the node: it is a property of
+/// the origin's call, which getSYCLUSMAllocKind reads (the callee's
+/// cir.sycl_usm_kind, or its constant usm::alloc operand).
 class USMAllocModel : public RoleModel {
 public:
   using RoleModel::RoleModel;
