@@ -1,8 +1,9 @@
 // The host/device closure-layout-mismatch check runs as the first pass of the
-// cir-offload-merge combine pipeline (always on), so a SYCL kernel whose
-// captured closure diverges host vs device produces a warning during the
-// normal combine step -- naming the kernel, the divergent field, and both
-// types. Analysis only: the combine still succeeds and produces its output.
+// cir-offload-merge combine pipeline (on by default; the tag
+// sycl-closure-layout-mismatch of --cir-offload-host-diagnostics), so a SYCL
+// kernel whose captured closure diverges host vs device produces a warning
+// during the normal combine step -- naming the divergent field and both
+// layouts. Analysis only: the combine still succeeds and produces its output.
 
 // RUN: rm -rf %t && split-file %s %t
 
@@ -13,7 +14,22 @@
 // RUN:   -output=%t/combined.cir 2>&1 | FileCheck %s
 // RUN: cir-opt %t/combined.cir --verify-roundtrip -o /dev/null
 
-// CHECK: warning: SYCL kernel captured-closure layout differs between host and device (captured field 'b'); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior
+// The tag selects the check; none, or a list without it, turns it off.
+// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   --cir-offload-host-diagnostics=sycl-closure-layout-mismatch \
+// RUN:   -output=%t/only.cir 2>&1 | FileCheck %s
+// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   --cir-offload-host-diagnostics=none \
+// RUN:   -output=%t/none.cir 2>&1 | FileCheck %s --check-prefix=OFF --allow-empty
+// RUN: cir-offload-merge -combine -input=%t/host.cir -input=%t/device.cir \
+// RUN:   -targets=host-x86_64-unknown-linux-gnu,sycl-spir64-unknown-unknown \
+// RUN:   --cir-offload-host-diagnostics=sycl-host-ptr-in-kernel \
+// RUN:   -output=%t/other.cir 2>&1 | FileCheck %s --check-prefix=OFF --allow-empty
+
+// CHECK: warning: SYCL kernel captured-closure layout differs between host and device (captured field 'b': host: double at offset 8, device: int32 at offset 8); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior [sycl-closure-layout-mismatch]
+// OFF-NOT: sycl-closure-layout-mismatch
 
 //--- host.cir
 !s8i = !cir.int<s, 8>

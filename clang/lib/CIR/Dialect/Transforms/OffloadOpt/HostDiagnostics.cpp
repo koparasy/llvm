@@ -17,7 +17,9 @@
 // option (--cir-offload-host-diagnostics=<tags|all|none> of
 // cir-offload-merge) selects, a function run on the shared context, and
 // whether `all` (the default) includes it: a check off by default runs only
-// when named. To add a check, add a function and an entry.
+// when named. To add a check, add a function and an entry. An entry without
+// a function (sycl-closure-layout-mismatch) is a check another pass runs (it
+// must see the IR before mem2reg); it is listed so the option accepts its tag.
 //
 // The rule every check follows: warn only on a MUST fact. The node the
 // warning is about has known origins of the bad kind only, is complete (no
@@ -306,6 +308,9 @@ constexpr HostDiagnosticCheck kChecks[] = {
     {"sycl-buffer-same-host-ptr", checkBufferSameHostPtr, true},
     {"sycl-mismatched-free", checkMismatchedFree, true},
     {"sycl-nd-range-geometry", checkNDRangeGeometry, true},
+    // Runs as its own pass (cir-offload-detect-host-device-closure-layout-
+    // mismatch), before mem2reg; listed so that the option accepts its tag.
+    {"sycl-closure-layout-mismatch", nullptr, true},
 };
 
 //===----------------------------------------------------------------------===//
@@ -2159,7 +2164,7 @@ void OffloadHostDiagnosticsPass::runOnOperation() {
       continue;
     if (name == "all") {
       for (const HostDiagnosticCheck &check : kChecks)
-        if (check.onByDefault)
+        if (check.onByDefault && check.run)
           selected.push_back(&check);
       continue;
     }
@@ -2174,7 +2179,8 @@ void OffloadHostDiagnosticsPass::runOnOperation() {
           << "' (expected all, none or one of: " << known << ")";
       return signalPassFailure();
     }
-    selected.push_back(found);
+    if (found->run)
+      selected.push_back(found);
   }
   if (selected.empty() || !cir::isOffloadContainer(container))
     return;

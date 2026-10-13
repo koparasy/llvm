@@ -747,21 +747,43 @@ def OffloadDetectHostDeviceClosureLayoutMismatch
     only a container pass can catch it.
 
     For each SYCL device `spir_kernel` this pass recovers, through the
-    KernelBindingTable, the host closure record (from the launch site's
-    HostKernelRef closure operand) and the device closure record (the record the
-    kernel prologue reconstructs). Matched by kernel binding -- never by
-    type-name equality, since the two records carry different aliases (`anon.0`
-    vs `__cir_lowered.anon.0`) -- it compares the ordered field lists (ignoring
-    a captured pointer's address space, a device-lowering artifact) and emits an
-    MLIR *warning* for each divergence (a differing field count, or a field whose
-    type differs), anchored at the capture's source line and naming the field.
-    Such a mismatch is a host/device closure mismatch (likely
-    `__SYCL_DEVICE_ONLY__` or divergent captures) and is undefined behavior.
+    KernelBindingTable, the host closure record (the record the host
+    HostKernelRef / HostKernel constructor of the launch wraps; all launch sites
+    must agree) and the device closure record (the `cir.sycl_kernel_object`
+    alloca). Records are never matched by name or source location. Both are
+    flattened with their own module's DataLayout to leaves (offset, size, kind:
+    integer width, bool, float kind, pointer -- address space and pointee
+    ignored --, array/vector of K elements of a kind), recursing into records,
+    skipping padding, and keeping SYCL library types and unions as opaque leaves
+    compared by size only. Each disagreeing offset warns once per captured field
+    (`[sycl-closure-layout-mismatch]`, "host: int32 at offset 8, device: float
+    at offset 8"), anchored at the field's source line; a differing leaf count
+    warns at the kernel. A captured accessor / local_accessor is checked against
+    the device kernel parameters it decomposes into (`cir.sycl_kernel_param`):
+    element type (data pointer pointee) and dimensions (access range rank).
+    What cannot be decided is not reported, unless `report-unchecked` asks for a
+    remark.
 
     Analysis only: the pass never mutates the module. It runs at the head of the
     cir-offload-merge combine pipeline, before the mem2reg that would promote the
     device closure alloca the device-record recovery reads.
   }];
+  let options = [
+    Option<"reportUnchecked", "report-unchecked", "bool", /*default=*/"false",
+           "Emit a remark for each kernel or captured accessor the check "
+           "cannot decide (debug aid)">
+  ];
+  let statistics = [
+    Statistic<"numKernelsChecked", "num-kernels-checked",
+              "Device kernels whose closure layout was compared">,
+    Statistic<"numKernelsUnchecked", "num-kernels-unchecked",
+              "Device kernels not checked (no unique host or device closure)">,
+    Statistic<"numAccessorsChecked", "num-accessors-checked",
+              "Captured accessors checked against the kernel parameters">,
+    Statistic<"numAccessorsUnchecked", "num-accessors-unchecked",
+              "Captured accessors that could not be checked">,
+    Statistic<"numWarnings", "num-warnings", "Warnings emitted">,
+  ];
   let constructor =
       "mlir::createOffloadDetectHostDeviceClosureLayoutMismatchPass()";
   let dependentDialects = ["cir::CIRDialect"];

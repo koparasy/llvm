@@ -1,0 +1,880 @@
+// RUN: cir-opt %s -split-input-file -verify-diagnostics \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-detect-host-device-closure-layout-mismatch)"
+// RUN: cir-opt %s -split-input-file \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-detect-host-device-closure-layout-mismatch{report-unchecked=true})" \
+// RUN:   -o /dev/null 2>&1 | FileCheck %s --check-prefix=UNCHECKED
+
+// [sycl-closure-layout-mismatch]: a SYCL kernel lambda is compiled for the host
+// and for the device; `#ifdef __SYCL_DEVICE_ONLY__` or divergent `[=]` captures
+// can give the two closures different layouts of the same total size, which the
+// `sizeof(KernelType) == KernelSize` static_assert does not catch. The check
+// pairs the host closure (the record the host HostKernelRef/HostKernel
+// constructor wraps) with the device closure (the cir.sycl_kernel_object
+// alloca) by kernel binding, flattens both with their module's DataLayout and
+// compares offset, size and kind of each leaf. Record names, pointer address
+// spaces and pointees, padding, and the representation of SYCL library types
+// are ignored. Captured accessors are checked against the kernel parameters
+// they decompose into. Each case below is one container.
+
+// -----
+// POSITIVE: int vs float of the same size. Field 'b' is `int` on the host
+// and `float` on the device (#ifdef __SYCL_DEVICE_ONLY__ around its declaration).
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hlam = !cir.struct<"anon.0" {data !cir.ptr<!s32i>, data !s32i}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !cir.ptr<!s32i, target_address_space(4)>, data !cir.float}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // expected-note@+1 {{in the SYCL kernel defined here}}
+    cir.func @_ZTSZ4mainEUlvE_(%p: !cir.ptr<!s32i, target_address_space(1)>, %b: !cir.float) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      %f0 = cir.get_member %clos[0] {name = "out"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
+      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'b': host: int32 at offset 8, device: float at offset 8); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior [sycl-closure-layout-mismatch]}}
+      %f1 = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.float>
+      cir.return
+    }
+  }
+}
+
+// -----
+// POSITIVE: a pointer on the host, a 64-bit integer on the device.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hlam = !cir.struct<"anon.0" {data !cir.ptr<!cir.float>, data !s32i}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !s64i, data !s32i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // expected-note@+1 {{in the SYCL kernel defined here}}
+    cir.func @_ZTSZ4mainEUlvE_(%p: !s64i, %b: !s32i) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'p': host: pointer at offset 0, device: int64 at offset 0); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior [sycl-closure-layout-mismatch]}}
+      %f0 = cir.get_member %clos[0] {name = "p"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s64i>
+      %f1 = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
+      cir.return
+    }
+  }
+}
+
+// -----
+// POSITIVE: a member of a captured struct diverges: S::y is `float` on the
+// host and `int` on the device. The records are recursed into by structure.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hs = !cir.struct<"S" {data !s32i, data !cir.float}>
+!rec_ds = !cir.struct<"__cir_lowered.S" {data !s32i, data !s32i}>
+!rec_hlam = !cir.struct<"anon.0" {data !rec_hs, data !s32i}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !rec_ds, data !s32i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // expected-note@+1 {{in the SYCL kernel defined here}}
+    cir.func @_ZTSZ4mainEUlvE_(%s: !cir.ptr<!rec_ds>, %n: !s32i) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 's': host: float at offset 4, device: int32 at offset 4); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior [sycl-closure-layout-mismatch]}}
+      %f0 = cir.get_member %clos[0] {name = "s"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_ds>
+      %f1 = cir.get_member %clos[1] {name = "n"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
+      cir.return
+    }
+  }
+}
+
+// -----
+// POSITIVE: field count. The host captures two `int`s where the device has
+// one `long` (equal size): the offset 0 kinds differ and the leaf counts differ.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hlam = !cir.struct<"anon.0" {data !s32i, data !s32i}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !s64i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // expected-note@+2 {{in the SYCL kernel defined here}}
+    // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (field count differs: host 2, device 1 fields); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior [sycl-closure-layout-mismatch]}}
+    cir.func @_ZTSZ4mainEUlvE_(%x: !s64i) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'x': host: int32 at offset 0, device: int64 at offset 0); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior [sycl-closure-layout-mismatch]}}
+      %f0 = cir.get_member %clos[0] {name = "x"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s64i>
+      cir.return
+    }
+  }
+}
+
+// -----
+// POSITIVE: an accessor's element type diverges: accessor<int> on the host,
+// the device data pointer (and accessor) is float.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_range1 = !cir.struct<class "__cir_lowered.sycl::_V1::range<1>" {data !cir.array<!u64i x 1>}>
+!rec_range2 = !cir.struct<class "__cir_lowered.sycl::_V1::range<2>" {data !cir.array<!u64i x 2>}>
+!rec_id1 = !cir.struct<class "__cir_lowered.sycl::_V1::id<1>" {data !cir.array<!u64i x 1>}>
+!rec_hacc = !cir.struct<class "sycl::_V1::accessor<int, 1, sycl::_V1::access::mode::read_write, sycl::_V1::access::target::device, sycl::_V1::access::placeholder::false_t, sycl::_V1::ext::oneapi::accessor_property_list<>>" {data !cir.array<!u64i x 2>, data !cir.ptr<!s8i>, pad !cir.array<!u8i x 8>}>
+!rec_dacc = !cir.struct<class "__cir_lowered.sycl::_V1::accessor<float, 1, sycl::_V1::access::mode::read_write, sycl::_V1::access::target::device, sycl::_V1::access::placeholder::false_t, sycl::_V1::ext::oneapi::accessor_property_list<>>" {data !cir.array<!u64i x 3>, data !cir.ptr<!cir.float, target_address_space(1)>}>
+!rec_hlam = !cir.struct<"anon.0" {data !rec_hacc, data !s32i}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !rec_dacc, data !s32i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // expected-note@+1 {{in the SYCL kernel defined here}}
+    cir.func @_ZTSZ4mainEUlvE_(%ap: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "acc", init_arg = 0 : i32, kind = "accessor", path = ["acc"]}}, %ar: !cir.ptr<!rec_range1> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "acc", init_arg = 1 : i32, kind = "accessor", path = ["acc"]}}, %mr: !cir.ptr<!rec_range1> {cir.sycl_kernel_param = {accessor_part = "mem_range", field = "acc", init_arg = 2 : i32, kind = "accessor", path = ["acc"]}}, %ao: !cir.ptr<!rec_id1> {cir.sycl_kernel_param = {accessor_part = "offset", field = "acc", init_arg = 3 : i32, kind = "accessor", path = ["acc"]}}, %n: !s32i) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured accessor 'acc': host: element type 'int', device: element type 'float'); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior [sycl-closure-layout-mismatch]}}
+      %f0 = cir.get_member %clos[0] {name = "acc"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_dacc>
+      %f1 = cir.get_member %clos[1] {name = "n"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
+      cir.return
+    }
+  }
+}
+
+// -----
+// POSITIVE: an accessor's dimensions diverge: 2 on the host, the device access
+// range is a range<1>.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_range1 = !cir.struct<class "__cir_lowered.sycl::_V1::range<1>" {data !cir.array<!u64i x 1>}>
+!rec_range2 = !cir.struct<class "__cir_lowered.sycl::_V1::range<2>" {data !cir.array<!u64i x 2>}>
+!rec_id1 = !cir.struct<class "__cir_lowered.sycl::_V1::id<1>" {data !cir.array<!u64i x 1>}>
+!rec_hacc = !cir.struct<class "sycl::_V1::accessor<float, 2, sycl::_V1::access::mode::read_write, sycl::_V1::access::target::device, sycl::_V1::access::placeholder::false_t, sycl::_V1::ext::oneapi::accessor_property_list<>>" {data !cir.array<!u64i x 2>, data !cir.ptr<!s8i>, pad !cir.array<!u8i x 8>}>
+!rec_dacc = !cir.struct<class "__cir_lowered.sycl::_V1::accessor<float, 1, sycl::_V1::access::mode::read_write, sycl::_V1::access::target::device, sycl::_V1::access::placeholder::false_t, sycl::_V1::ext::oneapi::accessor_property_list<>>" {data !cir.array<!u64i x 3>, data !cir.ptr<!cir.float, target_address_space(1)>}>
+!rec_hlam = !cir.struct<"anon.0" {data !rec_hacc}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !rec_dacc}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    // expected-note@+1 {{in the SYCL kernel defined here}}
+    cir.func @_ZTSZ4mainEUlvE_(%ap: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "acc", init_arg = 0 : i32, kind = "accessor", path = ["acc"]}}, %ar: !cir.ptr<!rec_range1> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "acc", init_arg = 1 : i32, kind = "accessor", path = ["acc"]}}, %mr: !cir.ptr<!rec_range1> {cir.sycl_kernel_param = {accessor_part = "mem_range", field = "acc", init_arg = 2 : i32, kind = "accessor", path = ["acc"]}}, %ao: !cir.ptr<!rec_id1> {cir.sycl_kernel_param = {accessor_part = "offset", field = "acc", init_arg = 3 : i32, kind = "accessor", path = ["acc"]}}) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured accessor 'acc': host: 2 dimensions, device: 1 dimensions); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior [sycl-closure-layout-mismatch]}}
+      %f0 = cir.get_member %clos[0] {name = "acc"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_dacc>
+      cir.return
+    }
+  }
+}
+
+// -----
+// NEGATIVE: the same `[=]` captures. The device records carry other names
+// and the device pointers an address space: no divergence.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hlam = !cir.struct<"anon.0" {data !cir.ptr<!s32i>, data !s32i, data !cir.double}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.3" {data !cir.ptr<!s32i, target_address_space(4)>, data !s32i, data !cir.double}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%p: !cir.ptr<!s32i, target_address_space(1)>, %b: !s32i, %c: !cir.double) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      %f0 = cir.get_member %clos[0] {name = "out"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
+      %f1 = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
+      %f2 = cir.get_member %clos[2] {name = "c"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.double>
+      cir.return
+    }
+  }
+}
+
+// -----
+// NEGATIVE: a captured struct with pointer members. The nested pointers are
+// in an address space on the device only, and the nested record is named
+// differently; their pointees (sycl::half: uint16_t on the host, _Float16 on the
+// device) differ by design and are not compared.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hhalf = !cir.struct<class "sycl::_V1::detail::half_impl::half" {data !u16i}>
+!rec_dhalf = !cir.struct<class "__cir_lowered.sycl::_V1::detail::half_impl::half" {data !cir.f16}>
+!rec_hs = !cir.struct<"Params" {data !cir.ptr<!rec_hhalf>, data !cir.ptr<!cir.float>, data !s32i}>
+!rec_ds = !cir.struct<"__cir_lowered.Params" {data !cir.ptr<!rec_dhalf, target_address_space(4)>, data !cir.ptr<!cir.float, target_address_space(4)>, data !s32i}>
+!rec_hlam = !cir.struct<"anon.0" {data !rec_hs, data !rec_hhalf}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !rec_ds, data !rec_dhalf}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%s: !cir.ptr<!rec_ds>, %h: !rec_dhalf) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      %f0 = cir.get_member %clos[0] {name = "s"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_ds>
+      %f1 = cir.get_member %clos[1] {name = "h"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_dhalf>
+      cir.return
+    }
+  }
+}
+
+// -----
+// NEGATIVE: a padding difference. The host spells the padding after the char
+// as a pad member, the device leaves it implicit: both put the int at offset 4.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_hlam = !cir.struct<"anon.0" packed {data !s8i, pad !cir.array<!u8i x 3>, data !s32i}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !s8i, data !s32i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%c: !s8i, %n: !s32i) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      %f0 = cir.get_member %clos[0] {name = "c"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s8i>
+      %f1 = cir.get_member %clos[1] {name = "n"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
+      cir.return
+    }
+  }
+}
+
+// -----
+// NEGATIVE: an accessor of the same element type and dimensions. The host and
+// device accessor records differ (runtime handle vs pointer and ranges) and are
+// compared by size only; the element type and rank are checked against the
+// kernel parameters.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_range1 = !cir.struct<class "__cir_lowered.sycl::_V1::range<1>" {data !cir.array<!u64i x 1>}>
+!rec_range2 = !cir.struct<class "__cir_lowered.sycl::_V1::range<2>" {data !cir.array<!u64i x 2>}>
+!rec_id1 = !cir.struct<class "__cir_lowered.sycl::_V1::id<1>" {data !cir.array<!u64i x 1>}>
+!rec_hacc = !cir.struct<class "sycl::_V1::accessor<const float, 1, sycl::_V1::access::mode::read_write, sycl::_V1::access::target::device, sycl::_V1::access::placeholder::false_t, sycl::_V1::ext::oneapi::accessor_property_list<>>" {data !cir.array<!u64i x 2>, data !cir.ptr<!s8i>, pad !cir.array<!u8i x 8>}>
+!rec_dacc = !cir.struct<class "__cir_lowered.sycl::_V1::accessor<const float, 1, sycl::_V1::access::mode::read_write, sycl::_V1::access::target::device, sycl::_V1::access::placeholder::false_t, sycl::_V1::ext::oneapi::accessor_property_list<>>" {data !cir.array<!u64i x 3>, data !cir.ptr<!cir.float, target_address_space(1)>}>
+!rec_hlam = !cir.struct<"anon.0" {data !rec_hacc, data !s32i}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !rec_dacc, data !s32i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%ap: !cir.ptr<!cir.float, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "acc", init_arg = 0 : i32, kind = "accessor", path = ["acc"]}}, %ar: !cir.ptr<!rec_range1> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "acc", init_arg = 1 : i32, kind = "accessor", path = ["acc"]}}, %mr: !cir.ptr<!rec_range1> {cir.sycl_kernel_param = {accessor_part = "mem_range", field = "acc", init_arg = 2 : i32, kind = "accessor", path = ["acc"]}}, %ao: !cir.ptr<!rec_id1> {cir.sycl_kernel_param = {accessor_part = "offset", field = "acc", init_arg = 3 : i32, kind = "accessor", path = ["acc"]}}, %n: !s32i) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      %f0 = cir.get_member %clos[0] {name = "acc"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_dacc>
+      %f1 = cir.get_member %clos[1] {name = "n"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
+      cir.return
+    }
+  }
+}
+
+// -----
+// NEGATIVE: a local_accessor and a stream. The local_accessor's element
+// type (a record) matches the device data pointer; the stream is compared by
+// size only.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_range1 = !cir.struct<class "__cir_lowered.sycl::_V1::range<1>" {data !cir.array<!u64i x 1>}>
+!rec_range2 = !cir.struct<class "__cir_lowered.sycl::_V1::range<2>" {data !cir.array<!u64i x 2>}>
+!rec_id1 = !cir.struct<class "__cir_lowered.sycl::_V1::id<1>" {data !cir.array<!u64i x 1>}>
+!rec_vec = !cir.struct<class "__cir_lowered.sycl::_V1::vec<unsigned char, 4>" {data !cir.array<!u8i x 4>}>
+!rec_hla = !cir.struct<class "sycl::_V1::local_accessor<sycl::_V1::vec<unsigned char, 4>, 1>" {data !cir.array<!u64i x 4>}>
+!rec_dla = !cir.struct<class "__cir_lowered.sycl::_V1::local_accessor<sycl::_V1::vec<unsigned char, 4>, 1>" {data !cir.array<!u64i x 3>, data !cir.ptr<!rec_vec, target_address_space(3)>}>
+!rec_hstream = !cir.struct<class "sycl::_V1::stream" {data !cir.array<!u64i x 2>}>
+!rec_dstream = !cir.struct<class "__cir_lowered.sycl::_V1::stream" {data !cir.ptr<!s8i, target_address_space(1)>, data !s32i, data !s32i}>
+!rec_hlam = !cir.struct<"anon.0" {data !rec_hla, data !rec_hstream}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !rec_dla, data !rec_dstream}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%ap: !cir.ptr<!rec_vec, target_address_space(3)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "blk", init_arg = 0 : i32, kind = "local_accessor", path = ["blk"]}}, %ar: !cir.ptr<!rec_range1> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "blk", init_arg = 1 : i32, kind = "local_accessor", path = ["blk"]}}, %mr: !cir.ptr<!rec_range1> {cir.sycl_kernel_param = {accessor_part = "mem_range", field = "blk", init_arg = 2 : i32, kind = "local_accessor", path = ["blk"]}}, %ao: !cir.ptr<!rec_id1> {cir.sycl_kernel_param = {accessor_part = "offset", field = "blk", init_arg = 3 : i32, kind = "local_accessor", path = ["blk"]}}) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      %f0 = cir.get_member %clos[0] {name = "blk"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_dla>
+      %f1 = cir.get_member %clos[1] {name = "os"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_dstream>
+      cir.return
+    }
+  }
+}
+
+// -----
+// NEGATIVE: a 0-dimensional local_accessor. The device lowers it with
+// 1-dimensional ranges (range<1>), which is not a dimension mismatch.
+
+!s8i = !cir.int<s, 8>
+!s16i = !cir.int<s, 16>
+!s32i = !cir.int<s, 32>
+!s64i = !cir.int<s, 64>
+!u8i = !cir.int<u, 8>
+!u16i = !cir.int<u, 16>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
+!rec_range1 = !cir.struct<class "__cir_lowered.sycl::_V1::range<1>" {data !cir.array<!u64i x 1>}>
+!rec_range2 = !cir.struct<class "__cir_lowered.sycl::_V1::range<2>" {data !cir.array<!u64i x 2>}>
+!rec_id1 = !cir.struct<class "__cir_lowered.sycl::_V1::id<1>" {data !cir.array<!u64i x 1>}>
+!rec_hla = !cir.struct<class "sycl::_V1::local_accessor<int, 0>" {data !cir.array<!u64i x 4>}>
+!rec_dla = !cir.struct<class "__cir_lowered.sycl::_V1::local_accessor<int, 0>" {data !cir.array<!u64i x 3>, data !cir.ptr<!s32i, target_address_space(3)>}>
+!rec_hlam = !cir.struct<"anon.0" {data !rec_hla, data !s32i}>
+!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !rec_dla, data !s32i}>
+!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
+      %lam = cir.alloca "lam" align(8) : !cir.ptr<!rec_hlam>
+      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
+      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
+      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
+      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTSZ4mainEUlvE_(%ap: !cir.ptr<!s32i, target_address_space(3)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "cnt", init_arg = 0 : i32, kind = "local_accessor", path = ["cnt"]}}, %ar: !cir.ptr<!rec_range1> {cir.sycl_kernel_param = {accessor_part = "access_range", field = "cnt", init_arg = 1 : i32, kind = "local_accessor", path = ["cnt"]}}, %mr: !cir.ptr<!rec_range1> {cir.sycl_kernel_param = {accessor_part = "mem_range", field = "cnt", init_arg = 2 : i32, kind = "local_accessor", path = ["cnt"]}}, %ao: !cir.ptr<!rec_id1> {cir.sycl_kernel_param = {accessor_part = "offset", field = "cnt", init_arg = 3 : i32, kind = "local_accessor", path = ["cnt"]}}, %n: !s32i) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
+      %f0 = cir.get_member %clos[0] {name = "cnt"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_dla>
+      %f1 = cir.get_member %clos[1] {name = "n"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
+      cir.return
+    }
+  }
+}
+
+// -----
+// NEGATIVE (the old false positive): one lambda in a function template,
+// instantiated for float and double. Both instances are at the same source
+// location; each is launched through the handler path, where
+// handler::StoreLambda<Name, Type> builds the HostKernel and calls
+// setDeviceKernelInfo<Name>, which holds the getDeviceKernelInfo<Name>()
+// marker. The host closure of each kernel is the one its own StoreLambda
+// wraps, so each instance is paired with its own device closure.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkbase = !cir.struct<"hkbase" {data !cir.ptr<!s8i>}>
+!rec_handler = !cir.struct<"handler" {data !cir.ptr<!rec_hkbase>}>
+!rec_hlamf = !cir.struct<"anon.1" {data !cir.ptr<!cir.float>, data !cir.float}>
+!rec_hlamd = !cir.struct<"anon.2" {data !cir.ptr<!cir.double>, data !cir.double}>
+!rec_hkf = !cir.struct<"sycl::_V1::detail::HostKernel<(lambda at t.cpp:5:7), sycl::_V1::item<1>, 1>" {data !rec_hkbase, data !rec_hlamf}>
+!rec_hkd = !cir.struct<"sycl::_V1::detail::HostKernel<(lambda at t.cpp:5:7), sycl::_V1::item<1>, 1>.0" {data !rec_hkbase, data !rec_hlamd}>
+!rec_dlamf = !cir.struct<"__cir_lowered.anon.0" {data !cir.ptr<!cir.float, target_address_space(4)>, data !cir.float}>
+!rec_dlamd = !cir.struct<"__cir_lowered.anon.1" {data !cir.ptr<!cir.double, target_address_space(4)>, data !cir.double}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".strf" = #cir.const_array<"_ZTS2KF" : !cir.array<!s8i x 7>, trailing_zeros> : !cir.array<!s8i x 8>
+    cir.global "private" constant cir_private @".strd" = #cir.const_array<"_ZTS2KD" : !cir.array<!s8i x 7>, trailing_zeros> : !cir.array<!s8i x 8>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KFEE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strf"> : !cir.ptr<!s8i>, #cir.int<7> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KDEE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strd"> : !cir.ptr<!s8i>, #cir.int<7> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "handler.set_kernel_info", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIfEC2E(!cir.ptr<!rec_hkf>, !cir.ptr<!rec_hlamf>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIdEC2E(!cir.ptr<!rec_hkd>, !cir.ptr<!rec_hlamd>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KFEEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KFEE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KDEEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KDEE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KFEEvPv(%h: !cir.ptr<!rec_handler>) {
+      %d = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KFEEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %d) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KDEEvPv(%h: !cir.ptr<!rec_handler>) {
+      %d = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KDEEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %d) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V17handler11StoreLambdaI2KFEEvv(%h: !cir.ptr<!rec_handler>, %lam: !cir.ptr<!rec_hlamf>) {
+      %hk = cir.alloca "hk" align(8) : !cir.ptr<!rec_hkf>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIfEC2E(%hk, %lam) : (!cir.ptr<!rec_hkf>, !cir.ptr<!rec_hlamf>) -> ()
+      cir.call @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KFEEvPv(%h) : (!cir.ptr<!rec_handler>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V17handler11StoreLambdaI2KDEEvv(%h: !cir.ptr<!rec_handler>, %lam: !cir.ptr<!rec_hlamd>) {
+      %hk = cir.alloca "hk" align(8) : !cir.ptr<!rec_hkd>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIdEC2E(%hk, %lam) : (!cir.ptr<!rec_hkd>, !cir.ptr<!rec_hlamd>) -> ()
+      cir.call @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KDEEvPv(%h) : (!cir.ptr<!rec_handler>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTS2KF(%p: !cir.ptr<!cir.float, target_address_space(1)>, %a: !cir.float) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlamf> {cir.sycl_kernel_object}
+      %f1 = cir.get_member %clos[1] {name = "a"} : !cir.ptr<!rec_dlamf> -> !cir.ptr<!cir.float>
+      cir.return
+    }
+    cir.func @_ZTS2KD(%p: !cir.ptr<!cir.double, target_address_space(1)>, %a: !cir.double) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlamd> {cir.sycl_kernel_object}
+      %f1 = cir.get_member %clos[1] {name = "a"} : !cir.ptr<!rec_dlamd> -> !cir.ptr<!cir.double>
+      cir.return
+    }
+  }
+}
+
+// -----
+// POSITIVE, handler path: as above, but the double instance's captured `a`
+// is a `long` on the device. Both instances are at the same source
+// location; each is launched through the handler path, where
+// handler::StoreLambda<Name, Type> builds the HostKernel and calls
+// setDeviceKernelInfo<Name>, which holds the getDeviceKernelInfo<Name>()
+// marker.
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkbase = !cir.struct<"hkbase" {data !cir.ptr<!s8i>}>
+!rec_handler = !cir.struct<"handler" {data !cir.ptr<!rec_hkbase>}>
+!rec_hlamf = !cir.struct<"anon.1" {data !cir.ptr<!cir.float>, data !cir.float}>
+!rec_hlamd = !cir.struct<"anon.2" {data !cir.ptr<!cir.double>, data !cir.double}>
+!rec_hkf = !cir.struct<"sycl::_V1::detail::HostKernel<(lambda at t.cpp:5:7), sycl::_V1::item<1>, 1>" {data !rec_hkbase, data !rec_hlamf}>
+!rec_hkd = !cir.struct<"sycl::_V1::detail::HostKernel<(lambda at t.cpp:5:7), sycl::_V1::item<1>, 1>.0" {data !rec_hkbase, data !rec_hlamd}>
+!rec_dlamf = !cir.struct<"__cir_lowered.anon.0" {data !cir.ptr<!cir.float, target_address_space(4)>, data !cir.float}>
+!rec_dlamd = !cir.struct<"__cir_lowered.anon.1" {data !cir.ptr<!cir.double, target_address_space(4)>, data !cir.int<s, 64>}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".strf" = #cir.const_array<"_ZTS2KF" : !cir.array<!s8i x 7>, trailing_zeros> : !cir.array<!s8i x 8>
+    cir.global "private" constant cir_private @".strd" = #cir.const_array<"_ZTS2KD" : !cir.array<!s8i x 7>, trailing_zeros> : !cir.array<!s8i x 8>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KFEE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strf"> : !cir.ptr<!s8i>, #cir.int<7> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KDEE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strd"> : !cir.ptr<!s8i>, #cir.int<7> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "handler.set_kernel_info", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIfEC2E(!cir.ptr<!rec_hkf>, !cir.ptr<!rec_hlamf>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIdEC2E(!cir.ptr<!rec_hkd>, !cir.ptr<!rec_hlamd>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KFEEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KFEE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KDEEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KDEE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KFEEvPv(%h: !cir.ptr<!rec_handler>) {
+      %d = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KFEEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %d) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KDEEvPv(%h: !cir.ptr<!rec_handler>) {
+      %d = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KDEEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %d) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V17handler11StoreLambdaI2KFEEvv(%h: !cir.ptr<!rec_handler>, %lam: !cir.ptr<!rec_hlamf>) {
+      %hk = cir.alloca "hk" align(8) : !cir.ptr<!rec_hkf>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIfEC2E(%hk, %lam) : (!cir.ptr<!rec_hkf>, !cir.ptr<!rec_hlamf>) -> ()
+      cir.call @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KFEEvPv(%h) : (!cir.ptr<!rec_handler>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V17handler11StoreLambdaI2KDEEvv(%h: !cir.ptr<!rec_handler>, %lam: !cir.ptr<!rec_hlamd>) {
+      %hk = cir.alloca "hk" align(8) : !cir.ptr<!rec_hkd>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIdEC2E(%hk, %lam) : (!cir.ptr<!rec_hkd>, !cir.ptr<!rec_hlamd>) -> ()
+      cir.call @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KDEEvPv(%h) : (!cir.ptr<!rec_handler>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTS2KF(%p: !cir.ptr<!cir.float, target_address_space(1)>, %a: !cir.float) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlamf> {cir.sycl_kernel_object}
+      %f1 = cir.get_member %clos[1] {name = "a"} : !cir.ptr<!rec_dlamf> -> !cir.ptr<!cir.float>
+      cir.return
+    }
+    // expected-note@+1 {{in the SYCL kernel defined here}}
+    cir.func @_ZTS2KD(%p: !cir.ptr<!cir.double, target_address_space(1)>, %a: !cir.int<s, 64>) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlamd> {cir.sycl_kernel_object}
+      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'a': host: double at offset 8, device: int64 at offset 8); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior [sycl-closure-layout-mismatch]}}
+      %f1 = cir.get_member %clos[1] {name = "a"} : !cir.ptr<!rec_dlamd> -> !cir.ptr<!cir.int<s, 64>>
+      cir.return
+    }
+  }
+}
+
+// -----
+// NOT CHECKED: the function that calls setDeviceKernelInfo<KF> also builds
+// a HostKernel of another closure, so the host closure of KF is not known
+// and nothing is reported for it (a remark with report-unchecked).
+
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
+!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
+!rec_hkbase = !cir.struct<"hkbase" {data !cir.ptr<!s8i>}>
+!rec_handler = !cir.struct<"handler" {data !cir.ptr<!rec_hkbase>}>
+!rec_hlamf = !cir.struct<"anon.1" {data !cir.ptr<!cir.float>, data !cir.float}>
+!rec_hlamd = !cir.struct<"anon.2" {data !cir.ptr<!cir.double>, data !cir.double}>
+!rec_hkf = !cir.struct<"sycl::_V1::detail::HostKernel<(lambda at t.cpp:5:7), sycl::_V1::item<1>, 1>" {data !rec_hkbase, data !rec_hlamf}>
+!rec_hkd = !cir.struct<"sycl::_V1::detail::HostKernel<(lambda at t.cpp:5:7), sycl::_V1::item<1>, 1>.0" {data !rec_hkbase, data !rec_hlamd}>
+!rec_dlamf = !cir.struct<"__cir_lowered.anon.0" {data !cir.ptr<!cir.float, target_address_space(4)>, data !cir.int<s, 32>}>
+!rec_dlamd = !cir.struct<"__cir_lowered.anon.1" {data !cir.ptr<!cir.double, target_address_space(4)>, data !cir.double}>
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>} {
+    cir.global "private" constant cir_private @".strf" = #cir.const_array<"_ZTS2KF" : !cir.array<!s8i x 7>, trailing_zeros> : !cir.array<!s8i x 8>
+    cir.global "private" constant cir_private @".strd" = #cir.const_array<"_ZTS2KD" : !cir.array<!s8i x 7>, trailing_zeros> : !cir.array<!s8i x 8>
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KFEE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strf"> : !cir.ptr<!s8i>, #cir.int<7> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KDEE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".strd"> : !cir.ptr<!s8i>, #cir.int<7> : !u64i}> : !rec_sv}> : !rec_ctki
+    cir.func private @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "handler.set_kernel_info", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIfEC2E(!cir.ptr<!rec_hkf>, !cir.ptr<!rec_hlamf>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func private @_ZN4sycl3_V16detail10HostKernelIdEC2E(!cir.ptr<!rec_hkd>, !cir.ptr<!rec_hlamd>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KFEEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KFEE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KDEEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
+      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoI2KDEE : !cir.ptr<!rec_ctki>
+      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
+      cir.return %1 : !cir.ptr<!s8i>
+    }
+    cir.func internal @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KFEEvPv(%h: !cir.ptr<!rec_handler>) {
+      %d = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KFEEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %d) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KDEEvPv(%h: !cir.ptr<!rec_handler>) {
+      %d = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoI2KDEEPv() : () -> !cir.ptr<!s8i>
+      cir.call @_ZN4sycl3_V17handler22setDeviceKernelInfoPtrEPNS0_6detail16DeviceKernelInfoE(%h, %d) : (!cir.ptr<!rec_handler>, !cir.ptr<!s8i>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V17handler11StoreLambdaI2KFEEvv(%h: !cir.ptr<!rec_handler>, %lam: !cir.ptr<!rec_hlamf>) {
+      %hk = cir.alloca "hk" align(8) : !cir.ptr<!rec_hkf>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIfEC2E(%hk, %lam) : (!cir.ptr<!rec_hkf>, !cir.ptr<!rec_hlamf>) -> ()
+      %hk2 = cir.alloca "hk2" align(8) : !cir.ptr<!rec_hkd>
+      %lam2 = cir.alloca "lam2" align(8) : !cir.ptr<!rec_hlamd>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIdEC2E(%hk2, %lam2) : (!cir.ptr<!rec_hkd>, !cir.ptr<!rec_hlamd>) -> ()
+      cir.call @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KFEEvPv(%h) : (!cir.ptr<!rec_handler>) -> ()
+      cir.return
+    }
+    cir.func internal @_ZN4sycl3_V17handler11StoreLambdaI2KDEEvv(%h: !cir.ptr<!rec_handler>, %lam: !cir.ptr<!rec_hlamd>) {
+      %hk = cir.alloca "hk" align(8) : !cir.ptr<!rec_hkd>
+      cir.call @_ZN4sycl3_V16detail10HostKernelIdEC2E(%hk, %lam) : (!cir.ptr<!rec_hkd>, !cir.ptr<!rec_hlamd>) -> ()
+      cir.call @_ZN4sycl3_V17handler19setDeviceKernelInfoI2KDEEvPv(%h) : (!cir.ptr<!rec_handler>) -> ()
+      cir.return
+    }
+  }
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
+    cir.func @_ZTS2KF(%p: !cir.ptr<!cir.float, target_address_space(1)>, %a: !cir.int<s, 32>) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlamf> {cir.sycl_kernel_object}
+      %f1 = cir.get_member %clos[1] {name = "a"} : !cir.ptr<!rec_dlamf> -> !cir.ptr<!cir.int<s, 32>>
+      cir.return
+    }
+    cir.func @_ZTS2KD(%p: !cir.ptr<!cir.double, target_address_space(1)>, %a: !cir.double) cc(spir_kernel) {
+      %clos = cir.alloca "clos" align(8) : !cir.ptr<!rec_dlamd> {cir.sycl_kernel_object}
+      %f1 = cir.get_member %clos[1] {name = "a"} : !cir.ptr<!rec_dlamd> -> !cir.ptr<!cir.double>
+      cir.return
+    }
+  }
+}
+
+// UNCHECKED-COUNT-1: remark: SYCL kernel closure layout not checked: no unique host closure record
+// UNCHECKED-NOT: remark:

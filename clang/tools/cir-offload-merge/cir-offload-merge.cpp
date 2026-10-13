@@ -195,7 +195,8 @@ llvm::cl::opt<std::string> HostDiagnostics(
                    "sycl-host-heap-ptr-in-kernel, "
                    "sycl-host-deref-device-usm, "
                    "sycl-buffer-same-host-ptr, sycl-mismatched-free, "
-                   "sycl-nd-range-geometry), all (the default: the "
+                   "sycl-nd-range-geometry, "
+                   "sycl-closure-layout-mismatch), all (the default: the "
                    "checks on by default, not sycl-host-heap-ptr-in-kernel) "
                    "or none"),
     llvm::cl::init("all"), llvm::cl::cat(CIROffloadMergeCategory));
@@ -561,6 +562,18 @@ static bool setHostFactsOptions(mlir::Pass &pass) {
                                                 }));
 }
 
+// Whether --cir-offload-host-diagnostics selects the closure-layout check,
+// which runs as its own pass at the head of the pipeline (before mem2reg).
+static bool closureLayoutCheckSelected() {
+  llvm::SmallVector<llvm::StringRef, 8> names;
+  llvm::StringRef(HostDiagnostics)
+      .split(names, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+  return llvm::any_of(names, [](llvm::StringRef name) {
+    name = name.trim();
+    return name == "all" || name == "sycl-closure-layout-mismatch";
+  });
+}
+
 int runOffloadOptPasses(mlir::ModuleOp module) {
   mlir::PassManager pm(module.getContext(), mlir::ModuleOp::getOperationName());
   if (mlir::failed(mlir::applyPassManagerCLOptions(pm)))
@@ -577,7 +590,8 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
   // the as-emitted container: the mem2reg below promotes the device closure
   // alloca whose get_member stores this check recovers the device closure
   // record from, so it must observe the IR before that. Diagnostic only.
-  pm.addPass(mlir::createOffloadDetectHostDeviceClosureLayoutMismatchPass());
+  if (closureLayoutCheckSelected())
+    pm.addPass(mlir::createOffloadDetectHostDeviceClosureLayoutMismatchPass());
 
   // Promote stack slots and propagate constants so that a kernel argument known
   // at compile time reaches the device stub call site as a cir.const. Runs on

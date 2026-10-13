@@ -133,6 +133,9 @@ public:
   T &operator[](unsigned long i) const { return MData[i]; }
 #else
   void *impl;
+  // The real headers pad the host accessor to the size of the device one, so
+  // a closure has the same layout on both sides.
+  char padding[sizeof(T *) + sizeof(AccImpl<D>) - sizeof(void *)];
 
 public:
   accessor(buffer<T, D> &b, handler &h);

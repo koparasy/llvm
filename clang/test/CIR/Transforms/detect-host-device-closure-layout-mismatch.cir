@@ -9,13 +9,15 @@
 // record (through the launch site's HostKernelRef closure operand) and the
 // device closure record (the alloca tagged cir.sycl_kernel_object), matches
 // them by kernel binding -- NOT by type-name equality, since the aliases differ
-// -- and warns on each field whose type diverges. Analysis only. This mirrors
+// -- and warns on each field whose layout diverges. Analysis only. More cases
+// in Analysis/sycl-diag-sycl-closure-layout-mismatch.cir. This mirrors
 // detect-host-uniform-int-divisor.cir's container scaffolding, whose lambda
 // kernel name (`_ZTSZ4mainEUlvE_`) makes the binding TU-local.
 
 // -----
-// MISMATCH: closure field 1 is `double` on the host but `s32i` on the device.
-// The pointer field 0 matches, so exactly one warning fires, naming field 'b'.
+// MISMATCH: closure field 1 is `double` on the host but `s32i` on the device
+// (8 vs 4 bytes, both at offset 8). The pointer field 0 matches, so exactly one
+// warning fires, naming field 'b'.
 
 !s8i = !cir.int<s, 8>
 !s32i = !cir.int<s, 32>
@@ -54,9 +56,10 @@ module attributes {cir.offload.container} {
     // get_member store of the decomposed scalar parameter. Field 1 ("b") is
     // s32i here but double on the host -> ABI mismatch. The warning anchors at
     // the field's get_member op (its source line).
+    // expected-note@+1 {{in the SYCL kernel defined here}}
     cir.func @_ZTSZ4mainEUlvE_(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i {cir.sycl_kernel_param = {field = "b", kind = "scalar", path = ["b"]}}) cc(spir_kernel) {
       %clos = cir.alloca "dlam" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
-      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'b'); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior}}
+      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'b': host: double at offset 8, device: int32 at offset 8); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior [sycl-closure-layout-mismatch]}}
       %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
       cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
       cir.return
@@ -111,14 +114,12 @@ module attributes {cir.offload.container} {
 }
 
 // -----
-// HANDLER LAUNCH PATH + address-space suppression. Here the launch does not
-// expose the closure operand (the binding reports "closure none"), so the host
-// closure record is recovered structurally from the host
-// `detail::HostKernel<(lambda at f.cpp:7:9), ...>` wrapper, matched to the
-// device kernel by its lambda source location. Field 0 is a captured pointer:
-// plain on the host, target_address_space(4) on the device -- an expected
-// lowering artifact, NOT a divergence, so it is suppressed. Field 1 is the real
-// divergence: host `float` vs device `int` (equal 4-byte size), one warning.
+// NO LAUNCH, LOCATION ONLY: the host has a `detail::HostKernel<(lambda at
+// f.cpp:7:9), ...>` wrapper whose name embeds the device kernel's lambda
+// location, but no launch of the kernel. The host closure is never recovered by
+// source location (a lambda in a function template has one closure per
+// instantiation, all at the same location), so the kernel is not checked and
+// the float/int divergence of field 'b' is not reported.
 
 !s8i = !cir.int<s, 8>
 !s32i = !cir.int<s, 32>
@@ -144,97 +145,7 @@ module attributes {cir.offload.container} {
   module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
     cir.func @_ZTStestkernel(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i {cir.sycl_kernel_param = {field = "b", kind = "scalar", path = ["b"]}}) cc(spir_kernel) {
       %clos = cir.alloca "__cir_lowered.anon.0" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
-      // Field 0: captured pointer, address-space-only difference -> no warning.
       %f0 = cir.get_member %clos[0] {name = "out"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
-      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'b'); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior}}
-      %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
-      cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
-      cir.return
-    } loc(#loc_k)
-  }
-}
-
-// -----
-// ACCESSOR: field 0 holds a SYCL accessor, whose host representation (the
-// runtime implementation) differs from the device one (pointer and ranges) by
-// design. It is reported as not checked instead of warned about; the scalar
-// field 1 still differs and warns.
-
-!s8i = !cir.int<s, 8>
-!s32i = !cir.int<s, 32>
-!u64i = !cir.int<u, 64>
-!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
-!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
-!rec_hacc = !cir.struct<"hacc" {data !cir.ptr<!s8i>, data !cir.ptr<!s8i>}>
-!rec_dacc = !cir.struct<"dacc" {data !u64i, data !u64i, data !u64i, data !cir.ptr<!s32i, target_address_space(1)>}>
-!rec_hlam = !cir.struct<"hlam" {data !rec_hacc, data !cir.double}>
-!rec_dlam = !cir.struct<"dlam" {data !rec_dacc, data !s32i}>
-!rec_hkrbase = !cir.struct<"hkrbase" {data !u64i}>
-!rec_hkr = !cir.struct<"hkr" {data !rec_hkrbase, data !cir.ptr<!rec_hlam>}>
-module attributes {cir.offload.container} {
-  module @host attributes {cir.offload.kind = #cir.offload<host>} {
-    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTSZ4mainEUlvE_" : !cir.array<!s8i x 16>, trailing_zeros> : !cir.array<!s8i x 17>
-    cir.global "private" constant internal @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<16> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V16detail13HostKernelRefC2E(!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
-    cir.func private @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) attributes {cir.sycl_host_api = "launch.direct_impl", cir.sycl_host_api_arg = 2 : i32}
-    cir.func internal @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() -> !cir.ptr<!s8i> attributes {cir.sycl_host_api = "kernel.info"} {
-      %0 = cir.get_global @_ZN4sycl3_V16detail21CompileTimeKernelInfoIZ4mainEUlvE_EE : !cir.ptr<!rec_ctki>
-      %1 = cir.const #cir.ptr<null> : !cir.ptr<!s8i>
-      cir.return %1 : !cir.ptr<!s8i>
-    }
-    cir.func @main(%ev: !cir.ptr<!s8i>, %q: !cir.ptr<!s8i>, %geom: !cir.ptr<!s8i>) {
-      %lam = cir.alloca "hlam" align(8) : !cir.ptr<!rec_hlam>
-      %hkr = cir.alloca "hkr" align(8) : !cir.ptr<!rec_hkr>
-      cir.call @_ZN4sycl3_V16detail13HostKernelRefC2E(%hkr, %lam) : (!cir.ptr<!rec_hkr>, !cir.ptr<!rec_hlam>) -> ()
-      %base = cir.base_class_addr nonnull %hkr [0] : !cir.ptr<!rec_hkr> -> !cir.ptr<!rec_hkrbase>
-      %dki = cir.call @_ZN4sycl3_V16detail19getDeviceKernelInfoIZ4mainEUlvE_EEPv() : () -> !cir.ptr<!s8i>
-      cir.call @_ZN4sycl3_V136submit_kernel_direct_with_event_implPvS_S_S_S_(%ev, %q, %geom, %base, %dki) : (!cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!s8i>, !cir.ptr<!rec_hkrbase>, !cir.ptr<!s8i>) -> ()
-      cir.return
-    }
-  }
-  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
-    cir.func @_ZTSZ4mainEUlvE_(%ptr: !cir.ptr<!s32i, target_address_space(1)> {cir.sycl_kernel_param = {accessor_part = "ptr", field = "acc", init_arg = 0 : i32, kind = "accessor", path = ["acc"]}}, %argB: !s32i {cir.sycl_kernel_param = {field = "b", kind = "scalar", path = ["b"]}}) cc(spir_kernel) {
-      %clos = cir.alloca "dlam" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
-      // expected-remark@+1 {{SYCL kernel captured field 'acc' not checked for a host/device layout difference: it holds a SYCL special type whose host and device representations differ}}
-      %facc = cir.get_member %clos[0] {name = "acc"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!rec_dacc>
-      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'b'); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior}}
-      %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
-      cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
-      cir.return
-    }
-  }
-}
-
-// -----
-// WRAPPED LAMBDA: the lambda location also appears in the range-rounding
-// wrapper HostKernel<RoundedRangeKernel<(lambda at ...)>>, declared first here.
-// Its closure (range + lambda) is not the lambda kernel's closure; the
-// innermost HostKernel<(lambda at ...)> is picked, so only field 'b' warns
-// (no field-count warning).
-
-!s8i = !cir.int<s, 8>
-!s32i = !cir.int<s, 32>
-!u64i = !cir.int<u, 64>
-!rec_sv = !cir.struct<"sv" {data !cir.ptr<!s8i>, data !u64i}>
-!rec_ctki = !cir.struct<"ctki" {data !rec_sv}>
-!rec_hlam = !cir.struct<"anon.1" {data !cir.ptr<!s32i>, data !cir.float}>
-!rec_rrk = !cir.struct<"sycl::_V1::detail::RoundedRangeKernel<sycl::_V1::item<1, true>, 1, (lambda at f.cpp:7:9)>" {data !u64i, data !rec_hlam}>
-!rec_wraprr = !cir.struct<"sycl::_V1::detail::HostKernel<sycl::_V1::detail::RoundedRangeKernel<sycl::_V1::item<1, true>, 1, (lambda at f.cpp:7:9)>, sycl::_V1::item<1, true>, 1>" {data !u64i}>
-!rec_wrap = !cir.struct<"sycl::_V1::detail::HostKernel<(lambda at f.cpp:7:9), void, 1>" {data !u64i}>
-!rec_dlam = !cir.struct<"__cir_lowered.anon.0" {data !cir.ptr<!s32i, target_address_space(4)>, data !s32i}>
-#loc_k = loc("f.cpp":7:9)
-module attributes {cir.offload.container} {
-  module @host attributes {cir.offload.kind = #cir.offload<host>} {
-    cir.global "private" constant cir_private @".str" = #cir.const_array<"_ZTStestkernel" : !cir.array<!s8i x 14>, trailing_zeros> : !cir.array<!s8i x 15>
-    cir.global "private" constant internal @_ZctkiInfo = #cir.const_record<{#cir.const_record<{#cir.global_view<@".str"> : !cir.ptr<!s8i>, #cir.int<14> : !u64i}> : !rec_sv}> : !rec_ctki
-    cir.func private @_ZN4sycl3_V16detail10HostKernelIrrEC2E(!cir.ptr<!rec_wraprr>, !cir.ptr<!rec_rrk>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
-    cir.func private @_ZN4sycl3_V16detail10HostKernelItestEC2E(!cir.ptr<!rec_wrap>, !cir.ptr<!rec_hlam>) attributes {cir.sycl_host_api = "hostkernel.ctor", cir.sycl_host_api_arg = 0 : i32}
-  }
-  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>} {
-    cir.func @_ZTStestkernel(%p: !cir.ptr<!s32i, target_address_space(1)>, %argB: !s32i {cir.sycl_kernel_param = {field = "b", kind = "scalar", path = ["b"]}}) cc(spir_kernel) {
-      %clos = cir.alloca "__cir_lowered.anon.0" align(8) : !cir.ptr<!rec_dlam> {cir.sycl_kernel_object}
-      %f0 = cir.get_member %clos[0] {name = "out"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!cir.ptr<!s32i, target_address_space(4)>>
-      // expected-warning@+1 {{SYCL kernel captured-closure layout differs between host and device (captured field 'b'); likely a #ifdef __SYCL_DEVICE_ONLY__ or divergent [=] capture -- undefined behavior}}
       %fb = cir.get_member %clos[1] {name = "b"} : !cir.ptr<!rec_dlam> -> !cir.ptr<!s32i>
       cir.store %argB, %fb : !s32i, !cir.ptr<!s32i>
       cir.return
