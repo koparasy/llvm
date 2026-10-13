@@ -137,6 +137,72 @@
 //    intersect. A buffer of no bytes is never reported.
 // The warning is at B, with a note at A and one at the allocation, if known.
 //
+// sycl-mismatched-free. SYCL 2020 sec:usm, sycl::free: its precondition is
+// that "ptr points to memory allocated against ctxt using one of the USM
+// allocation routines, or is a null pointer"; C17 7.22.3.3p2: free of a
+// pointer that "does not match a pointer earlier returned by a memory
+// management function" is undefined; C++20 [expr.delete]p2 and
+// [new.delete.single]p10, [new.delete.array]p9: operator delete releases
+// only what operator new returned, operator delete[] only what operator
+// new[] returned. The check: every deallocation in an analysed host
+// function (not the SYCL implementation): a call of sycl::free (usm.free),
+// of the C free or the global operator delete / delete[] (declarations;
+// a definition is the program's own and may release anything), or a
+// cir.delete_array of the global operator delete[], whose pointer
+// (SYCLHostFacts::allocationOfReleasedPointer)
+//  - must point into allocations of one kind: in every covered calling
+//    context, a node every origin of which is a USM allocation (usm.alloc),
+//    a C allocation function, a global operator new, a global operator
+//    new[], a stack object or a global, with no unknown, incomplete,
+//    may-be-shared, may-overlap or collapsed contribution (the device-USM
+//    rule, for any kind);
+//  - must be the start of its allocation: every value it may hold is an
+//    allocation's result or an object's address, passed on unchanged
+//    (casts, a zero stride, returns, formals, stores and loads). An
+//    interior pointer is another bug: silent;
+//  - and whose kind the deallocator does not release: free, operator delete
+//    or operator delete[] of USM memory; sycl::free of malloc, operator new
+//    or new[] memory, a stack object or a global; operator delete or
+//    delete[] of malloc memory; free of operator new or new[] memory;
+//    operator delete of new[] memory and operator delete[] of new memory.
+//    free or delete of a stack object or a global is not judged.
+// Exempt: a function that also releases the same memory with the matching
+// deallocator (it chooses at run time: `if (usm) sycl::free(p, q); else
+// free(p);`). The warning is at the deallocation, with a note at each
+// allocation (at most 4). Not path-sensitive otherwise (see
+// sycl-host-deref-device-usm).
+//
+// sycl-nd-range-geometry. SYCL 2020 sec:handlerClass, parallel_for(nd_range):
+// "Throws an exception with the errc::nd_range error code if the global size
+// defined in the associated executionRange defines a non-zero index space
+// which is not evenly divisible by the local size in each dimension";
+// sec:kernel.attributes, reqd_work_group_size: "If the kernel is submitted
+// to a device that does support the work-group size, but the application
+// provides an nd_range that does not match the size from the attribute, then
+// the implementation must throw a synchronous exception with the
+// errc::nd_range error code". The check: at each recorded launch (each
+// covered calling context; SYCLHostFacts::geometryOfLaunch, per launch, not
+// ANDed over the kernel's launches), with an nd_range whose components the
+// stored-value queries prove constant:
+//  - (a) a local size that does not divide the global size in a dimension,
+//    and (c) a local size of 0 (which divides no non-zero size), when every
+//    global component is a known non-zero constant (a non-empty index
+//    space);
+//  - (d) a local size that differs from the cir.reqd_work_group_size of the
+//    device kernel (the source's [[sycl::reqd_work_group_size]], which
+//    CIRGen emits; StampReqdWorkGroupSize never overrides it, and the size
+//    it stamps is the one every launch agrees on), with the same number of
+//    dimensions;
+//  - (b) only with max-work-group-size=N (cir-offload-merge
+//    --cir-offload-max-work-group-size): a work-group of more than N
+//    work-items. The limit is a device property
+//    (info::device::max_work_group_size, info::kernel_device_specific::
+//    work_group_size); SYCL 2020 sets none, so the check is off by default.
+// A finding must hold at every record of the launch the user wrote (the
+// innermost call of the record's calling context outside the SYCL
+// implementation), with the same values. The warning is at that launch,
+// with a note at the kernel.
+//
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/BuiltinOps.h"
@@ -151,6 +217,7 @@
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/KernelBindingTable.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLHostFacts.h"
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLKernelParams.h"
+#include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -193,6 +260,9 @@ struct DiagnosticContext {
   /// (location, text) of every warning emitted, to emit each once.
   std::set<std::pair<const void *, std::string>> emitted;
   unsigned numWarnings = 0;
+  /// The largest work-group (local size product) a launch may use, for the
+  /// opt-in part of sycl-nd-range-geometry; 0: not checked.
+  uint64_t maxWorkGroupSize = 0;
 
   DiagnosticContext(mlir::ModuleOp container, const cir::SYCLHostFacts &facts)
       : container(container),
@@ -225,6 +295,8 @@ void checkHostPtrInKernel(DiagnosticContext &dc);
 void checkHostHeapPtrInKernel(DiagnosticContext &dc);
 void checkHostDerefDeviceUSM(DiagnosticContext &dc);
 void checkBufferSameHostPtr(DiagnosticContext &dc);
+void checkMismatchedFree(DiagnosticContext &dc);
+void checkNDRangeGeometry(DiagnosticContext &dc);
 
 /// The checks, in the order they run.
 constexpr HostDiagnosticCheck kChecks[] = {
@@ -232,6 +304,8 @@ constexpr HostDiagnosticCheck kChecks[] = {
     {"sycl-host-heap-ptr-in-kernel", checkHostHeapPtrInKernel, false},
     {"sycl-host-deref-device-usm", checkHostDerefDeviceUSM, true},
     {"sycl-buffer-same-host-ptr", checkBufferSameHostPtr, true},
+    {"sycl-mismatched-free", checkMismatchedFree, true},
+    {"sycl-nd-range-geometry", checkNDRangeGeometry, true},
 };
 
 //===----------------------------------------------------------------------===//
@@ -1605,6 +1679,462 @@ void checkBufferSameHostPtr(DiagnosticContext &dc) {
 }
 
 //===----------------------------------------------------------------------===//
+// sycl-mismatched-free
+//===----------------------------------------------------------------------===//
+
+/// How a host call releases memory.
+enum class Release : uint8_t { None, Free, Delete, DeleteArray, SYCLFree };
+
+llvm::StringRef releaseName(Release release) {
+  switch (release) {
+  case Release::Free:
+    return "free";
+  case Release::Delete:
+    return "operator delete";
+  case Release::DeleteArray:
+    return "operator delete[]";
+  case Release::SYCLFree:
+    return "sycl::free";
+  case Release::None:
+    break;
+  }
+  return "?";
+}
+
+/// Whether memory of \p kind may be released with \p release: USM memory
+/// with sycl::free only (SYCL 2020 sec:usm, sycl::free), malloc memory with
+/// free (C17 7.22.3.3p2), operator new memory with operator delete and operator
+/// new[] memory with operator delete[] (C++20 [expr.delete]p2,
+/// [new.delete.single]p10, [new.delete.array]p9). std::nullopt: the check
+/// does not judge the pair (free or delete of a stack object or a global).
+std::optional<bool>
+releaseMatches(cir::SYCLHostFacts::ReleasedAllocation::Kind kind,
+               Release release) {
+  using Kind = cir::SYCLHostFacts::ReleasedAllocation::Kind;
+  switch (kind) {
+  case Kind::Unknown:
+    return std::nullopt;
+  case Kind::USM:
+    return release == Release::SYCLFree;
+  case Kind::Malloc:
+    return release == Release::Free;
+  case Kind::New:
+    return release == Release::Delete;
+  case Kind::NewArray:
+    return release == Release::DeleteArray;
+  case Kind::Stack:
+  case Kind::Global:
+    if (release == Release::SYCLFree)
+      return false;
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+void checkMismatchedFree(DiagnosticContext &dc) {
+  using Kind = cir::SYCLHostFacts::ReleasedAllocation::Kind;
+  using ReleasedAllocation = cir::SYCLHostFacts::ReleasedAllocation;
+  const cir::pointsto::PointsToAnalysis &analysis = dc.facts.getAnalysis();
+  auto calleeOf = [&](mlir::Operation *op, mlir::FlatSymbolRefAttr sym) {
+    return sym ? dc.symbols.lookupNearestSymbolFrom<cir::FuncOp>(op, sym)
+               : cir::FuncOp();
+  };
+  // The deallocation \p op makes, and the pointer it releases.
+  auto releaseOf = [&](mlir::Operation *op) -> std::pair<Release, mlir::Value> {
+    if (auto del = mlir::dyn_cast<cir::DeleteArrayOp>(op)) {
+      cir::FuncOp fn = calleeOf(op, del.getDeleteFnAttr());
+      if (fn && fn.isDeclaration() && fn.getSymName().starts_with("_Zda"))
+        return {Release::DeleteArray, del.getAddress()};
+      return {Release::None, {}};
+    }
+    auto call = mlir::dyn_cast<cir::CallOp>(op);
+    if (!call || call.isIndirect() || call.getArgOperands().empty())
+      return {Release::None, {}};
+    cir::FuncOp callee =
+        calleeOf(op, op->getAttrOfType<mlir::FlatSymbolRefAttr>("callee"));
+    if (!callee)
+      return {Release::None, {}};
+    mlir::Value ptr = call.getArgOperands().front();
+    if (!mlir::isa<cir::PointerType>(ptr.getType()))
+      return {Release::None, {}};
+    auto role = callee->getAttrOfType<mlir::StringAttr>(
+        cir::CIRDialect::getSYCLHostAPIAttrName());
+    if (role && role.getValue() == "usm.free")
+      return {Release::SYCLFree, ptr};
+    // The C library's free and the global operator delete; a definition is
+    // the program's own (or a replacement), which may release anything.
+    if (!callee.isDeclaration())
+      return {Release::None, {}};
+    llvm::StringRef name = callee.getSymName();
+    if (name == "free")
+      return {Release::Free, ptr};
+    if (name.starts_with("_ZdlPv"))
+      return {Release::Delete, ptr};
+    if (name.starts_with("_ZdaPv"))
+      return {Release::DeleteArray, ptr};
+    return {Release::None, {}};
+  };
+
+  for (const auto &fn : analysis.getFunctions()) {
+    cir::FuncOp func = fn->func;
+    // The SYCL implementation releases what it allocates (usm_allocator).
+    if (isSYCLImplementation(func))
+      continue;
+    struct Site {
+      mlir::Operation *op;
+      Release release;
+      mlir::Value ptr;
+      ReleasedAllocation memory;
+    };
+    llvm::SmallVector<Site, 4> sites;
+    func.walk([&](mlir::Operation *op) {
+      auto [release, ptr] = releaseOf(op);
+      if (release == Release::None)
+        return;
+      sites.push_back(
+          {op, release, ptr, dc.facts.allocationOfReleasedPointer(ptr)});
+    });
+    for (const Site &site : sites) {
+      const ReleasedAllocation &m = site.memory;
+      // CIRGen gives the operator delete call of a delete-expression the
+      // location of the whole function: the pointer's is the expression's.
+      mlir::Location at = site.op->getLoc();
+      if (at == func.getLoc())
+        if (mlir::Operation *def = site.ptr.getDefiningOp())
+          at = def->getLoc();
+      auto debug = [&](const llvm::Twine &verdict) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "mismatched-free: @" << func.getSymName() << " "
+                   << releaseName(site.release) << " at " << formatFileLine(at)
+                   << ": " << verdict << "\n");
+        (void)verdict;
+      };
+      if (m.kind == Kind::Unknown) {
+        debug(m.why);
+        continue;
+      }
+      std::optional<bool> matches = releaseMatches(m.kind, site.release);
+      if (!matches || *matches) {
+        debug(matches ? "matches its allocation" : "not judged");
+        continue;
+      }
+      if (!m.start) {
+        debug("not the start of the allocation: " + m.startWhy);
+        continue;
+      }
+      // A function that also releases the same memory with the matching
+      // deallocator chooses between them at run time (`if (usm)
+      // sycl::free(p, q); else free(p);`): the check is not path-sensitive.
+      // Not a release only on exception unwinding (the cleanup of a
+      // new-expression whose initializer throws).
+      auto onlyOnUnwind = [](mlir::Operation *op) {
+        for (mlir::Operation *p = op->getParentOp(); p; p = p->getParentOp())
+          if (auto scope = mlir::dyn_cast<cir::CleanupScopeOp>(p))
+            if (scope.getCleanupKind() == cir::CleanupKind::EH &&
+                scope.getCleanupRegion().isAncestor(op->getParentRegion()))
+              return true;
+        return false;
+      };
+      bool alternative = llvm::any_of(sites, [&](const Site &other) {
+        if (&other == &site || other.memory.kind != m.kind ||
+            onlyOnUnwind(other.op))
+          return false;
+        std::optional<bool> ok = releaseMatches(m.kind, other.release);
+        return ok && *ok &&
+               llvm::any_of(other.memory.nodes, [&](const auto *node) {
+                 return llvm::is_contained(m.nodes, node);
+               });
+      });
+      if (alternative) {
+        debug("the function also releases the memory with the matching "
+              "deallocator");
+        continue;
+      }
+      debug("mismatched");
+
+      // The allocation sites, for the text and the notes.
+      llvm::SmallVector<const cir::pointsto::Origin *, 4> origins;
+      llvm::DenseSet<mlir::Operation *> seen;
+      for (const cir::pointsto::Node *node : m.nodes)
+        for (const cir::pointsto::Origin &origin : node->getOrigins())
+          if (seen.insert(origin.site).second)
+            origins.push_back(&origin);
+      if (origins.empty())
+        continue;
+      auto locOf = [&](const cir::pointsto::Origin &origin) {
+        if (origin.kind == cir::pointsto::Origin::Kind::GlobalSym)
+          if (mlir::Operation *global =
+                  dc.symbols.lookupSymbolIn(dc.host, origin.sym))
+            return global->getLoc();
+        if (!origin.site)
+          return dc.container.getLoc();
+        // CIRGen gives the operator new call of a new-expression the
+        // location of the whole function: the users of its result have the
+        // expression's.
+        mlir::Location loc = origin.site->getLoc();
+        auto parent = origin.site->getParentOfType<cir::FuncOp>();
+        if (parent && loc == parent.getLoc() &&
+            origin.site->getNumResults() == 1)
+          for (mlir::Operation *user : origin.site->getResult(0).getUsers())
+            if (user->getLoc() != loc)
+              return user->getLoc();
+        return loc;
+      };
+      const cir::pointsto::Origin &first = *origins.front();
+      std::string by;
+      switch (m.kind) {
+      case Kind::USM: {
+        std::optional<cir::SYCLUSMKind> usm =
+            cir::getSYCLUSMAllocKind(first.site, &dc.symbols);
+        by = !usm                               ? "sycl::malloc"
+             : *usm == cir::SYCLUSMKind::Device ? "sycl::malloc_device"
+             : *usm == cir::SYCLUSMKind::Shared ? "sycl::malloc_shared"
+                                                : "sycl::malloc_host";
+        break;
+      }
+      case Kind::Malloc: {
+        auto call = mlir::dyn_cast_if_present<cir::CallOp>(first.site);
+        std::optional<llvm::StringRef> name =
+            call ? call.getCallee() : std::nullopt;
+        by = name ? name->str() : std::string("malloc");
+        break;
+      }
+      case Kind::New:
+        by = "operator new";
+        break;
+      case Kind::NewArray:
+        by = "operator new[]";
+        break;
+      case Kind::Stack: {
+        auto alloca = mlir::dyn_cast_if_present<cir::AllocaOp>(first.site);
+        by = ("the stack variable '" +
+              (alloca ? alloca.getName() : llvm::StringRef("?")) + "'")
+                 .str();
+        break;
+      }
+      case Kind::Global:
+        by = ("the global '" + first.sym.getLeafReference().getValue() + "'")
+                 .str();
+        break;
+      case Kind::Unknown:
+        continue;
+      }
+      std::string where = formatFileLine(locOf(first));
+      if (where.empty())
+        where = "an unknown location";
+      if (origins.size() > 1)
+        where += " (and " + std::to_string(origins.size() - 1) + " other site" +
+                 (origins.size() > 2 ? "s" : "") + ")";
+      bool object = m.kind == Kind::Stack || m.kind == Kind::Global;
+      std::string text = (object ? "memory of " : "memory allocated by ") + by +
+                         " at " + where + " is released with " +
+                         releaseName(site.release).str() +
+                         " [sycl-mismatched-free]";
+      std::optional<mlir::InFlightDiagnostic> diag = dc.warn(at, text);
+      if (!diag)
+        continue;
+      llvm::StringRef rule;
+      switch (m.kind) {
+      case Kind::USM:
+        rule = "USM memory must be released with sycl::free (SYCL 2020 "
+               "sec:usm, sycl::free)";
+        break;
+      case Kind::Malloc:
+        rule = "memory from the C allocation functions must be released with "
+               "free (C17 7.22.3.3)";
+        break;
+      case Kind::New:
+        rule = "memory from operator new must be released with operator "
+               "delete (C++20 [expr.delete])";
+        break;
+      case Kind::NewArray:
+        rule = "memory from operator new[] must be released with operator "
+               "delete[] (C++20 [expr.delete])";
+        break;
+      case Kind::Stack:
+      case Kind::Global:
+        rule = "sycl::free releases only USM allocations (SYCL 2020 "
+               "sec:usm, sycl::free)";
+        break;
+      case Kind::Unknown:
+        break;
+      }
+      bool firstNote = true;
+      for (const cir::pointsto::Origin *origin :
+           llvm::ArrayRef(origins).take_front(4)) {
+        if (firstNote)
+          diag->attachNote(locOf(*origin))
+              << (object ? "the object is defined here; "
+                         : "the memory is allocated here; ")
+              << rule;
+        else
+          diag->attachNote(locOf(*origin))
+              << (object ? "or here" : "or allocated here");
+        firstNote = false;
+      }
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// sycl-nd-range-geometry
+//===----------------------------------------------------------------------===//
+
+void checkNDRangeGeometry(DiagnosticContext &dc) {
+  const cir::pointsto::PointsToAnalysis &analysis = dc.facts.getAnalysis();
+  const cir::pointsto::CallPathTable &paths = analysis.getCallPaths();
+  auto inSYCL = [](mlir::Operation *op) {
+    auto func = op->getParentOfType<cir::FuncOp>();
+    return func && isSYCLImplementation(func);
+  };
+
+  // One group per (user launch call, kernel): the findings of its records
+  // (one per covered calling context). A finding is reported only if every
+  // record has it.
+  struct Group {
+    mlir::Operation *at = nullptr;
+    cir::FuncOp kernel;
+    unsigned records = 0;
+    // Each finding (its text) and the number of records that have it.
+    std::map<std::string, unsigned> findings;
+  };
+  llvm::MapVector<std::pair<mlir::Operation *, mlir::Operation *>, Group>
+      groups;
+  for (const cir::pointsto::LaunchRecord &launch : analysis.getLaunches()) {
+    // The launch as the user wrote it: the innermost call of the record's
+    // calling context (and the launch call itself) that is not in the SYCL
+    // implementation, which is the user's call into it.
+    llvm::SmallVector<mlir::Operation *, 4> chain = paths.getPath(launch.ctx);
+    chain.push_back(launch.call);
+    mlir::Operation *at = nullptr;
+    for (mlir::Operation *op : chain)
+      if (!inSYCL(op))
+        at = op;
+    if (!at)
+      at = launch.call;
+    cir::SYCLHostFacts::GeometryFact fact = dc.facts.geometryOfLaunch(launch);
+    const cir::SyclGeometry &g = fact.geometry;
+    LLVM_DEBUG(llvm::dbgs()
+               << "nd-range-geometry: launch at "
+               << formatFileLine(at->getLoc()) << " ("
+               << formatFileLine(launch.call->getLoc())
+               << "): " << cir::formatSyclGeometry(g)
+               << (fact.note.empty() ? "" : " (" + fact.note + ")") << "\n");
+    for (mlir::StringAttr name : launch.kernelNames) {
+      for (cir::FuncOp kernel : dc.facts.getDeviceKernels(name.getValue())) {
+        if (kernel.getCallingConv() != cir::CallingConv::SpirKernel)
+          continue;
+        Group &group = groups[{at, kernel.getOperation()}];
+        group.at = at;
+        group.kernel = kernel;
+        ++group.records;
+        // A plain range launch (no local size) has nothing to check.
+        if (!g.valid || g.local.empty() || g.local.size() != g.dims ||
+            g.global.size() != g.dims)
+          continue;
+        llvm::SmallVector<std::string, 2> found;
+        // The global index space is not empty: every global component is
+        // a known non-zero constant (SYCL 2020: an nd_range whose global
+        // size defines a zero index space is not checked).
+        bool nonEmpty = llvm::all_of(
+            g.global, [](std::optional<int64_t> c) { return c && *c > 0; });
+        for (unsigned d = 0; d < g.dims && nonEmpty; ++d) {
+          std::optional<int64_t> local = g.local[d];
+          if (!local || *local < 0)
+            continue;
+          // (c) A zero local size.
+          if (*local == 0) {
+            found.push_back("nd_range local size is 0 in dimension " +
+                            std::to_string(d) + " (global size " +
+                            std::to_string(*g.global[d]) + ")");
+            continue;
+          }
+          // (a) A local size that does not divide the global size.
+          if (*g.global[d] % *local != 0)
+            found.push_back(
+                "nd_range global size " + std::to_string(*g.global[d]) +
+                " is not a multiple of local size " + std::to_string(*local) +
+                " in dimension " + std::to_string(d));
+        }
+        auto formatLocal = [&](llvm::ArrayRef<int64_t> sizes) {
+          std::string out;
+          for (auto [i, s] : llvm::enumerate(sizes))
+            out += (i ? ", " : "") + std::to_string(s);
+          return out;
+        };
+        bool localKnown = llvm::all_of(
+            g.local, [](std::optional<int64_t> c) { return c && *c >= 0; });
+        llvm::SmallVector<int64_t, 3> local;
+        if (localKnown)
+          for (std::optional<int64_t> c : g.local)
+            local.push_back(*c);
+        // (b) Opt-in: a work-group larger than the given maximum.
+        if (localKnown && dc.maxWorkGroupSize) {
+          uint64_t product = 1;
+          bool overflow = false;
+          for (int64_t c : local)
+            overflow |= __builtin_mul_overflow(
+                product, static_cast<uint64_t>(c), &product);
+          if (overflow || product > dc.maxWorkGroupSize)
+            found.push_back(
+                "nd_range work-group size " + formatLocal(local) + " (" +
+                (overflow ? std::string("overflows")
+                          : std::to_string(product) + " work-items") +
+                ") exceeds the maximum work-group size " +
+                std::to_string(dc.maxWorkGroupSize) +
+                " given by --cir-offload-max-work-group-size");
+        }
+        // (d) A required work-group size on the kernel the local size does
+        // not match (in natural order, one entry per dimension).
+        if (localKnown)
+          if (auto reqd = kernel->getAttrOfType<mlir::ArrayAttr>(
+                  "cir.reqd_work_group_size");
+              reqd && reqd.size() == g.dims) {
+            llvm::SmallVector<int64_t, 3> want;
+            for (mlir::Attribute a : reqd)
+              if (auto i = mlir::dyn_cast<mlir::IntegerAttr>(a))
+                want.push_back(i.getInt());
+            if (want.size() == g.dims && want != local)
+              found.push_back("nd_range local size " + formatLocal(local) +
+                              " does not match the kernel's "
+                              "reqd_work_group_size(" +
+                              formatLocal(want) + ")");
+          }
+        for (std::string &text : found)
+          ++group.findings[text];
+      }
+    }
+  }
+
+  for (auto &entry : groups) {
+    Group &group = entry.second;
+    for (auto &[text, count] : group.findings) {
+      // The fact must hold at every record of the launch.
+      if (count != group.records)
+        continue;
+      std::optional<mlir::InFlightDiagnostic> diag =
+          dc.warn(group.at->getLoc(), text + " [sycl-nd-range-geometry]");
+      if (!diag)
+        continue;
+      if (llvm::StringRef(text).contains("reqd_work_group_size"))
+        diag->attachNote(group.kernel.getLoc())
+            << "the kernel requires this work-group size; a launch with "
+               "another local size throws errc::nd_range (SYCL 2020 "
+               "sec:kernel.attributes)";
+      else if (llvm::StringRef(text).contains("maximum work-group size"))
+        diag->attachNote(group.kernel.getLoc())
+            << "the kernel launched is defined here";
+      else
+        diag->attachNote(group.kernel.getLoc())
+            << "the kernel launched is defined here; the launch throws "
+               "errc::nd_range: the global size must be a multiple of the "
+               "local size in each dimension (SYCL 2020 sec:handlerClass, "
+               "parallel_for)";
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // The pass
 //===----------------------------------------------------------------------===//
 
@@ -1676,6 +2206,7 @@ void OffloadHostDiagnosticsPass::runOnOperation() {
 
   llvm::StringSet<> ran;
   DiagnosticContext dc(container, facts);
+  dc.maxWorkGroupSize = maxWorkGroupSize;
   for (const HostDiagnosticCheck *check : selected)
     if (ran.insert(check->tag).second)
       check->run(dc);

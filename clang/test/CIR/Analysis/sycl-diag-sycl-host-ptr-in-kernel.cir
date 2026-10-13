@@ -35,7 +35,7 @@
 // BOTH-COUNT-1: warning: kernel argument 'P' points to host heap memory
 // BOTH-NOT: warning:
 // NONE-NOT: warning
-// BAD: unknown host diagnostic 'bogus' (expected all, none or one of: sycl-host-ptr-in-kernel, sycl-host-heap-ptr-in-kernel, sycl-host-deref-device-usm, sycl-buffer-same-host-ptr)
+// BAD: unknown host diagnostic 'bogus' (expected all, none or one of: sycl-host-ptr-in-kernel, sycl-host-heap-ptr-in-kernel, sycl-host-deref-device-usm, sycl-buffer-same-host-ptr, sycl-mismatched-free, sycl-nd-range-geometry)
 
 // sycl-host-ptr-in-kernel (cir-offload-host-diagnostics, HostDiagnostics.cpp):
 // a pointer a kernel launch captures that must point to host memory (a stack

@@ -200,15 +200,12 @@ void OffloadStampReqdWorkGroupSizePass::runOnOperation() {
     for (cir::FuncOp kernel : binding.deviceKernels) {
       if (kernel.getCallingConv() != cir::CallingConv::SpirKernel)
         continue;
-      // A required size already present is authoritative -- never override it.
-      if (auto existing = kernel->getAttrOfType<mlir::ArrayAttr>(
-              "cir.reqd_work_group_size")) {
-        assert(existing == attr &&
-               "recovered local size disagrees with an existing "
-               "cir.reqd_work_group_size");
-        (void)existing;
+      // A required size already present (the source's
+      // reqd_work_group_size) is authoritative -- never override it. The
+      // launches may disagree with it: they throw errc::nd_range, which
+      // cir-offload-host-diagnostics (sycl-nd-range-geometry) reports.
+      if (kernel->hasAttr("cir.reqd_work_group_size"))
         continue;
-      }
       kernel->setAttr("cir.reqd_work_group_size", attr);
       changed = true;
       cir::noteInternalizedSYCLKernelUse(kernel);

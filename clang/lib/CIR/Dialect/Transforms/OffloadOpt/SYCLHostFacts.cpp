@@ -190,6 +190,7 @@
 #include "clang/CIR/Dialect/Transforms/OffloadOpt/SYCLPointsToModels.h"
 #include "clang/CIR/Interfaces/CIROpInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Path.h"
@@ -1172,6 +1173,343 @@ SYCLHostFacts::hostMemoryOfBuffer(Operation *op) const {
       return fail(*why);
   out.node = node;
   out.offset = offset;
+  return out;
+}
+
+// The released-allocation rule (allocationOfReleasedPointer, D4). A host
+// pointer value p of an analysed function F, released by a deallocation
+// call, must point into an allocation of kind K when, for every cell of
+// pointsToInContexts(p) (F's own graph, or, F covered, the leaves of its
+// calling contexts: every execution of F is in one of them):
+//  (a) the cell's node, and every node up to the root of its subobject tree
+//      (where the origins are), has none of UnknownObj, Ghost, Function,
+//      Incomplete, MayBeShared, MayOverlap or Collapsed, and the root has at
+//      least one origin, every one of kind K: a usm.alloc call (USM; the
+//      root is HasUSM), a call of a declared C allocation function (Malloc)
+//      or of a declared global operator new or new[] (New, NewArray; the
+//      root is not HasUSM), a cir.alloca (Stack) or a global (Global);
+//  (b) no node on that way is reachable from a formal of a function's own
+//      graph (BU mode, getFormalReach; see the device-USM rule (b));
+//  (c) the pointer value can only be one the analysed code computed:
+//      unknownValueWhy, as for noalias and the device-USM rule.
+// External is allowed, for the reason given at the host-only rule.
+// SOUNDNESS. As for the device-USM rule: by (c) a non-null run-time value of
+// p points into an object allocated at an origin of one of the roots, each
+// of kind K by (a). Whether p points to the object's start is a separate
+// question (isAllocationStart below): a pointer into an array node has
+// element-relative offsets, so the cell's offset says nothing about it.
+//
+// The start rule (notAllocationStartWhy): every value p may hold is the
+// start of the object its allocation made, when p is
+//  - a cir.alloca or cir.get_global (the object's address), or the result
+//    of a call of an allocation function (allocationKindOfCallee): what an
+//    allocation returns is the start of its object;
+//  - a bitcast, address-space or array-decay cast, or a cir.ptr_stride by a
+//    constant 0, of such a value (the same address);
+//  - the result of a call of a function with a body whose every cir.return
+//    operand is such a value (the walk enters the callee; a formal of the
+//    callee it reaches is the operand of that call);
+//  - a cir.load whose address points to one cell whose stored-value query
+//    at the load is complete, holds no constant but the null pointer and
+//    only defs that are such values (in any function: after a load the walk
+//    leaves the calls it entered, a formal it reaches is judged at every
+//    caller). A null pointer releases nothing (C17 7.22.3.3p2, C++20
+//    [expr.delete]p2, sycl::free accepts it): when the deallocation releases
+//    memory, the pointer is a start;
+//  - a formal of a function every caller of which is analysed and calls it
+//    directly (its address is not taken), whose operand at each call is such
+//    a value.
+// Anything else (a select, a ptr_stride by another offset, an integer round
+// trip, a value the walk cannot follow) is not known to be a start. A value
+// the walk reaches again while judging it (a cycle of copies: pointers
+// swapped in a loop) adds nothing: the values of a cycle are those entering
+// it, which the walk judges (the greatest fixed point; nothing is memoized
+// across queries).
+// SOUNDNESS. Each case only passes on an address unchanged (casts, a zero
+// stride, a returned value, a value stored and loaded back: the stored-value
+// query is sound for the analysed code's writes and complete means there are
+// no others; a formal holds what its callers pass) from an allocation's
+// result or an object's address, which is the start of that object. With
+// the rule above, p is the start of an object of kind K.
+SYCLHostFacts::ReleasedAllocation::Kind
+SYCLHostFacts::allocationKindOfCallee(cir::FuncOp callee) {
+  using Kind = ReleasedAllocation::Kind;
+  if (!callee)
+    return Kind::Unknown;
+  if (getRole(callee) == "usm.alloc")
+    return Kind::USM;
+  // A definition is the program's own allocator (or a replacement), whose
+  // memory may come from anywhere.
+  if (!callee.isDeclaration())
+    return Kind::Unknown;
+  StringRef name = callee.getSymName();
+  if (llvm::is_contained({"malloc", "calloc", "realloc", "aligned_alloc",
+                          "posix_memalign", "strdup", "strndup"},
+                         name))
+    return Kind::Malloc;
+  if (name.starts_with("_Znw"))
+    return Kind::New;
+  if (name.starts_with("_Zna"))
+    return Kind::NewArray;
+  return Kind::Unknown;
+}
+
+std::optional<std::string> SYCLHostFacts::notAllocationStartWhy(
+    Value value, SmallVectorImpl<Operation *> &entered, unsigned depth,
+    llvm::DenseSet<Value> &active) const {
+  if (depth > 24)
+    return std::string("the value is too far from its allocation");
+  // Casts and zero strides keep the address.
+  for (;;) {
+    if (auto cast = value.getDefiningOp<cir::CastOp>()) {
+      cir::CastKind kind = cast.getKind();
+      if (kind != cir::CastKind::bitcast &&
+          kind != cir::CastKind::address_space &&
+          kind != cir::CastKind::array_to_ptrdecay)
+        return "a " + cir::stringifyCastKind(kind).str() + " cast at " +
+               formatLocation(cast);
+      value = cast.getSrc();
+      continue;
+    }
+    if (auto stride = value.getDefiningOp<cir::PtrStrideOp>()) {
+      auto c = stride.getStride().getDefiningOp<cir::ConstantOp>();
+      auto i = c ? dyn_cast<cir::IntAttr>(c.getValue()) : cir::IntAttr();
+      if (!i || !i.getValue().isZero())
+        return "an offset pointer (cir.ptr_stride at " +
+               formatLocation(stride) + ")";
+      value = stride.getBase();
+      continue;
+    }
+    break;
+  }
+  // A value the walk is already judging: a cycle of copies (two pointers
+  // swapped in a loop). A copy adds no value of its own, so the values of a
+  // cycle are those that enter it, each of which the walk judges.
+  if (!active.insert(value).second)
+    return std::nullopt;
+  auto done = llvm::scope_exit([&] { active.erase(value); });
+
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    auto func = dyn_cast<cir::FuncOp>(arg.getOwner()->getParentOp());
+    if (!func || arg.getOwner() != &func.getBody().front())
+      return std::string("a block argument");
+    unsigned index = arg.getArgNumber();
+    // A formal of the callee the walk entered: that call's operand.
+    if (!entered.empty() && getDirectCallee(entered.back(), symbols) == func) {
+      Operation *call = entered.pop_back_val();
+      auto restore = llvm::scope_exit([&] { entered.push_back(call); });
+      auto callOp = cast<CIRCallOpInterface>(call);
+      if (index >= callOp.getNumArgOperands())
+        return std::string("a formal without an operand");
+      return notAllocationStartWhy(callOp.getArgOperand(index), entered,
+                                   depth + 1, active);
+    }
+    // Otherwise every caller's operand.
+    const TUFunction *fn = analysis->getFunction(func);
+    if (!fn || !fn->formalsComplete)
+      return ("parameter #" + Twine(index) + " of @" + func.getSymName() +
+              ", which may have callers that are not analysed")
+          .str();
+    if (!callers) {
+      callers.emplace();
+      auto module = func->getParentOfType<ModuleOp>();
+      if (std::optional<SymbolTable::UseRange> uses =
+              SymbolTable::getSymbolUses(&module.getBodyRegion()))
+        for (const SymbolTable::SymbolUse &use : *uses) {
+          Operation *user = use.getUser();
+          auto call = dyn_cast<CIRCallOpInterface>(user);
+          auto sym = user->getAttrOfType<FlatSymbolRefAttr>("callee");
+          StringAttr name = use.getSymbolRef().getRootReference();
+          if (call && !call.isIndirect() && sym &&
+              mlir::Attribute(sym) == use.getSymbolRef())
+            (*callers)[name].push_back(user);
+          else
+            (*callers)[name].push_back(nullptr); // Address taken.
+        }
+    }
+    auto it = callers->find(func.getSymNameAttr());
+    if (it == callers->end() || it->second.empty() || it->second.size() > 16)
+      return ("parameter #" + Twine(index) + " of @" + func.getSymName() +
+              (it == callers->end() || it->second.empty()
+                   ? ", which has no caller"
+                   : ", which has too many callers"))
+          .str();
+    for (Operation *call : it->second) {
+      if (!call)
+        return ("parameter #" + Twine(index) + " of @" + func.getSymName() +
+                ", whose address is taken")
+            .str();
+      auto callOp = cast<CIRCallOpInterface>(call);
+      if (index >= callOp.getNumArgOperands())
+        return std::string("a formal without an operand");
+      SmallVector<Operation *, 4> none;
+      if (std::optional<std::string> why = notAllocationStartWhy(
+              callOp.getArgOperand(index), none, depth + 1, active))
+        return why;
+    }
+    return std::nullopt;
+  }
+
+  Operation *def = value.getDefiningOp();
+  if (isa<cir::AllocaOp, cir::GetGlobalOp>(def))
+    return std::nullopt;
+  if (auto call = dyn_cast<CIRCallOpInterface>(def)) {
+    cir::FuncOp callee = getDirectCallee(def, symbols);
+    if (allocationKindOfCallee(callee) != ReleasedAllocation::Kind::Unknown)
+      return std::nullopt;
+    if (!callee || callee.isDeclaration() || entered.size() > 8)
+      return "the result of a call at " + formatLocation(def) +
+             " the analysis does not follow";
+    // Every value the callee returns.
+    SmallVector<cir::ReturnOp, 2> returns;
+    callee.walk([&](cir::ReturnOp ret) { returns.push_back(ret); });
+    if (returns.empty())
+      return "@" + callee.getSymName().str() + " returns no value";
+    entered.push_back(def);
+    auto restore = llvm::scope_exit([&] { entered.pop_back(); });
+    for (cir::ReturnOp ret : returns) {
+      if (ret.getNumOperands() != 1)
+        return "@" + callee.getSymName().str() + " returns no value";
+      if (std::optional<std::string> why = notAllocationStartWhy(
+              ret.getOperand(0), entered, depth + 1, active))
+        return why;
+    }
+    return std::nullopt;
+  }
+  if (auto load = dyn_cast<cir::LoadOp>(def)) {
+    auto func = load->getParentOfType<cir::FuncOp>();
+    if (!func || !analysis->getFunction(func))
+      return "a load at " + formatLocation(load) + " the analysis does not see";
+    ObjectSet set = analysis->pointsTo(load.getAddr());
+    if (set.cells.size() != 1)
+      return "a load at " + formatLocation(load) +
+             " from memory the analysis does not know";
+    auto ptrTy = dyn_cast<cir::PointerType>(load.getType());
+    if (!ptrTy)
+      return std::string("not a pointer");
+    StoredValues values = analysis->getStoredValueQuery().valuesAt(
+        set.cells.front(), layout->getTypeSize(ptrTy).getFixedValue(), load,
+        ptrTy);
+    if (!values.complete)
+      return "the load at " + formatLocation(load) +
+             " may read a value the analysis does not know: " +
+             explain(values.why);
+    // A null pointer releases nothing (C17 7.22.3.3p2, [expr.delete]p2,
+    // sycl::free): it is no other allocation's start.
+    if (!llvm::all_of(values.consts, [](TypedAttr c) {
+          auto p = dyn_cast<cir::ConstPtrAttr>(c);
+          return p && p.isNullValue();
+        }))
+      return "the load at " + formatLocation(load) +
+             " may read a constant that is not a null pointer";
+    if (values.defs.empty())
+      return "the load at " + formatLocation(load) + " reads no stored value";
+    // The stored values are of any function: leave the calls entered.
+    SmallVector<Operation *, 4> none;
+    for (Value stored : values.defs)
+      if (std::optional<std::string> why =
+              notAllocationStartWhy(stored, none, depth + 1, active))
+        return why;
+    return std::nullopt;
+  }
+  return "a value computed by " + def->getName().getStringRef().str() + " at " +
+         formatLocation(def);
+}
+
+SYCLHostFacts::ReleasedAllocation
+SYCLHostFacts::allocationOfReleasedPointer(Value ptr) const {
+  using Kind = ReleasedAllocation::Kind;
+  ReleasedAllocation out;
+  auto fail = [&](const Twine &why) {
+    out = ReleasedAllocation();
+    out.why = why.str();
+    return out;
+  };
+  if (!gaveUp.empty())
+    return fail(gaveUp);
+  if (!isa<cir::PointerType>(ptr.getType()))
+    return fail("not a pointer");
+  auto func = ptr.getParentRegion()
+                  ? ptr.getParentRegion()->getParentOfType<cir::FuncOp>()
+                  : cir::FuncOp();
+  if (!func || !analysis->getFunction(func))
+    return fail("not a value of an analysed function");
+  ObjectSet set = analysis->pointsToInContexts(ptr);
+  if (set.cells.empty())
+    return fail("it points to nothing the analysis sees");
+
+  const Graph &graph = analysis->getGraph();
+  const llvm::DenseSet<const Node *> &reach = getFormalReach();
+  constexpr NodeFlags unsure = NodeFlags::UnknownObj | NodeFlags::Ghost |
+                               NodeFlags::Function | NodeFlags::Incomplete |
+                               NodeFlags::MayBeShared | NodeFlags::MayOverlap |
+                               NodeFlags::Collapsed;
+  Kind kind = Kind::Unknown;
+  for (Cell cell : set.cells) {
+    const Node *start = cell.resolve().getNode();
+    const Node *node = start;
+    // (a), (b) The way up to the root of the subobject tree.
+    for (unsigned depth = 0;; ++depth) {
+      std::string id = ("n" + Twine(node->getId())).str();
+      if (hasAny(node->getFlags(), unsure))
+        return fail(id + " is " + toString(node->getFlags() & unsure));
+      if (reach.contains(node))
+        return fail(id + " is reachable from a formal of a function's own " +
+                    "graph");
+      if (!node->getOrigins().empty())
+        break;
+      SmallVector<ParentLink, 1> parents = graph.getParents(node);
+      if (parents.size() != 1 || depth > 16)
+        return fail(id + " has no allocation site the analysis sees");
+      node = parents.front().parent;
+    }
+    std::string id = ("n" + Twine(node->getId())).str();
+    bool usm = node->hasFlags(NodeFlags::HasUSM);
+    for (const Origin &origin : node->getOrigins()) {
+      Kind here = Kind::Unknown;
+      switch (origin.kind) {
+      case Origin::Kind::HeapCall:
+        here = allocationKindOfCallee(getDirectCallee(origin.site, symbols));
+        // HasUSM on the root iff the origins are USM allocations.
+        if ((here == Kind::USM) != usm)
+          here = Kind::Unknown;
+        break;
+      case Origin::Kind::Alloca:
+        if (!usm && isa_and_present<cir::AllocaOp>(origin.site))
+          here = Kind::Stack;
+        break;
+      case Origin::Kind::GlobalSym:
+        if (!usm && origin.sym)
+          here = Kind::Global;
+        break;
+      case Origin::Kind::GhostSite:
+      case Origin::Kind::FuncSym:
+        break;
+      }
+      if (here == Kind::Unknown)
+        return fail(id + " has an origin of no known allocation kind (" +
+                    formatLocation(origin.site) + ")");
+      if (kind != Kind::Unknown && kind != here)
+        return fail(id + " merges allocations of different kinds");
+      kind = here;
+    }
+    // (c) Only values the analysed code computed.
+    if (std::optional<std::string> why = unknownValueWhy(node, false))
+      return fail(*why);
+    if (start != node)
+      if (std::optional<std::string> why = unknownValueWhy(start, false))
+        return fail(*why);
+    if (!llvm::is_contained(out.nodes, node))
+      out.nodes.push_back(node);
+  }
+  out.kind = kind;
+  SmallVector<Operation *, 4> entered;
+  llvm::DenseSet<Value> active;
+  if (std::optional<std::string> why =
+          notAllocationStartWhy(ptr, entered, 0, active))
+    out.startWhy = *why;
+  else
+    out.start = true;
   return out;
 }
 

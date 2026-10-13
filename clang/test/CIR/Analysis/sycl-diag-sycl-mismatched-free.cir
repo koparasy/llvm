@@ -1,0 +1,251 @@
+// RUN: cir-opt %s -verify-diagnostics -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=sycl-mismatched-free})"
+// RUN: sed 's/CLOSED-xpected-/expected-/' %s > %t.closed.cir
+// RUN: cir-opt %t.closed.cir -verify-diagnostics -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=sycl-mismatched-free host-facts-closed-tu=true})"
+//
+// The same input without the expectations: with the check off (or only the
+// other checks), or no host facts, nothing is reported; the pass changes
+// nothing.
+// RUN: sed 's/expected-/xpected-/' %s > %t.cir
+// RUN: cir-opt %t.cir -o %t.none.cir \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=none})" 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=NONE --allow-empty
+// RUN: cir-opt %t.cir -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=sycl-host-ptr-in-kernel,sycl-host-heap-ptr-in-kernel,sycl-host-deref-device-usm,sycl-buffer-same-host-ptr,sycl-nd-range-geometry})" 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=NONE --allow-empty
+// RUN: cir-opt %t.cir -o /dev/null \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{host-facts=none})" 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=NONE --allow-empty
+// RUN: cir-opt %t.cir -o %t.all.cir 2>&1 \
+// RUN:   -pass-pipeline="builtin.module(cir-offload-host-diagnostics{checks=all})" \
+// RUN:   | FileCheck %s --check-prefix=ALL
+// RUN: diff %t.none.cir %t.all.cir
+
+// `all` includes the check: the 8 warnings below (open mode).
+// ALL-COUNT-8: warning: memory {{.*}} is released with {{.*}} [sycl-mismatched-free]
+// ALL-NOT: warning:
+// NONE-NOT: warning
+
+// sycl-mismatched-free (cir-offload-host-diagnostics, HostDiagnostics.cpp):
+// a deallocation whose pointer must be the start of an allocation of
+// another family (SYCL 2020 sec:usm, sycl::free; C17 7.22.3.3; C++20
+// [expr.delete]). The allocation and release functions are declarations
+// (the C library, the global operators, the role-tagged USM API).
+//
+// Positive:
+//  - USMFREE: free of a malloc_device result;
+//  - USMDELETE: operator delete[] of a malloc_shared result, through a
+//    local slot (the -O0 shape), which also may hold null;
+//  - MALLOCSYCL: sycl::free of a malloc result;
+//  - STACKSYCL: sycl::free of a stack array (array decay);
+//  - NEWARRAY: operator delete of an operator new[] result;
+//  - NEWFREE: free of an operator new result, whose new-expression has an
+//    exception cleanup that releases it with operator delete (only on
+//    unwinding: no run-time choice);
+//  - DELARRAY: cir.delete_array of a malloc result;
+//  - WRAPPED: free of what a wrapper returns (its body returns the
+//    malloc_host result);
+//  - HELPER (closed-tu only): a helper frees its parameter; its one caller
+//    passes a malloc_device result (open mode: the helper is externally
+//    visible, other TUs may call it);
+//  - OWNFREE (closed-tu only): the same in the program's own deallocator
+//    my_free, given a malloc_device result: the warning is at its free.
+// Negative (silent):
+//  - MATCH: the matching deallocators;
+//  - INTERIOR: free of a USM pointer plus 1 (not the start);
+//  - UNKNOWN: free of what an unknown function returns;
+//  - PARAM: free of a parameter of an uncalled external function;
+//  - SELECT: free of a select between a USM and a malloc pointer;
+//  - CHOOSE: sycl::free on one branch and free on the other (a run-time
+//    choice of deallocator);
+//  - MIXED: a helper sycl::frees its parameter, given USM and malloc memory.
+!s8i = !cir.int<s, 8>
+!s32i = !cir.int<s, 32>
+!u64i = !cir.int<u, 64>
+!f32 = !cir.float
+!void = !cir.void
+!rec_queue = !cir.struct<class "sycl::_V1::queue" {data !cir.ptr<!s8i>}>
+!rec_obj = !cir.struct<"Obj" {data !s32i}>
+
+module attributes {cir.offload.container} {
+  module @host attributes {cir.offload.kind = #cir.offload<host>, cir.triple = "x86_64-unknown-linux-gnu"} {
+    cir.func private @opaque() -> !cir.ptr<!f32>
+    cir.func private @cond() -> !cir.bool
+    cir.func private @malloc(!u64i) -> !cir.ptr<!void>
+    cir.func private @free(!cir.ptr<!void>)
+    cir.func private @_Znwm(!u64i) -> !cir.ptr<!void>
+    cir.func private @_Znam(!u64i) -> !cir.ptr<!void>
+    cir.func private @_ZdlPv(!cir.ptr<!void>)
+    cir.func private @_ZdaPv(!cir.ptr<!void>)
+    cir.func private @_ZN3ObjC1Ev(!cir.ptr<!rec_obj>)
+    cir.func private @malloc_device(!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32, cir.sycl_usm_kind = "device"}
+    cir.func private @malloc_shared(!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32, cir.sycl_usm_kind = "shared"}
+    cir.func private @malloc_host(!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32> attributes {cir.sycl_host_api = "usm.alloc", cir.sycl_host_api_arg = 0 : i32, cir.sycl_usm_kind = "host"}
+    cir.func private @usm_free(!cir.ptr<!void>, !cir.ptr<!rec_queue>) attributes {cir.sycl_host_api = "usm.free", cir.sycl_host_api_arg = 0 : i32}
+    // OWNFREE: the program's own deallocator, which calls free.
+    cir.func @my_free(%p: !cir.ptr<!void>) {
+      // CLOSED-xpected-warning @+1 {{memory allocated by sycl::malloc_device at}}
+      cir.call @free(%p) : (!cir.ptr<!void>) -> ()
+      cir.return
+    }
+
+    // WRAPPED: float *wrap(n, q) { return malloc_host(n, q); }
+    cir.func internal @wrap(%n: !u64i, %q: !cir.ptr<!rec_queue>) -> !cir.ptr<!f32> {
+      // expected-note @+1 {{the memory is allocated here}}
+      %h = cir.call @malloc_host(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      cir.return %h : !cir.ptr<!f32>
+    }
+    // HELPER: void release(float *p) { free(p); }, called once.
+    cir.func @release(%p: !cir.ptr<!f32>) {
+      %v = cir.cast bitcast %p : !cir.ptr<!f32> -> !cir.ptr<!void>
+      // CLOSED-xpected-warning @+1 {{memory allocated by sycl::malloc_device at}}
+      cir.call @free(%v) : (!cir.ptr<!void>) -> ()
+      cir.return
+    }
+    // PARAM: an uncalled external function frees its parameter.
+    cir.func @param(%p: !cir.ptr<!f32>) {
+      %v = cir.cast bitcast %p : !cir.ptr<!f32> -> !cir.ptr<!void>
+      cir.call @free(%v) : (!cir.ptr<!void>) -> ()
+      cir.return
+    }
+    // MIXED: a helper given USM and malloc memory.
+    cir.func internal @mixed(%p: !cir.ptr<!void>, %q: !cir.ptr<!rec_queue>) {
+      cir.call @usm_free(%p, %q) : (!cir.ptr<!void>, !cir.ptr<!rec_queue>) -> ()
+      cir.return
+    }
+
+    cir.func @main(%q: !cir.ptr<!rec_queue>) {
+      %n = cir.const #cir.int<64> : !u64i
+
+      // USMFREE
+      // expected-note @+1 {{the memory is allocated here; USM memory must be released with sycl::free}}
+      %d1 = cir.call @malloc_device(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      %v1 = cir.cast bitcast %d1 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      // expected-warning @+1 {{memory allocated by sycl::malloc_device at}}
+      cir.call @free(%v1) : (!cir.ptr<!void>) -> ()
+
+      // USMDELETE: float *s = nullptr; s = malloc_shared(n, q); delete[] s;
+      %slot = cir.alloca "s" align(8) : !cir.ptr<!cir.ptr<!f32>>
+      %null = cir.const #cir.ptr<null> : !cir.ptr<!f32>
+      cir.store %null, %slot : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      // expected-note @+1 {{the memory is allocated here}}
+      %s2 = cir.call @malloc_shared(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      cir.store %s2, %slot : !cir.ptr<!f32>, !cir.ptr<!cir.ptr<!f32>>
+      %l2 = cir.load %slot : !cir.ptr<!cir.ptr<!f32>>, !cir.ptr<!f32>
+      %v2 = cir.cast bitcast %l2 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      // expected-warning @+1 {{memory allocated by sycl::malloc_shared at}}
+      cir.call @_ZdaPv(%v2) : (!cir.ptr<!void>) -> ()
+
+      // MALLOCSYCL
+      // expected-note @+1 {{memory from the C allocation functions must be released with free}}
+      %m3 = cir.call @malloc(%n) : (!u64i) -> !cir.ptr<!void>
+      // expected-warning @+1 {{memory allocated by malloc at}}
+      cir.call @usm_free(%m3, %q) : (!cir.ptr<!void>, !cir.ptr<!rec_queue>) -> ()
+
+      // STACKSYCL
+      // expected-note @+1 {{the object is defined here; sycl::free releases only USM allocations}}
+      %arr = cir.alloca "arr" align(4) : !cir.ptr<!cir.array<!f32 x 4>>
+      %a4 = cir.cast array_to_ptrdecay %arr : !cir.ptr<!cir.array<!f32 x 4>> -> !cir.ptr<!f32>
+      %v4 = cir.cast bitcast %a4 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      // expected-warning @+1 {{memory of the stack variable 'arr' at}}
+      cir.call @usm_free(%v4, %q) : (!cir.ptr<!void>, !cir.ptr<!rec_queue>) -> ()
+
+      // NEWARRAY
+      // expected-note @+1 {{memory from operator new[] must be released with operator delete[]}}
+      %n5 = cir.call @_Znam(%n) : (!u64i) -> !cir.ptr<!void>
+      // expected-warning @+1 {{memory allocated by operator new[] at}}
+      cir.call @_ZdlPv(%n5) : (!cir.ptr<!void>) -> ()
+
+      // NEWFREE: Obj *o = new Obj; free(o);
+      %c4 = cir.const #cir.int<4> : !u64i
+      // expected-note @+1 {{memory from operator new must be released with operator delete}}
+      %n6 = cir.call @_Znwm(%c4) : (!u64i) -> !cir.ptr<!void>
+      %o6 = cir.cast bitcast %n6 : !cir.ptr<!void> -> !cir.ptr<!rec_obj>
+      cir.cleanup.scope {
+        cir.call @_ZN3ObjC1Ev(%o6) : (!cir.ptr<!rec_obj>) -> ()
+        cir.yield
+      } cleanup eh {
+        cir.call @_ZdlPv(%n6) : (!cir.ptr<!void>) -> ()
+        cir.yield
+      }
+      %v6 = cir.cast bitcast %o6 : !cir.ptr<!rec_obj> -> !cir.ptr<!void>
+      // expected-warning @+1 {{memory allocated by operator new at}}
+      cir.call @free(%v6) : (!cir.ptr<!void>) -> ()
+
+      // DELARRAY
+      // expected-note @+1 {{the memory is allocated here}}
+      %m7 = cir.call @malloc(%n) : (!u64i) -> !cir.ptr<!void>
+      %f7 = cir.cast bitcast %m7 : !cir.ptr<!void> -> !cir.ptr<!f32>
+      // expected-warning @+1 {{memory allocated by malloc at}}
+      cir.delete_array %f7 : !cir.ptr<!f32> delete_fn(@_ZdaPv) element_align(4)
+
+      // WRAPPED
+      %w8 = cir.call @wrap(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      %v8 = cir.cast bitcast %w8 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      // expected-warning @+1 {{memory allocated by sycl::malloc_host at}}
+      cir.call @free(%v8) : (!cir.ptr<!void>) -> ()
+
+      // HELPER
+      // CLOSED-xpected-note @+1 {{the memory is allocated here}}
+      %d9 = cir.call @malloc_device(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      cir.call @release(%d9) : (!cir.ptr<!f32>) -> ()
+
+      // MATCH
+      %d10 = cir.call @malloc_device(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      %v10 = cir.cast bitcast %d10 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      cir.call @usm_free(%v10, %q) : (!cir.ptr<!void>, !cir.ptr<!rec_queue>) -> ()
+      %m10 = cir.call @malloc(%n) : (!u64i) -> !cir.ptr<!void>
+      cir.call @free(%m10) : (!cir.ptr<!void>) -> ()
+      %a10 = cir.call @_Znam(%n) : (!u64i) -> !cir.ptr<!void>
+      cir.call @_ZdaPv(%a10) : (!cir.ptr<!void>) -> ()
+
+      // INTERIOR
+      %d11 = cir.call @malloc_device(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      %one = cir.const #cir.int<1> : !s32i
+      %i11 = cir.ptr_stride %d11, %one : (!cir.ptr<!f32>, !s32i) -> !cir.ptr<!f32>
+      %v11 = cir.cast bitcast %i11 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      cir.call @free(%v11) : (!cir.ptr<!void>) -> ()
+
+      // UNKNOWN
+      %u12 = cir.call @opaque() : () -> !cir.ptr<!f32>
+      %v12 = cir.cast bitcast %u12 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      cir.call @free(%v12) : (!cir.ptr<!void>) -> ()
+
+      // SELECT
+      %d13 = cir.call @malloc_device(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      %v13 = cir.cast bitcast %d13 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      %m13 = cir.call @malloc(%n) : (!u64i) -> !cir.ptr<!void>
+      %c13 = cir.call @cond() : () -> !cir.bool
+      %s13 = cir.select if %c13 then %v13 else %m13 : (!cir.bool, !cir.ptr<!void>, !cir.ptr<!void>) -> !cir.ptr<!void>
+      cir.call @free(%s13) : (!cir.ptr<!void>) -> ()
+
+      // CHOOSE
+      %d14 = cir.call @malloc_shared(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      %v14 = cir.cast bitcast %d14 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      %c14 = cir.call @cond() : () -> !cir.bool
+      cir.if %c14 {
+        cir.call @usm_free(%v14, %q) : (!cir.ptr<!void>, !cir.ptr<!rec_queue>) -> ()
+      } else {
+        cir.call @free(%v14) : (!cir.ptr<!void>) -> ()
+      }
+
+      // MIXED
+      %d15 = cir.call @malloc_shared(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      %v15 = cir.cast bitcast %d15 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      cir.call @mixed(%v15, %q) : (!cir.ptr<!void>, !cir.ptr<!rec_queue>) -> ()
+      %m15 = cir.call @malloc(%n) : (!u64i) -> !cir.ptr<!void>
+      cir.call @mixed(%m15, %q) : (!cir.ptr<!void>, !cir.ptr<!rec_queue>) -> ()
+
+      // OWNFREE
+      // CLOSED-xpected-note @+1 {{the memory is allocated here}}
+      %d16 = cir.call @malloc_device(%n, %q) : (!u64i, !cir.ptr<!rec_queue>) -> !cir.ptr<!f32>
+      %v16 = cir.cast bitcast %d16 : !cir.ptr<!f32> -> !cir.ptr<!void>
+      cir.call @my_free(%v16) : (!cir.ptr<!void>) -> ()
+      cir.return
+    }
+  }
+
+  module @device_sycl_spir64 attributes {cir.offload.kind = #cir.offload<device>, cir.triple = "spir64-unknown-unknown"} {
+  }
+}

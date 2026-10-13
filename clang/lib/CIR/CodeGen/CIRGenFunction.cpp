@@ -832,6 +832,18 @@ cir::FuncOp CIRGenFunction::generateCode(clang::GlobalDecl gd, cir::FuncOp fn,
     cgm.emitOpenCLKernelArgMetadata(fn, funcDecl);
   if (getLangOpts().SYCLIsDevice && funcDecl->hasAttr<DeviceKernelAttr>()) {
     cgm.emitSYCLKernelArgAccessorMetadata(fn, funcDecl);
+    // [[sycl::reqd_work_group_size(dim0[, dim1[, dim2]])]]: the sizes in
+    // natural order (dimension 0 first), as the offload combine stamps
+    // them; the lowering reverses and pads them into the metadata classic
+    // CodeGen emits.
+    if (const auto *reqd = funcDecl->getAttr<SYCLReqdWorkGroupSizeAttr>()) {
+      llvm::SmallVector<int32_t, 3> sizes;
+      for (std::optional<llvm::APSInt> dim :
+           {reqd->getXDimVal(), reqd->getYDimVal(), reqd->getZDimVal()})
+        if (dim)
+          sizes.push_back(static_cast<int32_t>(dim->getExtValue()));
+      fn->setAttr("cir.reqd_work_group_size", builder.getI32ArrayAttr(sizes));
+    }
     if (funcDecl->hasAttr<SYCLKernelAttr>())
       if (const VarDecl *kernelObj = cgm.emitSYCLKernelParamMap(fn, funcDecl))
         markSYCLKernelObject(kernelObj);

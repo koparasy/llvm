@@ -648,6 +648,21 @@ def OffloadHostDiagnostics
         sec:buf-sync-rules). Sub-buffers, copies and reinterpreted buffers
         are exempt. The warning is at the second construction, with a note
         at the first one and at the allocation.
+      - `sycl-mismatched-free`: a deallocation whose pointer must be the
+        start of an allocation of another family: free, operator delete or
+        operator delete[] of USM memory, sycl::free of host memory (malloc,
+        operator new, a stack object or a global), operator delete of malloc
+        memory, free of operator new memory, and operator delete of operator
+        new[] memory (and the reverse) (SYCL 2020 sec:usm, C17 7.22.3.3,
+        C++20 [expr.delete]). The warning is at the deallocation, with a
+        note at the allocation.
+      - `sycl-nd-range-geometry`: a launch whose constant nd_range throws
+        errc::nd_range in every calling context: a local size that does not
+        divide the global size, or is 0, in some dimension (the global index
+        space known not to be empty), or that does not match a
+        reqd_work_group_size of the kernel; with `max-work-group-size`, also
+        a work-group larger than that. The warning is at the launch, with a
+        note at the kernel.
   }];
   let constructor = "mlir::createOffloadHostDiagnosticsPass()";
   let dependentDialects = ["cir::CIRDialect"];
@@ -655,6 +670,11 @@ def OffloadHostDiagnostics
     Option<"checks", "checks", "std::string", /*default=*/"\"all\"",
            "The checks to run: a comma-separated list of tags, all or "
            "none.">,
+    Option<"maxWorkGroupSize", "max-work-group-size", "uint64_t",
+           /*default=*/"0",
+           "sycl-nd-range-geometry: also warn on a constant work-group "
+           "(local size product) larger than this (0: not checked; the "
+           "limit is a device property, SYCL 2020 has none)">,
   ]);
   let statistics = [
     Statistic<"numWarnings", "num-warnings", "Warnings emitted">,

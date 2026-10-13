@@ -205,6 +205,50 @@ public:
   /// computed). See the .cpp file.
   BufferHostMemory hostMemoryOfBuffer(mlir::Operation *call) const;
 
+  /// The allocation a pointer that is released must point to (the
+  /// sycl-mismatched-free diagnostic, HostDiagnostics.cpp).
+  struct ReleasedAllocation {
+    enum class Kind : uint8_t {
+      /// Not known: `why` says why.
+      Unknown,
+      /// A SYCL USM allocation (a usm.alloc call, any kind).
+      USM,
+      /// A C allocation function (malloc, calloc, realloc, aligned_alloc,
+      /// posix_memalign, strdup, strndup).
+      Malloc,
+      /// A global operator new (`_Znw*`).
+      New,
+      /// A global operator new[] (`_Zna*`).
+      NewArray,
+      /// A stack object of a host function.
+      Stack,
+      /// A global variable of the host module.
+      Global,
+    };
+    Kind kind = Kind::Unknown;
+    /// The allocation nodes (the roots of the subobject trees the pointer
+    /// points into), one per calling context the answer covers.
+    llvm::SmallVector<const pointsto::Node *, 2> nodes;
+    /// Whether every value the pointer may hold is the start of the object
+    /// its allocation made (offset 0): see isAllocationStart in the .cpp
+    /// file. False if not known; `startWhy` says why.
+    bool start = false;
+    std::string why, startWhy;
+  };
+  /// The kind of allocation the host pointer \p ptr (a value of an analysed
+  /// host function) must point into: in every calling context the analysis
+  /// covers, a node all of whose origins are allocations of that one kind,
+  /// with no unknown, incomplete, may-be-shared, may-overlap or collapsed
+  /// contribution, that no caller we don't see can pass in and that only
+  /// analysed code holds pointers to (the device-USM rule, for any kind);
+  /// and whether the pointer must be the start of the allocation. See the
+  /// .cpp file.
+  ReleasedAllocation allocationOfReleasedPointer(mlir::Value ptr) const;
+  /// The kind of allocation a call of \p callee returns (USM, Malloc, New
+  /// or NewArray: a usm.alloc role, or a declaration of a C allocation
+  /// function or a global operator new), or Unknown.
+  static ReleasedAllocation::Kind allocationKindOfCallee(cir::FuncOp callee);
+
   /// The noalias verdict of every candidate field of \p kernel (the
   /// candidates of its device kernels, getSYCLNoAliasCandidates): a field is
   /// no-alias iff at
@@ -314,6 +358,18 @@ private:
   mutable std::optional<llvm::DenseSet<const pointsto::Node *>> formalReach;
   /// A short name of the allocation of \p node, for notes.
   std::string describeAllocation(const pointsto::Node *node) const;
+  /// Why the pointer \p value may hold a value that is not the start of an
+  /// allocation, or std::nullopt (allocationOfReleasedPointer). \p entered:
+  /// the calls the walk entered a callee through (innermost last).
+  std::optional<std::string> notAllocationStartWhy(
+      mlir::Value value, llvm::SmallVectorImpl<mlir::Operation *> &entered,
+      unsigned depth, llvm::DenseSet<mlir::Value> &active) const;
+  /// The direct calls of each function of the host module, by name (a null
+  /// entry for a use that is not a direct call: its address is taken);
+  /// built on first use (notAllocationStartWhy).
+  mutable std::optional<
+      llvm::DenseMap<mlir::StringAttr, llvm::SmallVector<mlir::Operation *, 2>>>
+      callers;
   /// The part of a storage a view (`$view` ghost node) gives access to.
   struct ViewRange {
     /// Whether [lo, hi) is known: the elements (of the storage's element

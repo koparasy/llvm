@@ -28,7 +28,7 @@
 // ALL-COUNT-8: warning: host access to device USM memory allocated at
 // ALL-NOT: warning:
 // NONE-NOT: warning
-// BAD: unknown host diagnostic 'bogus' (expected all, none or one of: sycl-host-ptr-in-kernel, sycl-host-heap-ptr-in-kernel, sycl-host-deref-device-usm, sycl-buffer-same-host-ptr)
+// BAD: unknown host diagnostic 'bogus' (expected all, none or one of: sycl-host-ptr-in-kernel, sycl-host-heap-ptr-in-kernel, sycl-host-deref-device-usm, sycl-buffer-same-host-ptr, sycl-mismatched-free, sycl-nd-range-geometry)
 
 // sycl-host-deref-device-usm (cir-offload-host-diagnostics,
 // HostDiagnostics.cpp): a host load, store, copy or libc memory access

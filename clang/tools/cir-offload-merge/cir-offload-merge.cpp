@@ -194,10 +194,17 @@ llvm::cl::opt<std::string> HostDiagnostics(
                    "of check tags (sycl-host-ptr-in-kernel, "
                    "sycl-host-heap-ptr-in-kernel, "
                    "sycl-host-deref-device-usm, "
-                   "sycl-buffer-same-host-ptr), all (the default: the "
+                   "sycl-buffer-same-host-ptr, sycl-mismatched-free, "
+                   "sycl-nd-range-geometry), all (the default: the "
                    "checks on by default, not sycl-host-heap-ptr-in-kernel) "
                    "or none"),
     llvm::cl::init("all"), llvm::cl::cat(CIROffloadMergeCategory));
+llvm::cl::opt<uint64_t> MaxWorkGroupSize(
+    "cir-offload-max-work-group-size",
+    llvm::cl::desc("sycl-nd-range-geometry: also warn on a launch whose "
+                   "constant work-group (local size product) is larger than "
+                   "this (a device limit; 0, the default: not checked)"),
+    llvm::cl::init(0), llvm::cl::cat(CIROffloadMergeCategory));
 
 // Opt-in remarks (mlir::remark, as mlir-opt's --remarks-filter*): the
 // container passes report their decisions under a category each
@@ -646,7 +653,8 @@ int runOffloadOptPasses(mlir::ModuleOp module) {
     std::unique_ptr<mlir::Pass> diagnose =
         mlir::createOffloadHostDiagnosticsPass();
     if (mlir::failed(diagnose->initializeOptions(
-            getHostFactsPassOptions() + " checks=" + HostDiagnostics,
+            getHostFactsPassOptions() + " checks=" + HostDiagnostics +
+                " max-work-group-size=" + std::to_string(MaxWorkGroupSize),
             [](const llvm::Twine &message) {
               reportError(message);
               return mlir::failure();
