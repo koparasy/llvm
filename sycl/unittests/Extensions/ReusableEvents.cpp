@@ -14,8 +14,13 @@
 
 #include <sycl/ext/oneapi/experimental/reusable_events.hpp>
 
+#include <detail/event_impl.hpp>
+
 #include <condition_variable>
+#include <future>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace syclex = sycl::ext::oneapi::experimental;
@@ -197,6 +202,62 @@ ur_result_t redefinedUrDeviceRelease(void *pParams) {
   return UR_RESULT_SUCCESS;
 }
 
+// Callbacks giving every UR event a distinct handle, so that the signals of an
+// event can be told apart. They may be called from host task threads.
+std::mutex RecordMutex;
+uintptr_t LastUniqueHandle = 0x1000;
+std::vector<ur_event_handle_t> SignaledHandles;
+std::vector<std::vector<ur_event_handle_t>> KernelWaitLists;
+std::vector<ur_event_handle_t> KernelHandles;
+
+ur_event_handle_t nextUniqueHandle() {
+  return reinterpret_cast<ur_event_handle_t>(++LastUniqueHandle);
+}
+
+ur_result_t redefinedUrEventCreateExpUnique(void *pParams) {
+  auto params = *static_cast<ur_event_create_exp_params_t *>(pParams);
+  std::lock_guard<std::mutex> Lock(RecordMutex);
+  **params.pphEvent = nextUniqueHandle();
+  UrEventCreateExp_counter++;
+  return UR_RESULT_SUCCESS;
+}
+
+ur_result_t redefinedUrEventSuccess(void *) { return UR_RESULT_SUCCESS; }
+
+ur_result_t redefinedUrEnqueueEventsWaitWithBarrierExtRecord(void *pParams) {
+  auto params =
+      *static_cast<ur_enqueue_events_wait_with_barrier_ext_params_t *>(pParams);
+  std::lock_guard<std::mutex> Lock(RecordMutex);
+  if (*params.pnumEventsInWaitList == 0) {
+    if (*params.pphEvent && !**params.pphEvent)
+      **params.pphEvent = nextUniqueHandle();
+    SignaledHandles.push_back(*params.pphEvent ? **params.pphEvent : nullptr);
+  } else {
+    RedefinedUrEnqueueEventsWaitWithBarrierExt_wait_counter++;
+  }
+  return UR_RESULT_SUCCESS;
+}
+
+ur_result_t redefinedUrEnqueueKernelLaunchRecord(void *pParams) {
+  auto params =
+      *static_cast<ur_enqueue_kernel_launch_with_args_exp_params_t *>(pParams);
+  std::lock_guard<std::mutex> Lock(RecordMutex);
+  KernelWaitLists.emplace_back(*params.pphEventWaitList,
+                               *params.pphEventWaitList +
+                                   *params.pnumEventsInWaitList);
+  ur_event_handle_t Handle = nextUniqueHandle();
+  if (*params.pphEvent)
+    **params.pphEvent = Handle;
+  KernelHandles.push_back(Handle);
+  return UR_RESULT_SUCCESS;
+}
+
+ur_event_handle_t currentHandle(const sycl::event &Event) {
+  return sycl::detail::event_impl::resolveSignalTarget(
+             sycl::detail::getSyclObjImpl(Event))
+      ->getHandle();
+}
+
 } // namespace
 
 class ReusableEventsTest : public ::testing::Test {
@@ -236,6 +297,51 @@ protected:
   }
 
   sycl::unittest::UrMock<> Mock;
+};
+
+// Signals and waits held in the scheduler behind a host task, with distinct
+// UR event handles.
+class ReusableEventsSchedulerTest : public ReusableEventsTest {
+protected:
+  void SetUp() override {
+    ReusableEventsTest::SetUp();
+    CheckUrEventReleaseHandle = false;
+    LastUniqueHandle = 0x1000;
+    SignaledHandles.clear();
+    KernelWaitLists.clear();
+    KernelHandles.clear();
+
+    mock::getCallbacks().set_replace_callback("urEventCreateExp",
+                                              &redefinedUrEventCreateExpUnique);
+    mock::getCallbacks().set_replace_callback("urEventRetain",
+                                              &redefinedUrEventSuccess);
+    mock::getCallbacks().set_replace_callback("urEventWait",
+                                              &redefinedUrEventSuccess);
+    mock::getCallbacks().set_replace_callback(
+        "urEnqueueEventsWaitWithBarrierExt",
+        &redefinedUrEnqueueEventsWaitWithBarrierExtRecord);
+    mock::getCallbacks().set_replace_callback(
+        "urEnqueueKernelLaunchWithArgsExp",
+        &redefinedUrEnqueueKernelLaunchRecord);
+
+    // Created only now, so that the context is the mocked one.
+    MaybeDev = sycl::platform().get_devices()[0];
+    MaybeCtx.emplace(*MaybeDev);
+  }
+
+  // Submits a host task to Q which runs until Release is set.
+  void blockQueue(sycl::queue &Q) {
+    std::shared_future<void> Released = Release.get_future().share();
+    Q.submit([&](sycl::handler &CGH) {
+      CGH.host_task([Released] { Released.wait(); });
+    });
+  }
+
+  std::promise<void> Release;
+  std::optional<sycl::device> MaybeDev;
+  std::optional<sycl::context> MaybeCtx;
+  sycl::device &Dev() { return *MaybeDev; }
+  sycl::context &Ctx() { return *MaybeCtx; }
 };
 
 // make_event with no parameters
@@ -457,9 +563,8 @@ TEST_F(ReusableEventsTest, EventInDependsOn) {
   Queue.wait();
 }
 
-// Cross-context event with wait.
-// Current limitation is that the cross-context wait
-// is not supported.
+// Cross-context event with wait: the event of another context is a regular
+// dependency of the wait.
 TEST_F(ReusableEventsTest, CrossContextEventWait) {
   mock::getCallbacks().set_replace_callback("urDeviceGet",
                                             &redefinedUrDeviceGet);
@@ -483,27 +588,13 @@ TEST_F(ReusableEventsTest, CrossContextEventWait) {
 
   auto event = syclex::make_event(Ctx1);
 
-  bool exception = false;
-
-  // Current limitation is that an event from different context
-  // cannot be used with enqueue_wait_event
-  try {
-    syclex::enqueue_wait_event(Queue2, event);
-  } catch (sycl::exception const &e) {
-    exception = true;
-    EXPECT_EQ(e.code(), sycl::errc::invalid);
-    EXPECT_STREQ(e.what(), "Event context must match the queue context.");
-  }
-
-  EXPECT_TRUE(exception);
+  EXPECT_NO_THROW({ syclex::enqueue_wait_event(Queue2, event); });
 
   Queue1.wait();
   Queue2.wait();
 }
 
 // Cross-context events with wait (multiple events).
-// Current limitation is that the cross-context wait
-// is not supported.
 TEST_F(ReusableEventsTest, CrossContextEventsWait) {
   mock::getCallbacks().set_replace_callback("urDeviceGet",
                                             &redefinedUrDeviceGet);
@@ -524,26 +615,12 @@ TEST_F(ReusableEventsTest, CrossContextEventsWait) {
 
   sycl::queue Queue{Ctx1, Dev1};
 
-  // Check if the exception is thrown if one of the events
-  // has different context than the queue.
   auto event1 = syclex::make_event(Ctx1);
   auto event2 = syclex::make_event(Ctx2);
 
   std::vector<sycl::event> events{event1, event2};
 
-  bool exception = false;
-
-  // Current limitation is that an event from different context
-  // cannot be used with enqueue_wait_event
-  try {
-    syclex::enqueue_wait_events(Queue, events);
-  } catch (sycl::exception const &e) {
-    exception = true;
-    EXPECT_EQ(e.code(), sycl::errc::invalid);
-    EXPECT_STREQ(e.what(), "Event context must match the queue context.");
-  }
-
-  EXPECT_TRUE(exception);
+  EXPECT_NO_THROW({ syclex::enqueue_wait_events(Queue, events); });
 
   Queue.wait();
 }
@@ -679,4 +756,139 @@ TEST_F(ReusableEventsTest, QueueWithProfilingProperty) {
         event.get_profiling_info<sycl::info::event_profiling::command_end>();
     (void)end_time;
   });
+}
+
+// A signal behind a host task is held in the scheduler: the call returns while
+// the host task still waits for the application, so no deadlock can arise.
+TEST_F(ReusableEventsSchedulerTest, SignalBehindHostTask) {
+  sycl::queue Queue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  auto event = syclex::make_event(Ctx());
+
+  blockQueue(Queue);
+  EXPECT_NO_THROW({ syclex::enqueue_signal_event(Queue, event); });
+
+  EXPECT_TRUE(SignaledHandles.empty());
+  EXPECT_EQ(event.get_info<sycl::info::event::command_execution_status>(),
+            sycl::info::event_command_status::submitted);
+
+  Release.set_value();
+  event.wait();
+
+  // The backend event is created with the event's properties when the signal
+  // reaches the backend, and signaled by the barrier.
+  ASSERT_EQ(SignaledHandles.size(), 1u);
+  EXPECT_EQ(UrEventCreateExp_counter, 1);
+  EXPECT_EQ(SignaledHandles[0], currentHandle(event));
+}
+
+// A wait behind a host task is held in the scheduler too.
+TEST_F(ReusableEventsSchedulerTest, WaitBehindHostTask) {
+  sycl::queue SignalQueue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  sycl::queue Queue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  auto event = syclex::make_event(Ctx());
+  syclex::enqueue_signal_event(SignalQueue, event);
+
+  blockQueue(Queue);
+  EXPECT_NO_THROW({ syclex::enqueue_wait_event(Queue, event); });
+  EXPECT_EQ(RedefinedUrEnqueueEventsWaitWithBarrierExt_wait_counter, 0);
+
+  Release.set_value();
+  Queue.wait();
+  EXPECT_EQ(RedefinedUrEnqueueEventsWaitWithBarrierExt_wait_counter, 1);
+}
+
+// A dependency is captured at submission: signaling the event again before the
+// dependent command reaches the backend does not change what it waits for.
+TEST_F(ReusableEventsSchedulerTest, ResignalKeepsCapturedDependency) {
+  static sycl::unittest::MockDeviceImage DevImage =
+      sycl::unittest::generateDefaultImage({"TestKernel"});
+  static sycl::unittest::MockDeviceImageArray<1> DevImageArray = {&DevImage};
+
+  sycl::queue SignalQueue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  sycl::queue Queue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  auto event = syclex::make_event(Ctx());
+
+  syclex::enqueue_signal_event(SignalQueue, event);
+  ur_event_handle_t First = currentHandle(event);
+
+  blockQueue(Queue);
+  Queue.submit([&](sycl::handler &CGH) {
+    CGH.depends_on(event);
+    CGH.single_task<TestKernel>([] {});
+  });
+
+  // The pending kernel refers to the first signal, so the event moves on to a
+  // new backend event instead of signaling the first one again.
+  syclex::enqueue_signal_event(SignalQueue, event);
+  ur_event_handle_t Second = currentHandle(event);
+  EXPECT_NE(First, Second);
+  EXPECT_EQ(UrEventCreateExp_counter, 2);
+
+  Release.set_value();
+  Queue.wait();
+  ASSERT_EQ(KernelWaitLists.size(), 1u);
+  EXPECT_EQ(KernelWaitLists[0], std::vector<ur_event_handle_t>{First});
+
+  // Once nothing refers to the second signal, the next one reuses it.
+  syclex::enqueue_signal_event(SignalQueue, event);
+  EXPECT_EQ(currentHandle(event), Second);
+  EXPECT_EQ(UrEventCreateExp_counter, 2);
+}
+
+// Signaling the event of a command which is still held in the scheduler: the
+// command still produces its own event, and the event refers to the signal.
+TEST_F(ReusableEventsSchedulerTest, ResignalPendingCommandEvent) {
+  static sycl::unittest::MockDeviceImage DevImage =
+      sycl::unittest::generateDefaultImage({"TestKernel"});
+  static sycl::unittest::MockDeviceImageArray<1> DevImageArray = {&DevImage};
+
+  sycl::queue SignalQueue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  sycl::queue Queue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+
+  blockQueue(Queue);
+  sycl::event KernelEvent = Queue.submit(
+      [&](sycl::handler &CGH) { CGH.single_task<TestKernel>([] {}); });
+
+  syclex::enqueue_signal_event(SignalQueue, KernelEvent);
+  ur_event_handle_t Signal = currentHandle(KernelEvent);
+  ASSERT_NE(Signal, nullptr);
+
+  Release.set_value();
+  Queue.wait();
+  ASSERT_EQ(KernelHandles.size(), 1u);
+  EXPECT_EQ(sycl::detail::getSyclObjImpl(KernelEvent)->getHandle(),
+            KernelHandles[0]);
+  EXPECT_EQ(currentHandle(KernelEvent), Signal);
+
+  Queue.submit([&](sycl::handler &CGH) {
+    CGH.depends_on(KernelEvent);
+    CGH.single_task<TestKernel>([] {});
+  });
+  Queue.wait();
+  ASSERT_EQ(KernelWaitLists.size(), 2u);
+  EXPECT_EQ(KernelWaitLists[1], std::vector<ur_event_handle_t>{Signal});
+}
+
+// A signal held in the scheduler may depend on the event it signals (here the
+// last event of the in-order queue). That must not keep the event alive.
+TEST_F(ReusableEventsSchedulerTest, HeldSignalOfOwnDependencyIsReleased) {
+  static sycl::unittest::MockDeviceImage DevImage =
+      sycl::unittest::generateDefaultImage({"TestKernel"});
+  static sycl::unittest::MockDeviceImageArray<1> DevImageArray = {&DevImage};
+
+  std::weak_ptr<sycl::detail::event_impl> KernelEventImpl;
+  {
+    sycl::queue Queue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+    blockQueue(Queue);
+    sycl::event KernelEvent = Queue.submit(
+        [&](sycl::handler &CGH) { CGH.single_task<TestKernel>([] {}); });
+    KernelEventImpl = sycl::detail::getSyclObjImpl(KernelEvent);
+
+    syclex::enqueue_signal_event(Queue, KernelEvent);
+
+    Release.set_value();
+    KernelEvent.wait();
+    Queue.wait();
+  }
+  EXPECT_TRUE(KernelEventImpl.expired());
 }

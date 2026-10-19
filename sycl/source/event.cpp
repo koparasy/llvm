@@ -37,7 +37,14 @@ bool event::operator==(const event &rhs) const { return rhs.impl == impl; }
 bool event::operator!=(const event &rhs) const { return !(*this == rhs); }
 #endif // __INTEL_PREVIEW_BREAKING_CHANGES
 
-void event::wait() { impl->wait(); }
+// The public API reports on the latest signal of an event, see
+// event_impl::resolveSignalTarget.
+static std::shared_ptr<detail::event_impl>
+current(const std::shared_ptr<detail::event_impl> &Impl) {
+  return detail::event_impl::resolveSignalTarget(Impl);
+}
+
+void event::wait() { current(impl)->wait(); }
 
 void event::wait(const std::vector<event> &EventList) {
   for (auto E : EventList) {
@@ -45,7 +52,7 @@ void event::wait(const std::vector<event> &EventList) {
   }
 }
 
-void event::wait_and_throw() { impl->wait_and_throw(); }
+void event::wait_and_throw() { current(impl)->wait_and_throw(); }
 
 void event::wait_and_throw(const std::vector<event> &EventList) {
   for (auto E : EventList) {
@@ -56,7 +63,7 @@ void event::wait_and_throw(const std::vector<event> &EventList) {
 std::vector<event> event::get_wait_list() {
   std::vector<event> Result;
 
-  for (auto &EventImpl : impl->getWaitList())
+  for (auto &EventImpl : current(impl)->getWaitList())
     Result.push_back(detail::createSyclObjFromImpl<event>(EventImpl));
 
   return Result;
@@ -68,19 +75,20 @@ event::event(std::shared_ptr<detail::event_impl> event_impl)
 template <typename Param>
 typename detail::is_event_info_desc<Param>::return_type
 event::get_info() const {
-  return impl->template get_info<Param>();
+  return current(impl)->template get_info<Param>();
 }
 
 template <typename Param>
 typename detail::is_backend_info_desc<Param>::return_type
 event::get_backend_info() const {
-  return impl->get_backend_info<Param>();
+  return current(impl)->get_backend_info<Param>();
 }
 
 template <typename Param>
 typename detail::is_event_profiling_info_desc<Param>::return_type
 event::get_profiling_info() const {
-  if (impl->hasCommandGraph()) {
+  std::shared_ptr<detail::event_impl> Impl = current(impl);
+  if (Impl->hasCommandGraph()) {
     throw sycl::exception(make_error_code(errc::invalid),
                           "Profiling information is unavailable for events "
                           "returned from a submission to a queue in the "
@@ -89,10 +97,10 @@ event::get_profiling_info() const {
 
   // A profiling tag uses its device-recorded completion time for submit too.
   if (!std::is_same_v<Param, info::event_profiling::command_submit> ||
-      impl->isProfilingTagEvent()) {
-    impl->wait();
+      Impl->isProfilingTagEvent()) {
+    Impl->wait();
   }
-  return impl->template get_profiling_info<Param>();
+  return Impl->template get_profiling_info<Param>();
 }
 
 #define __SYCL_EVENT_INFO_INST(NAME, RETURN_T)                                 \
@@ -122,10 +130,12 @@ bool event::ext_oneapi_ipc_enabled() const noexcept {
   return impl->isIPCEnabled();
 }
 
-ur_native_handle_t event::getNative() const { return impl->getNative(); }
+ur_native_handle_t event::getNative() const {
+  return current(impl)->getNative();
+}
 
 std::vector<ur_native_handle_t> event::getNativeVector() const {
-  std::vector<ur_native_handle_t> ReturnVector = {impl->getNative()};
+  std::vector<ur_native_handle_t> ReturnVector = {current(impl)->getNative()};
   return ReturnVector;
 }
 

@@ -133,6 +133,48 @@ public:
   /// \param Handle is a UR handle to be set
   void setHandleReusable(ur_event_handle_t Handle);
 
+  /// Returns the event which public queries and new dependencies on \p Event
+  /// refer to: the target of the latest enqueue_signal_event on \p Event, or
+  /// \p Event itself if it has never been enqueued for signaling.
+  ///
+  /// Each signal of an event is tracked by a separate internal event, the
+  /// signal target, so that whatever captured the event (or an earlier target)
+  /// before the signal keeps referring to what it captured, as required by
+  /// sycl_ext_oneapi_reusable_events. Only code which receives an event from
+  /// the application resolves it; internal holders must not.
+  static EventImplPtr resolveSignalTarget(const EventImplPtr &Event) {
+    if (!Event || !Event->MHasSignalTarget.load(std::memory_order_acquire))
+      return Event;
+    std::lock_guard<std::mutex> Lock(Event->MMutex);
+    return Event->MSignalTarget;
+  }
+
+  /// Returns the event to signal for an enqueue_signal_event on \p Event
+  /// submitted directly to the backend, and makes it the signal target of
+  /// \p Event.
+  ///
+  /// The current signal target is signaled again in place if nothing but
+  /// \p Event refers to it, which keeps its backend event. Otherwise \p Event
+  /// moves on to a new signal target. An IPC event is always signaled itself,
+  /// as its backend event is shared with another process.
+  static EventImplPtr prepareSignalTarget(const EventImplPtr &Event);
+
+  /// Makes \p Target the signal target of this event.
+  void setSignalTarget(EventImplPtr Target);
+
+  /// Creates an event to be used as a signal target of this event, with the
+  /// same context and event properties.
+  EventImplPtr createSignalTarget() const;
+
+  /// Turns a signal target created by createSignalTarget into the event of a
+  /// command submitted to \p Queue through the scheduler. The backend event is
+  /// created when the command is enqueued, so that the target shows no backend
+  /// event before then.
+  void initSignalTargetForQueue(queue_impl &Queue);
+
+  /// True for an event created by createSignalTarget.
+  bool isSignalTarget() const noexcept { return MIsSignalTarget; }
+
   /// Waits for the event.
   ///
   /// \param Success is an optional parameter that, when set to a non-null
@@ -417,6 +459,10 @@ public:
   // Initializes the host profiling info for the event.
   void initHostProfilingInfo();
 
+  // Creates a backend UR event on \p Device with this event's profiling/IPC
+  // flags. The context must already be bound.
+  ur_event_handle_t createDeviceUrEvent(device_impl &Device);
+
 protected:
   // When instrumentation is enabled emits trace event for event wait begin and
   // returns the telemetry event generated for the wait
@@ -526,9 +572,12 @@ protected:
   // when needed.
   void initContextIfNeeded();
 
-  // Creates a backend UR event on \p Device with this event's profiling/IPC
-  // flags. The context must already be bound.
-  ur_event_handle_t createDeviceUrEvent(device_impl &Device);
+  /// The signal target of this event, see resolveSignalTarget. Guarded by
+  /// MMutex; MHasSignalTarget is set once it is non-null and never reset.
+  EventImplPtr MSignalTarget;
+  std::atomic<bool> MHasSignalTarget{false};
+  bool MIsSignalTarget = false;
+
   // Event class represents 3 different kinds of operations:
   // | type  | has UR event | MContext | MIsHostTask | MIsDefaultConstructed |
   // | dev   | true         | !nullptr | false       | false                 |

@@ -330,11 +330,16 @@ class CGBarrier : public CG {
 public:
   ext::oneapi::experimental::event_mode_enum MEventMode =
       ext::oneapi::experimental::event_mode_enum::none;
+  /// For an enqueue_signal_event held in the scheduler, the signal target
+  /// which becomes the event of the command (see
+  /// event_impl::resolveSignalTarget).
+  EventImplPtr MSignalTarget;
 
   CGBarrier(ext::oneapi::experimental::event_mode_enum EventMode,
             CG::StorageInitHelper CGData, CGType Type,
-            detail::code_location loc = {})
-      : CG(Type, std::move(CGData), std::move(loc)), MEventMode(EventMode) {}
+            detail::code_location loc = {}, EventImplPtr SignalTarget = {})
+      : CG(Type, std::move(CGData), std::move(loc)), MEventMode(EventMode),
+        MSignalTarget(std::move(SignalTarget)) {}
 };
 
 class CGProfilingTag : public CG {

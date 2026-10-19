@@ -246,19 +246,24 @@ TEST_F(NativeRecordingTest, PotentiallyNativeRecordedEventsOtherContext) {
 }
 
 TEST_F(NativeRecordingTest, PotentiallyNativeRecordedReusableEvent) {
+  // The flag belongs to the latest signal of the event.
+  auto currentSignal = [](const event &Event) -> sycl::detail::event_impl & {
+    return *sycl::detail::event_impl::resolveSignalTarget(
+        getSyclObjImpl(Event));
+  };
   auto Graph = makeGraph();
   auto Reusable = experimental::make_event(Queue.get_context());
 
   experimental::enqueue_signal_event(Queue, Reusable);
-  EXPECT_FALSE(getSyclObjImpl(Reusable)->isPotentiallyNativeRecorded());
+  EXPECT_FALSE(currentSignal(Reusable).isPotentiallyNativeRecorded());
 
   Graph.begin_recording(Queue);
   experimental::enqueue_signal_event(Queue, Reusable);
-  EXPECT_TRUE(getSyclObjImpl(Reusable)->isPotentiallyNativeRecorded());
+  EXPECT_TRUE(currentSignal(Reusable).isPotentiallyNativeRecorded());
   Graph.end_recording(Queue);
 
   experimental::enqueue_signal_event(Queue, Reusable);
-  EXPECT_FALSE(getSyclObjImpl(Reusable)->isPotentiallyNativeRecorded());
+  EXPECT_FALSE(currentSignal(Reusable).isPotentiallyNativeRecorded());
 }
 
 TEST_F(NativeRecordingTest, ExternalSignalDepReachesUr) {

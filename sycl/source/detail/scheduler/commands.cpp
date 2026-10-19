@@ -1996,8 +1996,18 @@ EventImplPtr ExecCGCommand::makeEvent(const detail::CG &CG, queue_impl *Queue) {
     if (SubmitQueue->MIsProfilingEnabled)
       ResEvent->initHostProfilingInfo();
   } else {
-    ResEvent = Queue ? event_impl::create_device_event(*Queue)
-                     : event_impl::create_incomplete_host_event();
+    const EventImplPtr *SignalTarget =
+        CG.getType() == CGType::Barrier
+            ? &static_cast<const CGBarrier &>(CG).MSignalTarget
+            : nullptr;
+    if (SignalTarget && *SignalTarget) {
+      assert(Queue && "Signal requires a valid queue");
+      ResEvent = *SignalTarget;
+      ResEvent->initSignalTargetForQueue(*Queue);
+    } else {
+      ResEvent = Queue ? event_impl::create_device_event(*Queue)
+                       : event_impl::create_incomplete_host_event();
+    }
     if (Queue) {
       ResEvent->setWorkerQueue(Queue->shared_from_this());
       ResEvent->setSubmittedQueue(Queue);
@@ -3702,11 +3712,22 @@ ur_result_t ExecCGCommand::enqueueImpQueue() {
       if (Result != UR_RESULT_SUCCESS)
         return Result;
     }
+    // A signal target gets its backend event only now, so that it has none
+    // while the signal is held in the scheduler. With reusable-event support
+    // the barrier signals the event created with the event's properties.
+    const bool CreatesSignalEvent =
+        Barrier->MSignalTarget &&
+        MQueue->getContextImpl().supportsReusableEvents();
+    if (CreatesSignalEvent)
+      UREvent = MEvent->createDeviceUrEvent(MQueue->getDeviceImpl());
     if (auto Result =
             Adapter.call_nocheck<UrApiKind::urEnqueueEventsWaitWithBarrierExt>(
                 MQueue->getHandleRef(), &Properties, 0, nullptr, Event);
-        Result != UR_RESULT_SUCCESS)
+        Result != UR_RESULT_SUCCESS) {
+      if (CreatesSignalEvent)
+        Adapter.call<UrApiKind::urEventRelease>(UREvent);
       return Result;
+    }
 
     SetEventHandleOrDiscard();
     return UR_RESULT_SUCCESS;

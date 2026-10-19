@@ -309,6 +309,50 @@ void event_impl::setHandleReusable(ur_event_handle_t Handle) {
   }
 }
 
+EventImplPtr event_impl::prepareSignalTarget(const EventImplPtr &Event) {
+  if (Event->MIPCEnabled || Event->MOpenedFromIpc)
+    return Event;
+
+  std::lock_guard<std::mutex> Lock(Event->MMutex);
+  EventImplPtr &Target = Event->MSignalTarget;
+  // New references to a target are only taken by resolveSignalTarget, under
+  // MMutex, so a count of one cannot grow until the lock is released. A target
+  // without a backend event that has been enqueued already (e.g. one whose
+  // command was discarded) cannot be signaled in place.
+  if (Target && Target.use_count() == 1 &&
+      (Target->isDefaultConstructed() || Target->getHandle()))
+    return Target;
+
+  Target = Event->createSignalTarget();
+  Event->MHasSignalTarget.store(true, std::memory_order_release);
+  return Target;
+}
+
+void event_impl::setSignalTarget(EventImplPtr Target) {
+  assert(Target && Target->isSignalTarget());
+  std::lock_guard<std::mutex> Lock(MMutex);
+  MSignalTarget = std::move(Target);
+  MHasSignalTarget.store(true, std::memory_order_release);
+}
+
+EventImplPtr event_impl::createSignalTarget() const {
+  assert(MContext && "the context of a signaled event must be bound");
+  EventImplPtr Target = create_default_event();
+  Target->MContext = MContext;
+  Target->MIsProfilingEnabled = MIsProfilingEnabled;
+  Target->MLowPower = MLowPower;
+  Target->MIsSignalTarget = true;
+  return Target;
+}
+
+void event_impl::initSignalTargetForQueue(queue_impl &Queue) {
+  assert(MIsSignalTarget && MIsDefaultConstructed && !getHandle());
+  MIsDefaultConstructed = false;
+  MIsFlushed = false;
+  setQueue(Queue);
+  markAsProfilingTagEvent();
+}
+
 void event_impl::initHostProfilingInfo() {
   assert(isHost() && "This must be a host event");
   assert(MState == HES_NotComplete &&

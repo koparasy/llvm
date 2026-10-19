@@ -1566,8 +1566,8 @@ void handler::use_kernel_bundle(
 }
 
 void handler::depends_on(event Event) {
-  auto EventImpl = detail::getSyclObjImpl(Event);
-  depends_on(EventImpl);
+  depends_on(
+      detail::event_impl::resolveSignalTarget(detail::getSyclObjImpl(Event)));
 }
 
 void handler::depends_on(const std::vector<event> &Events) {

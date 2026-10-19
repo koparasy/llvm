@@ -226,7 +226,13 @@ public:
     return nullptr;
   }
 
-  virtual ~Command() { MEvent->cleanDepEventsThroughOneLevel(); }
+  virtual ~Command() {
+    MEvent->cleanDepEventsThroughOneLevel();
+    // A signal target is owned by the event it was signaled for, which its
+    // dependencies may refer to in turn.
+    if (MEvent->isSignalTarget())
+      MEvent->cleanupDependencyEvents();
+  }
 
   const char *getBlockReason() const;
 

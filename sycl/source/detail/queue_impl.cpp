@@ -18,6 +18,7 @@
 #include <sycl/device.hpp>
 #include <sycl/ext/oneapi/work_group_scratch_memory.hpp>
 
+#include <algorithm>
 #include <cstring>
 #include <shared_mutex>
 #include <utility>
@@ -51,6 +52,24 @@ private:
   // Cache the TLS location to decrease amount of TLS accesses.
   bool &NestedCallsDetectorRef = NestedCallsDetector;
 };
+
+// Returns DepEvents with each event replaced by its signal target, see
+// event_impl::resolveSignalTarget. Storage is only filled if an event has one.
+static const std::vector<event> &
+resolveSignalTargets(const std::vector<event> &DepEvents,
+                     std::vector<event> &Storage) {
+  auto HasTarget = [](const event &Event) {
+    const EventImplPtr &Impl = getSyclObjImpl(Event);
+    return event_impl::resolveSignalTarget(Impl) != Impl;
+  };
+  if (std::none_of(DepEvents.begin(), DepEvents.end(), HasTarget))
+    return DepEvents;
+  Storage.reserve(DepEvents.size());
+  for (const event &Event : DepEvents)
+    Storage.push_back(createSyclObjFromImpl<event>(
+        event_impl::resolveSignalTarget(getSyclObjImpl(Event))));
+  return Storage;
+}
 
 static std::vector<ur_event_handle_t>
 getUrEvents(const std::vector<sycl::event> &DepEvents) {
@@ -575,26 +594,43 @@ EventImplPtr queue_impl::submit_barrier_direct_impl(
                                CGData.MEvents, getContextImpl());
 
     if (SchedulerBypass) {
-      return {submit_barrier_scheduler_bypass(CGData.MEvents, BarrierType,
-                                              CallerNeedsEvent, EventForReuse),
+      return {submit_barrier_scheduler_bypass(
+                  CGData.MEvents, BarrierType, CallerNeedsEvent,
+                  EventForReuse ? event_impl::prepareSignalTarget(EventForReuse)
+                                : nullptr),
               /*SchedulerBypass*/ true};
     }
 
-    if (EventForReuse || !CallerNeedsEvent) {
-      // Current limitation: reusable events require scheduler bypass so that
-      // the barrier can be submitted directly to the backend with the reusable
-      // event's handle as the output event. Scheduler bypass is not possible
-      // when dependencies include host tasks or cross-context dependencies.
-      //
-      // This limitation applies to both: enqueue_signal_event and
-      // enqueue_wait_event(s).
-      //
-      // The !CallerNeedsEvent condition is used to detect the
-      // enqueue_wait_event(s) function calls.
-      throw sycl::exception(
-          sycl::make_error_code(errc::invalid),
-          "An event cannot be enqueued for signaling or waiting "
-          "behind a command which is not enqueued in the backend.");
+    // The !CallerNeedsEvent condition is used to detect the
+    // enqueue_wait_event(s) function calls.
+    if (!CallerNeedsEvent && getCommandGraph()) {
+      throw sycl::exception(sycl::make_error_code(errc::invalid),
+                            "Enqueueing a wait on an event is not supported "
+                            "on a queue which is recording a graph.");
+    }
+
+    if (EventForReuse) {
+      // The backend event of an IPC event is shared with another process, so
+      // every signal has to go to the backend directly through it.
+      if (EventForReuse->isIPCEnabled() || EventForReuse->isOpenedFromIpc()) {
+        throw sycl::exception(
+            sycl::make_error_code(errc::invalid),
+            "An IPC event cannot be enqueued for signaling behind a command "
+            "which is not enqueued in the backend.");
+      }
+      // The signal is held in the scheduler, so it gets a signal target of its
+      // own, which becomes the event of its command. It is installed only once
+      // the command exists, so that a failed submission leaves the event as it
+      // was.
+      EventImplPtr SignalTarget = EventForReuse->createSignalTarget();
+      std::unique_ptr<detail::CG> CommandGroup(new detail::CGBarrier(
+          ext::oneapi::experimental::event_mode_enum::none, std::move(CGData),
+          BarrierType, CodeLoc, SignalTarget));
+      EventImplPtr ResEvent = detail::Scheduler::getInstance().addCG(
+          std::move(CommandGroup), *this, true);
+      assert(ResEvent == SignalTarget);
+      EventForReuse->setSignalTarget(SignalTarget);
+      return {std::move(ResEvent), /*SchedulerBypass*/ false};
     }
 
     std::unique_ptr<detail::CG> CommandGroup;
@@ -1135,8 +1171,9 @@ detail::EventImplPtr queue_impl::submit_direct(
 
   for (event e : DepEvents) {
     registerEventDependency</*LockQueue*/ false>(
-        getSyclObjImpl(e), CGData.MEvents, this, getContextImpl(),
-        getDeviceImpl(), hasCommandGraph() ? getCommandGraph().get() : nullptr);
+        event_impl::resolveSignalTarget(getSyclObjImpl(e)), CGData.MEvents,
+        this, getContextImpl(), getDeviceImpl(),
+        hasCommandGraph() ? getCommandGraph().get() : nullptr);
   }
 
   // Barrier and un-enqueued commands synchronization for out or order queue
@@ -1219,9 +1256,12 @@ queue_impl::submitMemOpHelper(const std::vector<event> &DepEvents,
   {
     std::unique_lock<std::mutex> Lock(MMutex, std::defer_lock);
 
+    std::vector<event> ResolvedDepEvents;
+    const std::vector<event> &UserDepEvents =
+        resolveSignalTargets(DepEvents, ResolvedDepEvents);
     std::vector<event> MutableDepEvents;
     const std::vector<event> &ExpandedDepEvents =
-        getExtendDependencyList(DepEvents, MutableDepEvents, Lock);
+        getExtendDependencyList(UserDepEvents, MutableDepEvents, Lock);
 
     MEmpty = false;
 
