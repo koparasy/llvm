@@ -320,8 +320,13 @@ EventImplPtr event_impl::prepareSignalTarget(const EventImplPtr &Event) {
   // without a backend event that has been enqueued already (e.g. one whose
   // command was discarded) cannot be signaled in place.
   if (Target && Target.use_count() == 1 &&
-      (Target->isDefaultConstructed() || Target->getHandle()))
+      (Target->isDefaultConstructed() || Target->getHandle())) {
+    // use_count is a relaxed load. Pairs with the release the last other owner
+    // performed when dropping its reference, so that whatever it did with the
+    // target happens before the target is signaled again.
+    std::atomic_thread_fence(std::memory_order_acquire);
     return Target;
+  }
 
   Target = createSignalTarget(Event);
   Event->MHasSignalTarget.store(true, std::memory_order_release);
