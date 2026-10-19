@@ -53,28 +53,11 @@ private:
   bool &NestedCallsDetectorRef = NestedCallsDetector;
 };
 
-// Returns DepEvents with each event replaced by its signal target, see
-// event_impl::resolveSignalTarget. Storage is only filled if an event has one.
-static const std::vector<event> &
-resolveSignalTargets(const std::vector<event> &DepEvents,
-                     std::vector<event> &Storage) {
-  auto HasTarget = [](const event &Event) {
-    return getUserEventImpl(Event) != getSyclObjImpl(Event);
-  };
-  if (std::none_of(DepEvents.begin(), DepEvents.end(), HasTarget))
-    return DepEvents;
-  Storage.reserve(DepEvents.size());
-  for (const event &Event : DepEvents)
-    Storage.push_back(createSyclObjFromImpl<event>(getUserEventImpl(Event)));
-  return Storage;
-}
-
 static std::vector<ur_event_handle_t>
-getUrEvents(const std::vector<sycl::event> &DepEvents) {
+getUrEvents(const std::vector<EventImplPtr> &DepEvents) {
   std::vector<ur_event_handle_t> RetUrEvents;
-  for (const sycl::event &Event : DepEvents) {
-    event_impl &EventImpl = *detail::getSyclObjImpl(Event);
-    auto Handle = EventImpl.getHandle();
+  for (const EventImplPtr &EventImpl : DepEvents) {
+    auto Handle = EventImpl->getHandle();
     if (Handle != nullptr)
       RetUrEvents.push_back(Handle);
   }
@@ -107,29 +90,24 @@ prepareSYCLEventAssociatedWithQueue(detail::queue_impl &QueueImpl) {
   return EventImpl;
 }
 
-const std::vector<event> &
+std::vector<EventImplPtr>
 queue_impl::getExtendDependencyList(const std::vector<event> &DepEvents,
-                                    std::vector<event> &MutableVec,
                                     std::unique_lock<std::mutex> &QueueLock) {
+  std::vector<EventImplPtr> Result;
+  Result.reserve(DepEvents.size() + 2);
+  for (const event &Event : DepEvents)
+    Result.push_back(getUserEventImpl(Event));
   if (!isInOrder())
-    return DepEvents;
+    return Result;
 
   QueueLock.lock();
-  EventImplPtr ExtraEvent = MGraph.expired() ? MDefaultGraphDeps.LastEventPtr
-                                             : MExtGraphDeps.LastEventPtr;
-  std::optional<event> ExternalEvent = popExternalEvent();
-
-  if (!ExternalEvent && !ExtraEvent)
-    return DepEvents;
-
-  MutableVec = DepEvents;
-  if (ExternalEvent)
-    MutableVec.push_back(
-        detail::createSyclObjFromImpl<event>(getUserEventImpl(*ExternalEvent)));
-  if (ExtraEvent)
-    MutableVec.push_back(
-        detail::createSyclObjFromImpl<event>(std::move(ExtraEvent)));
-  return MutableVec;
+  if (std::optional<event> ExternalEvent = popExternalEvent())
+    Result.push_back(getUserEventImpl(*ExternalEvent));
+  if (const EventImplPtr &LastEvent = MGraph.expired()
+                                          ? MDefaultGraphDeps.LastEventPtr
+                                          : MExtGraphDeps.LastEventPtr)
+    Result.push_back(LastEvent);
+  return Result;
 }
 
 EventImplPtr queue_impl::memset(void *Ptr, int Value, size_t Count,
@@ -1163,8 +1141,8 @@ detail::EventImplPtr queue_impl::submit_direct(
   std::optional<event> ExternalEvent = popExternalEvent();
   if (ExternalEvent) {
     registerEventDependency</*LockQueue*/ false>(
-        DepSource::User, getSyclObjImpl(*ExternalEvent), CGData.MEvents, this,
-        getContextImpl(), getDeviceImpl(),
+        DepSource::User, getEventImplNoResolve(*ExternalEvent), CGData.MEvents,
+        this, getContextImpl(), getDeviceImpl(),
         hasCommandGraph() ? getCommandGraph().get() : nullptr);
   }
 
@@ -1187,7 +1165,7 @@ detail::EventImplPtr queue_impl::submit_direct(
 
   for (event e : DepEvents) {
     registerEventDependency</*LockQueue*/ false>(
-        DepSource::User, getSyclObjImpl(e), CGData.MEvents, this,
+        DepSource::User, getEventImplNoResolve(e), CGData.MEvents, this,
         getContextImpl(), getDeviceImpl(),
         hasCommandGraph() ? getCommandGraph().get() : nullptr);
   }
@@ -1272,12 +1250,8 @@ queue_impl::submitMemOpHelper(const std::vector<event> &DepEvents,
   {
     std::unique_lock<std::mutex> Lock(MMutex, std::defer_lock);
 
-    std::vector<event> ResolvedDepEvents;
-    const std::vector<event> &UserDepEvents =
-        resolveSignalTargets(DepEvents, ResolvedDepEvents);
-    std::vector<event> MutableDepEvents;
-    const std::vector<event> &ExpandedDepEvents =
-        getExtendDependencyList(UserDepEvents, MutableDepEvents, Lock);
+    std::vector<EventImplPtr> ExpandedDepEvents =
+        getExtendDependencyList(DepEvents, Lock);
 
     MEmpty = false;
 
@@ -1308,12 +1282,7 @@ queue_impl::submitMemOpHelper(const std::vector<event> &DepEvents,
         ResEventImpl->setEnqueued();
         // connect returned event with dependent events
         if (!isInOrder()) {
-          std::vector<EventImplPtr> &ExpandedDepEventImplPtrs =
-              ResEventImpl->getPreparedDepsEvents();
-          ExpandedDepEventImplPtrs.reserve(ExpandedDepEvents.size());
-          for (const event &DepEvent : ExpandedDepEvents)
-            ExpandedDepEventImplPtrs.push_back(
-                detail::getSyclObjImpl(DepEvent));
+          ResEventImpl->getPreparedDepsEvents() = std::move(ExpandedDepEvents);
 
           // ResEventImpl is local for current thread, no need to lock.
           ResEventImpl->cleanDepEventsThroughOneLevelUnlocked();

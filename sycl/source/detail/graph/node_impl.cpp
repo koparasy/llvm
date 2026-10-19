@@ -26,7 +26,7 @@ std::vector<node> node::get_successors() const {
 }
 
 node node::get_node_from_event(event nodeEvent) {
-  auto EventImpl = sycl::detail::getSyclObjImpl(nodeEvent);
+  auto EventImpl = sycl::detail::getEventImplNoResolve(nodeEvent);
   auto GraphImpl = EventImpl->getCommandGraph();
 
   return sycl::detail::createSyclObjFromImpl<node>(

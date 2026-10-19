@@ -618,13 +618,22 @@ protected:
 /// takes an event from the application must use this instead of
 /// getSyclObjImpl, which returns the event itself.
 inline EventImplPtr getUserEventImpl(const event &Event) {
-  return event_impl::resolveSignalTarget(getSyclObjImpl(Event));
+  return event_impl::resolveSignalTarget(ImplUtils::getSyclObjImpl(Event));
 }
 
+/// Returns the implementation of \p Event itself, not of its latest signal.
+/// Only for code concerned with the event object rather than with the work it
+/// stands for: its identity, its kind (host, interop, IPC) or its properties,
+/// and enqueue_signal_event.
+inline const EventImplPtr &getEventImplNoResolve(const event &Event) {
+  return ImplUtils::getSyclObjImpl(Event);
+}
+
+// Holds no sycl::event alternative: an event from the application has to be
+// resolved first, see getUserEventImpl.
 using events_iterator =
     variadic_iterator<event,
                       std::vector<std::shared_ptr<event_impl>>::const_iterator,
-                      std::vector<event>::const_iterator,
                       std::vector<event_impl *>::const_iterator, event_impl *>;
 
 class events_range : public iterator_range<events_iterator> {

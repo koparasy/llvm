@@ -49,7 +49,8 @@ __SYCL_EXPORT sycl::event make_event(const sycl::context &ctxt,
   }
 
   sycl::event RetEvent{};
-  detail::event_impl &EventImpl = *sycl::detail::getSyclObjImpl(RetEvent);
+  detail::event_impl &EventImpl =
+      *sycl::detail::getEventImplNoResolve(RetEvent);
   EventImpl.setContextImpl(ContextImpl);
   EventImpl.setProfilingEnabled(EnableProfiling);
   EventImpl.setIPCEnabled(EnableIPC);
@@ -77,7 +78,7 @@ static void CheckEventForSignal(detail::event_impl &EventImpl,
 static void CheckIPCEventsNotHeld(detail::queue_impl &QueueImpl,
                                   sycl::span<const event> Events) {
   bool HasIPCEvent = std::any_of(Events.begin(), Events.end(), [](auto &E) {
-    return detail::getSyclObjImpl(E)->isSharedWithProcesses();
+    return detail::getEventImplNoResolve(E)->isSharedWithProcesses();
   });
   if (HasIPCEvent && QueueImpl.hasIncompleteHostTask()) {
     throw sycl::exception(sycl::make_error_code(errc::feature_not_supported),
@@ -108,7 +109,8 @@ __SYCL_EXPORT void enqueue_wait_events(sycl::queue q,
 
 __SYCL_EXPORT void enqueue_signal_event(sycl::queue q, event &evt) {
   detail::queue_impl &QueueImpl = *sycl::detail::getSyclObjImpl(q);
-  detail::event_impl &EventImpl = *sycl::detail::getSyclObjImpl(evt);
+  // The signal is about the event itself, not about its latest signal.
+  detail::event_impl &EventImpl = *sycl::detail::getEventImplNoResolve(evt);
 
   if (EventImpl.isInterop()) {
     throw sycl::exception(
@@ -135,7 +137,7 @@ __SYCL_EXPORT void enqueue_signal_event(sycl::queue q, event &evt) {
 
   QueueImpl.submit_barrier_direct_without_event(
       {}, detail::CGType::Barrier, detail::code_location::current(),
-      sycl::detail::getSyclObjImpl(evt));
+      sycl::detail::getEventImplNoResolve(evt));
 }
 
 } // namespace ext::oneapi::experimental

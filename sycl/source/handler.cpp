@@ -1586,7 +1586,7 @@ addDependency(detail::handler_impl &Impl, detail::DepSource Source,
 }
 
 void handler::depends_on(event Event) {
-  const detail::EventImplPtr &EventImpl = detail::getSyclObjImpl(Event);
+  const detail::EventImplPtr &EventImpl = detail::getEventImplNoResolve(Event);
   // See sycl_ext_oneapi_inter_process_communication.
   if (EventImpl->isSharedWithProcesses())
     if (detail::queue_impl *Queue = impl->get_queue_or_null();
@@ -1594,8 +1594,8 @@ void handler::depends_on(event Event) {
       throw sycl::exception(make_error_code(errc::feature_not_supported),
                             "An IPC event cannot be used on a queue with an "
                             "incomplete host task.");
-  addDependency(*impl, detail::DepSource::User, detail::getSyclObjImpl(Event),
-                getType(), getCommandGraph().get());
+  addDependency(*impl, detail::DepSource::User, EventImpl, getType(),
+                getCommandGraph().get());
 }
 
 void handler::depends_on(const std::vector<event> &Events) {

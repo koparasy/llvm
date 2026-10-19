@@ -778,9 +778,11 @@ public:
     return Result;
   }
 
-  const std::vector<event> &
+  /// Returns the dependencies of a command submitted without a handler: the
+  /// events from the application (resolved, see getUserEventImpl) and, for an
+  /// in-order queue, the external and the last event.
+  std::vector<EventImplPtr>
   getExtendDependencyList(const std::vector<event> &DepEvents,
-                          std::vector<event> &MutableVec,
                           std::unique_lock<std::mutex> &QueueLock);
 
   // Called on host task completion that could block some kernels from enqueue.

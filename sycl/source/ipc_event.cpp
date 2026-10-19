@@ -68,7 +68,7 @@ __SYCL_EXPORT handle get(const sycl::event &Evt) {
         sycl::make_error_code(errc::invalid),
         "Event was not created with the enable_ipc property.");
 
-  auto EvtImpl = sycl::detail::getSyclObjImpl(Evt);
+  auto EvtImpl = sycl::detail::getEventImplNoResolve(Evt);
 
   // The backend event is created lazily; materialize it if get() is called
   // before the first signal.

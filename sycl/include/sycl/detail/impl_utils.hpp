@@ -16,6 +16,7 @@
 
 namespace sycl {
 inline namespace _V1 {
+class event;
 class handler;
 namespace detail {
 // Note! This class relies on the fact that all SYCL interface
@@ -53,6 +54,14 @@ inline constexpr struct GetSyclObjImpl {
   template <class Obj>
   auto operator()(const Obj &SyclObj) const
       -> decltype(ImplUtils::getSyclObjImpl(SyclObj)) {
+#ifdef __SYCL_CHECK_USER_EVENT_ACCESS
+    // Inside the SYCL runtime, an event from the application stands for its
+    // latest signal (sycl_ext_oneapi_reusable_events), so its users have to
+    // say which implementation they need.
+    static_assert(!std::is_same_v<Obj, event>,
+                  "use detail::getUserEventImpl or "
+                  "detail::getEventImplNoResolve for a sycl::event");
+#endif
     return ImplUtils::getSyclObjImpl(SyclObj);
   }
 } getSyclObjImpl;
