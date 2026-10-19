@@ -890,6 +890,10 @@ TEST_F(ReusableEventsSchedulerTest, HeldSignalOfOwnDependencyIsReleased) {
     KernelEvent.wait();
     Queue.wait();
   }
+  // The scheduler may defer the cleanup of commands to its next activity, so
+  // trigger it. A cycle would keep the event alive regardless.
+  sycl::queue Other{Ctx(), Dev()};
+  Other.submit([&](sycl::handler &CGH) { CGH.host_task([] {}); }).wait();
   EXPECT_TRUE(KernelEventImpl.expired());
 }
 
