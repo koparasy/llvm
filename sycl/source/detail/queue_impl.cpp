@@ -307,6 +307,21 @@ sycl::detail::optional<event> queue_impl::getLastEvent() {
   return detail::createSyclObjFromImpl<event>(insertMarkerEvent());
 }
 
+bool queue_impl::hasIncompleteHostTask() {
+  std::lock_guard<std::mutex> Lock{MMutex};
+  if (isInOrder()) {
+    const EventImplPtr &LastEvent = MDefaultGraphDeps.LastEventPtr;
+    return LastEvent &&
+           !Scheduler::areEventsSafeForSchedulerBypass({*LastEvent}, *MContext);
+  }
+  // Host tasks are always recorded here, as they have no backend event.
+  return std::any_of(MEventsWeak.begin(), MEventsWeak.end(),
+                     [](const std::weak_ptr<event_impl> &Weak) {
+                       EventImplPtr Event = Weak.lock();
+                       return Event && Event->isHost() && !Event->isCompleted();
+                     });
+}
+
 void queue_impl::addEvent(const detail::EventImplPtr &EventImpl) {
   if (!EventImpl)
     return;
@@ -612,9 +627,9 @@ EventImplPtr queue_impl::submit_barrier_direct_impl(
     if (EventForReuse) {
       // The backend event of an IPC event is shared with another process, so
       // every signal has to go to the backend directly through it.
-      if (EventForReuse->isIPCEnabled() || EventForReuse->isOpenedFromIpc()) {
+      if (EventForReuse->isSharedWithProcesses()) {
         throw sycl::exception(
-            sycl::make_error_code(errc::invalid),
+            sycl::make_error_code(errc::feature_not_supported),
             "An IPC event cannot be enqueued for signaling behind a command "
             "which is not enqueued in the backend.");
       }

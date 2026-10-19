@@ -757,6 +757,11 @@ public:
 
   void *getTraceEvent() { return MTraceEvent; }
 
+  /// Whether a host task submitted to this queue has not completed. For an
+  /// in-order queue, whether its last command is still held inside the SYCL
+  /// runtime, which is what a host task makes the commands behind it.
+  bool hasIncompleteHostTask();
+
   void setExternalEvent(const event &Event) {
     MInOrderExternalEvent.set([&](std::optional<event> &InOrderExternalEvent) {
       InOrderExternalEvent = Event;
@@ -848,7 +853,7 @@ protected:
     // event reflects the corresponding external event dependence as well.
     std::optional<event> ExternalEvent = popExternalEvent();
     if (ExternalEvent)
-      Handler.depends_on(*ExternalEvent);
+      Handler.depends_on(getUserEventImpl(*ExternalEvent));
   }
 
   inline const detail::EventImplPtr &

@@ -18,6 +18,7 @@
 #include <sycl/device_selector.hpp>
 #include <sycl/feature_test.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -106,6 +107,20 @@ EventImplPtr Scheduler::addCG(
     std::unique_ptr<detail::CG> CommandGroup, queue_impl &Queue,
     bool EventNeeded, ur_exp_command_buffer_handle_t CommandBuffer,
     const std::vector<ur_exp_command_buffer_sync_point_t> &Dependencies) {
+  // A dependency on an IPC event cannot be held inside the runtime, see
+  // event_impl::isSharedWithProcesses. It would be if another dependency has
+  // not reached the backend yet.
+  std::vector<EventImplPtr> &Deps = CommandGroup->getEvents();
+  if (std::any_of(Deps.begin(), Deps.end(),
+                  [](const EventImplPtr &Dep) {
+                    return Dep && Dep->isSharedWithProcesses();
+                  }) &&
+      !areEventsSafeForSchedulerBypass(Deps, Queue.getContextImpl())) {
+    throw sycl::exception(make_error_code(errc::feature_not_supported),
+                          "An IPC event cannot be used behind a command which "
+                          "is not enqueued in the backend.");
+  }
+
   EventImplPtr NewEvent = nullptr;
   const CGType Type = CommandGroup->getType();
   std::vector<Command *> AuxiliaryCmds;

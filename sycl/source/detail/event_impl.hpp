@@ -533,6 +533,13 @@ protected:
 public:
   bool isIPCEnabled() const noexcept { return MIPCEnabled; }
   bool isOpenedFromIpc() const noexcept { return MOpenedFromIpc; }
+  /// True if the backend event is shared with another process, exported or
+  /// imported. Such an event cannot have separate signals (see
+  /// resolveSignalTarget), so an operation on it must not be held inside the
+  /// SYCL runtime: another process may signal it again in the meantime.
+  bool isSharedWithProcesses() const noexcept {
+    return MIPCEnabled || MOpenedFromIpc;
+  }
   void setIPCEnabled(bool Value) { MIPCEnabled = Value; }
 
   /// Returns the exported IPC handle data for this producer IPC event,

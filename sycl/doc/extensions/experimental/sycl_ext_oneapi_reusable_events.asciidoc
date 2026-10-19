@@ -516,16 +516,14 @@ This extension has been implemented with the following limitations.
 
 * An event created with the `enable_ipc` property or opened from an IPC handle
   (see link:../experimental/sycl_ext_oneapi_inter_process_communication.asciidoc[
-  sycl_ext_oneapi_inter_process_communication]) cannot be enqueued for
-  signaling behind a command which is pending inside the SYCL runtime, for
-  example because it depends on a host task submitted using
-  `handler::host_task`, on a command held by a host accessor or on a
-  cross-context dependency. The implementation throws an `exception` with the
-  `errc::invalid` error code if, at the point of the call to
-  `enqueue_signal_event`, such a command is still pending inside the SYCL
-  runtime. If that command has already been submitted to the backend by then,
-  the call succeeds instead. Since an application cannot generally observe which
-  of the two is the case, it must not rely on either outcome.
+  sycl_ext_oneapi_inter_process_communication]) cannot be used by a command
+  which is held inside the SYCL runtime, as its backend event is shared with
+  another process. In addition to the cases that extension describes, the
+  `enqueue_signal_event`, `enqueue_wait_event` and `enqueue_wait_events`
+  functions and the submission of a command which depends on such an event
+  throw an `exception` with the `errc::feature_not_supported` error code if
+  the operation would be held inside the SYCL runtime for another reason, for
+  example a dependency on a host task submitted to another queue.
 * The `enqueue_wait_event` and `enqueue_wait_events` functions cannot be called
   on a queue which is recording a graph (see
   link:../experimental/sycl_ext_oneapi_graph.asciidoc[sycl_ext_oneapi_graph]).

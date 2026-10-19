@@ -16,6 +16,9 @@
 #include <sycl/device.hpp>
 #include <sycl/ext/oneapi/experimental/ipc_event.hpp>
 #include <sycl/ext/oneapi/experimental/reusable_events.hpp>
+#include <sycl/properties/queue_properties.hpp>
+
+#include <future>
 
 namespace syclexp = sycl::ext::oneapi::experimental;
 namespace ipcevt = sycl::ext::oneapi::experimental::ipc::event;
@@ -357,6 +360,106 @@ TEST_F(IPCEventTests, OpenNoAspectThrows) {
   }
   EXPECT_TRUE(caught);
   EXPECT_EQ(urIPCOpenEventHandleExp_counter, 0);
+}
+
+// Operations on an IPC event cannot be held inside the SYCL runtime: they
+// throw errc::feature_not_supported behind an incomplete host task, see
+// sycl_ext_oneapi_inter_process_communication.
+class IPCEventHostTaskTests : public IPCEventTests {
+protected:
+  void TearDown() override { Release.set_value(); }
+
+  // Submits a host task to Q which runs until the test ends.
+  sycl::event blockQueue(sycl::queue &Q) {
+    return Q.submit([&](sycl::handler &CGH) {
+      CGH.host_task([Released = Released] { Released.wait(); });
+    });
+  }
+
+  template <typename F> void expectNotSupported(F &&Op) {
+    try {
+      Op();
+      ADD_FAILURE() << "no exception thrown";
+    } catch (const sycl::exception &E) {
+      EXPECT_EQ(E.code(),
+                sycl::make_error_code(sycl::errc::feature_not_supported));
+    }
+  }
+
+  sycl::event makeIPCEvent() {
+    return syclexp::make_event(Ctxt,
+                               syclexp::properties{syclexp::enable_ipc{true}});
+  }
+
+  std::promise<void> Release;
+  std::shared_future<void> Released = Release.get_future().share();
+  sycl::device Dev = Ctxt.get_devices()[0];
+};
+
+TEST_F(IPCEventHostTaskTests, SignalBehindHostTask) {
+  sycl::queue Queue{Ctxt, Dev, sycl::property::queue::in_order{}};
+  sycl::event Evt = makeIPCEvent();
+  blockQueue(Queue);
+  expectNotSupported([&] { syclexp::enqueue_signal_event(Queue, Evt); });
+}
+
+TEST_F(IPCEventHostTaskTests, WaitBehindHostTask) {
+  sycl::queue SignalQueue{Ctxt, Dev, sycl::property::queue::in_order{}};
+  sycl::event Evt = makeIPCEvent();
+  syclexp::enqueue_signal_event(SignalQueue, Evt);
+
+  sycl::queue Queue{Ctxt, Dev, sycl::property::queue::in_order{}};
+  blockQueue(Queue);
+  expectNotSupported([&] { syclexp::enqueue_wait_event(Queue, Evt); });
+  expectNotSupported([&] { syclexp::enqueue_wait_events(Queue, {Evt}); });
+}
+
+TEST_F(IPCEventHostTaskTests, DependsOnBehindHostTask) {
+  sycl::event Evt = makeIPCEvent();
+  for (bool InOrder : {true, false}) {
+    sycl::queue Queue =
+        InOrder ? sycl::queue{Ctxt, Dev, sycl::property::queue::in_order{}}
+                : sycl::queue{Ctxt, Dev};
+    blockQueue(Queue);
+    expectNotSupported([&] {
+      Queue.submit([&](sycl::handler &CGH) {
+        CGH.depends_on(Evt);
+        CGH.host_task([] {});
+      });
+    });
+  }
+}
+
+// The host task of another queue holds the command just as well.
+TEST_F(IPCEventHostTaskTests, DependsOnHeldByOtherQueue) {
+  sycl::event Evt = makeIPCEvent();
+  sycl::queue OtherQueue{Ctxt, Dev};
+  sycl::event HostTask = blockQueue(OtherQueue);
+
+  sycl::queue Queue{Ctxt, Dev};
+  expectNotSupported([&] {
+    Queue.submit([&](sycl::handler &CGH) {
+      CGH.depends_on(Evt);
+      CGH.depends_on(HostTask);
+      CGH.host_task([] {});
+    });
+  });
+}
+
+// Without an incomplete host task nothing is held, and the operations work.
+TEST_F(IPCEventHostTaskTests, NoHostTask) {
+  sycl::queue Queue{Ctxt, Dev, sycl::property::queue::in_order{}};
+  sycl::event Evt = makeIPCEvent();
+
+  EXPECT_NO_THROW({
+    syclexp::enqueue_signal_event(Queue, Evt);
+    syclexp::enqueue_wait_event(Queue, Evt);
+    Queue.submit([&](sycl::handler &CGH) {
+      CGH.depends_on(Evt);
+      CGH.host_task([] {});
+    });
+  });
+  Queue.wait();
 }
 
 } // namespace

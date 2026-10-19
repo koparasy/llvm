@@ -12,6 +12,8 @@
 #include <sycl/detail/ur.hpp>
 #include <sycl/ext/oneapi/experimental/reusable_events.hpp>
 
+#include <algorithm>
+
 namespace sycl {
 inline namespace _V1 {
 namespace ext::oneapi::experimental {
@@ -71,10 +73,24 @@ static void CheckEventForSignal(detail::event_impl &EventImpl,
   }
 }
 
+// See sycl_ext_oneapi_inter_process_communication.
+static void CheckIPCEventsNotHeld(detail::queue_impl &QueueImpl,
+                                  sycl::span<const event> Events) {
+  bool HasIPCEvent = std::any_of(Events.begin(), Events.end(), [](auto &E) {
+    return detail::getSyclObjImpl(E)->isSharedWithProcesses();
+  });
+  if (HasIPCEvent && QueueImpl.hasIncompleteHostTask()) {
+    throw sycl::exception(sycl::make_error_code(errc::feature_not_supported),
+                          "An IPC event cannot be used on a queue with an "
+                          "incomplete host task.");
+  }
+}
+
 } // namespace detail
 
 __SYCL_EXPORT void enqueue_wait_event(sycl::queue q, const event &evt) {
   detail::queue_impl &QueueImpl = *sycl::detail::getSyclObjImpl(q);
+  detail::CheckIPCEventsNotHeld(QueueImpl, sycl::span<const event>(&evt, 1));
 
   QueueImpl.submit_barrier_direct_without_event(
       sycl::span<const event>(&evt, 1), detail::CGType::BarrierWaitlist,
@@ -84,6 +100,7 @@ __SYCL_EXPORT void enqueue_wait_event(sycl::queue q, const event &evt) {
 __SYCL_EXPORT void enqueue_wait_events(sycl::queue q,
                                        const std::vector<event> &evts) {
   detail::queue_impl &QueueImpl = *sycl::detail::getSyclObjImpl(q);
+  detail::CheckIPCEventsNotHeld(QueueImpl, evts);
 
   QueueImpl.submit_barrier_direct_without_event(
       evts, detail::CGType::BarrierWaitlist, detail::code_location::current());
@@ -106,6 +123,7 @@ __SYCL_EXPORT void enqueue_signal_event(sycl::queue q, event &evt) {
   }
 
   detail::CheckEventForSignal(EventImpl, QueueImpl.getContextImpl());
+  detail::CheckIPCEventsNotHeld(QueueImpl, sycl::span<const event>(&evt, 1));
 
   // An IPC event cannot be signaled on a profiling-enabled queue.
   if (EventImpl.isIPCEnabled() && QueueImpl.MIsProfilingEnabled) {
