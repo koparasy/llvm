@@ -590,6 +590,14 @@ protected:
   bool MIsHostEvent = false;
 };
 
+/// Returns the implementation of an event received from the application,
+/// which is its latest signal (see event_impl::resolveSignalTarget). Code which
+/// takes an event from the application must use this instead of
+/// getSyclObjImpl, which returns the event itself.
+inline EventImplPtr getUserEventImpl(const event &Event) {
+  return event_impl::resolveSignalTarget(getSyclObjImpl(Event));
+}
+
 using events_iterator =
     variadic_iterator<event,
                       std::vector<std::shared_ptr<event_impl>>::const_iterator,

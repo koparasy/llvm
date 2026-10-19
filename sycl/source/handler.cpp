@@ -1565,9 +1565,29 @@ void handler::use_kernel_bundle(
   setHandlerKernelBundle(detail::getSyclObjImpl(ExecBundle));
 }
 
+// Adds a dependency of this command group on EventImpl.
+static void
+addDependency(detail::handler_impl &Impl, detail::DepSource Source,
+              const detail::EventImplPtr &EventImpl, detail::CGType Type,
+              ext::oneapi::experimental::detail::graph_impl *Graph) {
+  // Async alloc calls the adapter immediately, when the command group function
+  // is executed. Any explicit/implicit dependencies are handled at that point,
+  // including in order queue deps. Adding a dependency afterwards would have no
+  // effect, so it is explicitly disallowed.
+  if (EventImpl && Type == detail::CGType::AsyncAlloc) {
+    throw sycl::exception(make_error_code(errc::invalid),
+                          "Cannot submit a dependency after an asynchronous "
+                          "allocation has already been executed!");
+  }
+
+  registerEventDependency(Source, EventImpl, Impl.CGData.MEvents,
+                          Impl.get_queue_or_null(), Impl.get_context(),
+                          Impl.get_device(), Graph);
+}
+
 void handler::depends_on(event Event) {
-  depends_on(
-      detail::event_impl::resolveSignalTarget(detail::getSyclObjImpl(Event)));
+  addDependency(*impl, detail::DepSource::User, detail::getSyclObjImpl(Event),
+                getType(), getCommandGraph().get());
 }
 
 void handler::depends_on(const std::vector<event> &Events) {
@@ -1577,19 +1597,8 @@ void handler::depends_on(const std::vector<event> &Events) {
 }
 
 void handler::depends_on(const detail::EventImplPtr &EventImpl) {
-  // Async alloc calls the adapter immediately, when the command group function
-  // is executed. Any explicit/implicit dependencies are handled at that point,
-  // including in order queue deps. Adding a dependency afterwards would have no
-  // effect, so it is explicitly disallowed.
-  if (EventImpl && getType() == detail::CGType::AsyncAlloc) {
-    throw sycl::exception(make_error_code(errc::invalid),
-                          "Cannot submit a dependency after an asynchronous "
-                          "allocation has already been executed!");
-  }
-
-  registerEventDependency(EventImpl, impl->CGData.MEvents,
-                          impl->get_queue_or_null(), impl->get_context(),
-                          impl->get_device(), getCommandGraph().get());
+  addDependency(*impl, detail::DepSource::Runtime, EventImpl, getType(),
+                getCommandGraph().get());
 }
 
 void handler::depends_on(const std::vector<detail::EventImplPtr> &Events) {

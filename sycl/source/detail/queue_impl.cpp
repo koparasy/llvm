@@ -59,15 +59,13 @@ static const std::vector<event> &
 resolveSignalTargets(const std::vector<event> &DepEvents,
                      std::vector<event> &Storage) {
   auto HasTarget = [](const event &Event) {
-    const EventImplPtr &Impl = getSyclObjImpl(Event);
-    return event_impl::resolveSignalTarget(Impl) != Impl;
+    return getUserEventImpl(Event) != getSyclObjImpl(Event);
   };
   if (std::none_of(DepEvents.begin(), DepEvents.end(), HasTarget))
     return DepEvents;
   Storage.reserve(DepEvents.size());
   for (const event &Event : DepEvents)
-    Storage.push_back(createSyclObjFromImpl<event>(
-        event_impl::resolveSignalTarget(getSyclObjImpl(Event))));
+    Storage.push_back(createSyclObjFromImpl<event>(getUserEventImpl(Event)));
   return Storage;
 }
 
@@ -126,7 +124,8 @@ queue_impl::getExtendDependencyList(const std::vector<event> &DepEvents,
 
   MutableVec = DepEvents;
   if (ExternalEvent)
-    MutableVec.push_back(*ExternalEvent);
+    MutableVec.push_back(
+        detail::createSyclObjFromImpl<event>(getUserEventImpl(*ExternalEvent)));
   if (ExtraEvent)
     MutableVec.push_back(
         detail::createSyclObjFromImpl<event>(std::move(ExtraEvent)));
@@ -1148,8 +1147,9 @@ detail::EventImplPtr queue_impl::submit_direct(
   std::optional<event> ExternalEvent = popExternalEvent();
   if (ExternalEvent) {
     registerEventDependency</*LockQueue*/ false>(
-        getSyclObjImpl(*ExternalEvent), CGData.MEvents, this, getContextImpl(),
-        getDeviceImpl(), hasCommandGraph() ? getCommandGraph().get() : nullptr);
+        DepSource::User, getSyclObjImpl(*ExternalEvent), CGData.MEvents, this,
+        getContextImpl(), getDeviceImpl(),
+        hasCommandGraph() ? getCommandGraph().get() : nullptr);
   }
 
   auto &Deps = hasCommandGraph() ? MExtGraphDeps : MDefaultGraphDeps;
@@ -1158,21 +1158,21 @@ detail::EventImplPtr queue_impl::submit_direct(
   EventImplPtr &LastEvent = Deps.LastEventPtr;
   if (inOrder && LastEvent) {
     registerEventDependency</*LockQueue*/ false>(
-        LastEvent, CGData.MEvents, this, getContextImpl(), getDeviceImpl(),
-        hasCommandGraph() ? getCommandGraph().get() : nullptr);
+        DepSource::Runtime, LastEvent, CGData.MEvents, this, getContextImpl(),
+        getDeviceImpl(), hasCommandGraph() ? getCommandGraph().get() : nullptr);
   } else if (inOrder && !MEmpty.load(std::memory_order_acquire) &&
              InsertBarrierForInOrderCommand) {
     // A barrier is injected to ensure ordering with prior commands
     auto ResEvent = insertHelperBarrier();
     registerEventDependency</*LockQueue*/ false>(
-        ResEvent, CGData.MEvents, this, getContextImpl(), getDeviceImpl(),
-        hasCommandGraph() ? getCommandGraph().get() : nullptr);
+        DepSource::Runtime, ResEvent, CGData.MEvents, this, getContextImpl(),
+        getDeviceImpl(), hasCommandGraph() ? getCommandGraph().get() : nullptr);
   }
 
   for (event e : DepEvents) {
     registerEventDependency</*LockQueue*/ false>(
-        event_impl::resolveSignalTarget(getSyclObjImpl(e)), CGData.MEvents,
-        this, getContextImpl(), getDeviceImpl(),
+        DepSource::User, getSyclObjImpl(e), CGData.MEvents, this,
+        getContextImpl(), getDeviceImpl(),
         hasCommandGraph() ? getCommandGraph().get() : nullptr);
   }
 

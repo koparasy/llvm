@@ -22,6 +22,12 @@ namespace sycl {
 inline namespace _V1 {
 namespace detail {
 
+/// Where an event dependency comes from. An event from the application stands
+/// for its latest signal and is resolved to it (see
+/// event_impl::resolveSignalTarget). An event the runtime holds already refers
+/// to the signal it was captured for and is used as it is.
+enum class DepSource { User, Runtime };
+
 /// Adds an event dependency to the list of dependencies, performing
 /// a series of checks.
 ///
@@ -34,7 +40,8 @@ namespace detail {
 /// set to false in cases where the event dependencies are set directly
 /// in the command submission flow and the lock is already acquired.
 ///
-/// \param EventImpl Event to register as a dependency
+/// \param Source Whether Dep comes from the application or from the runtime.
+/// \param Dep Event to register as a dependency
 /// \param EventsRegistered A list of already registered events, where
 /// the event will be added.
 /// \param QueueImpl A queue associated with the event dependencies. Can
@@ -45,11 +52,12 @@ namespace detail {
 /// be nullptr if no associated graph.
 template <bool LockQueue = true>
 void registerEventDependency(
-    const EventImplPtr &EventImpl, std::vector<EventImplPtr> &EventsRegistered,
-    queue_impl *QueueImpl, const context_impl &ContextImpl,
-    const device_impl &DeviceImpl,
+    DepSource Source, const EventImplPtr &Dep,
+    std::vector<EventImplPtr> &EventsRegistered, queue_impl *QueueImpl,
+    const context_impl &ContextImpl, const device_impl &DeviceImpl,
     const ext::oneapi::experimental::detail::graph_impl *GraphImpl) {
-
+  const EventImplPtr EventImpl =
+      Source == DepSource::User ? event_impl::resolveSignalTarget(Dep) : Dep;
   if (!EventImpl)
     return;
   if (EventImpl->isDiscarded()) {

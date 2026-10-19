@@ -290,9 +290,7 @@ void queue::ext_oneapi_set_external_event(const event &external_event) {
     throw sycl::exception(make_error_code(errc::invalid),
                           "ext_oneapi_set_external_event() can only be called "
                           "on in-order queues.");
-  return impl->setExternalEvent(detail::createSyclObjFromImpl<event>(
-      detail::event_impl::resolveSignalTarget(
-          detail::getSyclObjImpl(external_event))));
+  return impl->setExternalEvent(external_event);
 }
 
 const property_list &queue::getPropList() const { return impl->getPropList(); }

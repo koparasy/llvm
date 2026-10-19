@@ -892,3 +892,24 @@ TEST_F(ReusableEventsSchedulerTest, HeldSignalOfOwnDependencyIsReleased) {
   }
   EXPECT_TRUE(KernelEventImpl.expired());
 }
+
+// An external event of an in-order queue is resolved when the next command is
+// submitted, so it refers to the signal current at that point.
+TEST_F(ReusableEventsSchedulerTest, ExternalEventCapturedAtSubmission) {
+  static sycl::unittest::MockDeviceImage DevImage =
+      sycl::unittest::generateDefaultImage({"TestKernel"});
+  static sycl::unittest::MockDeviceImageArray<1> DevImageArray = {&DevImage};
+
+  sycl::queue SignalQueue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  sycl::queue Queue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  auto event = syclex::make_event(Ctx());
+
+  Queue.ext_oneapi_set_external_event(event);
+  syclex::enqueue_signal_event(SignalQueue, event);
+  Queue.single_task<TestKernel>([] {});
+  Queue.wait();
+
+  ASSERT_EQ(KernelWaitLists.size(), 1u);
+  EXPECT_EQ(KernelWaitLists[0],
+            std::vector<ur_event_handle_t>{currentHandle(event)});
+}
