@@ -301,7 +301,8 @@ sycl::detail::optional<event> queue_impl::getLastEvent() {
                                      : MExtGraphDeps.LastEventPtr;
   // If the event comes from a graph, we must return it.
   if (LastEvent)
-    return detail::createSyclObjFromImpl<event>(LastEvent);
+    return detail::createSyclObjFromImpl<event>(
+        event_impl::toUserEvent(LastEvent));
   // We insert a marker to represent an event at end.
   return detail::createSyclObjFromImpl<event>(insertMarkerEvent());
 }
@@ -621,7 +622,7 @@ EventImplPtr queue_impl::submit_barrier_direct_impl(
       // own, which becomes the event of its command. It is installed only once
       // the command exists, so that a failed submission leaves the event as it
       // was.
-      EventImplPtr SignalTarget = EventForReuse->createSignalTarget();
+      EventImplPtr SignalTarget = event_impl::createSignalTarget(EventForReuse);
       std::unique_ptr<detail::CG> CommandGroup(new detail::CGBarrier(
           ext::oneapi::experimental::event_mode_enum::none, std::move(CGData),
           BarrierType, CodeLoc, SignalTarget));

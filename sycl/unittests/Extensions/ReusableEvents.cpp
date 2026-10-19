@@ -917,3 +917,49 @@ TEST_F(ReusableEventsSchedulerTest, ExternalEventCapturedAtSubmission) {
   EXPECT_EQ(KernelWaitLists[0],
             std::vector<ur_event_handle_t>{currentHandle(event)});
 }
+
+// Events handed back to the application compare equal to the event it holds
+// while that event still stands for the same signal.
+TEST_F(ReusableEventsSchedulerTest, WaitListReturnsSignaledEvent) {
+  static sycl::unittest::MockDeviceImage DevImage =
+      sycl::unittest::generateDefaultImage({"TestKernel"});
+  static sycl::unittest::MockDeviceImageArray<1> DevImageArray = {&DevImage};
+
+  sycl::queue SignalQueue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  sycl::queue Queue{Ctx(), Dev()};
+  auto event = syclex::make_event(Ctx());
+  syclex::enqueue_signal_event(SignalQueue, event);
+  ur_event_handle_t First = currentHandle(event);
+
+  sycl::event Kernel = Queue.submit([&](sycl::handler &CGH) {
+    CGH.depends_on(event);
+    CGH.single_task<TestKernel>([] {});
+  });
+  std::vector<sycl::event> WaitList = Kernel.get_wait_list();
+  ASSERT_EQ(WaitList.size(), 1u);
+  EXPECT_EQ(WaitList[0], event);
+
+  // Once the event moves on to another signal, the wait list still refers to
+  // the first one.
+  syclex::enqueue_signal_event(SignalQueue, event);
+  ASSERT_NE(currentHandle(event), First);
+  WaitList = Kernel.get_wait_list();
+  ASSERT_EQ(WaitList.size(), 1u);
+  EXPECT_NE(WaitList[0], event);
+  EXPECT_EQ(sycl::detail::getSyclObjImpl(WaitList[0])->getHandle(), First);
+  Queue.wait();
+}
+
+TEST_F(ReusableEventsSchedulerTest, LastEventOfHeldSignal) {
+  sycl::queue Queue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  auto event = syclex::make_event(Ctx());
+
+  blockQueue(Queue);
+  syclex::enqueue_signal_event(Queue, event);
+  auto LastEvent = Queue.ext_oneapi_get_last_event();
+  ASSERT_TRUE(LastEvent.has_value());
+  EXPECT_EQ(*LastEvent, event);
+
+  Release.set_value();
+  Queue.wait();
+}

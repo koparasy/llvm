@@ -162,9 +162,22 @@ public:
   /// Makes \p Target the signal target of this event.
   void setSignalTarget(EventImplPtr Target);
 
-  /// Creates an event to be used as a signal target of this event, with the
-  /// same context and event properties.
-  EventImplPtr createSignalTarget() const;
+  /// Creates an event to be used as a signal target of \p Owner, with the same
+  /// context and event properties.
+  static EventImplPtr createSignalTarget(const EventImplPtr &Owner);
+
+  /// Returns the event to hand to the application for \p Event. For a signal
+  /// target which is still the latest signal of the event it was created for,
+  /// that is this event, so that it compares equal to the event the
+  /// application holds. Otherwise the event has moved on to another signal and
+  /// no longer stands for the work of \p Event, so \p Event is returned.
+  static EventImplPtr toUserEvent(const EventImplPtr &Event) {
+    if (Event && Event->MIsSignalTarget)
+      if (EventImplPtr Owner = Event->MSignalOwner.lock())
+        if (resolveSignalTarget(Owner) == Event)
+          return Owner;
+    return Event;
+  }
 
   /// Turns a signal target created by createSignalTarget into the event of a
   /// command submitted to \p Queue through the scheduler. The backend event is
@@ -577,6 +590,9 @@ protected:
   EventImplPtr MSignalTarget;
   std::atomic<bool> MHasSignalTarget{false};
   bool MIsSignalTarget = false;
+  /// For a signal target, the event it was created for. Set before the target
+  /// is shared and never changed. Weak, as the owner holds the target.
+  std::weak_ptr<event_impl> MSignalOwner;
 
   // Event class represents 3 different kinds of operations:
   // | type  | has UR event | MContext | MIsHostTask | MIsDefaultConstructed |

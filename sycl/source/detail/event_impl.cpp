@@ -323,7 +323,7 @@ EventImplPtr event_impl::prepareSignalTarget(const EventImplPtr &Event) {
       (Target->isDefaultConstructed() || Target->getHandle()))
     return Target;
 
-  Target = Event->createSignalTarget();
+  Target = createSignalTarget(Event);
   Event->MHasSignalTarget.store(true, std::memory_order_release);
   return Target;
 }
@@ -335,13 +335,14 @@ void event_impl::setSignalTarget(EventImplPtr Target) {
   MHasSignalTarget.store(true, std::memory_order_release);
 }
 
-EventImplPtr event_impl::createSignalTarget() const {
-  assert(MContext && "the context of a signaled event must be bound");
+EventImplPtr event_impl::createSignalTarget(const EventImplPtr &Owner) {
+  assert(Owner->MContext && "the context of a signaled event must be bound");
   EventImplPtr Target = create_default_event();
-  Target->MContext = MContext;
-  Target->MIsProfilingEnabled = MIsProfilingEnabled;
-  Target->MLowPower = MLowPower;
+  Target->MContext = Owner->MContext;
+  Target->MIsProfilingEnabled = Owner->MIsProfilingEnabled;
+  Target->MLowPower = Owner->MLowPower;
   Target->MIsSignalTarget = true;
+  Target->MSignalOwner = Owner;
   return Target;
 }
 

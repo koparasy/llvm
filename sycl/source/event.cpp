@@ -64,7 +64,8 @@ std::vector<event> event::get_wait_list() {
   std::vector<event> Result;
 
   for (auto &EventImpl : current(impl)->getWaitList())
-    Result.push_back(detail::createSyclObjFromImpl<event>(EventImpl));
+    Result.push_back(detail::createSyclObjFromImpl<event>(
+        detail::event_impl::toUserEvent(EventImpl)));
 
   return Result;
 }
