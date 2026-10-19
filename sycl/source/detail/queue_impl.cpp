@@ -490,6 +490,7 @@ EventImplPtr queue_impl::submit_kernel_scheduler_bypass(
       ResultEvent->getPreparedDepsEvents() = DepEvents;
       // ResultEvent is local for current thread, no need to lock.
       ResultEvent->cleanDepEventsThroughOneLevelUnlocked();
+      ResultEvent->releaseCapturedDependenciesUnlocked();
     }
   }
 
@@ -571,6 +572,7 @@ EventImplPtr queue_impl::submit_barrier_scheduler_bypass(
     ResEvent->getPreparedDepsEvents() = std::move(DepEvents);
     // ResultEvent is local for current thread, no need to lock.
     ResEvent->cleanDepEventsThroughOneLevelUnlocked();
+    ResEvent->releaseCapturedDependenciesUnlocked();
   }
 
   return (DiscardEvent || EventForReuse) ? nullptr : ResEvent;
@@ -668,6 +670,7 @@ queue_impl::makeEnqueuedEvent(ur_event_handle_t UREvent,
     ResEvent->getPreparedDepsEvents() = std::move(DepEvents);
     // ResEvent is local for the current thread, no need to lock.
     ResEvent->cleanDepEventsThroughOneLevelUnlocked();
+    ResEvent->releaseCapturedDependenciesUnlocked();
   }
 
   return ResEvent;
@@ -1286,6 +1289,7 @@ queue_impl::submitMemOpHelper(const std::vector<event> &DepEvents,
 
           // ResEventImpl is local for current thread, no need to lock.
           ResEventImpl->cleanDepEventsThroughOneLevelUnlocked();
+          ResEventImpl->releaseCapturedDependenciesUnlocked();
         }
       }
 

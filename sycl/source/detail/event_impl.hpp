@@ -329,6 +329,22 @@ public:
   /// Cleans dependencies of this event's dependencies w/o locking MMutex.
   void cleanDepEventsThroughOneLevelUnlocked();
 
+  /// Called once the dependencies of this event are no longer waited for
+  /// through these lists (the backend has them): replaces each signal target
+  /// among them by the event it was created for, so that it does not keep the
+  /// target from being signaled again in place (see prepareSignalTarget). The
+  /// lists then serve event::get_wait_list and cleanup only, as for an event
+  /// which was never signaled.
+  void releaseCapturedDependencies();
+
+  /// Same as releaseCapturedDependencies, w/o locking MMutex.
+  void releaseCapturedDependenciesUnlocked();
+
+  /// Same as releaseCapturedDependencies, for a list of dependencies \p Deps
+  /// of the event \p Self.
+  static void releaseCapturedSignals(const event_impl &Self,
+                                     std::vector<EventImplPtr> &Deps);
+
   /// Checks if this event is discarded by SYCL implementation.
   ///
   /// \return true if this event is discarded.

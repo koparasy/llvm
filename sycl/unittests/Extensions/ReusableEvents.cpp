@@ -349,14 +349,14 @@ protected:
   }
 
   // Submits a host task to Q which runs until Release is set.
-  void blockQueue(sycl::queue &Q) {
-    std::shared_future<void> Released = Release.get_future().share();
-    Q.submit([&](sycl::handler &CGH) {
-      CGH.host_task([Released] { Released.wait(); });
+  sycl::event blockQueue(sycl::queue &Q) {
+    return Q.submit([&](sycl::handler &CGH) {
+      CGH.host_task([Released = Released] { Released.wait(); });
     });
   }
 
   std::promise<void> Release;
+  std::shared_future<void> Released = Release.get_future().share();
   std::optional<sycl::device> MaybeDev;
   std::optional<sycl::context> MaybeCtx;
   sycl::device &Dev() { return *MaybeDev; }
@@ -950,6 +950,8 @@ TEST_F(ReusableEventsSchedulerTest, WaitListReturnsSignaledEvent) {
   syclex::enqueue_signal_event(SignalQueue, event);
   ur_event_handle_t First = currentHandle(event);
 
+  // A command in the backend no longer holds on to the signal it waited for:
+  // its wait list shows the event, and the signal can be reused.
   sycl::event Kernel = Queue.submit([&](sycl::handler &CGH) {
     CGH.depends_on(event);
     CGH.single_task<TestKernel>([] {});
@@ -957,15 +959,33 @@ TEST_F(ReusableEventsSchedulerTest, WaitListReturnsSignaledEvent) {
   std::vector<sycl::event> WaitList = Kernel.get_wait_list();
   ASSERT_EQ(WaitList.size(), 1u);
   EXPECT_EQ(WaitList[0], event);
+  syclex::enqueue_signal_event(SignalQueue, event);
+  EXPECT_EQ(currentHandle(event), First);
 
-  // Once the event moves on to another signal, the wait list still refers to
-  // the first one.
+  // A command held in the runtime still refers to the signal it captured once
+  // the event moves on to another one.
+  sycl::event HostTask = blockQueue(Queue);
+  sycl::event Held = Queue.submit([&](sycl::handler &CGH) {
+    CGH.depends_on(HostTask);
+    CGH.depends_on(event);
+    CGH.single_task<TestKernel>([] {});
+  });
+  auto HasHandle = [](const std::vector<sycl::event> &Events,
+                      ur_event_handle_t Handle) {
+    return std::any_of(Events.begin(), Events.end(), [&](const auto &E) {
+      return sycl::detail::getSyclObjImpl(E)->getHandle() == Handle;
+    });
+  };
+  WaitList = Held.get_wait_list();
+  ASSERT_EQ(WaitList.size(), 2u);
+  EXPECT_NE(std::find(WaitList.begin(), WaitList.end(), event), WaitList.end());
   syclex::enqueue_signal_event(SignalQueue, event);
   ASSERT_NE(currentHandle(event), First);
-  WaitList = Kernel.get_wait_list();
-  ASSERT_EQ(WaitList.size(), 1u);
-  EXPECT_NE(WaitList[0], event);
-  EXPECT_EQ(sycl::detail::getSyclObjImpl(WaitList[0])->getHandle(), First);
+  WaitList = Held.get_wait_list();
+  ASSERT_EQ(WaitList.size(), 2u);
+  EXPECT_EQ(std::find(WaitList.begin(), WaitList.end(), event), WaitList.end());
+  EXPECT_TRUE(HasHandle(WaitList, First));
+  Release.set_value();
   Queue.wait();
 }
 
@@ -1010,4 +1030,105 @@ TEST_F(ReusableEventsSchedulerTest, InteropMemObjectAvailableEvent) {
                      EventToWait);
   EXPECT_EQ(EventToWait, currentHandle(event));
   EXPECT_NE(EventToWait, nullptr);
+}
+
+// In a loop which signals an event and waits for it, the backend event of the
+// signal is reused once the previous iteration's consumers are in the backend,
+// whatever kind of consumer it is.
+class ReusableEventsReuseTest : public ReusableEventsSchedulerTest {
+protected:
+  static constexpr int Iterations = 8;
+
+  void SetUp() override {
+    ReusableEventsSchedulerTest::SetUp();
+    static sycl::unittest::MockDeviceImage DevImage =
+        sycl::unittest::generateDefaultImage({"TestKernel"});
+    static sycl::unittest::MockDeviceImageArray<1> DevImageArray = {&DevImage};
+  }
+};
+
+TEST_F(ReusableEventsReuseTest, OutOfOrderWait) {
+  sycl::queue SignalQueue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  sycl::queue Queue{Ctx(), Dev()};
+  auto event = syclex::make_event(Ctx());
+  for (int I = 0; I < Iterations; ++I) {
+    syclex::enqueue_signal_event(SignalQueue, event);
+    syclex::enqueue_wait_event(Queue, event);
+  }
+  Queue.wait();
+  EXPECT_EQ(UrEventCreateExp_counter, 1);
+}
+
+TEST_F(ReusableEventsReuseTest, OutOfOrderKernelEventsKept) {
+  sycl::queue SignalQueue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  sycl::queue Queue{Ctx(), Dev()};
+  auto event = syclex::make_event(Ctx());
+  std::vector<sycl::event> Kernels;
+  for (int I = 0; I < Iterations; ++I) {
+    syclex::enqueue_signal_event(SignalQueue, event);
+    Kernels.push_back(Queue.submit([&](sycl::handler &CGH) {
+      CGH.depends_on(event);
+      CGH.single_task<TestKernel>([] {});
+    }));
+  }
+  Queue.wait();
+  EXPECT_EQ(UrEventCreateExp_counter, 1);
+}
+
+TEST_F(ReusableEventsReuseTest, HostTaskConsumer) {
+  sycl::queue SignalQueue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  sycl::queue Queue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  auto event = syclex::make_event(Ctx());
+  std::vector<sycl::event> HostTasks;
+  for (int I = 0; I < Iterations; ++I) {
+    syclex::enqueue_signal_event(SignalQueue, event);
+    HostTasks.push_back(Queue.submit([&](sycl::handler &CGH) {
+      CGH.depends_on(event);
+      CGH.host_task([] {});
+    }));
+    HostTasks.back().wait();
+  }
+  EXPECT_EQ(UrEventCreateExp_counter, 1);
+}
+
+TEST_F(ReusableEventsReuseTest, AccessorConsumer) {
+  sycl::queue SignalQueue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  sycl::queue Queue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  auto event = syclex::make_event(Ctx());
+  sycl::buffer<int, 1> Buffer{sycl::range<1>{1}};
+  int Out = 0;
+  std::vector<sycl::event> Copies;
+  for (int I = 0; I < Iterations; ++I) {
+    syclex::enqueue_signal_event(SignalQueue, event);
+    Copies.push_back(Queue.submit([&](sycl::handler &CGH) {
+      sycl::accessor Acc{Buffer, CGH, sycl::read_only};
+      CGH.depends_on(event);
+      CGH.copy(Acc, &Out);
+    }));
+  }
+  Queue.wait();
+  EXPECT_EQ(UrEventCreateExp_counter, 1);
+}
+
+// Two signals held in a row: each depends on the previous one, through the
+// last event of the in-order queue. Releasing what they captured must not let
+// the event own itself.
+TEST_F(ReusableEventsSchedulerTest, ConsecutiveHeldSignalsAreReleased) {
+  std::weak_ptr<sycl::detail::event_impl> EventImpl;
+  {
+    sycl::queue Queue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+    auto event = syclex::make_event(Ctx());
+    EventImpl = sycl::detail::getSyclObjImpl(event);
+    blockQueue(Queue);
+    syclex::enqueue_signal_event(Queue, event);
+    syclex::enqueue_signal_event(Queue, event);
+    Release.set_value();
+    event.wait();
+    Queue.wait();
+  }
+  // The scheduler may defer the cleanup of commands to its next activity, so
+  // trigger it.
+  sycl::queue Other{Ctx(), Dev()};
+  Other.submit([&](sycl::handler &CGH) { CGH.host_task([] {}); }).wait();
+  EXPECT_TRUE(EventImpl.expired());
 }

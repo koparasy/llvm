@@ -706,6 +706,35 @@ void event_impl::cleanDepEventsThroughOneLevelUnlocked() {
   }
 }
 
+void event_impl::releaseCapturedSignals(const event_impl &Self,
+                                        std::vector<EventImplPtr> &Deps) {
+  // A signal target of the event Self is a signal target of is kept: that
+  // event owns Self, so it would own itself.
+  EventImplPtr SelfOwner =
+      Self.MIsSignalTarget ? Self.MSignalOwner.lock() : nullptr;
+  for (EventImplPtr &Dep : Deps) {
+    if (!Dep || !Dep->MIsSignalTarget)
+      continue;
+    EventImplPtr Owner = Dep->MSignalOwner.lock();
+    if (!Owner || Owner == SelfOwner)
+      continue;
+    // The owner does not reach the target's dependencies, so clean them as
+    // cleanDepEventsThroughOneLevel would have through the target.
+    Dep->cleanupDependencyEvents();
+    Dep = std::move(Owner);
+  }
+}
+
+void event_impl::releaseCapturedDependenciesUnlocked() {
+  releaseCapturedSignals(*this, MPreparedDepsEvents);
+  releaseCapturedSignals(*this, MPreparedHostDepsEvents);
+}
+
+void event_impl::releaseCapturedDependencies() {
+  std::lock_guard<std::mutex> Lock(MMutex);
+  releaseCapturedDependenciesUnlocked();
+}
+
 void event_impl::cleanDepEventsThroughOneLevel() {
   std::lock_guard<std::mutex> Lock(MMutex);
   cleanDepEventsThroughOneLevelUnlocked();

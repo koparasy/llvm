@@ -257,6 +257,12 @@ public:
                                                     queue_impl *CommandQueue,
                                                     bool IsHostTaskCommand);
 
+  /// Releases the signals this command captured as dependencies once it no
+  /// longer waits for them, see event_impl::releaseCapturedDependencies.
+  virtual void releaseCapturedDependencies() {
+    MEvent->releaseCapturedDependencies();
+  }
+
   /// Returns true iff this command represents a host task. Only ExecCGCommand
   /// can, so the base implementation always returns false: the command type
   /// alone does not imply the dynamic type of the command.
@@ -643,6 +649,8 @@ void enqueueImpKernel(
 /// operation.
 class ExecCGCommand : public Command {
 public:
+  void releaseCapturedDependencies() final;
+
   ExecCGCommand(
       std::unique_ptr<detail::CG> CommandGroup, queue_impl *Queue,
       bool EventNeeded, ur_exp_command_buffer_handle_t CommandBuffer = nullptr,

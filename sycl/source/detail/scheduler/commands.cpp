@@ -342,6 +342,7 @@ public:
       SchedulerInst.NotifyHostTaskCompletion(MThisCmd);
       return;
     }
+    MThisCmd->releaseCapturedDependencies();
 
     try {
       // we're ready to call the user-defined lambda now
@@ -917,6 +918,10 @@ bool Command::enqueue(EnqueueResultT &EnqueueResult, BlockingT Blocking,
     WakeWaitersOnFailure();
   } else {
     MEvent->setEnqueued();
+    // The backend has the dependencies now. A host task waits for them when it
+    // runs, see DispatchHostTask.
+    if (!isHostTask())
+      releaseCapturedDependencies();
     if (MShouldCompleteEventIfPossible && !MEvent->isDiscarded() &&
         (MEvent->isHost() || MEvent->getHandle() == nullptr))
       MEvent->setComplete();
@@ -1974,6 +1979,12 @@ ExecCGCommand::ExecCGCommand(
               CommandBuffer, Dependencies),
       MEventNeeded(EventNeeded), MCommandGroup(std::move(CommandGroup)) {
   emitInstrumentationDataProxy();
+}
+
+void ExecCGCommand::releaseCapturedDependencies() {
+  Command::releaseCapturedDependencies();
+  // The command group keeps the dependencies it was submitted with.
+  event_impl::releaseCapturedSignals(*MEvent, MCommandGroup->getEvents());
 }
 
 EventImplPtr ExecCGCommand::makeEvent(const detail::CG &CG, queue_impl *Queue) {
