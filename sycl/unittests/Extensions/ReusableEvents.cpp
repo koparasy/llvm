@@ -14,7 +14,9 @@
 
 #include <sycl/ext/oneapi/experimental/reusable_events.hpp>
 
+#include <detail/buffer_impl.hpp>
 #include <detail/event_impl.hpp>
+#include <sycl/detail/sycl_mem_obj_allocator.hpp>
 
 #include <condition_variable>
 #include <future>
@@ -249,6 +251,23 @@ ur_result_t redefinedUrEnqueueKernelLaunchRecord(void *pParams) {
   if (*params.pphEvent)
     **params.pphEvent = Handle;
   KernelHandles.push_back(Handle);
+  return UR_RESULT_SUCCESS;
+}
+
+ur_result_t redefinedUrMemGetInfo(void *pParams) {
+  auto params = *static_cast<ur_mem_get_info_params_t *>(pParams);
+  if (*params.ppropName == UR_MEM_INFO_CONTEXT && *params.ppPropValue)
+    *static_cast<ur_context_handle_t *>(*params.ppPropValue) =
+        DummyContextHandle;
+  else if (*params.ppropName == UR_MEM_INFO_SIZE && *params.ppPropValue)
+    *static_cast<size_t *>(*params.ppPropValue) = 16;
+  return UR_RESULT_SUCCESS;
+}
+
+ur_result_t redefinedUrMemBufferCreateWithNativeHandle(void *pParams) {
+  auto params =
+      *static_cast<ur_mem_buffer_create_with_native_handle_params_t *>(pParams);
+  **params.pphMem = reinterpret_cast<ur_mem_handle_t>(0x20);
   return UR_RESULT_SUCCESS;
 }
 
@@ -962,4 +981,33 @@ TEST_F(ReusableEventsSchedulerTest, LastEventOfHeldSignal) {
 
   Release.set_value();
   Queue.wait();
+}
+
+// The event a memory object is created with from a native handle is captured
+// at construction: the allocation waits for the signal current at that point.
+TEST_F(ReusableEventsSchedulerTest, InteropMemObjectAvailableEvent) {
+  mock::getCallbacks().set_replace_callback("urMemGetInfo",
+                                            &redefinedUrMemGetInfo);
+  mock::getCallbacks().set_replace_callback(
+      "urMemBufferCreateWithNativeHandle",
+      &redefinedUrMemBufferCreateWithNativeHandle);
+  mock::getCallbacks().set_replace_callback("urMemRetain",
+                                            &redefinedUrEventSuccess);
+  mock::getCallbacks().set_replace_callback("urMemRelease",
+                                            &redefinedUrEventSuccess);
+  sycl::queue SignalQueue{Ctx(), Dev(), sycl::property::queue::in_order{}};
+  auto event = syclex::make_event(Ctx());
+  syclex::enqueue_signal_event(SignalQueue, event);
+
+  sycl::detail::buffer_impl Buffer(
+      ur_native_handle_t{0x10}, Ctx(),
+      std::make_unique<sycl::detail::SYCLMemObjAllocatorHolder<
+          sycl::buffer_allocator<char>, char>>(),
+      /*OwnNativeHandle*/ false, event);
+  ur_event_handle_t EventToWait = nullptr;
+  Buffer.allocateMem(sycl::detail::getSyclObjImpl(Ctx()).get(),
+                     /*InitFromUserData*/ true, /*HostPtr*/ nullptr,
+                     EventToWait);
+  EXPECT_EQ(EventToWait, currentHandle(event));
+  EXPECT_NE(EventToWait, nullptr);
 }
